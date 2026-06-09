@@ -2241,7 +2241,7 @@ describe("isTelemetryDisabled", () => {
 describe("scrubPaths", () => {
   test("redacts macOS user directories", () => {
     assert.strictEqual(
-      scrubPaths("failed to read /Users/reinhard/projects/app/dist"),
+      scrubPaths("failed to read /Users/alice/projects/app/dist"),
       "failed to read /Users/<redacted>/projects/app/dist"
     );
   });

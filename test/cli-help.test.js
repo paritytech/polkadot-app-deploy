@@ -53,9 +53,8 @@ describe("--list-environments", () => {
     const out = runCli("bin/polkadot-app-deploy", "--list-environments");
     assert.match(out, /\bID\b/);
     assert.match(out, /paseo-next/);
-    assert.match(out, /polkadot/);
+    assert.match(out, /summit/);
     assert.match(out, /testnet/);
-    assert.match(out, /mainnet/);
   });
 });
 

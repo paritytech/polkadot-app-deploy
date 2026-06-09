@@ -97,31 +97,31 @@ const MOCKS = {
 
 describe("probe-env-health", () => {
   test("exits 0 on healthy chain", async () => {
-    const { code, stdout } = await runProbe({ env: "preview", scenario: "healthy" });
+    const { code, stdout } = await runProbe({ env: "paseo-next-v2", scenario: "healthy" });
     assert.strictEqual(code, 0, `expected exit 0, got ${code}; stdout: ${stdout}`);
     assert.match(stdout, /healthy/i);
   });
 
   test("exits non-zero on WS connect error", async () => {
-    const { code, stderr } = await runProbe({ env: "preview", scenario: "ws_connect_error" });
+    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "ws_connect_error" });
     assert.notStrictEqual(code, 0);
     assert.match(stderr, /ws_connect_error/);
   });
 
   test("exits non-zero on rpc error", async () => {
-    const { code, stderr } = await runProbe({ env: "preview", scenario: "rpc_error" });
+    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "rpc_error" });
     assert.notStrictEqual(code, 0);
     assert.match(stderr, /rpc_error/);
   });
 
   test("exits non-zero on runtime_call_error", async () => {
-    const { code, stderr } = await runProbe({ env: "preview", scenario: "runtime_call_error" });
+    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "runtime_call_error" });
     assert.notStrictEqual(code, 0);
     assert.match(stderr, /runtime_call_error/);
   });
 
   test("exits non-zero on timeout", async () => {
-    const { code, stderr } = await runProbe({ env: "preview", scenario: "timeout", timeoutMs: 500 });
+    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "timeout", timeoutMs: 500 });
     assert.notStrictEqual(code, 0);
     assert.match(stderr, /timeout/);
   });
@@ -134,7 +134,7 @@ describe("probe-env-health", () => {
   });
 
   test("exits non-zero on gateway_error (chains up, gateway HTTP throws)", async () => {
-    const { code, stderr } = await runProbe({ env: "preview", scenario: "gateway_error" });
+    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "gateway_error" });
     assert.notStrictEqual(code, 0);
     assert.match(stderr, /gateway_error/);
     assert.match(stderr, /gateway /);

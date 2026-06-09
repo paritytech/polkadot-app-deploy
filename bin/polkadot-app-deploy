@@ -1,0 +1,536 @@
+#!/usr/bin/env node
+
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish } from "../dist/deploy.js";
+import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
+import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
+import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
+import { loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
+import { loadEnvironments, listEnvironments, formatEnvironmentTable, DEFAULT_ENV_ID } from "../dist/environments.js";
+import * as fs from "fs";
+
+// Suppress "@parity/product-sdk-logger" localStorage warning in Node.js v22+.
+// The logger tries to read log-level config from localStorage which doesn't exist
+// in Node.js — it emits a NoSuchNativeMethod warning we cannot fix upstream.
+const _origEmitWarning = process.emitWarning.bind(process);
+process.emitWarning = (warning, ...rest) => {
+  const msg = (typeof warning === "string" ? warning : warning?.message ?? String(warning)).toLowerCase();
+  if (msg.includes("localstorage") || msg.includes("local storage")) return;
+  _origEmitWarning(warning, ...rest);
+};
+
+// Install early so anything printed during flag parsing / preflight is
+// available to the bug-report log tail.
+installLogCapture();
+
+// Preflight: fail fast on unsupported Node.js versions.
+{
+  const pkgPath = new URL("../package.json", import.meta.url);
+  const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  const nodeErr = checkNodeVersion(pkg.engines?.node ?? ">=22", process.version);
+  if (nodeErr) { console.error(`Error: ${nodeErr}`); process.exit(1); }
+}
+
+const args = process.argv.slice(2);
+
+const flags = {};
+const positional = [];
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "--bootstrap") { flags.removedBootstrap = true; }
+  else if (args[i] === "--pool-size") { flags.poolSize = parseInt(args[++i], 10); }
+  else if (args[i] === "--mnemonic") { flags.mnemonic = args[++i]; }
+  else if (args[i] === "--derivation-path") { flags.derivationPath = args[++i]; }
+  else if (args[i] === "--rpc") { flags.rpc = args[++i]; }
+  else if (args[i] === "--env") { flags.env = args[++i]; }
+  else if (args[i] === "--contract") {
+    // Repeatable: --contract KEY=0xADDRESS. Supplies/overrides a DotNS contract
+    // address (merged over the env's map). Required for --env custom.
+    const kv = args[++i] ?? "";
+    const eq = kv.indexOf("=");
+    if (eq <= 0) {
+      console.error(`Error: --contract expects KEY=0xADDRESS, got "${kv}"`);
+      process.exit(1);
+    }
+    (flags.contracts ??= {})[kv.slice(0, eq)] = kv.slice(eq + 1);
+  }
+  else if (args[i] === "--environment-file") { flags.environmentFile = args[++i]; }
+  else if (args[i] === "--list-environments") { flags.listEnvironments = true; }
+  else if (args[i] === "--password") { flags.password = args[++i]; }
+  else if (args[i] === "--js-merkle") { flags.jsMerkle = true; }
+  else if (args[i] === "--input-car") { flags.inputCar = args[++i]; }
+  else if (args[i] === "--tag") { flags.tag = args[++i]; }
+  else if (args[i] === "--config") { flags.config = args[++i]; }
+  else if (args[i] === "--gh-pages-mirror") { flags.ghPagesMirror = true; }
+  else if (args[i] === "--allow-large-deploy") { flags.allowLargeDeploy = true; }
+  else if (args[i] === "--reproducible") { flags.reproducibleSource = "commit"; }
+  else if (args[i].startsWith("--reproducible=")) { flags.reproducibleSource = args[i].slice("--reproducible=".length); }
+  else if (args[i] === "--dump-car") { flags.dumpCar = true; }
+  else if (args[i].startsWith("--dump-car=")) { flags.dumpCar = args[i].slice("--dump-car=".length); }
+  else if (args[i] === "--publish") { flags.publish = true; }
+  else if (args[i] === "--unpublish") { flags.unpublish = true; }
+  else if (args[i] === "--fail-on-publish-error") { flags.failOnPublishError = true; }
+  else if (args[i] === "--suri") { flags.suri = args[++i]; }
+  else if (args[i] === "--no-transfer-to-signedin-user") { flags.noTransferToSignedinUser = true; }
+  else if (args[i] === "--to") { flags.to = args[++i]; }
+  else if (args[i] === "--version" || args[i] === "-V") { flags.version = true; }
+  else if (args[i] === "--help" || args[i] === "-h") { flags.help = true; }
+  else { positional.push(args[i]); }
+}
+
+if (flags.publish && flags.unpublish) {
+  console.error("Error: --publish and --unpublish are mutually exclusive.");
+  process.exit(1);
+}
+
+// --environment-file: propagate to the env var so all internal loadEnvironments()
+// call sites (deploy.ts, manifest/publish.ts, personhood) honor the override.
+if (flags.environmentFile) {
+  process.env.PAD_ENV_FILE = flags.environmentFile;
+}
+
+if (flags.version) {
+  console.log(`polkadot-app-deploy v${VERSION}`);
+  process.exit(0);
+}
+
+if (flags.removedBootstrap) {
+  console.error("Error: --bootstrap was removed from polkadot-app-deploy. Use polkadot-app-bootstrap instead.");
+  process.exit(1);
+}
+
+// --list-environments: print the environments table and exit. Composes with
+// nothing else (deploy positional args are ignored).
+if (flags.listEnvironments) {
+  try {
+    const { doc } = await loadEnvironments({ userFilePath: flags.environmentFile ?? process.env.PAD_ENV_FILE });
+    console.log(formatEnvironmentTable(listEnvironments(doc)));
+    process.exit(0);
+  } catch (e) {
+    console.error(`Error: failed to load environments: ${e?.message ?? e}`);
+    process.exit(1);
+  }
+}
+
+if (flags.unpublish) {
+  if (!flags.mnemonic && !process.env.MNEMONIC) {
+    console.error("Error: --unpublish requires --mnemonic (or MNEMONIC env var).");
+    process.exit(1);
+  }
+  const [domain] = positional;
+  if (!domain) {
+    console.error("Error: --unpublish requires a domain (e.g. my-app.dot)");
+    process.exit(1);
+  }
+  try {
+    const result = await unpublish(domain, {
+      mnemonic: flags.mnemonic,
+      derivationPath: flags.derivationPath,
+      rpc: flags.rpc,
+      env: flags.env,
+    });
+    console.log(`Domain: ${result.domainName}`);
+    console.log(`Status: ${result.status}`);
+    process.exit(0);
+  } catch (e) {
+    console.error(`Unpublish failed:`, e?.message ?? e);
+    process.exit(1);
+  }
+}
+
+// The SSO adapter's polkadot-api client fires a benign `DestroyedError: Client
+// destroyed` on orphaned pending-response promises during WS teardown, AFTER an
+// SSO subcommand has done its work. The deploy path's handlers (below) aren't
+// installed yet here, so SSO subcommands install these guards to swallow that +
+// connection-teardown noise and surface anything else.
+function installSsoTeardownGuards() {
+  process.on("unhandledRejection", (e) => { if (!isBenignTeardownError(e)) { console.error(e); process.exit(1); } });
+  process.on("uncaughtException", (e) => { if (!isBenignTeardownError(e)) { console.error(e); process.exit(1); } });
+}
+
+// Sign-in subcommands: login / logout / whoami.
+// Lazy-imported from dist so the SSO deps never load in headless/deploy mode.
+{
+  const sub = positional[0];
+  if (sub === "login" || sub === "logout" || sub === "whoami") {
+    const envId = flags.env ?? DEFAULT_ENV_ID;
+    installSsoTeardownGuards();
+    try {
+      const capSub = sub.charAt(0).toUpperCase() + sub.slice(1);
+      const mod = await import(`../dist/commands/${sub}.js`);
+      await mod[`run${capSub}`](envId, { suri: flags.suri });
+    } catch (err) {
+      console.error(`Error: ${err?.message ?? err}`);
+      process.exit(1);
+    }
+    await closeTelemetry();
+    process.exit(0);
+  }
+}
+
+// `transfer` subcommand: hand a name you registered to the signed-in account
+// (or --to). Stand-alone handover + recovery for a deploy whose transfer step
+// failed. Uses the SSO stack to resolve the session recipient.
+if (positional[0] === "transfer") {
+  const envId = flags.env ?? DEFAULT_ENV_ID;
+  installSsoTeardownGuards();
+  try {
+    const { runTransfer } = await import("../dist/commands/transfer.js");
+    await runTransfer(envId, { label: positional[1], to: flags.to, mnemonic: flags.mnemonic });
+  } catch (err) {
+    console.error(`Error: ${err?.message ?? err}`);
+    process.exit(1);
+  }
+  await closeTelemetry();
+  process.exit(0);
+}
+
+// `product` subcommand. Only `validate` is wired today. `publish` and `resolve` arrive in later phases.
+if (positional[0] === "product") {
+  const verb = positional[1];
+  if (verb === "validate") {
+    try {
+      const { loadProductConfig, pessimisticSizePreflight, getTextRecordBudgetBytes } =
+        await import("../dist/index.js");
+      const explicitPath = positional[2];
+      const { config, sourcePath } = explicitPath
+        ? await loadProductConfig({ path: explicitPath })
+        : await loadProductConfig();
+      console.log(`✓ Loaded   ${sourcePath}`);
+      console.log(`✓ Schema   ${config.domain} (${config.executables.length} executable${config.executables.length === 1 ? "" : "s"})`);
+      const budget = getTextRecordBudgetBytes();
+      const report = pessimisticSizePreflight(config, budget);
+      for (const check of report.checks) {
+        const tag = check.ok ? "✓" : "✗";
+        console.log(`${tag} ${check.key.padEnd(40)} ${check.bytes} B / ${check.budget} B`);
+      }
+      if (!report.ok) {
+        console.error("Pessimistic size preflight failed — at least one manifest exceeds the dotNS text-record budget.");
+        process.exit(EXIT_CODE_NO_RETRY);
+      }
+      console.log("Validate complete.");
+      process.exit(0);
+    } catch (err) {
+      console.error(`Error: ${err?.message ?? err}`);
+      process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
+    }
+  }
+  if (verb === "publish" || verb === "resolve") {
+    console.error(`'product ${verb}' is not implemented yet (planned for a later phase).`);
+    process.exit(2);
+  }
+  console.error(`Unknown product subcommand: ${verb ?? "(none)"}. Try: polkadot-app-deploy product validate [<config-path>]`);
+  process.exit(2);
+}
+
+if (flags.publish && !flags.mnemonic && !process.env.MNEMONIC) {
+  console.error("Error: --publish requires --mnemonic (or MNEMONIC env var).");
+  process.exit(1);
+}
+
+if (flags.help || positional.length === 0) {
+  console.log(`polkadot-app-deploy v${VERSION}
+
+Usage:
+  polkadot-app-deploy <build-dir> <domain.dot>  Deploy an app
+  polkadot-app-deploy login                     Sign in with your Polkadot mobile app
+  polkadot-app-deploy logout                    Sign out and clear the session
+  polkadot-app-deploy whoami                    Show the currently signed-in identity
+  polkadot-app-deploy transfer <domain.dot>     Hand a name you registered to the signed-in account (or --to)
+
+Aliases: pad (short), polkadot-app-deploy (full)
+
+Options:
+  --env <id>               Target environment from environments.json (default: paseo-next-v2).
+                           Drives both the bulletin RPC and the asset-hub RPC used
+                           by DotNS. See --list-environments for valid ids.
+  --environment-file <path>
+                           Path to a JSON file deep-merged over the bundled
+                           environments.json. Override only the fields you need
+                           (e.g. contract addresses after a chain reset); unspecified
+                           fields fall through to the bundled values. Also honored
+                           via PAD_ENV_FILE env var.
+                           Warning: values are not validated against chain.
+  --list-environments      Print the environments table and exit.
+  --contract <KEY>=<addr>  Supply/override a DotNS contract address (repeatable).
+                           Merged over the chosen --env's contracts map; required
+                           for --env custom (which ships none). KEY is a DOTNS_*
+                           name from environments.json, e.g.
+                           --contract DOTNS_REGISTRY=0x.. --contract DOTNS_CONTENT_RESOLVER=0x..
+  --mnemonic "..."         DotNS owner mnemonic (or set MNEMONIC env var)
+  --derivation-path "..."  Optional Substrate-style path applied to --mnemonic (e.g. //deploy/3)
+  --no-transfer-to-signedin-user
+                           When signed in, sign every DotNS tx with your mobile
+                           session (today's behavior) instead of the default:
+                           a local worker (Alice, or --mnemonic) registers +
+                           deploys, then hands the name to your signed-in
+                           account with zero mobile signatures. Testnet only.
+  --to <0xH160>            (transfer subcommand) recipient address; defaults to
+                           the signed-in account.
+  --rpc wss://...          Override the bulletin RPC for the chosen --env (or set BULLETIN_RPC).
+                           Precedence: --rpc > BULLETIN_RPC > --env's bulletin endpoint.
+  --pool-size N       Number of pool accounts (default: 10)
+  --password "..."    Encrypt SPA content (users will be prompted to decrypt)
+  --js-merkle         Use pure-JS merkleization (no IPFS Kubo binary required)
+  --input-car <path>  Deploy a pre-built CAR file; skips directory scan and merkleization.
+                      Usage: polkadot-app-deploy --input-car <file.car> <domain.dot>
+  --dump-car[=<path>] Save the pre-upload CAR file to disk. Default path: <buildDir>.bulletin.car.
+                      Override path with =<path>. Also settable via PAD_DUMP_CAR env var.
+  --tag "..."         Label deploy in telemetry (or set DEPLOY_TAG env var); see Telemetry in README
+  --config <path>     Explicit path to a polkadot-app-deploy.config.ts (default: walk up from
+                      <build-dir> looking for polkadot-app-deploy.config.{ts,js,mjs}). When a
+                      config is found, deploy ALSO writes the manifest + executable text
+                      records on <domain> and its app/widget/worker subnames.
+  --gh-pages-mirror   After deploy, push the CAR to the current repo's gh-pages branch
+                      at bulletin/<domain>.dot.car (opt-in; also set GH_PAGES_MIRROR=1)
+  --publish           After deploy, list <domain> in the on-chain Publisher
+                      registry (Publisher.publish). Only takes effect on envs
+                      with a deployed Publisher (currently: paseo-next-v2).
+                      Requires --mnemonic (the signer must own the label).
+  --unpublish         Standalone mode: removes <domain> from the Publisher
+                      registry (Publisher.unpublish). Skips the deploy.
+                      Usage: polkadot-app-deploy --unpublish <domain.dot>
+                      Requires --mnemonic. Mutually exclusive with --publish.
+  --fail-on-publish-error
+                      Exit non-zero if --publish fails after a successful deploy.
+                      Default: non-fatal (warning logged, exit 0).
+  --version           Show version
+  --help              Show this help`);
+  process.exit(0);
+}
+
+const rcWarning = preReleaseWarning(VERSION);
+if (rcWarning) console.error(rcWarning);
+
+// Fire in background immediately; await just before deploy() to stay non-blocking during flag-parse.
+const _versionCheckPromise = process.env.PAD_UPDATE_CHECK !== "0"
+  ? fetchVersionInfo()
+  : Promise.resolve(null);
+
+// ── Crash capture (issue #154) ───────────────────────────────────
+// Only wire crash capture for actual deploy runs — skip for --help / --version
+// (which exit above).
+if (!flags.help && !flags.version) {
+  // Sanitised argv — positional args + presence-only flag summary. Never
+  // puts a mnemonic/password/RPC/derivation-path on disk, even if the user
+  // passes one on the command line.
+  const sanitizedArgv = [
+    ...positional,
+    ...buildCliFlagsSummary(flags).split(" ").filter(Boolean),
+  ];
+
+  // Check if the previous run left a stale "running" or "crashed" marker
+  // (i.e. this process is a relaunch after a SIGKILL/OOM). Print a hint
+  // BEFORE resetting state so the user sees what happened.
+  const prev = loadRunState();
+  if (prev && (prev.status === "running" || prev.status === "crashed") && !shouldSkipStaleWarning(prev)) {
+    if (shouldShowOomHint(prev)) {
+      const peak = prev.lastPeakRssMb ?? "unknown";
+      const stage = prev.lastStage ?? "unknown";
+      const threshold = probablyOomRssMb();
+      console.error("");
+      console.error(`   Warning: previous deploy did not exit cleanly (peak RSS ${peak} MB at stage "${stage}", threshold ${threshold} MB).`);
+      console.error(`   This looks like an out-of-memory kill. Retry with a larger heap:`);
+      console.error(`     NODE_OPTIONS='--max-old-space-size=8192' polkadot-app-deploy ...`);
+      console.error("");
+      markRelaunchOomHintShown();
+    } else if (prev.status === "crashed" && prev.reason) {
+      const reasonMap = {
+        "unhandled": "crashed unexpectedly",
+        "uncaught": "crashed unexpectedly",
+        "SIGINT": "was interrupted (Ctrl-C)",
+        "SIGTERM": "was stopped",
+      };
+      const friendly = reasonMap[prev.reason] ?? "did not exit cleanly";
+      console.error(`   Previous deploy ${friendly}. Continuing.`);
+    } else if (prev.status === "running") {
+      console.error(`   Previous deploy did not exit cleanly. Continuing.`);
+    }
+  }
+
+  // Reset the state file to reflect THIS run. Any previous status (crashed,
+  // succeeded, etc.) is overwritten — we already surfaced the warning above.
+  writeRunState({
+    status: "running",
+    pid: process.pid,
+    startedAt: Date.now(),
+    endedAt: undefined,
+    toolVersion: VERSION,
+    argv: sanitizedArgv,
+    lastPeakRssMb: null,
+    lastStage: null,
+    reason: undefined,
+  });
+  setRunStateActive(true);
+
+  // ── Signal / uncaught handlers ──────────────────────────────
+  // Guard against re-entry: if a handler itself throws (e.g. Sentry close
+  // rejects), unhandledRejection must not recursively call finalize.
+  let finalizing = false;
+  const finalize = async (reason, exitCode) => {
+    if (finalizing) return;
+    finalizing = true;
+    try {
+      setDeployAttribute("deploy.status", "killed");
+      setDeployAttribute("deploy.killed", reason);
+      setDeployAttribute("deploy.sad", "true");
+      captureWarning(`deploy process terminated: ${reason}`);
+    } catch { /* telemetry best-effort */ }
+    try { await closeTelemetry(1000); } catch { /* ignore */ }
+    try {
+      writeRunState({ status: "crashed", endedAt: Date.now(), reason });
+    } catch { /* fs best-effort */ }
+    process.exit(exitCode);
+  };
+
+  // Connection errors propagate from polkadot-api's internal subscriptions
+  // (chainHead etc.) when the WS halts mid-call. They're recoverable via
+  // storeChunkedContent's reconnect path; don't exit. The retry-budget
+  // circuit breaker (#271) bounds repeat occurrences — if too many fire in
+  // 30s, the deploy bails cleanly with "Retry budget exhausted" instead of
+  // looping forever. Issue #278 has the full diagnosis.
+  const handleUnhandled = (e, kind) => {
+    const msgStr = e instanceof Error ? (e.message ?? "") : String(e);
+    // Debug breadcrumb — gated by env so it doesn't add stderr noise in
+    // production but helps when running E2E fault-injection scenarios.
+    if (process.env.PAD_DEBUG_HANDLERS === "1") {
+      console.error(`[handleUnhandled ${kind}] match=${isConnectionError(e)} type=${e?.constructor?.name ?? typeof e} msg=${msgStr.slice(0, 200)}`);
+    }
+    // Benign teardown noise (connection errors + "DestroyedError: Client destroyed"
+    // from session-adapter teardown after the deploy's work is done) must not mark
+    // the deploy killed / exit 2. The SSO subcommands already whitelist this; the
+    // deploy path must too (the owner-signs update path tears down a session).
+    if (isBenignTeardownError(e)) {
+      try {
+        captureWarning(`Suppressed ${kind} teardown/connection noise`, { msg: msgStr.slice(0, 200) });
+      } catch { /* telemetry best-effort */ }
+      return;
+    }
+    try { setDeployAttribute("deploy.error", msgStr.slice(0, 200)); } catch {}
+    finalize(kind, 2);
+  };
+  process.on("uncaughtException", (e) => handleUnhandled(e, "uncaught"));
+  process.on("unhandledRejection", (e) => handleUnhandled(e, "unhandled"));
+  // POSIX exit codes: 128 + signal number. Signal exits (130/SIGINT,
+  // 143/SIGTERM, 129/SIGHUP) indicate cancellation or environment teardown
+  // and are retryable from the consumer's perspective. Contrast with
+  // NonRetryableError exits (code 78, POSIX EX_CONFIG) which callers must
+  // NOT retry — see EXIT_CODE_NO_RETRY in src/errors.ts.
+  process.on("SIGINT", () => finalize("SIGINT", 130));
+  process.on("SIGTERM", () => finalize("SIGTERM", 143));
+  process.on("SIGHUP", () => finalize("SIGHUP", 129));
+}
+
+try {
+  let buildDir, domain;
+  if (flags.inputCar) {
+    // --input-car mode: positional[0] is the domain; no build directory needed.
+    [domain] = positional;
+    if (!flags.inputCar) { console.error("Error: --input-car requires a path argument"); process.exit(1); }
+    if (!domain) { console.error("Error: domain required (e.g. my-app.dot)"); process.exit(1); }
+    if (!fs.existsSync(flags.inputCar)) { console.error(`Error: ${flags.inputCar} does not exist`); process.exit(1); }
+    buildDir = flags.inputCar; // passed as `content` to deploy(); inputCar branch handles it
+  } else {
+    [buildDir, domain] = positional;
+    if (!buildDir) { console.error("Error: build directory required"); process.exit(1); }
+    if (!domain) { console.error("Error: domain required (e.g. my-app.dot)"); process.exit(1); }
+    if (!fs.existsSync(buildDir)) { console.error(`Error: ${buildDir} does not exist`); process.exit(1); }
+  }
+
+  const effectiveRpc = flags.rpc ?? process.env.BULLETIN_RPC ?? DEFAULT_BULLETIN_RPC;
+  const deployTag = flags.tag ?? process.env.DEPLOY_TAG;
+  const ci = process.env.GITHUB_ACTIONS === "true" ? {
+    runUrl: process.env.GITHUB_SERVER_URL && process.env.GITHUB_REPOSITORY && process.env.GITHUB_RUN_ID
+      ? `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}${process.env.GITHUB_RUN_ATTEMPT ? `/attempts/${process.env.GITHUB_RUN_ATTEMPT}` : ""}`
+      : undefined,
+    workflow: process.env.GITHUB_WORKFLOW,
+    job: process.env.GITHUB_JOB,
+    sha: process.env.GITHUB_SHA,
+  } : undefined;
+  setDeployContext({
+    domain,
+    rpc: effectiveRpc,
+    repo: process.env.GITHUB_REPOSITORY,
+    branch: process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME,
+    signerMode: flags.mnemonic ? "direct" : "pool",
+    deployTag,
+    cliFlags: buildCliFlagsSummary(flags),
+    ci,
+  });
+
+  // Await the background version check started at startup.
+  const _versionInfo = await _versionCheckPromise;
+  if (handlePreflightVersionCheck(_versionInfo) === "abort") process.exit(1);
+
+  const result = await deploy(buildDir, domain, {
+    mnemonic: flags.mnemonic,
+    derivationPath: flags.derivationPath,
+    suri: flags.suri,
+    rpc: flags.rpc,
+    env: flags.env,
+    poolSize: flags.poolSize,
+    password: flags.password,
+    contracts: flags.contracts,
+    jsMerkle: flags.jsMerkle,
+    inputCar: flags.inputCar,
+    tag: flags.tag,
+    ghPagesMirror: flags.ghPagesMirror,
+    allowLargeDeploy: flags.allowLargeDeploy,
+    reproducibleSource: flags.reproducibleSource,
+    dumpCar: flags.dumpCar,
+    publish: flags.publish,
+    failOnPublishError: flags.failOnPublishError,
+    transferToSignedInUser: !flags.noTransferToSignedinUser,
+  });
+
+  const output = process.env.GITHUB_OUTPUT;
+  if (output) {
+    fs.appendFileSync(output, `cid=${result.cid}\n`);
+    fs.appendFileSync(output, `domain=${result.domainName}\n`);
+  }
+
+  console.log(`CID: ${result.cid}`);
+  console.log(`Domain: ${result.fullDomain}`);
+
+  // Opt-in manifest publish on top of the legacy contenthash deploy.
+  //
+  // Walks up from <build-dir> (or honours --config) looking for
+  // polkadot-app-deploy.config.{ts,js,mjs}. When found, writes the root + per-
+  // executable text records, otherwise the legacy flow returns unchanged.
+  {
+    const { tryLoadProductConfig, publishManifest } = await import("../dist/index.js");
+    const path = await import("node:path");
+    const buildDirAbs = path.resolve(buildDir);
+    const loaded = await tryLoadProductConfig(
+      flags.config ? { path: flags.config } : { cwd: buildDirAbs, walkUp: true },
+    );
+    if (loaded) {
+      try {
+        await publishManifest({
+          loaded,
+          domain,
+          buildDirCid: { absPath: buildDirAbs, cid: result.cid },
+          env: flags.env,
+          rpc: flags.rpc,
+          mnemonic: flags.mnemonic,
+          derivationPath: flags.derivationPath,
+        });
+      } catch (err) {
+        console.error(`Manifest publish failed: ${err?.message ?? err}`);
+        process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
+      }
+    }
+    // No config → the contenthash-only deploy above is the whole job; nothing else to do.
+  }
+
+  if (!flags.help && !flags.version) {
+    try { writeRunState({ status: "succeeded", endedAt: Date.now() }); } catch {}
+  }
+  process.exit(0);
+} catch (error) {
+  const noRetry = error instanceof NonRetryableError;
+  console.error(`Deployment failed${noRetry ? " (not retryable)" : ""}:`, error.message);
+  await handleFailedDeploy(error);
+  if (!flags.help && !flags.version) {
+    try { writeRunState({ status: "failed", endedAt: Date.now(), reason: (error?.message ?? String(error)).slice(0, 200) }); } catch {}
+  }
+  process.exit(noRetry ? EXIT_CODE_NO_RETRY : 1);
+}

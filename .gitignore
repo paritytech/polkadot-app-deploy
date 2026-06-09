@@ -1,0 +1,32 @@
+node_modules/
+.DS_Store
+dist/
+coverage/
+.env*
+
+.ref/
+.claude/worktrees/
+e2e-reports/
+
+# Python bytecode
+__pycache__/
+*.pyc
+.worktrees/
+
+# Bootstrap-reprove mnemonic cache (contains private key material)
+tools/.reprove-mnemonic.txt
+
+# Per-engineer Claude overrides (never check in)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+CLAUDE.local.md
+
+# Personal probe scripts (tools/.<topic>-probe.mjs convention)
+tools/.*.mjs
+
+# Other AI-tooling local state (Claude paths handled above)
+.cursor/
+.mcp.json
+opencode.json
+
+# Lockfile policy: package-lock.json IS committed (npm ci reproducibility)

@@ -1,0 +1,9 @@
+.claude/
+.git/
+node_modules/
+.ref/
+src/
+tsconfig.json
+README.md
+docs/e2e-bootstrap.md
+docs/testing.md

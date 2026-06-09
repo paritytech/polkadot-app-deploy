@@ -1,0 +1,117 @@
+{
+  "environments": [
+    {
+      "id": "paseo-next-v2",
+      "name": "Paseo Next v2",
+      "network": "testnet",
+      "description": "Next iteration of the Paseo Next testnet",
+      "e2eEligible": true,
+      "ipfs": "https://paseo-bulletin-next-ipfs.polkadot.io",
+      "autoAccountMapping": true,
+      "nativeToEthRatio": 100000000,
+      "registerStorageDeposit": 2000000000000,
+      "contracts": {
+        "DOTNS_PROTOCOL_REGISTRY": "0x8F28419f4E32Bb0aA02e156A0543Ff253f126D7D",
+        "DOTNS_REGISTRAR": "0xf7Ad3F44F316C73E4a2b46b1ed48d376bCc9E639",
+        "DOTNS_REGISTRAR_CONTROLLER": "0x674b705268DAE369F0a7BE9cbaCDb928b8BA38C2",
+        "DOTNS_REGISTRY": "0xa1b2b939E82b2ecE55Bd8a0E283818BfC1CA6CDc",
+        "DOTNS_POP_CONTROLLER": "0x1c858C31497a7715C0D56A11208feB6b74FaB2aB",
+        "ROOT_GATEWAY_DISPATCHER": "0xd3F059FA65dA566B294b5d755a06054d4bE7ce7C",
+        "DOTNS_RESOLVER": "0xA8988eA083174ea94Ed1D686f0F073a10f65598D",
+        "DOTNS_CONTENT_RESOLVER": "0x8A26480b0B5Df3d4D9b95adc24a5Ecb33A5b8F64",
+        "DOTNS_REVERSE_RESOLVER": "0x259B9D8199c29d2EF132264ad05f8F74F3115A2E",
+        "DOTNS_POP_RESOLVER": "0xC9D511Eb80fD8B745DC5Be59aCF5d700271bC01e",
+        "DOTNS_NAME_ESCROW": "0x2Cb9899d91Ee575E8917958723F5E941b1BcC6A1",
+        "POP_RULES": "0x4909bFb3f4Fd86244abD6430fDfA0Ce5C91aD0c4",
+        "STORE_FACTORY": "0x692047C1477a017F287488E1c85F96Ca28C23fD8",
+        "LABEL_STORE_BEACON": "0x86ff9CE56C86bC3DfcaA7E316FB0Dd816e9fA2df",
+        "USER_STORE_BEACON": "0x6a7a938f72D39f949ee484a78c4C500514E2cb69",
+        "PUBLISHER": "0xa616254fd98724c7a3d295c98ca393a486096b68"
+      }
+    },
+    {
+      "id": "summit",
+      "name": "Summit",
+      "network": "testnet",
+      "description": "Web3 Summit Network",
+      "e2eEligible": false,
+      "ipfs": "https://summit-ipfs.polkadot.io",
+      "autoAccountMapping": true,
+      "nativeToEthRatio": 100000000,
+      "registerStorageDeposit": 2000000000000,
+      "contracts": {
+        "DOTNS_PROTOCOL_REGISTRY": "0x09f1AE947950eA2d1f010fE2abC00fDd5A745820",
+        "DOTNS_REGISTRAR": "0xf3969bCBE60463302306663C62A6A8ef91ab9aA5",
+        "DOTNS_REGISTRAR_CONTROLLER": "0xA68a5b2A6be6d014be0dB07c0ed4bacc4A6A570A",
+        "DOTNS_REGISTRY": "0xFb7AB7E142ED0248D77198CA8722D67C1930D783",
+        "DOTNS_POP_CONTROLLER": "0xC7DD78B145ed109092A2d1E79324E5FE219B9518",
+        "ROOT_GATEWAY_DISPATCHER": "0x22362162032ED2442b43f5902b3421be5aCF1b60",
+        "DOTNS_RESOLVER": "0xC7f1C3B16BFd0c5910EE37a4a2033f4506AcE94d",
+        "DOTNS_CONTENT_RESOLVER": "0xf110e5799c3f0adb8ED885C02c45Ecfe7fD86226",
+        "DOTNS_REVERSE_RESOLVER": "0x5aa444C6cbA9bd703d1a0B5E5C643FB886F80bB4",
+        "DOTNS_POP_RESOLVER": "0x03FD2ed7B1b848c59A2428224162dE00D11a8133",
+        "DOTNS_NAME_ESCROW": "0xDbE911007f8cd9876D384b8c025d3BB157DCCcA4",
+        "POP_RULES": "0x6331e51C9AfC73BfE12562fd160BA2c66A73f984",
+        "STORE_FACTORY": "0x2947af3CBFb45b89610524a25921C32cB65C4C39",
+        "LABEL_STORE_BEACON": "0x670Dab225ea4f2EeB0e6Df2e49AA595aB2CAa5cb",
+        "USER_STORE_BEACON": "0x31e392736889c973A25509861C7D6E6F2EaD951C",
+        "MULTICALL3": "0x1C1044BEa5bDe0F435436bB52A8340fBE1D59847"
+      }
+    }
+  ],
+  "chains": [
+    {
+      "id": "relay",
+      "name": "Relay",
+      "endpoints": {
+        "paseo-next-v2": {
+          "wss": "wss://paseo-rpc.n.dwellir.com",
+          "uptimeUrl": "https://stats.uptimerobot.com/UrEXbl6Xyt"
+        },
+        "summit": {
+          "wss": "wss://summit-rpc.polkadot.io"
+        }
+      }
+    },
+    {
+      "id": "asset-hub",
+      "name": "Asset Hub",
+      "endpoints": {
+        "paseo-next-v2": {
+          "wss": "wss://paseo-asset-hub-next-rpc.polkadot.io",
+          "parachainId": 1500
+        },
+        "summit": {
+          "wss": "wss://summit-asset-hub-rpc.polkadot.io"
+        }
+      }
+    },
+    {
+      "id": "people",
+      "name": "People",
+      "endpoints": {
+        "paseo-next-v2": {
+          "wss": "wss://paseo-people-next-system-rpc.polkadot.io",
+          "parachainId": 1502
+        },
+        "summit": {
+          "wss": "wss://summit-people-rpc.polkadot.io"
+        }
+      }
+    },
+    {
+      "id": "bulletin",
+      "name": "Bulletin",
+      "endpoints": {
+        "paseo-next-v2": {
+          "wss": "wss://paseo-bulletin-next-rpc.polkadot.io",
+          "parachainId": 1501
+        },
+        "summit": {
+          "wss": "wss://summit-bulletin-rpc.polkadot.io"
+        }
+      }
+    }
+  ],
+  "source": "https://docs.google.com/document/d/1xQoAmWDpbjhuXKT79DTNKFzv7ZkFr5npjo0BvrxXDIw"
+}

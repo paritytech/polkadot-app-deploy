@@ -1,0 +1,64 @@
+name: Publish to npm
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Maintainer-triggered: this fires on `release: created`, which only repo
+    # maintainers can do. `release` is a protected environment — configure
+    # required reviewers + the NPM_TOKEN secret on it in repo Settings →
+    # Environments so a publish needs an explicit human approval click.
+    environment: release
+    permissions:
+      contents: read
+      # id-token: write enables npm provenance now, and tokenless OIDC
+      # Trusted Publishing later (see the publish step).
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - run: npm install
+
+      # Runs the full offline suite the project's npm test script runs:
+      # test/test.js + test/pool.test.js + test/helpers/e2e-helpers.test.js.
+      # Includes the build internally (npm test → npm run build → node --test).
+      #
+      # The public package intentionally ships with NO Sentry DSN: telemetry is
+      # strictly opt-in AND has nowhere to send unless the user supplies their
+      # own DSN (telemetry plumbing is inert by default). Do NOT add a
+      # SENTRY_DSN secret to this repo — leaving it unset is the design.
+      - run: npm test
+
+      # Pre-releases (e.g. 0.6.9-rc.0) publish under the `rc` dist-tag so
+      # consumers who run `npm install polkadot-app-deploy` (which resolves `@latest`)
+      # never pick one up by accident. Stable versions publish to `@latest`.
+      # Publishes with --provenance (signed build attestation, requires the
+      # id-token: write permission above + a GitHub-hosted runner).
+      #
+      # BOOTSTRAP: the first release authenticates with a short-lived,
+      # package-scoped NPM_TOKEN (set as a secret on the `release` environment).
+      # SWITCH TO TOKENLESS once the package exists on npm:
+      #   1. npmjs.org → polkadot-app-deploy → Settings → Trusted Publishing →
+      #      add this repo (paritytech/polkadot-app-deploy) + workflow `publish.yml`.
+      #   2. Delete the NPM_TOKEN secret and drop the `env: NODE_AUTH_TOKEN` block
+      #      below. The id-token: write permission then carries auth via OIDC.
+      - name: Publish to npm
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [[ "$VERSION" == *-* ]]; then
+            echo "Publishing $VERSION as pre-release under @rc"
+            npm publish --access public --provenance --tag rc
+          else
+            echo "Publishing $VERSION as stable under @latest"
+            npm publish --access public --provenance
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

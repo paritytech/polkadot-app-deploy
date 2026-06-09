@@ -1,0 +1,369 @@
+name: Deploy on Polkadot
+
+on:
+  workflow_call:
+    inputs:
+      dotns-domain:
+        description: 'DotNS domain name (with .dot extension)'
+        required: false
+        type: string
+        default: ''
+      artifact-name:
+        description: 'Name of the build artifact to download'
+        required: true
+        type: string
+      skip-cache:
+        description: 'Skip deployment cache and force redeploy'
+        type: boolean
+        default: false
+      comment-on-pr:
+        description: 'Post a comment on the PR with the deployment summary'
+        type: boolean
+        default: false
+      max-retries:
+        description: 'Maximum number of deployment retry attempts (default: 1 = no retry)'
+        type: number
+        default: 1
+      js-merkle:
+        description: 'Use pure-JS merkleization (no IPFS Kubo required)'
+        type: boolean
+        default: false
+      direct-signer:
+        description: 'Use mnemonic as direct signer instead of pool mode'
+        type: boolean
+        default: false
+      derivation-path:
+        description: 'Substrate-style derivation path applied to the mnemonic (e.g. //deploy/3). Lets parallel direct-signer runs pick different sub-accounts of the same mnemonic to avoid nonce contention.'
+        type: string
+        default: ''
+      rpc:
+        description: 'Override the Bulletin chain RPC endpoint within the chosen env (default: derived from --env). Precedence: rpc > BULLETIN_RPC > env bulletin endpoint.'
+        type: string
+        default: ''
+      env:
+        description: 'Target environment id from environments.json (e.g. paseo-next-v2, paseo-next, paseo-review). Default: paseo-next-v2. Drives both the bulletin RPC and the asset-hub RPC.'
+        type: string
+        default: ''
+      pool-size:
+        description: 'Number of pool accounts (default: 10)'
+        type: number
+        default: 0
+      runner:
+        description: 'GitHub Actions runner label (default: ubuntu-latest).'
+        type: string
+        default: 'ubuntu-latest'
+      polkadot-app-deploy-version:
+        description: 'npm version or dist-tag of polkadot-app-deploy to install (e.g. "0.6.9-rc.2" or "rc"). Empty = latest stable. Ignored if polkadot-app-deploy-ref is set.'
+        type: string
+        default: ''
+      polkadot-app-deploy-ref:
+        description: 'Git ref (branch/tag/SHA) of paritytech/polkadot-app-deploy to build from source. When set, takes precedence over polkadot-app-deploy-version — useful for testing a commit before it ships to npm. The polkadot-app-deploy nightly uses this to source-build main HEAD.'
+        type: string
+        default: ''
+      tag:
+        description: 'Free-form label attached to the deploy span as deploy.tag (e.g. "e2e-ci-pr", "load-test"). Lets Sentry dashboards filter test/benchmark traffic out of real-user views. Empty = no tag.'
+        type: string
+        default: ''
+      gh-pages-mirror:
+        description: 'Opt-in: after deploy, push the CAR to the caller repo''s gh-pages branch as a fast-path HTTP cache (see --gh-pages-mirror). Requires contents:write on the calling workflow.'
+        type: boolean
+        default: false
+      gateway:
+        description: 'Gateway host used to construct browser URLs in the deployment summary and PR comment (e.g. "dot.li", "paseo.li"). Does not affect the deploy itself — only the URL displayed.'
+        type: string
+        default: 'dot.li'
+      gateway-path-style:
+        description: 'If true, build URLs as https://{gateway}/{domain}.dot (e.g. paseo.li/my-app.dot). If false (default), use subdomain form https://{domain}.{gateway} (e.g. my-app.paseo.li).'
+        type: boolean
+        default: false
+      comment-header:
+        description: 'Sticky-comment header used to identify this workflow''s prior PR comment so it can be replaced on re-runs (marocchino/sticky-pull-request-comment). Override when multiple deploy workflows in the same repo each post their own comment.'
+        type: string
+        default: 'polkadot-app-deploy'
+      publish:
+        description: 'After a successful deploy, list <dotns-domain> in the on-chain Publisher registry (Publisher.publish / --publish). Takes effect on any env whose environments.json config has a non-zero PUBLISHER contract (currently paseo-next-v2 and preview/previewnet, which share the same Publisher address); a non-fatal skip on envs without one (e.g. preview-pvm, paseo-next, paseo-review). The DotNS owner mnemonic (secrets.mnemonic) signs it — no direct-signer required. Subdomains are skipped by the registry.'
+        type: boolean
+        default: false
+      fail-on-publish-error:
+        description: 'If true, a publish failure after a successful content deploy fails the run (--fail-on-publish-error). Default false: publish errors are logged as a non-fatal warning and the deploy still succeeds. Ignored unless publish is true.'
+        type: boolean
+        default: false
+    secrets:
+      mnemonic:
+        description: 'Mnemonic (DotNS domain owner)'
+        required: true
+      sentry-dsn:
+        description: 'Sentry DSN for deploy telemetry'
+        required: false
+    outputs:
+      cid:
+        description: 'Content CID'
+        value: ${{ jobs.deploy.outputs.cid }}
+      domain:
+        description: 'Full domain name (with .dot)'
+        value: ${{ jobs.deploy.outputs.domain }}
+
+jobs:
+  deploy:
+    name: Deploy on ${{ inputs.env }}
+    runs-on: ${{ inputs.runner }}
+    # Workflow-level safety net so a runaway hang (dead RPC, broken setup
+    # action, etc.) cannot consume the GitHub default 6h ceiling. The deploy
+    # step itself has its own 15m timeout via nick-fields/retry; 30m here
+    # leaves headroom for setup/install/cache/teardown around it.
+    timeout-minutes: 30
+    outputs:
+      cid: ${{ steps.final.outputs.cid }}
+      domain: ${{ steps.final.outputs.domain }}
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: build
+
+      - name: Compute build hash
+        id: hash
+        run: echo "hash=$(find build -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Check deployment cache
+        id: cache
+        if: inputs.skip-cache != true
+        uses: actions/cache@v5
+        with:
+          path: .deploy-cache
+          key: deploy-${{ steps.hash.outputs.hash }}
+
+      - name: Load cached CID
+        id: cached-deploy
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: |
+          echo "cid=$(cat .deploy-cache/cid)" >> "$GITHUB_OUTPUT"
+          echo "::notice::Found cached CID: $(cat .deploy-cache/cid)"
+
+      - name: Setup IPFS Kubo
+        # Inline download with retry. `ipfs/download-ipfs-distribution-action@v1`
+        # wraps curl in a single composite action that can't be wrapped by
+        # `nick-fields/retry`, so occasional HTTP/2 INTERNAL_ERROR failures
+        # from dist.ipfs.tech fail a whole deploy (e.g. release run
+        # 24624209590's pool/kubo ubuntu-latest leg). 3 attempts × 30s
+        # backoff is sufficient in practice.
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.js-merkle != true
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08  # v3
+        env:
+          KUBO_VERSION: v0.33.0
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: |
+            set -euo pipefail
+            ARCH="linux-amd64"
+            TARBALL="kubo_${KUBO_VERSION}_${ARCH}.tar.gz"
+            URL="https://dist.ipfs.tech/kubo/${KUBO_VERSION}/${TARBALL}"
+            echo "Downloading ${URL}"
+            curl --fail --retry 5 --retry-all-errors --retry-delay 2 \
+                 --connect-timeout 30 --max-time 300 \
+                 --no-progress-meter --output "${TARBALL}" "${URL}"
+            tar -xzf "${TARBALL}"
+            sudo install -m 0755 kubo/ipfs /usr/local/bin/ipfs
+            rm -rf kubo "${TARBALL}"
+            ipfs --version
+
+      - name: Initialize IPFS
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.js-merkle != true
+        run: ipfs init
+
+      # Source-build path (polkadot-app-deploy-ref set): clone + npm ci, run via
+      # local bin/polkadot-app-deploy. Used by the polkadot-app-deploy nightly to
+      # exercise main HEAD. Skipped (path empty) when an npm version was
+      # requested or when no source build is needed.
+      - name: Checkout polkadot-app-deploy source
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.polkadot-app-deploy-ref != ''
+        uses: actions/checkout@v6
+        with:
+          repository: paritytech/polkadot-app-deploy
+          ref: ${{ inputs.polkadot-app-deploy-ref }}
+          path: polkadot-app-deploy-src
+
+      - name: Install polkadot-app-deploy
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          REF='${{ inputs.polkadot-app-deploy-ref }}'
+          VERSION='${{ inputs.polkadot-app-deploy-version }}'
+          if [ -n "$REF" ]; then
+            echo "Building polkadot-app-deploy from source ref: $REF"
+            cd polkadot-app-deploy-src
+            npm ci
+            cd ..
+            BIN="$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy"
+            WRAPPER="$(pwd)/polkadot-app-deploy-src/tools/release-retry-wrapper.mjs"
+            echo "BULLETIN_DEPLOY_BIN=$BIN" >> "$GITHUB_ENV"
+            echo "RELEASE_RETRY_WRAPPER=$WRAPPER" >> "$GITHUB_ENV"
+            echo "::notice::Using source-built polkadot-app-deploy from ref $REF"
+          elif [ -n "$VERSION" ]; then
+            echo "Installing polkadot-app-deploy@$VERSION"
+            npm install -g "polkadot-app-deploy@$VERSION"
+            echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+          else
+            echo "Installing polkadot-app-deploy (latest stable)"
+            npm install -g polkadot-app-deploy
+            echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+          fi
+
+      - name: Verify minimum polkadot-app-deploy version
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.polkadot-app-deploy-ref == ''
+        env:
+          BULLETIN_DEPLOY_MIN_VERSION: "0.7.0"
+        run: |
+          INSTALLED=$(polkadot-app-deploy --version | sed 's/polkadot-app-deploy v//')
+          INSTALLED="$INSTALLED" node -e "
+            const semverCmp = (a, b) => {
+              const [ca, pa] = a.split('-'); const [cb, pb] = b.split('-');
+              const va = ca.split('.').map(Number); const vb = cb.split('.').map(Number);
+              for (let i = 0; i < 3; i++) {
+                if ((va[i]||0) < (vb[i]||0)) return -1;
+                if ((va[i]||0) > (vb[i]||0)) return 1;
+              }
+              if (pa && !pb) return -1; if (!pa && pb) return 1; return 0;
+            };
+            const v = process.env.INSTALLED, m = process.env.BULLETIN_DEPLOY_MIN_VERSION;
+            if (semverCmp(v, m) < 0) {
+              process.stderr.write('Error: polkadot-app-deploy v' + v + ' is below minimum v' + m + '. Set polkadot-app-deploy-version: \"' + m + '\" or later in your workflow.\n');
+              process.exit(1);
+            }
+            console.log('polkadot-app-deploy v' + v + ' OK (>= v' + m + ')');
+          "
+
+      - name: Deploying
+        id: deploy
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: nick-fields/retry@ce71cc2ab81d554ebbe88c79ab5975992d79ba08  # v3
+        with:
+          timeout_minutes: 15
+          max_attempts: ${{ inputs.max-retries }}
+          retry_wait_seconds: 30
+          # retry_on_exit_code: 75 means retries fire ONLY when the wrapper
+          # classifies stderr as a flake-class error (nonce-stale, ChainHead
+          # disjointed, connection lost, account-mapping race). Any other
+          # failure (assertion mismatches, contract reverts, verify failures)
+          # fails fast on the first attempt.
+          #
+          # Consumer safety: the wrapper is only invoked when max-retries > 1.
+          # When max-retries == 1 (the default), the deploy command runs
+          # directly so the child's exit code propagates as-is — no
+          # classification side-effects for consumers who don't opt in to retry.
+          retry_on_exit_code: 75
+          command: |
+            export MNEMONIC='${{ secrets.mnemonic }}'
+            export IPFS_CID='${{ steps.cached-deploy.outputs.cid }}'
+            export NODE_OPTIONS='--max-old-space-size=8192'
+            export SENTRY_DSN='${{ secrets.sentry-dsn }}'
+            export GITHUB_REPOSITORY='${{ github.repository }}'
+            # Build argv as a bash array rather than a space-joined string. With a
+            # string + `polkadot-app-deploy $FLAGS`, shell word-splits on whitespace and
+            # single quotes inside the value become literal argv characters — that's
+            # how `--tag '$val'` ended up producing deploy.tag="'e2e-ci-release'" in
+            # Sentry. An array preserves argv boundaries and needs no quote escaping.
+            FLAGS=()
+            if [ -n "${{ inputs.tag }}" ]; then FLAGS+=(--tag "${{ inputs.tag }}"); fi
+            if [ "${{ inputs.js-merkle }}" = "true" ]; then FLAGS+=(--js-merkle); fi
+            if [ "${{ inputs.gh-pages-mirror }}" = "true" ]; then FLAGS+=(--gh-pages-mirror); fi
+            if [ "${{ inputs.direct-signer }}" = "true" ]; then FLAGS+=(--mnemonic "${{ secrets.mnemonic }}"); fi
+            if [ -n "${{ inputs.derivation-path }}" ]; then FLAGS+=(--derivation-path "${{ inputs.derivation-path }}"); fi
+            if [ -n "${{ inputs.rpc }}" ]; then FLAGS+=(--rpc "${{ inputs.rpc }}"); fi
+            if [ -n "${{ inputs.env }}" ]; then FLAGS+=(--env "${{ inputs.env }}"); fi
+            if [ "${{ inputs.pool-size }}" != "0" ]; then FLAGS+=(--pool-size "${{ inputs.pool-size }}"); fi
+            # --publish needs a mnemonic; the MNEMONIC env exported above satisfies
+            # the CLI's signer guard, so this works in pool mode without direct-signer.
+            if [ "${{ inputs.publish }}" = "true" ]; then FLAGS+=(--publish); fi
+            if [ "${{ inputs.fail-on-publish-error }}" = "true" ]; then FLAGS+=(--fail-on-publish-error); fi
+            # Only use the wrapper when retry is actually configured (max-retries > 1).
+            # Default callers (max-retries: 1) run the deploy directly so there
+            # are no wrapper stderr-capture or exit-75 classification side-effects.
+            if [ "${{ inputs.max-retries }}" -gt 1 ] && [ -n "$RELEASE_RETRY_WRAPPER" ]; then
+              node "$RELEASE_RETRY_WRAPPER" "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" 'build' '${{ inputs.dotns-domain }}'
+            else
+              "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" 'build' '${{ inputs.dotns-domain }}'
+            fi
+
+      - name: Validate deployment outputs
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          if [ -z "${{ steps.deploy.outputs.cid }}" ] || [ -z "${{ steps.deploy.outputs.domain }}" ]; then
+            echo "::error::Deployment step completed but produced no CID or domain output. This usually means the deploy process crashed (e.g. OOM) without propagating a failure exit code."
+            exit 1
+          fi
+
+      - name: Save deployment to cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p .deploy-cache
+          echo "${{ steps.deploy.outputs.cid }}" > .deploy-cache/cid
+
+      - name: Set deployment outputs
+        id: final
+        run: |
+          if [ "${{ steps.cache.outputs.cache-hit }}" == "true" ]; then
+            DOMAIN="${{ inputs.dotns-domain }}"
+            DOMAIN="${DOMAIN%.dot}"
+            echo "cid=${{ steps.cached-deploy.outputs.cid }}" >> "$GITHUB_OUTPUT"
+            echo "domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
+          else
+            echo "cid=${{ steps.deploy.outputs.cid }}" >> "$GITHUB_OUTPUT"
+            echo "domain=${{ steps.deploy.outputs.domain }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute browser URL
+        id: browser
+        if: steps.final.outputs.domain != ''
+        env:
+          DOMAIN: ${{ steps.final.outputs.domain }}
+          GATEWAY: ${{ inputs.gateway }}
+          PATH_STYLE: ${{ inputs.gateway-path-style }}
+        run: |
+          if [ "$PATH_STYLE" = "true" ]; then
+            URL="https://${GATEWAY}/${DOMAIN}.dot"
+          else
+            URL="https://${DOMAIN}.${GATEWAY}"
+          fi
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Deployment summary
+        env:
+          DOMAIN: ${{ steps.final.outputs.domain }}
+          CID: ${{ steps.final.outputs.cid }}
+          BROWSER_URL: ${{ steps.browser.outputs.url }}
+        run: |
+          if [ -z "$DOMAIN" ]; then
+            {
+              echo "### Deployment completed but domain output is missing"
+              echo ""
+              echo "CID \`${CID}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "### ${DOMAIN}.dot"
+              echo ""
+              echo "Browser &nbsp; ${BROWSER_URL}"
+              echo "Desktop &nbsp; \`${DOMAIN}.dot\`"
+              echo "CID &nbsp; \`${CID}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Comment on PR
+        if: inputs.comment-on-pr && github.event.pull_request && steps.final.outputs.domain != ''
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405  # v2.9.4
+        with:
+          header: ${{ inputs.comment-header }}
+          message: |
+            **${{ steps.final.outputs.domain }}.dot** · [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            ${{ steps.browser.outputs.url }}

@@ -1,0 +1,100 @@
+name: Promote RC to latest
+
+# Manually-triggered workflow that promotes a published `polkadot-app-deploy@<rc>`
+# version to the `latest` dist-tag on npm. Use after the release-event E2E on a
+# prerelease has run green: `npm dist-tag add` repoints `latest` to the
+# already-published artifact bytes — no second `npm publish`, so the bytes
+# users install are guaranteed identical to the bytes E2E validated.
+#
+# The maintainer triggers this from the Actions UI:
+#   Actions → "Promote RC to latest" → Run workflow → version: 0.7.7-rc.0
+#
+# Pre-flight checks performed by the workflow:
+#   * version is non-empty and is a real prerelease (matches semver `x.y.z-…`)
+#   * `npm view polkadot-app-deploy@<version>` resolves (i.e. the version is on the
+#     registry — refuses to promote a phantom)
+#
+# Compatible with the existing publish.yml: that workflow already publishes
+# prereleases under `--tag rc` (so they don't steal `@latest` accidentally).
+# This workflow is what completes the cycle.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to promote to @latest (e.g. 0.7.7-rc.0). Must already exist on npm.'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.version }} to @latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Validate version input
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "$V" ]; then
+            echo "::error::version input is required"
+            exit 1
+          fi
+          # Refuse to promote anything that doesn't look like a prerelease —
+          # this workflow is specifically for the RC promotion flow. Stable
+          # releases publish to @latest directly via publish.yml.
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "::error::Version '$V' must be a semver prerelease like 0.7.7-rc.0"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify version exists on npm
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # `npm view` exits non-zero if the version is not on the registry.
+          # Refuses to promote a phantom that would leave @latest dangling.
+          ON_NPM=$(npm view "polkadot-app-deploy@$V" version 2>/dev/null || true)
+          if [ "$ON_NPM" != "$V" ]; then
+            echo "::error::polkadot-app-deploy@$V is not on npm (got: '$ON_NPM'). Cut the prerelease first via the GitHub Release UI; publish.yml will handle the npm publish."
+            exit 1
+          fi
+          echo "::notice::Confirmed polkadot-app-deploy@$V is on npm"
+
+      - name: Show current dist-tags
+        run: npm dist-tag ls polkadot-app-deploy
+
+      - name: Promote ${{ inputs.version }} to @latest
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          npm dist-tag add "polkadot-app-deploy@$V" latest
+          echo "::notice::polkadot-app-deploy@latest is now $V"
+
+      - name: Verify @latest now points at ${{ inputs.version }}
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          LATEST=$(npm view polkadot-app-deploy@latest version)
+          echo "Resolved polkadot-app-deploy@latest -> $LATEST"
+          if [ "$LATEST" != "$V" ]; then
+            echo "::error::Promotion did not stick: @latest is $LATEST, expected $V"
+            exit 1
+          fi
+          echo "## Promoted polkadot-app-deploy@$V to @latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          npm dist-tag ls polkadot-app-deploy >> "$GITHUB_STEP_SUMMARY"

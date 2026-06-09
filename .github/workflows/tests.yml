@@ -1,0 +1,60 @@
+name: Unit Tests
+
+# Per-event run title — see .github/workflows/e2e.yml's run-name block for
+# the full rationale. Same pattern: PRs get "PR #N: <title>", post-merge
+# push runs get "main: <commit message>" (which already includes the
+# `(#NNN)` suffix GitHub appends to squash merges).
+run-name: >-
+  ${{ github.event_name == 'pull_request' &&
+      format('PR #{0}: {1}', github.event.pull_request.number, github.event.pull_request.title) ||
+      github.event_name == 'push' &&
+      format('main: {0}', github.event.head_commit.message) ||
+      github.event_name }}
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - package.json
+      - package-lock.json
+      - '**/*.md'
+      - docs/**
+      - docs-internal/**
+      - sentry/**
+      - .npmignore
+      - .gitignore
+      - LICENSE
+  push:
+    branches: [main]
+    paths-ignore:
+      - package.json
+      - package-lock.json
+      - '**/*.md'
+      - docs/**
+      - docs-internal/**
+      - sentry/**
+      - .npmignore
+      - .gitignore
+      - LICENSE
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege: this workflow runs untrusted PR code, so it gets read-only
+# access and no secrets. Never raise these without a matching review.
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test

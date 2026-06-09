@@ -1,0 +1,8 @@
+# Verified false positives — test fixtures, not real secrets.
+# Fingerprints are <relative-path>:<rule>:<line> (gitleaks --no-git).
+# test/error-pattern-signature.test.js:103 — the public jwt.io demo token (HS256, sub:user), used to test JWT scrubbing.
+test/error-pattern-signature.test.js:jwt:103
+# test/test.js:6214 — a FAKE ghp_ PAT inside an Error string, asserting the error scrubber redacts tokens.
+test/test.js:generic-api-key:6214
+# test/test.js:6918 — an SS58 dev/test account address (public key), passed to ensureAuthorized in a unit test.
+test/test.js:generic-api-key:6918

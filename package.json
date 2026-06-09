@@ -1,0 +1,106 @@
+{
+  "name": "polkadot-app-deploy",
+  "version": "0.10.0",
+  "private": false,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/paritytech/polkadot-app-deploy.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "polkadot-app-deploy": "./bin/polkadot-app-deploy",
+    "pad": "./bin/polkadot-app-deploy",
+    "polkadot-app-bootstrap": "./bin/polkadot-app-bootstrap",
+    "pad-bootstrap": "./bin/polkadot-app-bootstrap"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./deploy": {
+      "types": "./dist/deploy.d.ts",
+      "import": "./dist/deploy.js"
+    },
+    "./manifest-roundtrip": {
+      "types": "./dist/manifest-roundtrip.d.ts",
+      "import": "./dist/manifest-roundtrip.js"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetry.d.ts",
+      "import": "./dist/telemetry.js"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "docs",
+    "assets",
+    "patches",
+    "DEPLOYMENT.md",
+    "tools/release-retry-wrapper.mjs"
+  ],
+  "scripts": {
+    "build": "tsup src/index.ts src/deploy.ts src/dotns.ts src/pool.ts src/telemetry.ts src/memory-report.ts src/merkle.ts src/gh-pages-mirror.ts src/version-check.ts src/bug-report.ts src/run-state.ts src/environments.ts src/errors.ts src/manifest.ts src/chunk-probe.ts src/manifest-embed.ts src/manifest-fetch.ts src/manifest-roundtrip.ts src/incremental-stats.ts src/chunker.ts src/personhood/encoding.ts src/personhood/hashing.ts src/personhood/constants.ts src/personhood/member-key.ts src/personhood/people-client.ts src/personhood/proof-validity.ts src/personhood/reprove.ts src/personhood/bind-personal-id.ts src/personhood/claim-pgas.ts src/personhood/bind-paid-alias.ts src/personhood/bootstrap.ts src/personhood/chain-prereqs.ts src/manifest/types.ts src/manifest/schema.ts src/manifest/byte-budget.ts src/manifest/config-load.ts src/manifest/publish.ts src/auth/index.ts src/auth/vendor/index.ts src/auth/vendor/ui/index.ts src/auth-config.ts src/commands/login.ts src/commands/logout.ts src/commands/whoami.ts src/commands/transfer.ts src/storage-signer.ts src/spinner.ts src/sss-allowance.ts src/sss-allowance-cache.ts src/deploy-actors.ts --format esm --dts --clean --target node22",
+    "postinstall": "patch-package || true",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test test/test.js test/cli-help.test.js test/helpers/e2e-helpers.test.js test/environments.test.js test/product-manifest.test.js test/error-pattern-signature.test.js test/exit-codes.test.js test/probe-env-health.test.js test/e2e-chain-calls.test.js test/auth-config.test.js test/whoami.test.js test/login.test.js test/logout.test.js test/auth-resolve.test.js test/storage-signer.test.js test/spinner.test.js test/sss-allowance.test.js test/sss-allowance-cache.test.js test/dotns-transfer.test.js test/deploy-actors.test.js test/transfer-command.test.js test/dotns-register-fee.test.js test/deploy-label-ordering.test.js test/benign-teardown.test.js && npm run test:vendor",
+    "test:e2e": "npm run build && node --test test/e2e.test.js",
+    "test:e2e:smoke": "bash scripts/e2e-pass.sh smoke",
+    "test:e2e:pr": "bash scripts/e2e-pass.sh pr",
+    "test:e2e:nightly": "bash scripts/e2e-pass.sh nightly",
+    "benchmark": "npm run build && node benchmark.js",
+    "test:vendor": "vitest run src/auth/vendor"
+  },
+  "dependencies": {
+    "@ipld/car": "^5.4.3",
+    "@ipld/dag-pb": "^4.1.3",
+    "@noble/hashes": "^1.7.2",
+    "@parity/product-sdk-address": "^0.1.1",
+    "@parity/product-sdk-keys": "^0.3.0",
+    "@parity/product-sdk-terminal": "^0.4.0",
+    "@parity/product-sdk-tx": "^0.2.4",
+    "@polkadot-api/metadata-builders": "^0.14.2",
+    "@polkadot-api/substrate-bindings": "^0.20.2",
+    "@polkadot-labs/hdkd": "^0.0.28",
+    "@polkadot-labs/hdkd-helpers": "^0.0.30",
+    "@polkadot/keyring": "^14.0.3",
+    "@polkadot/util-crypto": "^14.0.3",
+    "@sentry/node": "^9.14.0",
+    "ipfs-unixfs": "^11.2.0",
+    "ipfs-unixfs-importer": "^16.1.4",
+    "jiti": "^2.4.2",
+    "multiformats": "^13.4.1",
+    "patch-package": "^8.0.1",
+    "polkadot-api": "^2.1.3",
+    "verifiablejs": "1.3.0-beta.4",
+    "viem": "^2.30.5",
+    "ws": "^8.20.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.1",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
+  },
+  "overrides": {
+    "@polkadot-api/json-rpc-provider": "^0.2.0",
+    "@novasamatech/host-api": "0.8.6",
+    "@novasamatech/host-papp": "0.8.6",
+    "@novasamatech/scale": "0.8.6",
+    "@novasamatech/statement-store": "0.8.6",
+    "@novasamatech/storage-adapter": "0.8.6"
+  },
+  "minimumVersion": "0.5.6",
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "GPL-3.0-or-later"
+}

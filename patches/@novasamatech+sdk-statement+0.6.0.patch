@@ -1,0 +1,47 @@
+diff --git a/node_modules/@novasamatech/sdk-statement/dist/statement-sdk.js b/node_modules/@novasamatech/sdk-statement/dist/statement-sdk.js
+index 3e6bcd2..5f17175 100644
+--- a/node_modules/@novasamatech/sdk-statement/dist/statement-sdk.js
++++ b/node_modules/@novasamatech/sdk-statement/dist/statement-sdk.js
+@@ -8,7 +8,19 @@ const createStatementSdk = (req, subscribe) => {
+   const api = getApi(req, subscribe);
+   const getStatements = (filter = ANY_FILTER) => new Promise((resolve, reject) => {
+     const statements = [];
+-    const unsubscribe = api.subscribeStatement(
++    // PATCH(bulletin-deploy): `unsubscribe` was a `const` initialized from
++    // api.subscribeStatement(...) while BOTH callbacks reference it. When the
++    // underlying observable settles synchronously at subscribe time (e.g. a
++    // poll fires after the websocket client was destroyed, so subscribe
++    // errors immediately), the callback runs before the const is assigned:
++    // "ReferenceError: Cannot access 'unsubscribe' before initialization",
++    // rethrown by rxjs as an uncaughtException. Hit on Ctrl+C / teardown
++    // during an active pairing poll. `let` + a settled flag covers both the
++    // sync-error and sync-completion shapes. Remove when fixed upstream.
++    // From playground-cli PR #281.
++    let settled = false;
++    let unsubscribe = null;
++    unsubscribe = api.subscribeStatement(
+       filter,
+       (event) => {
+         if (event.event === "newStatements") {
+@@ -19,16 +31,19 @@ const createStatementSdk = (req, subscribe) => {
+             }
+           }
+           if (event.data.remaining === 0 || event.data.remaining === void 0) {
+-            unsubscribe();
++            settled = true;
++            unsubscribe?.();
+             resolve(statements);
+           }
+         }
+       },
+       (error) => {
+-        unsubscribe();
++        settled = true;
++        unsubscribe?.();
+         reject(error);
+       }
+     );
++    if (settled) unsubscribe();
+   });
+   return {
+     /**

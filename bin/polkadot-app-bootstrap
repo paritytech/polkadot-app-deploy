@@ -1,0 +1,101 @@
+#!/usr/bin/env node
+
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE } from "../dist/deploy.js";
+import { bootstrapPool } from "../dist/pool.js";
+import { VERSION } from "../dist/telemetry.js";
+
+const args = process.argv.slice(2);
+
+const flags = {};
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "--pool-size") { flags.poolSize = parseInt(args[++i], 10); }
+  else if (args[i] === "--mnemonic") { flags.mnemonic = args[++i]; }
+  else if (args[i] === "--authorizer") { flags.authorizer = args[++i]; }
+  else if (args[i] === "--rpc") { flags.rpc = args[++i]; }
+  else if (args[i] === "--env") { flags.env = args[++i]; }
+  else if (args[i] === "--version" || args[i] === "-V") { flags.version = true; }
+  else if (args[i] === "--help" || args[i] === "-h") { flags.help = true; }
+  else {
+    console.error(`Error: unknown argument ${args[i]}`);
+    process.exit(1);
+  }
+}
+
+if (flags.version) {
+  console.log(`polkadot-app-bootstrap v${VERSION}`);
+  process.exit(0);
+}
+
+if (flags.help) {
+  console.log(`polkadot-app-bootstrap v${VERSION}
+
+Usage:
+  polkadot-app-bootstrap [options]
+
+Reports the authorization status of each pool account and, when an authorizer
+key is available, grants authorization to any account that needs it.
+
+The Bulletin chain has no fee model — storage access is gated by TransactionStorage
+authorization quota, not account balance. This tool manages that quota.
+
+Aliases: pad-bootstrap (short), polkadot-app-bootstrap (full)
+
+Options:
+  --mnemonic "..."    Pool root mnemonic used to derive pool accounts
+                      (also readable from BULLETIN_POOL_MNEMONIC or MNEMONIC env var).
+                      Default: the well-known dev phrase (same key the deploy path uses).
+  --authorizer "..."  Seed/mnemonic of the key that holds authorization authority
+                      on this chain (e.g. "//Alice", a full mnemonic, or a hex seed).
+                      On testnets, defaults to //Alice if omitted.
+                      On non-testnets, required to grant — omit to get status only.
+  --rpc wss://...     Bulletin RPC endpoint (or set BULLETIN_RPC env var)
+  --env <id>          Load environment by id from environments.json
+  --pool-size N       Number of pool accounts to check/initialize (default: 10)
+  --version           Show version
+  --help              Show this help`);
+  process.exit(0);
+}
+
+let rpc = flags.rpc ?? process.env.BULLETIN_RPC ?? DEFAULT_BULLETIN_RPC;
+const poolSize = flags.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
+const mnemonic = flags.mnemonic ?? process.env.BULLETIN_POOL_MNEMONIC ?? process.env.MNEMONIC;
+
+const bootstrapOpts = {};
+
+if (flags.authorizer) {
+  bootstrapOpts.authorizerMnemonic = flags.authorizer;
+}
+
+if (flags.env) {
+  const envJsonPath = fileURLToPath(new URL("../assets/environments.json", import.meta.url));
+  let envDoc;
+  try {
+    const raw = await fs.readFile(envJsonPath, "utf8");
+    envDoc = JSON.parse(raw);
+  } catch (e) {
+    console.error(`Error: could not load environments.json: ${e.message}`);
+    process.exit(1);
+  }
+
+  const envEntry = envDoc.environments.find(e => e.id === flags.env);
+  if (!envEntry) {
+    const valid = envDoc.environments.map(e => e.id).join(", ");
+    console.error(`Error: unknown environment '${flags.env}'. Valid: ${valid}.`);
+    process.exit(1);
+  }
+
+  if (!flags.rpc) {
+    const bulletinChain = envDoc.chains.find(c => c.id === "bulletin");
+    const ep = bulletinChain?.endpoints?.[flags.env];
+    if (ep?.wss) {
+      rpc = Array.isArray(ep.wss) ? ep.wss[0] : ep.wss;
+    }
+  }
+
+  bootstrapOpts.bulletinAuthorizeV2 = envEntry.bulletinAuthorizeV2 ?? false;
+}
+
+await bootstrapPool(rpc, poolSize, mnemonic, bootstrapOpts);

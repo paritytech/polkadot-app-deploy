@@ -1,0 +1,13 @@
+{
+  "_doc": "Realistic Vite asset rotation patch. Applied on top of v1/ produces v2 — simulates a typical frontend rebuild where one source file changed (Home.tsx 'Decentralized on Polkadot' → 'Decentralized on Bulletin'), causing Vite to emit a new content-hashed bundle filename and update index.html's script tag. Source: github.com/paritytech/Rock-Paper-Scissors built with vite 7.0.",
+  "delete": [
+    "assets/index-CRsfbGL9.js"
+  ],
+  "patch_files_under": "patch/",
+  "summary": {
+    "v1_total_bytes": 10070389,
+    "v1_file_count": 60,
+    "patch_bytes": 468430,
+    "rotated_bundle_kb": 466
+  }
+}

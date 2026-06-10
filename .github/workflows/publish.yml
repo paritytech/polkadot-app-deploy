@@ -7,58 +7,57 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # Maintainer-triggered: this fires on `release: created`, which only repo
-    # maintainers can do. `release` is a protected environment — configure
-    # required reviewers + the NPM_TOKEN secret on it in repo Settings →
-    # Environments so a publish needs an explicit human approval click.
+    # Maintainer-triggered: fires on `release: created`, which only repo
+    # maintainers can do. `release` is a protected environment with required
+    # reviewers (a maintainer + the builder-experience team), so a publish
+    # needs an explicit human approval click before this job runs.
     environment: release
     permissions:
       contents: read
-      # id-token: write enables npm provenance now, and tokenless OIDC
-      # Trusted Publishing later (see the publish step).
-      id-token: write
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
 
-      - run: npm install
+      - run: npm ci
 
-      # Runs the full offline suite the project's npm test script runs:
-      # test/test.js + test/pool.test.js + test/helpers/e2e-helpers.test.js.
-      # Includes the build internally (npm test → npm run build → node --test).
-      #
-      # The public package intentionally ships with NO Sentry DSN: telemetry is
-      # strictly opt-in AND has nowhere to send unless the user supplies their
-      # own DSN (telemetry plumbing is inert by default). Do NOT add a
-      # SENTRY_DSN secret to this repo — leaving it unset is the design.
+      # Full offline suite (test/test.js etc.) — builds internally
+      # (npm test → npm run build → node --test). The public package ships with
+      # NO Sentry DSN: telemetry is strictly opt-in and inert by default. Do NOT
+      # add a SENTRY_DSN secret to this repo — leaving it unset is the design.
       - run: npm test
 
-      # Pre-releases (e.g. 0.6.9-rc.0) publish under the `rc` dist-tag so
-      # consumers who run `npm install @parity/polkadot-app-deploy` (which resolves `@latest`)
-      # never pick one up by accident. Stable versions publish to `@latest`.
-      # Publishes with --provenance (signed build attestation, requires the
-      # id-token: write permission above + a GitHub-hosted runner).
-      #
-      # BOOTSTRAP: the first release authenticates with a short-lived,
-      # package-scoped NPM_TOKEN (set as a secret on the `release` environment).
-      # SWITCH TO TOKENLESS once the package exists on npm:
-      #   1. npmjs.org → polkadot-app-deploy → Settings → Trusted Publishing →
-      #      add this repo (paritytech/polkadot-app-deploy) + workflow `publish.yml`.
-      #   2. Delete the NPM_TOKEN secret and drop the `env: NODE_AUTH_TOKEN` block
-      #      below. The id-token: write permission then carries auth via OIDC.
-      - name: Publish to npm
+      # The package is published to the @parity scope through Parity's
+      # `npm_publish_automation` — this repo never holds an npm token. We build
+      # the tarball, upload it as an artifact, and dispatch to the automation,
+      # which downloads the artifact (via its org token), re-checks the packed
+      # name against its allowlist, and runs `npm publish` with the @parity
+      # credentials. Same flow bulletin-deploy uses for @parity/product-deploy.
+      - name: Determine npm dist-tag
+        id: tag
         run: |
           VERSION=$(node -p "require('./package.json').version")
           if [[ "$VERSION" == *-* ]]; then
-            echo "Publishing $VERSION as pre-release under @rc"
-            npm publish --access public --provenance --tag rc
+            echo "npm_tag=rc" >> "$GITHUB_OUTPUT"   # pre-release → @rc, @latest untouched
           else
-            echo "Publishing $VERSION as stable under @latest"
-            npm publish --access public --provenance
+            echo "npm_tag=" >> "$GITHUB_OUTPUT"      # stable → @latest
           fi
+
+      - name: Pack @parity/polkadot-app-deploy
+        run: npm pack
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: polkadot-app-deploy
+          path: "*.tgz"
+
+      - name: Dispatch to npm_publish_automation
+        uses: octokit/request-action@v2.x
+        with:
+          route: POST /repos/paritytech/npm_publish_automation/actions/workflows/publish.yml/dispatches
+          ref: main
+          inputs: '${{ format(''{{ "repo": "{0}", "run_id": "{1}", "npm_tag": "{2}", "artifact_name": "polkadot-app-deploy" }}'', github.repository, github.run_id, steps.tag.outputs.npm_tag) }}'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.NPM_PUBLISH_AUTOMATION_TOKEN }}

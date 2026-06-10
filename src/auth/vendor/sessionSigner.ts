@@ -132,6 +132,14 @@ export function createSessionSigner(
                 noAllowanceMsg = msg;
                 return; // suppress raw stack trace — NonRetryableError below is the clean message
             }
+            // Swallow teardown noise emitted by the statement-store adapter when
+            // the deploy has already failed and the WS is being torn down. The
+            // pattern "submitRequest failed: Error: Not connected" (and similar
+            // DestroyedError / Client destroyed variants) is benign post-failure
+            // noise — the user already sees the clean Deployment failed message.
+            if (/submitRequest failed/i.test(msg) && /not connected|destroyederror|client destroyed/i.test(msg)) {
+                return;
+            }
             origErr(...args);
         };
 

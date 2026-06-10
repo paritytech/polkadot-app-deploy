@@ -197,7 +197,10 @@ export function isConnectionError(error: any): boolean {
   // down a client mid-subscription. Treating it as a connection error so
   // the retry path triggers doReconnect (build a fresh client) rather than
   // looping on the destroyed one.
-  return /heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed/i.test(msg);
+  // `Not connected` / `not connected` is the polkadot-api raw-client error
+  // emitted during teardown when a WS subscription is torn down after the
+  // client is already closed — matches the login.ts teardown pattern.
+  return /heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|not connected/i.test(msg);
 }
 
 /**
@@ -2595,7 +2598,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       sessionCleanup = actors.worker.destroy.bind(actors.worker);
       if (actors.worker.source === "session") resolvedUserSession = actors.worker;
       if (actors.recipientH160) {
-        console.log(`   Worker: ${actors.worker.source} signer ${actors.worker.address} → will transfer ${domainName ?? "the name"} to ${actors.recipientH160}`);
+        console.log(`   Worker: ${actors.worker.source} signer ${actors.worker.address} (final owner: ${actors.recipientH160})`);
       } else {
         console.log(`   Using ${actors.worker.source} signer: ${actors.worker.address}`);
       }

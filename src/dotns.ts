@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { createReadStream } from "fs";
+import * as readline from "readline";
 import { createClient, Enum } from "polkadot-api";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { getWsProvider } from "polkadot-api/ws";
@@ -245,6 +246,21 @@ export const WS_HEARTBEAT_TIMEOUT_MS: number = 300_000;
 // concurrent jobs off the same retry tick), NOT more attempts: the old loop retried
 // back-to-back with zero delay, so the burst re-collided on the same nonce each time.
 export const DOTNS_TX_MAX_ATTEMPTS: number = 3;
+
+/**
+ * Thrown by signAndSubmitExtrinsic when the transaction watcher goes silent
+ * with NO prior event — i.e. the chain never received a "signed" / "broadcasted"
+ * event before the silence deadline. On the phone/session-signer path this
+ * typically means the user hasn't approved the request on their phone yet.
+ * Typed separately from a plain Error so signAndSubmitWithRetry can apply a
+ * different policy (pause-and-resume) instead of the default retry.
+ */
+export class WatcherSilentNoEventError extends Error {
+  constructor(silentMs: number) {
+    super(`transaction watcher silent for ${Math.floor(silentMs / 1000)}s — no response received (did you approve on your phone?)`);
+    this.name = "WatcherSilentNoEventError";
+  }
+}
 
 // Retry decision for DotNS extrinsic submission errors. Stale / Future /
 // connection errors mean the tx didn't land due to mortality or network
@@ -1046,7 +1062,14 @@ class ReviveClientWrapper {
           const silentMs = Date.now() - lastEventAt;
           if (silentMs > TX_NO_PROGRESS_MS) {
             statusCallback("failed");
-            finish(reject)(new Error(`transaction watcher silent for ${Math.floor(silentMs / 1000)}s after ${lastEventType}`));
+            // No-event case (never reached "signed"/"broadcasted"): throw a typed
+            // error so signAndSubmitWithRetry can detect it and apply phone-signer
+            // pause-and-resume instead of the default WS-stall retry.
+            if (lastEventType === "(none)") {
+              finish(reject)(new WatcherSilentNoEventError(silentMs));
+            } else {
+              finish(reject)(new Error(`transaction watcher silent for ${Math.floor(silentMs / 1000)}s after ${lastEventType}`));
+            }
             return;
           }
         } catch { /* transient RPC hiccup — retry next tick */ }
@@ -1087,7 +1110,7 @@ class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas" } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
@@ -1098,6 +1121,38 @@ class ReviveClientWrapper {
         return await this.signAndSubmitExtrinsic(buildExtrinsic(), signer, filter.callback, opts);
       } catch (e: any) {
         lastError = e;
+
+        // Phone-signer / no-event case: the watcher went silent before any
+        // blockchain event arrived — the user never approved on their phone.
+        // Instead of retrying (which wastes ~3×90s), pause and let them catch up.
+        // SAFETY: gated on isTTY FIRST, before any readline is constructed.
+        // Non-TTY (CI, E2E, piped) must fail fast and never block.
+        if (e instanceof WatcherSilentNoEventError && opts.isPhoneSigner === true) {
+          if (!(process.stdin.isTTY && process.stdout.isTTY)) {
+            // Non-interactive environment (CI / E2E / piped). Fail immediately with
+            // a clear message; do NOT prompt or wait.
+            filter.flush();
+            throw new NonRetryableError(
+              "No signature received from the phone — re-run when you can approve on your phone.",
+            );
+          }
+          // Interactive TTY: pause and let the user approve, then re-attempt.
+          console.log(`\n   Waiting until you're back — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
+          let approved = false;
+          while (!approved) {
+            const answer = await new Promise<string>((resolve) => {
+              const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+              rl.question("   > ", (line: string) => { rl.close(); resolve(line.trim()); });
+            });
+            if (answer.toLowerCase() === "y" || answer === "") {
+              approved = true;
+            }
+          }
+          // Re-attempt from the top of the loop; don't count this as a retry.
+          filter.reset();
+          continue;
+        }
+
         const decision = classifyTxRetryDecision(e);
         const msg = e?.message ?? String(e);
         if (!shouldRetryTxAttempt(attempt, DOTNS_TX_MAX_ATTEMPTS, decision)) {
@@ -1160,7 +1215,7 @@ class ReviveClientWrapper {
     signerSubstrateAddress: string,
     signer: PolkadotSigner,
     statusCallback: (status: string) => void,
-    { rpcs, useNoncePolling, functionName, args, contracts, verifyEffect, feeAsset }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas" },
+    { rpcs, useNoncePolling, functionName, args, contracts, verifyEffect, feeAsset, isPhoneSigner }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean },
   ): Promise<TxResolution> {
     await this.ensureAccountMapped(signerSubstrateAddress, signer);
     // For register specifically, re-check mapping immediately before the dry-run.
@@ -1197,7 +1252,7 @@ class ReviveClientWrapper {
       "chain.tx.submit",
       `sign+submit ${functionName ?? "Revive.call"}`,
       { "chain.function_name": functionName ?? "Revive.call", "chain.use_nonce_polling": Boolean(useNoncePolling) },
-      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset }),
+      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner }),
     );
   }
 
@@ -1990,7 +2045,7 @@ export class DotNS {
     const encodedCallData = encodeFunctionData({ abi: contractAbi, functionName, args });
     const rpcs = this.rpc ? [this.rpc, ...this.assetHubEndpoints.filter((ep) => ep !== this.rpc)] : this.assetHubEndpoints;
     return await withTimeout(
-      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, { rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset }),
+      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, { rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset, isPhoneSigner: this._usesExternalSigner }),
       OPERATION_TIMEOUT_MS,
       functionName,
     );

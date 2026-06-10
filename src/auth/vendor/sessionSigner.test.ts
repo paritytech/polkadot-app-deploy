@@ -100,3 +100,19 @@ describe("session signer account equivalence", () => {
         ).toThrow('Stored login session is missing the root account public key.');
     });
 });
+
+// ---------------------------------------------------------------------------
+// Issue 2: console.error patch in sessionSigner swallows teardown noise
+// ---------------------------------------------------------------------------
+describe("sessionSigner teardown noise suppression (issue 2)", () => {
+    test("console.error patch source contains teardown noise suppression for submitRequest failed", () => {
+        // Verify the source-level fix is present — the patch now also swallows
+        // "submitRequest failed: ... Not connected / DestroyedError / Client destroyed".
+        const src = require("fs").readFileSync(
+            require("path").join(__dirname, "sessionSigner.ts"),
+            "utf8",
+        );
+        expect(src).toMatch(/submitRequest failed/i);
+        expect(src).toMatch(/not connected|destroyederror|client destroyed/i);
+    });
+});

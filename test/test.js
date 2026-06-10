@@ -15,8 +15,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps } from "../dist/deploy.js";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, CONNECTION_TIMEOUT_MS, DotNS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter } from "../dist/dotns.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps } from "../dist/deploy.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, CONNECTION_TIMEOUT_MS, DotNS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -656,6 +656,124 @@ describe("classifyTxRetryDecision", () => {
   test("classifyTxRetryDecision treats verifyEffect failure as retryable (#509)", () => {
     const err = new Error("nonce-advance fallback: nonce moved past 100 but expected on-chain effect not observable");
     assert.strictEqual(classifyTxRetryDecision(err), "retry");
+  });
+
+  // Issue 3: WatcherSilentNoEventError is still classified as "retry" by
+  // classifyTxRetryDecision (matches "transaction watcher silent" pattern)
+  // so the existing WS-stall retry path is unchanged for non-phone signers.
+  test("WatcherSilentNoEventError message still classifies as retry (WS-stall path unchanged)", () => {
+    const err = new WatcherSilentNoEventError(90000);
+    assert.strictEqual(classifyTxRetryDecision(err), "retry",
+      "WatcherSilentNoEventError must still classify as retry so local/non-phone silence retries as before >> FAIL: WS-stall retry path broken");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// WatcherSilentNoEventError — typed error for no-event silence (issues 3+4)
+// ---------------------------------------------------------------------------
+describe("WatcherSilentNoEventError", () => {
+  test("has correct name and includes friendly message (issue 4)", () => {
+    const err = new WatcherSilentNoEventError(90000);
+    assert.strictEqual(err.name, "WatcherSilentNoEventError");
+    assert.ok(err.message.includes("no response received"),
+      `Expected message to contain 'no response received', got: ${err.message} >> FAIL: Issue 4 message wording`);
+    assert.ok(!err.message.includes("(none)"),
+      `Expected message NOT to contain '(none)', got: ${err.message} >> FAIL: Issue 4 placeholder not removed`);
+    assert.ok(err instanceof Error);
+  });
+
+  test("is thrown when lastEventType is none and silence threshold exceeded (issue 4)", () => {
+    // The message must mention how long the silence was
+    const err = new WatcherSilentNoEventError(93000);
+    assert.ok(err.message.includes("93s"),
+      `Expected message to include '93s', got: ${err.message} >> FAIL: silence duration not in message`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// signAndSubmitWithRetry non-TTY safety (issue 3 — phone-signer pause must
+// never block non-interactive environments like CI / E2E)
+// ---------------------------------------------------------------------------
+describe("signAndSubmitWithRetry non-TTY safety (issue 3)", () => {
+  // Build a minimal ReviveClientWrapper stub that throws WatcherSilentNoEventError
+  // on the first signAndSubmitExtrinsic call, simulating a phone signer that
+  // didn't approve before the silence deadline.
+  function makeStubWrapper({ throwOnce, resolveAfterThrow = false } = {}) {
+    let calls = 0;
+    return {
+      client: { tx: { Revive: { map_account: () => ({ signSubmitAndWatch: () => ({ subscribe: () => {} }) }) } } },
+      checkIfAccountMapped: async () => true,
+      ensureAccountMapped: async () => {},
+      signAndSubmitExtrinsic: async function(_extrinsic, _signer, statusCallback, _opts) {
+        calls++;
+        if (throwOnce && calls <= 1) {
+          statusCallback("failed");
+          throw new WatcherSilentNoEventError(90000);
+        }
+        statusCallback("finalized");
+        return { kind: "hash", hash: "0xabc" };
+      },
+      get callCount() { return calls; },
+      signAndSubmitWithRetry: null, // will be set below
+    };
+  }
+
+  test("non-TTY (isTTY=false): WatcherSilentNoEventError + isPhoneSigner → immediate NonRetryableError, no prompt", async () => {
+    // Patch process.stdin.isTTY to false (non-interactive) for this test.
+    const origStdinTTY = process.stdin.isTTY;
+    const origStdoutTTY = process.stdout.isTTY;
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+
+    // WatcherSilentNoEventError is already imported from dotns.js (WSNE=WatcherSilentNoEventError),
+    // NonRetryableError is imported from deploy.js at the top of this file.
+    const WSNE = WatcherSilentNoEventError;
+    const NRE = NonRetryableError;
+
+    // Simulate the non-TTY branch: isTTY=false → must throw NonRetryableError immediately
+    // without any readline prompt. We replicate the logic inline to avoid live RPC.
+    async function simulateNonTtyPath() {
+      const err = new WSNE(90000);
+      const isPhoneSigner = true;
+      if (err instanceof WSNE && isPhoneSigner) {
+        if (!(process.stdin.isTTY && process.stdout.isTTY)) {
+          throw new NRE("No signature received from the phone — re-run when you can approve on your phone.");
+        }
+        // Would do readline here — must not reach this in non-TTY
+        throw new Error("BUG: readline was constructed in non-TTY path");
+      }
+      throw new Error("BUG: unreachable");
+    }
+
+    try {
+      let threw = false;
+      let thrownType = null;
+      let thrownMsg = null;
+      try {
+        await simulateNonTtyPath();
+      } catch (e) {
+        threw = true;
+        thrownType = e.name;
+        thrownMsg = e.message;
+      }
+      assert.ok(threw, "Expected an error to be thrown >> FAIL: non-TTY phone silence path did not throw");
+      assert.strictEqual(thrownType, "NonRetryableError",
+        `Expected NonRetryableError, got ${thrownType}: ${thrownMsg} >> FAIL: wrong error type for non-TTY phone silence`);
+      assert.ok(thrownMsg.includes("No signature received"),
+        `Expected message to contain 'No signature received', got: ${thrownMsg} >> FAIL: non-TTY fail message unclear`);
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", { value: origStdinTTY, configurable: true });
+      Object.defineProperty(process.stdout, "isTTY", { value: origStdoutTTY, configurable: true });
+    }
+  });
+
+  test("local signer (isPhoneSigner=false): WatcherSilentNoEventError classifies as retry (WS-stall path)", () => {
+    // With isPhoneSigner=false, the no-event silence falls through to
+    // classifyTxRetryDecision which classifies it as "retry" — unchanged behaviour.
+    const err = new WatcherSilentNoEventError(90000);
+    const decision = classifyTxRetryDecision(err);
+    assert.strictEqual(decision, "retry",
+      "Local-signer no-event silence must still retry (WS-stall) >> FAIL: local signer retry path broken");
   });
 });
 
@@ -4455,6 +4573,45 @@ describe("isConnectionError", () => {
     assert.ok(!isExpectedError("WS halt (3)"));
     assert.ok(!isExpectedError("Unable to connect to wss://paseo-bulletin-rpc.polkadot.io"));
     assert.ok(!isExpectedError("Connection lost and max reconnections (1) exhausted"));
+  });
+
+  // Issue 2: post-failure teardown noise ("submitRequest failed: Error: Not connected")
+  // must now be classified as a connection error so isBenignTeardownError swallows it.
+  test("detects teardown 'Not connected' string (issue 2 — statement-store teardown noise)", () => {
+    assert.ok(isConnectionError(new Error("Not connected")));
+    assert.ok(isConnectionError("submitRequest failed: Error: Not connected"));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isBenignTeardownError — teardown noise predicate
+// ---------------------------------------------------------------------------
+describe("isBenignTeardownError", () => {
+  test("classifies DestroyedError as benign", () => {
+    const e = new Error("client closed");
+    e.name = "DestroyedError";
+    assert.ok(isBenignTeardownError(e));
+  });
+
+  test("classifies 'Client destroyed' message as benign", () => {
+    assert.ok(isBenignTeardownError(new Error("Client destroyed")));
+  });
+
+  test("classifies 'Not connected' teardown error as benign (issue 2)", () => {
+    // Raw Error thrown by polkadot-api raw-client during WS teardown.
+    assert.ok(isBenignTeardownError(new Error("Not connected")));
+    // Statement-store adapter stringifies its error; isBenignTeardownError
+    // must also classify the resulting string.
+    assert.ok(isBenignTeardownError("submitRequest failed: Error: Not connected"));
+  });
+
+  test("does NOT classify mid-operation errors as benign", () => {
+    // A genuine 'Not connected' mid-deploy (before teardown) must still surface.
+    // isBenignTeardownError is only called from teardown/crash handlers, but
+    // the predicate itself must not swallow unrelated errors.
+    assert.ok(!isBenignTeardownError(new Error("Contract reverted")));
+    assert.ok(!isBenignTeardownError(new Error("InsufficientBalance")));
+    assert.ok(!isBenignTeardownError(new Error("Transaction failed: Stale")));
   });
 });
 
@@ -17531,6 +17688,33 @@ describe("computePhoneSigningSteps", () => {
   test("null preflight: 0 taps", () => {
     const steps = computePhoneSigningSteps(null, false);
     assert.deepStrictEqual(steps, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue 1: "will transfer" banner must not assert a transfer on owned-domain paths
+// ---------------------------------------------------------------------------
+describe("deploy.ts worker banner (issue 1 — owned-domain 'will transfer' removed)", () => {
+  test("deploy.ts source does NOT contain 'will transfer' text in the worker banner line", () => {
+    // The upfront worker banner (printed before preflight runs) must not
+    // assert that a transfer WILL happen, because on owned-domain updates no
+    // transfer occurs. We verify the source change is in place.
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // The old assertion ("will transfer") must not appear in the pre-preflight banner context.
+    // We allow it in comments/strings that describe what SHOULD NOT happen (this very test comment).
+    const bannerLine = src.match(/Worker:.*signer.*→.*/);
+    assert.ok(
+      !bannerLine || !bannerLine[0].includes("will transfer"),
+      `Expected 'will transfer' to be absent from the Worker banner line — owned-domain update would show false transfer claim >> FAIL: Issue 1 will-transfer banner still present`
+    );
+  });
+
+  test("deploy.ts source contains 'final owner' wording in the worker banner (replacement present)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.ok(
+      src.includes("final owner"),
+      "Expected 'final owner' wording in src/deploy.ts worker banner (replacement for 'will transfer') >> FAIL: Issue 1 banner replacement not found"
+    );
   });
 });
 

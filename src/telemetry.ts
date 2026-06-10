@@ -630,11 +630,12 @@ function toMb(bytes: number): number {
 // Record a memory sample on the active span (labelled by `stage`) and roll
 // running peaks onto the captured deploy span. Peaks are written on every
 // sample rather than only in a final block so early exits still get a valid
-// snapshot. No-op when telemetry is disabled.
+// snapshot. The run-state write (lastPeakRssMb) is a LOCAL crash-recovery
+// feature and runs regardless of whether Sentry is initialized. Span
+// attributes are gated on `active` / `deployRootSpan` being non-null.
 export function sampleMemory(stage: string): void {
-  if (!Sentry) return;
   const m = process.memoryUsage();
-  const active = Sentry.getActiveSpan();
+  const active = Sentry ? Sentry.getActiveSpan() : null;
   if (process.env.PAD_MEM_DEBUG) {
     console.error(`[sampleMemory] stage=${stage} active=${active ? (active as any).description ?? (active as any).name ?? "?" : "null"} rss=${toMb(m.rss)}MB`);
   }
@@ -676,11 +677,22 @@ export function sampleMemory(stage: string): void {
 }
 
 export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>): Promise<T> {
-  if (!Sentry) return fn();
-  const attrs: Record<string, string | number | boolean | undefined> = { ...getDeployAttributes(domain), "deploy.domain": domain };
+  // Always initialize peak-RSS tracking — this is a LOCAL crash-recovery
+  // feature (run-state lastPeakRssMb) that must work whether or not Sentry
+  // is initialized. Span creation and setAttribute calls remain Sentry-gated.
   const m0 = process.memoryUsage();
   memoryPeak = { rss: m0.rss, heapUsed: m0.heapUsed, external: m0.external, arrayBuffers: m0.arrayBuffers };
   stageSamples = {};
+  if (!Sentry) {
+    try {
+      return await fn();
+    } finally {
+      sampleMemory("end"); // folds end into peak + persists run-state lastPeakRssMb
+      memoryPeak = null;
+      stageSamples = {};
+    }
+  }
+  const attrs: Record<string, string | number | boolean | undefined> = { ...getDeployAttributes(domain), "deploy.domain": domain };
   reportContext = {};
   currentErrorCategory = null;
   currentDeploySad = false;

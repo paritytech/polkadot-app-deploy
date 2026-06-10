@@ -7795,6 +7795,46 @@ describe("writeRunState", () => {
   });
 });
 
+// Unit 2b: withDeploySpan persists lastPeakRssMb to run-state even when
+// Sentry is not initialised (public no-DSN build / telemetry-off path).
+// Regression guard for the bug where memoryPeak was initialised only INSIDE
+// the `if (!Sentry)` early-return in withDeploySpan, and sampleMemory bailed
+// at its own `if (!Sentry) return` before reaching writeRunState — so
+// lastPeakRssMb always stayed null when telemetry was off (S7 FAIL).
+describe("withDeploySpan no-telemetry run-state RSS", () => {
+  test("persists lastPeakRssMb as a positive number when Sentry is not initialised", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bd-rss-"));
+    try {
+      const res = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        import { writeRunState, loadRunState } from "${pathToFileUrl(path.resolve("dist/run-state.js"))}";
+        import { withDeploySpan, sampleMemory, setRunStateActive } from "${pathToFileUrl(path.resolve("dist/telemetry.js"))}";
+        // Seed a running-state entry so writeRunState has something to merge into.
+        writeRunState({ status: "running", pid: 123, startedAt: 1, toolVersion: "test", argv: [], lastPeakRssMb: null, lastStage: null });
+        // Activate run-state persistence (mirrors what the CLI bin does on startup).
+        setRunStateActive(true);
+        // Sentry is NOT initialised — withDeploySpan must still persist peak RSS.
+        await withDeploySpan("example.dot", async () => {
+          sampleMemory("chunk_upload_start");
+        });
+        const state = loadRunState();
+        process.stdout.write(JSON.stringify({ lastPeakRssMb: state && state.lastPeakRssMb, lastStage: state && state.lastStage }));
+      `], { encoding: "utf-8", env: { ...process.env, HOME: tmp, XDG_STATE_HOME: path.join(tmp, ".local", "state"), LOCALAPPDATA: path.join(tmp, "AppData", "Local") } });
+      assert.equal(res.status, 0, `subprocess failed:\n${res.stderr}`);
+      const parsed = JSON.parse(res.stdout);
+      assert.ok(
+        typeof parsed.lastPeakRssMb === "number" && parsed.lastPeakRssMb > 0,
+        `lastPeakRssMb must be a positive number when telemetry is off, got ${JSON.stringify(parsed.lastPeakRssMb)}`,
+      );
+      assert.ok(
+        typeof parsed.lastStage === "string" && parsed.lastStage.length > 0,
+        `lastStage must be a non-empty string, got ${JSON.stringify(parsed.lastStage)}`,
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
 // Unit 3: loadRunState missing / malformed / permission error.
 describe("loadRunState", () => {
   test("returns null when file is missing", () => {

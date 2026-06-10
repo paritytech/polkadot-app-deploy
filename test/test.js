@@ -8258,7 +8258,10 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     });
   }
 
-  for (const file of [".github/workflows/e2e.yml", ".github/workflows/tests.yml"]) {
+  // Only e2e.yml skips pure release version bumps. tests.yml deliberately does
+  // NOT (see the always-run assertion below): "Unit Tests" is a required status
+  // check on main, and a skipped required check never reports → the PR deadlocks.
+  for (const file of [".github/workflows/e2e.yml"]) {
     for (const eventName of ["pull_request", "push"]) {
       test(`${file}: ${eventName} skips pure release version bumps`, () => {
         const ignored = pathsIgnoredByTrigger(fs.readFileSync(file, "utf-8"), eventName);
@@ -8270,6 +8273,22 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         }
       });
     }
+  }
+
+  // tests.yml MUST run on every PR/push with no path filter. "Unit Tests" is a
+  // required status check on main; a `paths-ignore` would skip the workflow on
+  // docs-only / version-bump PRs, leaving the required check stuck "Expected"
+  // and blocking the merge forever. (e2e.yml is NOT required, so it skips freely
+  // above.) This guards against anyone re-introducing the deadlock.
+  for (const eventName of ["pull_request", "push"]) {
+    test(`.github/workflows/tests.yml: ${eventName} runs on all paths (no paths-ignore)`, () => {
+      const block = parseOnEvent(fs.readFileSync(".github/workflows/tests.yml", "utf-8"), eventName);
+      assert.doesNotMatch(
+        block,
+        /^ {4}paths-ignore:/m,
+        `tests.yml: on.${eventName} must NOT declare paths-ignore — the required "Unit Tests" check must always report, or docs-only/version-bump PRs deadlock`,
+      );
+    });
   }
 
   // E2E specifically must skip YAML-only / repo-meta-only PRs. Any YAML change

@@ -7146,7 +7146,7 @@ describe("S7 SIGINT scenario anchor sync", () => {
     const script = fs.readFileSync("scripts/e2e-sigint-scenario.mjs", "utf-8");
     const runState = fs.readFileSync("src/run-state.ts", "utf-8");
     for (const fragment of [
-      `"Library", "Application Support", "bulletin-deploy"`,
+      `"Library", "Application Support", "polkadot-app-deploy"`,
       `"AppData", "Local"`,
       `XDG_STATE_HOME`,
       `".local", "state"`,
@@ -7699,19 +7699,19 @@ import { fileURLToPath } from "node:url";
 
 const BIN_PATH = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkadot-app-deploy");
 
-// Helper: run bulletin-deploy with HOME/XDG_STATE_HOME pointed at a tmpdir
+// Helper: run polkadot-app-deploy with HOME/XDG_STATE_HOME pointed at a tmpdir
 // so the on-disk state file is isolated per-test. Also returns the tmpdir
 // so the caller can inspect/preseed the state file.
 function runBinIsolated(tmpdir, argv, { preseedState, extraEnv } = {}) {
-  // Platform-appropriate base + bulletin-deploy subdir — must match
+  // Platform-appropriate base + polkadot-app-deploy subdir — must match
   // resolveStateDir() exactly, because tests pre-seed the file path.
   let stateDir;
   if (process.platform === "darwin") {
-    stateDir = path.join(tmpdir, "Library", "Application Support", "bulletin-deploy");
+    stateDir = path.join(tmpdir, "Library", "Application Support", "polkadot-app-deploy");
   } else if (process.platform === "win32") {
-    stateDir = path.join(tmpdir, "AppData", "Local", "bulletin-deploy");
+    stateDir = path.join(tmpdir, "AppData", "Local", "polkadot-app-deploy");
   } else {
-    stateDir = path.join(tmpdir, ".local", "state", "bulletin-deploy");
+    stateDir = path.join(tmpdir, ".local", "state", "polkadot-app-deploy");
   }
   fs.mkdirSync(stateDir, { recursive: true });
   if (preseedState) {
@@ -7737,7 +7737,7 @@ describe("resolveStateDir", () => {
   test("returns an absolute path under the user's home", () => {
     const dir = resolveStateDir();
     assert.ok(path.isAbsolute(dir), "state dir must be absolute");
-    assert.ok(dir.endsWith("bulletin-deploy"), "state dir must end with bulletin-deploy");
+    assert.ok(dir.endsWith("polkadot-app-deploy"), "state dir must end with polkadot-app-deploy");
   });
 
   test("stateFilePath is <stateDir>/last-run.json", () => {
@@ -7757,7 +7757,7 @@ describe("resolveStateDir", () => {
       `;
       const res = spawnSync(process.execPath, ["--input-type=module", "-e", code], { encoding: "utf-8" });
       assert.equal(res.status, 0, res.stderr);
-      assert.equal(res.stdout, path.join(tmp, "xdg", "bulletin-deploy"));
+      assert.equal(res.stdout, path.join(tmp, "xdg", "polkadot-app-deploy"));
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -7856,9 +7856,9 @@ describe("loadRunState", () => {
     try {
       // Pre-seed a corrupt file so loadRunState must handle it.
       let stateDir;
-      if (process.platform === "darwin") stateDir = path.join(tmp, "Library", "Application Support", "bulletin-deploy");
-      else if (process.platform === "win32") stateDir = path.join(tmp, "AppData", "Local", "bulletin-deploy");
-      else stateDir = path.join(tmp, ".local", "state", "bulletin-deploy");
+      if (process.platform === "darwin") stateDir = path.join(tmp, "Library", "Application Support", "polkadot-app-deploy");
+      else if (process.platform === "win32") stateDir = path.join(tmp, "AppData", "Local", "polkadot-app-deploy");
+      else stateDir = path.join(tmp, ".local", "state", "polkadot-app-deploy");
       fs.mkdirSync(stateDir, { recursive: true });
       fs.writeFileSync(path.join(stateDir, "last-run.json"), "{not json");
       const res = spawnSync(process.execPath, ["--input-type=module", "-e", `
@@ -14689,10 +14689,10 @@ describe("manifest-fetch.ts: persistent local cache", () => {
     assert.ok(/PAD_CACHE_DIR/.test(src), "honors PAD_CACHE_DIR env override");
   });
 
-  test("getCacheDir uses os.homedir() + .cache/bulletin-deploy/manifests/ on non-Windows", () => {
+  test("getCacheDir uses os.homedir() + .cache/polkadot-app-deploy/manifests/ on non-Windows", () => {
     const src = fs.readFileSync("src/manifest-fetch.ts", "utf8");
     assert.ok(/os\.homedir|homedir/.test(src), "uses os.homedir()");
-    assert.ok(/\.cache\/bulletin-deploy\/manifests|\.cache.*bulletin-deploy.*manifests/.test(src), "uses .cache/bulletin-deploy/manifests/");
+    assert.ok(/\.cache\/polkadot-app-deploy\/manifests|\.cache.*polkadot-app-deploy.*manifests/.test(src), "uses .cache/polkadot-app-deploy/manifests/");
   });
 
   test("readPersistentLocalManifest exported", () => {

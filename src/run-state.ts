@@ -38,17 +38,17 @@ export interface RunState {
 // degrade gracefully (write failures swallowed).
 export function resolveStateDir(): string {
   if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "bulletin-deploy");
+    return path.join(os.homedir(), "Library", "Application Support", "polkadot-app-deploy");
   }
   if (process.platform === "win32") {
     const base = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
-    return path.join(base, "bulletin-deploy");
+    return path.join(base, "polkadot-app-deploy");
   }
   // Linux / other POSIX: XDG_STATE_HOME spec.
   const base = process.env.XDG_STATE_HOME && process.env.XDG_STATE_HOME.length > 0
     ? process.env.XDG_STATE_HOME
     : path.join(os.homedir(), ".local", "state");
-  return path.join(base, "bulletin-deploy");
+  return path.join(base, "polkadot-app-deploy");
 }
 
 export function stateFilePath(): string {

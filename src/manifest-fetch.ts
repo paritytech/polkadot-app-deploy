@@ -1,7 +1,7 @@
 // Fetch the embedded manifest from a previous deploy.
 //
 // Priority order (gateway-first, see plan 2026-05-21-manifest-fetch-gateway-pivot.md):
-//   1. Persistent local cache at ~/.cache/bulletin-deploy/manifests/ (survives rebuilds).
+//   1. Persistent local cache at ~/.cache/polkadot-app-deploy/manifests/ (survives rebuilds).
 //   2. IPFS gateway tier ladder (range-request, falls through to full-body if needed).
 //   3. Heuristic fallback: caller proceeds with lossier file classification.
 //
@@ -111,8 +111,8 @@ export function getCacheDir(): string | null {
   if (process.platform === "win32") return null;
   // Honor XDG_CACHE_HOME (Linux convention), fall back to ~/.cache.
   const xdg = process.env.XDG_CACHE_HOME;
-  if (xdg) return path.join(xdg, "bulletin-deploy", "manifests");
-  return path.join(os.homedir(), ".cache", "bulletin-deploy", "manifests");
+  if (xdg) return path.join(xdg, "polkadot-app-deploy", "manifests");
+  return path.join(os.homedir(), ".cache", "polkadot-app-deploy", "manifests");
 }
 
 // Read persistent local manifest. Returns null on any miss (no domain, no

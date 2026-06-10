@@ -27,7 +27,7 @@
 // this script doesn't need a Sentry token.
 //
 // State-dir caveat: on macOS the state directory is hardcoded to
-// ~/Library/Application Support/bulletin-deploy and cannot be redirected
+// ~/Library/Application Support/polkadot-app-deploy and cannot be redirected
 // via env var. Running this script locally on macOS will overwrite the
 // user's `last-run.json`. CI (Linux) is unaffected since
 // XDG_STATE_HOME=$RUNNER_TEMP/state isolates the test.
@@ -68,16 +68,16 @@ function required(name) {
 // cost (would force npm install + build before nightly-s7).
 function stateFilePath() {
   if (process.platform === "darwin") {
-    return path.join(os.homedir(), "Library", "Application Support", "bulletin-deploy", "last-run.json");
+    return path.join(os.homedir(), "Library", "Application Support", "polkadot-app-deploy", "last-run.json");
   }
   if (process.platform === "win32") {
     const base = process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
-    return path.join(base, "bulletin-deploy", "last-run.json");
+    return path.join(base, "polkadot-app-deploy", "last-run.json");
   }
   const base = process.env.XDG_STATE_HOME && process.env.XDG_STATE_HOME.length > 0
     ? process.env.XDG_STATE_HOME
     : path.join(os.homedir(), ".local", "state");
-  return path.join(base, "bulletin-deploy", "last-run.json");
+  return path.join(base, "polkadot-app-deploy", "last-run.json");
 }
 
 function fail(reason) {

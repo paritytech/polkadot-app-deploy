@@ -1,6 +1,6 @@
 name: Promote RC to latest
 
-# Manually-triggered workflow that promotes a published `polkadot-app-deploy@<rc>`
+# Manually-triggered workflow that promotes a published `@parity/polkadot-app-deploy@<rc>`
 # version to the `latest` dist-tag on npm. Use after the release-event E2E on a
 # prerelease has run green: `npm dist-tag add` repoints `latest` to the
 # already-published artifact bytes — no second `npm publish`, so the bytes
@@ -11,7 +11,7 @@ name: Promote RC to latest
 #
 # Pre-flight checks performed by the workflow:
 #   * version is non-empty and is a real prerelease (matches semver `x.y.z-…`)
-#   * `npm view polkadot-app-deploy@<version>` resolves (i.e. the version is on the
+#   * `npm view @parity/polkadot-app-deploy@<version>` resolves (i.e. the version is on the
 #     registry — refuses to promote a phantom)
 #
 # Compatible with the existing publish.yml: that workflow already publishes
@@ -65,15 +65,15 @@ jobs:
           set -euo pipefail
           # `npm view` exits non-zero if the version is not on the registry.
           # Refuses to promote a phantom that would leave @latest dangling.
-          ON_NPM=$(npm view "polkadot-app-deploy@$V" version 2>/dev/null || true)
+          ON_NPM=$(npm view "@parity/polkadot-app-deploy@$V" version 2>/dev/null || true)
           if [ "$ON_NPM" != "$V" ]; then
-            echo "::error::polkadot-app-deploy@$V is not on npm (got: '$ON_NPM'). Cut the prerelease first via the GitHub Release UI; publish.yml will handle the npm publish."
+            echo "::error::@parity/polkadot-app-deploy@$V is not on npm (got: '$ON_NPM'). Cut the prerelease first via the GitHub Release UI; publish.yml will handle the npm publish."
             exit 1
           fi
-          echo "::notice::Confirmed polkadot-app-deploy@$V is on npm"
+          echo "::notice::Confirmed @parity/polkadot-app-deploy@$V is on npm"
 
       - name: Show current dist-tags
-        run: npm dist-tag ls polkadot-app-deploy
+        run: npm dist-tag ls @parity/polkadot-app-deploy
 
       - name: Promote ${{ inputs.version }} to @latest
         env:
@@ -81,20 +81,20 @@ jobs:
           V: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          npm dist-tag add "polkadot-app-deploy@$V" latest
-          echo "::notice::polkadot-app-deploy@latest is now $V"
+          npm dist-tag add "@parity/polkadot-app-deploy@$V" latest
+          echo "::notice::@parity/polkadot-app-deploy@latest is now $V"
 
       - name: Verify @latest now points at ${{ inputs.version }}
         env:
           V: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          LATEST=$(npm view polkadot-app-deploy@latest version)
-          echo "Resolved polkadot-app-deploy@latest -> $LATEST"
+          LATEST=$(npm view @parity/polkadot-app-deploy@latest version)
+          echo "Resolved @parity/polkadot-app-deploy@latest -> $LATEST"
           if [ "$LATEST" != "$V" ]; then
             echo "::error::Promotion did not stick: @latest is $LATEST, expected $V"
             exit 1
           fi
-          echo "## Promoted polkadot-app-deploy@$V to @latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Promoted @parity/polkadot-app-deploy@$V to @latest" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          npm dist-tag ls polkadot-app-deploy >> "$GITHUB_STEP_SUMMARY"
+          npm dist-tag ls @parity/polkadot-app-deploy >> "$GITHUB_STEP_SUMMARY"

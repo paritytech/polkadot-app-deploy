@@ -13,7 +13,7 @@
  * safe after the deploy completes.
  *
  * The config is written as `.mjs` (native ESM) rather than `.ts` to
- * avoid the bare-specifier `import { defineConfig } from "polkadot-app-deploy"`
+ * avoid the bare-specifier `import { defineConfig } from "@parity/polkadot-app-deploy"`
  * resolution from a fresh tmpdir, which would fail in the test runner's
  * filesystem layout. The runtime validator doesn't require
  * `defineConfig` — it only inspects the default export shape.

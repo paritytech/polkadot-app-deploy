@@ -11683,7 +11683,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00\.dot/, "nightly S-CAR must use a dynamic NoStatus label");
     const sExt = workflowJobBlock(workflow, "nightly-s-ext-signer");
     assert.match(sExt, /setContenthash\("e2epoolns01", expected\)/, "nightly S-ext-signer must write the v2 NoStatus pool label");
-    assert.match(sExt, /import \{ DotNS, loadEnvironments, resolveEndpoints \} from "polkadot-app-deploy"/, "npm-installed S-ext must use the package's environment helpers");
+    assert.match(sExt, /import \{ DotNS, loadEnvironments, resolveEndpoints \} from "@parity\/polkadot-app-deploy"/, "npm-installed S-ext must use the package's environment helpers");
     assert.match(sExt, /const \{ doc \} = await loadEnvironments\(\)/, "npm-installed S-ext must load environments through actual bulletin-deploy code");
     assert.match(sExt, /const resolved = resolveEndpoints\(doc, envId\)/, "npm-installed S-ext must resolve env options through actual bulletin-deploy code");
     assert.doesNotMatch(sExt, /assets\/environments\.json/, "S-ext must not manually read the packaged environments asset");

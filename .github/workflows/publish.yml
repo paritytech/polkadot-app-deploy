@@ -38,7 +38,7 @@ jobs:
       - run: npm test
 
       # Pre-releases (e.g. 0.6.9-rc.0) publish under the `rc` dist-tag so
-      # consumers who run `npm install polkadot-app-deploy` (which resolves `@latest`)
+      # consumers who run `npm install @parity/polkadot-app-deploy` (which resolves `@latest`)
       # never pick one up by accident. Stable versions publish to `@latest`.
       # Publishes with --provenance (signed build attestation, requires the
       # id-token: write permission above + a GitHub-hosted runner).

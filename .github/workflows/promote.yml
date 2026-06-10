@@ -33,6 +33,14 @@ permissions:
 jobs:
   promote:
     name: Promote ${{ inputs.version }} to @latest
+    # DISABLED on the public repo: this workflow does `npm dist-tag add`, which
+    # needs npm credentials. Publishing here goes through the org
+    # `npm_publish_automation` (publish.yml), which only publishes tarballs — it
+    # does NOT do dist-tag moves, and this repo intentionally holds no npm token.
+    # promote.yml is the hotfix-only exception path, not part of the default
+    # RC→stable flow. To re-enable, wire a dist-tag path with proper @parity
+    # credentials, then remove this `if: false`.
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

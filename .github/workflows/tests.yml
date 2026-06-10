@@ -11,31 +11,15 @@ run-name: >-
       format('main: {0}', github.event.head_commit.message) ||
       github.event_name }}
 
+# Runs on every PR and every push to main, with no path filter: "Unit Tests"
+# is a required status check on main, so it must always report — a paths-ignore
+# would skip the check on docs-only PRs and leave the required check pending,
+# deadlocking the merge.
 on:
   pull_request:
     branches: [main]
-    paths-ignore:
-      - package.json
-      - package-lock.json
-      - '**/*.md'
-      - docs/**
-      - docs-internal/**
-      - sentry/**
-      - .npmignore
-      - .gitignore
-      - LICENSE
   push:
     branches: [main]
-    paths-ignore:
-      - package.json
-      - package-lock.json
-      - '**/*.md'
-      - docs/**
-      - docs-internal/**
-      - sentry/**
-      - .npmignore
-      - .gitignore
-      - LICENSE
 
 concurrency:
   group: tests-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}

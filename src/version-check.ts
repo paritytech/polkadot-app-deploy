@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
 import { VERSION } from "./telemetry.js";
 
-const REGISTRY_URL = "https://registry.npmjs.org/polkadot-app-deploy/latest";
+const REGISTRY_URL = "https://registry.npmjs.org/@parity/polkadot-app-deploy/latest";
 const FETCH_TIMEOUT = 3000;
 
 interface VersionInfo {
@@ -56,7 +56,7 @@ export function preReleaseWarning(version: string): string | null {
     "",
     `⚠️  Running polkadot-app-deploy ${version} (release candidate).`,
     "   This version is not recommended for production deploys.",
-    "   For stable:  npm install -g polkadot-app-deploy@latest",
+    "   For stable:  npm install -g @parity/polkadot-app-deploy@latest",
     "",
   ].join("\n");
 }
@@ -87,12 +87,12 @@ export function handlePreflightVersionCheck(info: VersionInfo | null): "abort" |
   if (!info) return "ok";
   if (info.minimumFromRegistry && compareSemver(VERSION, info.minimumFromRegistry) < 0) {
     console.error(`\n   polkadot-app-deploy ${VERSION} is no longer supported (minimum: ${info.minimumFromRegistry}).`);
-    console.error(`   Please update: npm install -g polkadot-app-deploy@latest\n`);
+    console.error(`   Please update: npm install -g @parity/polkadot-app-deploy@latest\n`);
     return "abort";
   }
   if (compareSemver(VERSION, info.latest) < 0) {
     console.error(`\n   A newer version of polkadot-app-deploy is available (${VERSION} → ${info.latest}).`);
-    console.error(`   Run: npm install -g polkadot-app-deploy@latest\n`);
+    console.error(`   Run: npm install -g @parity/polkadot-app-deploy@latest\n`);
     return "nudge";
   }
   return "ok";
@@ -148,12 +148,12 @@ export async function promptYesNo(question: string, input?: Readable): Promise<b
 function updateAndRetry(): void {
   console.error("\n   Updating polkadot-app-deploy...");
   try {
-    execSync("npm install -g polkadot-app-deploy@latest", { stdio: "inherit" });
+    execSync("npm install -g @parity/polkadot-app-deploy@latest", { stdio: "inherit" });
     console.error("   Updated. Retrying deploy...\n");
     execFileSync(process.argv[0], process.argv.slice(1), { stdio: "inherit" });
     process.exit(0);
   } catch {
-    console.error("   Update failed. Please run: npm install -g polkadot-app-deploy@latest");
+    console.error("   Update failed. Please run: npm install -g @parity/polkadot-app-deploy@latest");
     process.exit(1);
   }
 }
@@ -209,17 +209,17 @@ export async function handleFailedDeploy(error: Error): Promise<void> {
   switch (verdict.action) {
     case "forced_update":
       console.error(`\n   polkadot-app-deploy ${verdict.currentVersion} is no longer supported (minimum: ${verdict.minimumVersion}).`);
-      console.error(`   Please update: npm install -g polkadot-app-deploy@latest\n`);
+      console.error(`   Please update: npm install -g @parity/polkadot-app-deploy@latest\n`);
       break;
 
     case "suggest_update":
       if (isInteractive()) {
         const yes = await promptYesNo(`\n   polkadot-app-deploy ${verdict.currentVersion} → ${verdict.latestVersion} available. Update and retry? [Y/n] `);
         if (yes) updateAndRetry();
-        else console.error(`   Skipped. Run: npm install -g polkadot-app-deploy@latest\n`);
+        else console.error(`   Skipped. Run: npm install -g @parity/polkadot-app-deploy@latest\n`);
       } else {
         console.error(`\n   A newer version of polkadot-app-deploy is available (${verdict.currentVersion} → ${verdict.latestVersion}).`);
-        console.error(`   Run: npm install -g polkadot-app-deploy@latest\n`);
+        console.error(`   Run: npm install -g @parity/polkadot-app-deploy@latest\n`);
       }
       break;
 

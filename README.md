@@ -23,7 +23,7 @@ It targets Polkadot **testnets** (default: `paseo-next-v2`). This is reference t
 ## Install
 
 ```sh
-npm install -g polkadot-app-deploy
+npm install -g @parity/polkadot-app-deploy
 ```
 
 Installs two commands: **`polkadot-app-deploy`** (and its alias **`pad`**) for deploying, and **`polkadot-app-bootstrap`** (alias **`pad-bootstrap`**) for operator setup.

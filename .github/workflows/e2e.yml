@@ -564,16 +564,16 @@ jobs:
         env:
           V: ${{ steps.version.outputs.test-version }}
         run: |
-          echo "Waiting for polkadot-app-deploy@$V on npm registry..."
+          echo "Waiting for @parity/polkadot-app-deploy@$V on npm registry..."
           for i in $(seq 1 60); do
-            if npm view "polkadot-app-deploy@$V" version >/dev/null 2>&1; then
-              echo "Found polkadot-app-deploy@$V on attempt $i"
+            if npm view "@parity/polkadot-app-deploy@$V" version >/dev/null 2>&1; then
+              echo "Found @parity/polkadot-app-deploy@$V on attempt $i"
               exit 0
             fi
             echo "  attempt $i/60: not yet available, sleeping 10s"
             sleep 10
           done
-          echo "::error::Timed out waiting for polkadot-app-deploy@$V on npm after 10 minutes"
+          echo "::error::Timed out waiting for @parity/polkadot-app-deploy@$V on npm after 10 minutes"
           exit 1
       - name: Mutate fixture into build/
         id: prep
@@ -893,12 +893,12 @@ jobs:
             cd ..
             echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
           elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           else
-            echo "Installing polkadot-app-deploy (latest stable)"
-            npm install -g polkadot-app-deploy
+            echo "Installing @parity/polkadot-app-deploy (latest stable)"
+            npm install -g @parity/polkadot-app-deploy
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           fi
       - name: Deploy to Bob's domain — expect rejection
@@ -988,12 +988,12 @@ jobs:
             cd ..
             echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
           elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           else
-            echo "Installing polkadot-app-deploy (latest stable)"
-            npm install -g polkadot-app-deploy
+            echo "Installing @parity/polkadot-app-deploy (latest stable)"
+            npm install -g @parity/polkadot-app-deploy
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           fi
       - name: Deploy with DOTNS_COMMITMENT_BUFFER=0 — expect retry escalation
@@ -1102,12 +1102,12 @@ jobs:
             cd ..
             echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
           elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           else
-            echo "Installing polkadot-app-deploy (latest stable)"
-            npm install -g polkadot-app-deploy
+            echo "Installing @parity/polkadot-app-deploy (latest stable)"
+            npm install -g @parity/polkadot-app-deploy
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           fi
       - name: Deploy with unroutable primary RPC — expect failover to default
@@ -1279,12 +1279,12 @@ jobs:
             cd ..
             echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
           elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           else
-            echo "Installing polkadot-app-deploy (latest stable)"
-            npm install -g polkadot-app-deploy
+            echo "Installing @parity/polkadot-app-deploy (latest stable)"
+            npm install -g @parity/polkadot-app-deploy
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           fi
       - name: Run S7 SIGINT scenario
@@ -1344,10 +1344,10 @@ jobs:
         run: |
           V="${BULLETIN_DEPLOY_VERSION:-latest}"
           # ws is a devDep needed by test/helpers/ws-fault-proxy.mjs; not in the published package
-          npm install --no-save "polkadot-app-deploy@${V}" ws
+          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
           # e2e.test.js resolves imports from ../dist — symlink the installed dist so
           # relative imports work on the npm-install path (no local build on this path).
-          ln -sf node_modules/polkadot-app-deploy/dist dist
+          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S8 WS fault-injection scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@v3
         env:
@@ -1410,8 +1410,8 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
           V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/polkadot-app-deploy/dist dist
+          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S9 parallel nonce-collision scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@v3
         env:
@@ -1468,8 +1468,8 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
           V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/polkadot-app-deploy/dist dist
+          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S-GRANDPA-REUPLOAD scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@v3
         env:
@@ -1527,8 +1527,8 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
           V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/polkadot-app-deploy/dist dist
+          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S-MORTALITY chunk expiry retry scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@v3
         env:
@@ -1666,10 +1666,10 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
           V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          echo "Installing polkadot-app-deploy@$V into /tmp/bd-s-car"
+          echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-car"
           mkdir -p /tmp/bd-s-car
           echo '{"type":"module"}' > /tmp/bd-s-car/package.json
-          cd /tmp/bd-s-car && npm install "polkadot-app-deploy@${V}"
+          cd /tmp/bd-s-car && npm install "@parity/polkadot-app-deploy@${V}"
       - name: Write S-CAR inline test script
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
@@ -1906,10 +1906,10 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
           V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          echo "Installing polkadot-app-deploy@$V into /tmp/bd-s-ext"
+          echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-ext"
           mkdir -p /tmp/bd-s-ext
           echo '{"type":"module"}' > /tmp/bd-s-ext/package.json
-          cd /tmp/bd-s-ext && npm install "polkadot-app-deploy@${V}" @polkadot/keyring polkadot-api
+          cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring polkadot-api
       - name: Write external signer test script
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
@@ -1917,7 +1917,7 @@ jobs:
           # 'polkadot-api' from /tmp/bd-s-ext/node_modules (script location = module root).
           # Using a file rather than piped inline code avoids shell-escape hazards (!=, etc).
           cat > /tmp/bd-s-ext/run-s-ext.mjs << 'SCRIPT'
-          import { DotNS, loadEnvironments, resolveEndpoints } from "polkadot-app-deploy";
+          import { DotNS, loadEnvironments, resolveEndpoints } from "@parity/polkadot-app-deploy";
           import { Keyring } from "@polkadot/keyring";
           import { cryptoWaitReady } from "@polkadot/util-crypto";
           import { getPolkadotSigner } from "polkadot-api/signer";

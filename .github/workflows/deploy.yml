@@ -53,7 +53,7 @@ on:
         type: string
         default: 'ubuntu-latest'
       polkadot-app-deploy-version:
-        description: 'npm version or dist-tag of polkadot-app-deploy to install (e.g. "0.6.9-rc.2" or "rc"). Empty = latest stable. Ignored if polkadot-app-deploy-ref is set.'
+        description: 'npm version or dist-tag of @parity/polkadot-app-deploy to install (e.g. "0.6.9-rc.2" or "rc"). Empty = latest stable. Ignored if polkadot-app-deploy-ref is set.'
         type: string
         default: ''
       polkadot-app-deploy-ref:
@@ -207,15 +207,15 @@ jobs:
             echo "RELEASE_RETRY_WRAPPER=$WRAPPER" >> "$GITHUB_ENV"
             echo "::notice::Using source-built polkadot-app-deploy from ref $REF"
           elif [ -n "$VERSION" ]; then
-            echo "Installing polkadot-app-deploy@$VERSION"
-            npm install -g "polkadot-app-deploy@$VERSION"
+            echo "Installing @parity/polkadot-app-deploy@$VERSION"
+            npm install -g "@parity/polkadot-app-deploy@$VERSION"
             echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
           else
-            echo "Installing polkadot-app-deploy (latest stable)"
-            npm install -g polkadot-app-deploy
+            echo "Installing @parity/polkadot-app-deploy (latest stable)"
+            npm install -g @parity/polkadot-app-deploy
             echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
           fi
 
       - name: Verify minimum polkadot-app-deploy version

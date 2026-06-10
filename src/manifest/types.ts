@@ -106,7 +106,7 @@ export interface ProductConfig {
  * Identity helper that lets `polkadot-app-deploy.config.ts` authors get IntelliSense on the discriminated `ExecutableConfig` union.
  *
  * @example
- *   import { defineConfig } from "polkadot-app-deploy";
+ *   import { defineConfig } from "@parity/polkadot-app-deploy";
  *   export default defineConfig({ domain: "demoapp.dot", ... });
  */
 export function defineConfig<T extends ProductConfig>(config: T): T {

@@ -1142,7 +1142,11 @@ jobs:
     # race on the gh-pages push and serve stale CARs for one env. Single-env
     # (selected_env) is intentional here.
     needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s5, nightly-s6, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    # `release` intentionally omitted: release-gating runs install the package
+    # from npm (no source ref), so deploy.yml skips the checkout and the
+    # gh-pages mirror has no git repo to push from (git worktree fails). Tracked
+    # in #11. S4 still runs on schedule/dispatch (which carry a source ref).
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     # Timeout cap lives in deploy.yml — see nightly-s1-pool note above.
     permissions:
       # contents:write is required by the --gh-pages-mirror flag: deploy.yml
@@ -1169,7 +1173,8 @@ jobs:
   nightly-verify-s4:
     name: Verify nightly S4 mirror URL serves the CAR
     needs: nightly-s4
-    if: always() && needs.nightly-s4.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    # See nightly-s4: `release` omitted (npm-mode mirror has no git repo, #11).
+    if: always() && needs.nightly-s4.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

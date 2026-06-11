@@ -2933,6 +2933,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
               toolVersion: VERSION,
               bulletinRpc: BULLETIN_ENDPOINTS[0],
               encrypted: Boolean(options.password),
+              repoPath: process.env.PAD_GH_PAGES_REPO || undefined,
             }).catch((err: unknown) => (err instanceof Error ? err : new Error(String(err))));
           }
           cid = (await storeChunkedContent(carChunks, providerWithReconnect)).storageCid;
@@ -2999,6 +3000,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
                     toolVersion: VERSION,
                     bulletinRpc: BULLETIN_ENDPOINTS[0],
                     encrypted: Boolean(options.password),
+                    repoPath: process.env.PAD_GH_PAGES_REPO || undefined,
                   }).catch((err: unknown) => (err instanceof Error ? err : new Error(String(err))));
                 }
               },

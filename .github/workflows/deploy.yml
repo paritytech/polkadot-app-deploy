@@ -191,6 +191,21 @@ jobs:
           ref: ${{ inputs.polkadot-app-deploy-ref }}
           path: polkadot-app-deploy-src
 
+      # Checkout the caller's repo so the gh-pages mirror has a real git context
+      # (origin + push credentials). The deploy CLI runs in the workspace root,
+      # which is NOT a git repo (the artifact lands in build/; the source clone,
+      # when present, lives in polkadot-app-deploy-src/). Without this checkout
+      # `git worktree add … HEAD` fails and gh-pages is never created.
+      # The path (.gh-pages-mirror-ctx) is a sibling of build/ so it does not
+      # clobber the downloaded artifact. PAD_GH_PAGES_REPO is exported in the
+      # Deploying step so the CLI child process inherits it.
+      - name: Checkout repo for gh-pages mirror context
+        if: inputs.gh-pages-mirror == true
+        uses: actions/checkout@v6
+        with:
+          path: .gh-pages-mirror-ctx
+          fetch-depth: 1
+
       - name: Install polkadot-app-deploy
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -267,6 +282,7 @@ jobs:
             export NODE_OPTIONS='--max-old-space-size=8192'
             export SENTRY_DSN='${{ secrets.sentry-dsn }}'
             export GITHUB_REPOSITORY='${{ github.repository }}'
+            if [ "${{ inputs.gh-pages-mirror }}" = "true" ]; then export PAD_GH_PAGES_REPO="$(pwd)/.gh-pages-mirror-ctx"; fi
             # Build argv as a bash array rather than a space-joined string. With a
             # string + `polkadot-app-deploy $FLAGS`, shell word-splits on whitespace and
             # single quotes inside the value become literal argv characters — that's

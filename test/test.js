@@ -7461,6 +7461,45 @@ describe("gh-pages-mirror", () => {
       }
     });
   });
+
+  describe("PAD_GH_PAGES_REPO env-var threading (issue #11)", () => {
+    // The fix for #11 lives entirely in deploy.ts: both mirrorToGitHubPages call
+    // sites must forward process.env.PAD_GH_PAGES_REPO as repoPath so CI can
+    // point the mirror at a real git checkout instead of the non-git workspace
+    // root. We verify the wiring by source-scanning deploy.ts; a behavioural test
+    // would require a live git push and cannot run offline.
+    const deploySrc = fs.readFileSync("src/deploy.ts", "utf-8");
+    test("both mirrorToGitHubPages call sites thread PAD_GH_PAGES_REPO as repoPath", () => {
+      // Each call site should include `repoPath: process.env.PAD_GH_PAGES_REPO`
+      // (or `|| undefined` variant) in its argument object.
+      const matches = [...deploySrc.matchAll(/repoPath:\s*process\.env\.PAD_GH_PAGES_REPO/g)];
+      assert.strictEqual(
+        matches.length,
+        2,
+        `Expected 2 mirrorToGitHubPages call sites to thread PAD_GH_PAGES_REPO as repoPath, found ${matches.length}. ` +
+          "Both the CAR-bytes path (~line 2929) and the onCarReady callback path (~line 2995) must include " +
+          "`repoPath: process.env.PAD_GH_PAGES_REPO || undefined`."
+      );
+    });
+    test("deploy.yml exports PAD_GH_PAGES_REPO when gh-pages-mirror is true", () => {
+      const deployYml = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+      assert.ok(
+        deployYml.includes("PAD_GH_PAGES_REPO"),
+        "deploy.yml must export PAD_GH_PAGES_REPO so the CLI child process inherits the git repo context"
+      );
+      assert.ok(
+        deployYml.includes(".gh-pages-mirror-ctx"),
+        "deploy.yml must reference the .gh-pages-mirror-ctx checkout path"
+      );
+    });
+    test("deploy.yml includes a gh-pages mirror checkout step", () => {
+      const deployYml = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+      assert.ok(
+        deployYml.includes("Checkout repo for gh-pages mirror context"),
+        "deploy.yml must contain a 'Checkout repo for gh-pages mirror context' step (issue #11)"
+      );
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

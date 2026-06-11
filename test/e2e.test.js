@@ -199,6 +199,23 @@ function pickFreshRunLabel(prefix) {
   return label;
 }
 
+// Burst-heavy re-upload scenarios get a DEDICATED derived signer so they don't
+// contend on Alice's shared nonce stream (the documented Invalid::Stale failure
+// mode — see the MANIFEST_SCENARIOS note below). These accounts are provisioned
+// (funded + Bulletin-authorized) by tools/setup-e2e-derivation-signers.mjs.
+// Applied UNCONDITIONALLY (even on a custom PAD_ENV), unlike the s1-direct
+// fallback which still uses Alice root on custom envs.
+const ISOLATED_DIRECT_SIGNERS = {
+  "s9": "//e2e-s9",
+  "s-grandpa-reupload": "//e2e-sgrandpa",
+};
+
+function directSignerDerivationPath() {
+  if (ISOLATED_DIRECT_SIGNERS[SCENARIO]) return ISOLATED_DIRECT_SIGNERS[SCENARIO];
+  if (!PAD_ENV) return "//e2e-direct";
+  return null;
+}
+
 function buildArgs(fixtureDir, label) {
   const args = [fixtureDir, label, "--tag", process.env.DEPLOY_TAG];
   if (MERKLE === "js") args.push("--js-merkle");
@@ -209,7 +226,8 @@ function buildArgs(fixtureDir, label) {
   // still exercising the direct-signer CLI path.
   if (SIGNER === "direct") {
     args.push("--mnemonic", ALICE_MNEMONIC);
-    if (!PAD_ENV) args.push("--derivation-path", "//e2e-direct");
+    const deriv = directSignerDerivationPath();
+    if (deriv) args.push("--derivation-path", deriv);
   }
   // Manifest sidecar is restricted to the scenarios where the manifest path is
   // load-bearing for coverage (s1 happy-path, s-inc incremental). Running it
@@ -230,7 +248,8 @@ function buildInputCarArgs(dumpPath, label) {
   if (PAD_ENV) args.push("--env", PAD_ENV);
   if (SIGNER === "direct") {
     args.push("--mnemonic", ALICE_MNEMONIC);
-    if (!PAD_ENV) args.push("--derivation-path", "//e2e-direct");
+    const deriv = directSignerDerivationPath();
+    if (deriv) args.push("--derivation-path", deriv);
   }
   return args;
 }
@@ -1204,7 +1223,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           "--tag", process.env.DEPLOY_TAG,
           "--mnemonic", ALICE_MNEMONIC,
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
-          ...(PAD_ENV ? [] : ["--derivation-path", "//e2e-direct"]),
+          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
           ...(PAD_ENV ? ["--env", PAD_ENV] : []),
         ];
       }
@@ -1267,7 +1286,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           `${label}.dot`,
           "--tag", process.env.DEPLOY_TAG,
           "--mnemonic", ALICE_MNEMONIC,
-          ...(PAD_ENV ? [] : ["--derivation-path", "//e2e-direct"]),
+          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
           ...(PAD_ENV ? ["--env", PAD_ENV] : []),
         ];
         const result = await runBulletinDeploy({
@@ -1350,7 +1369,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           "--tag", process.env.DEPLOY_TAG,
           "--mnemonic", ALICE_MNEMONIC,
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
-          ...(PAD_ENV ? [] : ["--derivation-path", "//e2e-direct"]),
+          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
           ...(PAD_ENV ? ["--env", PAD_ENV] : []),
         ];
         const result = await runBulletinDeploy({

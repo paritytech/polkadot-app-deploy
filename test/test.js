@@ -8660,8 +8660,83 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     // Diagnostic capture: curl -sI -D writes headers to a file on failure.
     assert.match(verifyBlock, /curl -sI -D/, "nightly-verify-s4 error path must capture full response headers via curl -sI -D");
 
-    // last-modified header must be extracted and printed for CDN triage.
+    // last-modified header must be extracted and printed for CDN geo-cache triage.
     assert.match(verifyBlock, /last-modified/, "nightly-verify-s4 error path must print the last-modified header value for CDN geo-cache triage");
+  });
+
+  // ---- publish-wait gate (issue #23) -------------------------------------
+  // build-nightly must wait for publish.yml to complete BEFORE polling npm.
+  // Without this gate, the 10-min npm poll races the human approval in the
+  // `environment: release` gate, timing out and failing the E2E with zero
+  // scenarios run. See issue #23 and docs-internal/superpowers/specs/ for design.
+
+  test("e2e.yml: build-nightly has a publish-wait step that fires only on release trigger", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    // The publish-wait step must exist.
+    assert.match(bn, /name:\s*Wait for publish\.yml to complete/,
+      ">> FAIL: build-nightly publish-wait: step 'Wait for publish.yml to complete' must exist in build-nightly");
+
+    // Guard must be `github.event_name == 'release'`, not `test-version != ''`.
+    // workflow_dispatch with a version string also sets test-version but has no
+    // live publish.yml run — using the wrong guard hangs the job for 45 min.
+    assert.match(bn, /if:\s*github\.event_name == 'release'/,
+      ">> FAIL: build-nightly publish-wait: publish-wait step's `if:` must guard on `github.event_name == 'release'` (not `test-version != ''`)");
+  });
+
+  test("e2e.yml: publish-wait step is ordered BEFORE the npm poll step in build-nightly", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    const publishWaitIdx = bn.indexOf("Wait for publish.yml to complete");
+    const npmPollIdx = bn.indexOf("Wait for polkadot-app-deploy@");
+    assert.ok(publishWaitIdx !== -1,
+      ">> FAIL: build-nightly step order: 'Wait for publish.yml to complete' step must exist in build-nightly");
+    assert.ok(npmPollIdx !== -1,
+      ">> FAIL: build-nightly step order: 'Wait for polkadot-app-deploy@' (npm poll) step must exist in build-nightly");
+    assert.ok(publishWaitIdx < npmPollIdx,
+      ">> FAIL: build-nightly step order: publish-wait must appear BEFORE the npm poll step (publish.yml must complete before we poll npm)");
+  });
+
+  test("e2e.yml: build-nightly has actions:read permission for workflow run listing", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    assert.match(bn, /actions:\s*read/,
+      ">> FAIL: build-nightly permissions: must include `actions: read` so the publish.yml run list API call does not 403");
+  });
+
+  test("e2e.yml: build-nightly publish-wait correlates by head_sha and checks conclusion", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    // Must correlate to the right publish.yml run by head SHA, not just any run.
+    assert.match(bn, /head_sha/,
+      ">> FAIL: build-nightly publish-wait: must correlate publish.yml run by head_sha to avoid matching a stale run from a different release");
+
+    // Must branch on conclusion so a rejected approval fails fast with a clear message.
+    assert.match(bn, /conclusion/,
+      ">> FAIL: build-nightly publish-wait: must check publish.yml run conclusion (success vs failure/cancelled) after status==completed");
+  });
+
+  test("e2e.yml: build-nightly npm poll shortened to ≤5 min after publish-wait", () => {
+    // The old 10-min npm poll budget was sized to absorb the human-approval delay.
+    // That delay is now handled by the upstream publish-wait step. The npm poll
+    // only needs to cover the ~1-2 min automation lag after approval.
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const bn = jobBlock(e2e, "build-nightly");
+
+    // Extract the npm poll loop: find the block between "Wait for polkadot-app-deploy"
+    // and the next "- name:" step. The seq budget controls the wall-clock cap.
+    const npmPollMatch = bn.match(/name:\s*Wait for polkadot-app-deploy[^]*?(?=\s*- (?:name:|uses:|run:|\w))/);
+    assert.ok(npmPollMatch, ">> FAIL: build-nightly npm poll: npm poll step must exist");
+    const seqMatch = npmPollMatch[0].match(/seq 1 (\d+)/);
+    assert.ok(seqMatch, ">> FAIL: build-nightly npm poll: npm poll loop must use 'seq 1 N' to bound iterations");
+    const iterations = Number(seqMatch[1]);
+    // ≤30 iterations × 10s = ≤5 min. Old value was 60 (10 min).
+    assert.ok(iterations <= 30,
+      `>> FAIL: build-nightly npm poll: seq 1 ${iterations} gives ${iterations * 10}s poll budget — must be ≤ 30 (≤5 min) now that the approval wait is handled upstream`);
   });
 });
 

@@ -1109,6 +1109,14 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         });
       }
 
+      // A WS halt between the batch loop and here leaves the client destroyed
+      // with no chunk error to trigger doReconnect; rebuild before re-uploading
+      // (mirrors the proactive guard at the top of the batch loop, ~L932). #946
+      if (wsHaltDetected && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
+        wsHaltDetected = false;
+        await doReconnect();
+      }
+
       let reuploadCount = 0;
       for (const m of missingResults) {
         const idx = cidToIndex.get(m.cid)!;
@@ -1121,6 +1129,13 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             reuploadCount++;
             break;
           } catch (e: any) {
+            // ChainHead disjointed / WS drop: rebuild the client (rebinds
+            // unsafeApi/signer/ss58) and retry the remaining attempts against
+            // it, instead of re-running every attempt on the dead client —
+            // matches the batch-retry and root-store loops. #946
+            if (isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
+              try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
+            }
             if (attempt === MAX_REPROBE_RETRIES) {
               throw new Error(`Nonce-collision re-upload of chunk ${idx + 1} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
             }
@@ -1973,35 +1988,48 @@ export async function storeDirectoryV2(
           // be sequential), then poll all of them together in one shared loop.
           // Saves up to ~(N-1) × poll-interval vs. polling each chunk in turn.
           const reuploadList = [...missingCids];
-          for (let i = 0; i < reuploadList.length; i++) {
-            const cid = reuploadList[i];
-            const freshNonce = await fetchNonceFn(BULLETIN_ENDPOINTS, phaseALiveProvider.ss58 as string);
-            if (cid === storageCid) {
-              // Root re-upload: store_with_cid_config with DAG-PB codec.
-              const rootTx = phaseALiveProvider.unsafeApi.tx.TransactionStorage.store_with_cid_config({
-                cid: { codec: BigInt(0x70), hashing: toHashingEnum(rootHashCode) },
-                data: rootDagBytes,
-              });
-              await watchTransaction(rootTx, phaseALiveProvider.signer as PolkadotSigner, { mortality: { mortal: true, period: 256 }, nonce: freshNonce }, () => storageCid, {
-                label: "root-reupload",
-                rpc: BULLETIN_ENDPOINTS,
-                senderSS58: phaseALiveProvider.ss58 as string,
-                expectedNonce: freshNonce,
-                timeoutMs: CHUNK_TIMEOUT_MS,
-                fetchNonce: phaseALiveProvider.fetchNonce,
-              });
-            } else {
-              const chunkBytes = phaseBChunkByCid.get(cid);
-              if (!chunkBytes) {
-                throw new Error(
-                  `Deploy verification failed: chunk ${cid.slice(0, 20)}… missing at finalised head and ` +
-                  `its bytes are not in phaseB.chunks (cannot re-upload). This indicates an internal state issue.`
-                );
+          try {
+            for (let i = 0; i < reuploadList.length; i++) {
+              const cid = reuploadList[i];
+              const freshNonce = await fetchNonceFn(BULLETIN_ENDPOINTS, phaseALiveProvider.ss58 as string);
+              if (cid === storageCid) {
+                // Root re-upload: store_with_cid_config with DAG-PB codec.
+                const rootTx = phaseALiveProvider.unsafeApi.tx.TransactionStorage.store_with_cid_config({
+                  cid: { codec: BigInt(0x70), hashing: toHashingEnum(rootHashCode) },
+                  data: rootDagBytes,
+                });
+                await watchTransaction(rootTx, phaseALiveProvider.signer as PolkadotSigner, { mortality: { mortal: true, period: 256 }, nonce: freshNonce }, () => storageCid, {
+                  label: "root-reupload",
+                  rpc: BULLETIN_ENDPOINTS,
+                  senderSS58: phaseALiveProvider.ss58 as string,
+                  expectedNonce: freshNonce,
+                  timeoutMs: CHUNK_TIMEOUT_MS,
+                  fetchNonce: phaseALiveProvider.fetchNonce,
+                });
+              } else {
+                const chunkBytes = phaseBChunkByCid.get(cid);
+                if (!chunkBytes) {
+                  throw new Error(
+                    `Deploy verification failed: chunk ${cid.slice(0, 20)}… missing at finalised head and ` +
+                    `its bytes are not in phaseB.chunks (cannot re-upload). This indicates an internal state issue.`
+                  );
+                }
+                await storeChunk(phaseALiveProvider.unsafeApi, phaseALiveProvider.signer as PolkadotSigner, chunkBytes, freshNonce, phaseALiveProvider.ss58 as string, { fetchNonce: phaseALiveProvider.fetchNonce });
               }
-              await storeChunk(phaseALiveProvider.unsafeApi, phaseALiveProvider.signer as PolkadotSigner, chunkBytes, freshNonce, phaseALiveProvider.ss58 as string, { fetchNonce: phaseALiveProvider.fetchNonce });
+              reuploadCount++;
+              console.log(`      [${i + 1}/${reuploadList.length}] re-uploaded ${cid.slice(0, 20)}… (nonce ${freshNonce})`);
             }
-            reuploadCount++;
-            console.log(`      [${i + 1}/${reuploadList.length}] re-uploaded ${cid.slice(0, 20)}… (nonce ${freshNonce})`);
+          } catch (e: any) {
+            // ChainHead disjointed mid-re-upload: rebuild the client and retry
+            // this round on the fresh provider (the round counter bounds total
+            // attempts; missingCids still drives what gets re-submitted). #946
+            if (isConnectionError(e) && phaseALiveProvider.reconnect) {
+              try { phaseALiveProvider.client!.destroy(); } catch { /* already dead */ }
+              const fresh = await phaseALiveProvider.reconnect();
+              phaseALiveProvider = { ...phaseALiveProvider, ...fresh };
+              continue;
+            }
+            throw e;
           }
 
           const reuploadStart = Date.now();

@@ -459,7 +459,7 @@ jobs:
 
       - name: Post or update PR comment
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -672,7 +672,7 @@ jobs:
         run: ipfs init
       - run: npm ci
       - name: Run scenario (one retry on transient testnet failures)
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
           E2E_SCENARIO: ${{ matrix.scenario }}
@@ -997,7 +997,7 @@ jobs:
             echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
           fi
       - name: Deploy with DOTNS_COMMITMENT_BUFFER=0 — expect retry escalation
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           # 512 MB cap scoped to the test step: exercises polkadot-app-deploy CLI
           # memory-pressure behaviour. At job-level it leaks into npm ci's
@@ -1354,7 +1354,7 @@ jobs:
           # relative imports work on the npm-install path (no local build on this path).
           ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S8 WS fault-injection scenario (one retry on transient testnet failures)
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
           E2E_SCENARIO: s8
@@ -1418,7 +1418,7 @@ jobs:
           npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
           ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S9 parallel nonce-collision scenario (one retry on transient testnet failures)
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
           E2E_SCENARIO: s9
@@ -1476,7 +1476,7 @@ jobs:
           npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
           ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S-GRANDPA-REUPLOAD scenario (one retry on transient testnet failures)
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
           E2E_SCENARIO: s-grandpa-reupload
@@ -1535,7 +1535,7 @@ jobs:
           npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
           ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S-MORTALITY chunk expiry retry scenario (one retry on transient testnet failures)
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
           E2E_SCENARIO: s-mortality
@@ -1578,11 +1578,11 @@ jobs:
       MNEMONIC: ${{ secrets.DOTNS_MNEMONIC || 'bottom drive obey lake curtain smoke basket hold race lonely fit walk' }}
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: paritytech/polkadot-app-deploy
           ref: ${{ env.BULLETIN_DEPLOY_REF || '' }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
@@ -1590,7 +1590,7 @@ jobs:
         run: |
           SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
       - name: Run S-REPROVE auto-reprove scenario (one retry on transient testnet failures)
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
           PAD_ENV: ${{ matrix.env }}
@@ -1646,7 +1646,7 @@ jobs:
         run: cd polkadot-app-deploy-src && npm ci
       - name: Run S-CAR --input-car scenario (source-build path, one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
           E2E_SCENARIO: s-car
@@ -1760,7 +1760,7 @@ jobs:
           SCRIPT
       - name: Run S-CAR --input-car scenario (npm-install path, one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF == ''
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           PAD_ENV: ${{ matrix.env }}
           # x00 forces NoStatus classification on both e2eEligible envs without
@@ -1826,7 +1826,7 @@ jobs:
         run: cd polkadot-app-deploy-src && npm ci
       - name: Run S-INC scenario (one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           E2E: "1"
           E2E_SCENARIO: ${{ matrix.scenario }}
@@ -1886,7 +1886,7 @@ jobs:
         run: cd polkadot-app-deploy-src && npm ci
       - name: Run external signer test (source build, one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           # 512 MB cap scoped to the test step: exercises polkadot-app-deploy CLI
           # memory-pressure behaviour. At job-level it leaks into npm ci's
@@ -2258,7 +2258,7 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Assert nightly Sentry telemetry
@@ -2294,7 +2294,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Assert pool-account selection distribution
@@ -2374,7 +2374,7 @@ jobs:
         run: node tools/check-dotns-contract-addresses.mjs
       - name: Open issue on address drift
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         continue-on-error: true
         with:
           script: |
@@ -2410,7 +2410,7 @@ jobs:
       issues: write
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: Check dead-branch coverage in Sentry
@@ -2419,7 +2419,7 @@ jobs:
         run: python3 tools/check-code-path-coverage.py
       - name: Open issue on dead paths
         if: failure()
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         continue-on-error: true
         with:
           script: |

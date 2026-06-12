@@ -48,16 +48,28 @@ jobs:
       - name: Pack @parity/polkadot-app-deploy
         run: npm pack
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: polkadot-app-deploy
           path: "*.tgz"
 
+      # Was octokit/request-action@v2.x — that action has no Node-24 release and
+      # would break after GitHub forces JS actions onto Node 24 (June 16 2026).
+      # `gh api` runs natively on the runner (Node-version-agnostic) and sends
+      # the identical dispatch body: ref=main + the nested `inputs` object. jq
+      # builds the JSON from env vars so values can't break out of the literal.
       - name: Dispatch to npm_publish_automation
-        uses: octokit/request-action@v2.x
-        with:
-          route: POST /repos/paritytech/npm_publish_automation/actions/workflows/publish.yml/dispatches
-          ref: main
-          inputs: '${{ format(''{{ "repo": "{0}", "run_id": "{1}", "npm_tag": "{2}", "artifact_name": "polkadot-app-deploy" }}'', github.repository, github.run_id, steps.tag.outputs.npm_tag) }}'
         env:
-          GITHUB_TOKEN: ${{ secrets.NPM_PUBLISH_AUTOMATION_TOKEN }}
+          GH_TOKEN: ${{ secrets.NPM_PUBLISH_AUTOMATION_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          NPM_TAG: ${{ steps.tag.outputs.npm_tag }}
+        run: |
+          jq -nc \
+            --arg repo "$REPO" \
+            --arg run_id "$RUN_ID" \
+            --arg npm_tag "$NPM_TAG" \
+            '{ref: "main", inputs: {repo: $repo, run_id: $run_id, npm_tag: $npm_tag, artifact_name: "polkadot-app-deploy"}}' \
+            | gh api --method POST \
+                /repos/paritytech/npm_publish_automation/actions/workflows/publish.yml/dispatches \
+                --input -

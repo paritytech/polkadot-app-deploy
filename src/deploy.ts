@@ -920,10 +920,32 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
 
     // Pre-compute dense nonces: skipped chunks consume zero nonce slots, so the
     // actually-submitted chunks receive consecutive nonces startNonce..N.
-    // Re-running assignDenseNonces after reconnect (see startNonce re-fetch below)
-    // is safe: by that point more stored[] entries may be non-null, so the map
-    // shrinks further — still dense, still correct.
-    const assignedNonces = assignDenseNonces(stored, startNonce);
+    // Re-running assignDenseNonces after reconnect (see doReconnectAndRebase below)
+    // is necessary when the pool rotates to a different account (ss58 changes):
+    // old-account nonces are invalid on the new account. `let` because the rebase
+    // reassigns this map on rotation.
+    let assignedNonces = assignDenseNonces(stored, startNonce);
+
+    // Reconnect and rebase dense nonces if the pool rotated to a different account.
+    // Returns { changed: bool, currentNonce: number }.
+    //   changed=true  → ss58 changed; assignedNonces has been rebased to the new
+    //                   account's nonce base. Callers must skip the "nonce consumed →
+    //                   included" heuristic — old-account nonce values are meaningless
+    //                   on the new account (the #951 false-positive).
+    //   changed=false → same-account reconnect; behaviour unchanged (heuristic valid).
+    // #946 sites (nonce-collision re-upload, root-node reconnect) keep calling
+    // doReconnect() directly — they do not read assignedNonces so no rebase needed.
+    const doReconnectAndRebase = async (): Promise<{ changed: boolean; currentNonce: number }> => {
+      const prevSS58 = ss58;
+      await doReconnect();
+      const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+      const changed = ss58 !== prevSS58;
+      if (changed) {
+        assignedNonces = assignDenseNonces(stored, currentNonce);
+        startNonce = currentNonce;
+      }
+      return { changed, currentNonce };
+    };
 
     // Upload-pass numerator: how many chunks we will actually submit. The
     // reconnect path only re-tries existing stored[]===null entries; it never
@@ -984,18 +1006,25 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       // the WS is healthy, the retry path will reissue with a fresh nonce.
       const needsReconnect = failures.some(f => isConnectionError(f.error));
       if (needsReconnect && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
-        await doReconnect();
-        const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
-        for (const idx of batchIndices) {
-          const chunkNonce = assignedNonces.get(idx);
-          if (chunkNonce !== undefined && chunkNonce < currentNonce && stored[idx] === null) {
-            console.log(`   Chunk ${idx + 1}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
-            stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
-            nonceAdvanceIndices.add(idx);
-            assignedNonces.delete(idx);
+        const { changed, currentNonce } = await doReconnectAndRebase();
+        // "nonce consumed → included" heuristic: only valid when the account did
+        // NOT change. On rotation the old assignedNonce baseline belongs to a
+        // different account — currentNonce (new account) is always higher and
+        // would produce a false "included" for chunks never submitted anywhere
+        // (#951). Skip the heuristic; the downstream re-probe backstop in
+        // nonceAdvanceIndices handles genuinely-missing chunks.
+        if (!changed) {
+          for (const idx of batchIndices) {
+            const chunkNonce = assignedNonces.get(idx);
+            if (chunkNonce !== undefined && chunkNonce < currentNonce && stored[idx] === null) {
+              console.log(`   Chunk ${idx + 1}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
+              stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
+              nonceAdvanceIndices.add(idx);
+              assignedNonces.delete(idx);
+            }
           }
+          startNonce = Math.max(startNonce, currentNonce);
         }
-        startNonce = Math.max(startNonce, currentNonce);
         if (failures.some(f => stored[f.index] === null)) {
           // Some chunks still missing post-reconnect — retry the same batch
           // (with a possibly smaller batchSize on the next iteration since
@@ -1034,10 +1063,14 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           const retryDelay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
           console.log(`   Retrying chunk ${fail.index + 1} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
           await new Promise(r => setTimeout(r, retryDelay));
-          // If this was a connection error, reconnect before retrying
+          // If this was a connection error, reconnect before retrying.
+          // Use doReconnectAndRebase so that a pool account rotation (new ss58)
+          // rebases assignedNonces to the new account's nonce base — preventing
+          // stale old-account nonces from being submitted on the new account (#951).
+          let perRetryChanged = false;
           if (isConnectionError(fail.error) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
             try {
-              await doReconnect();
+              ({ changed: perRetryChanged } = await doReconnectAndRebase());
             } catch (reconnectErr: any) {
               console.log(`   Reconnect failed: ${reconnectErr.message?.slice(0, 80)}`);
               break;
@@ -1046,7 +1079,11 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           try {
             const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
             const originalNonce = assignedNonces.get(fail.index);
-            if (originalNonce !== undefined && originalNonce < currentNonce) {
+            // "nonce consumed → included" heuristic: only valid on same account.
+            // On rotation, originalNonce is the new account's rebased value and
+            // the comparison is not meaningful until the new account actually
+            // advances its nonce (#951).
+            if (!perRetryChanged && originalNonce !== undefined && originalNonce < currentNonce) {
               console.log(`   Chunk ${fail.index + 1}: nonce ${originalNonce} consumed (current=${currentNonce}), treating as included`);
               stored[fail.index] = { cid: createCID(fail.chunkData, CID_CONFIG.codec, 0x12), len: fail.chunkData.length, viaFallback: true };
               nonceAdvanceIndices.add(fail.index);

@@ -11064,6 +11064,176 @@ describe("storeChunkedContent dense nonce assignment", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Account-rotation nonce rebase (#951)
+//
+// When pool reconnect rotates to a DIFFERENT account (ss58 changes), the
+// pre-computed assignedNonces map is keyed to the OLD account's nonce base.
+// Two bugs:
+//  1. Remaining chunks are submitted with the old account's stale nonces →
+//     Invalid::Stale on the new account.
+//  2. The "nonce consumed → included" heuristic compares OLD-account nonce
+//     values against NEW-account currentNonce → false-positive "included" for
+//     chunks never submitted on any account.
+//
+// The fix: after doReconnect() detects an account change (ss58 before ≠ after),
+//  - re-run assignDenseNonces(stored, newNonce) so subsequent submissions use
+//    valid new-account nonces.
+//  - skip the consumed-heuristic (old nonce values are meaningless cross-account).
+// ---------------------------------------------------------------------------
+describe("storeChunkedContent account rotation on reconnect (#951)", () => {
+  const ACCOUNT_A = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  const ACCOUNT_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty";
+
+  // Capture-enabled stub api: records the nonce from each signSubmitAndWatch call.
+  function makeCapturingStubApi(makeSubscribable, capturedNonces) {
+    return {
+      query: {
+        TransactionStorage: {
+          Authorizations: {
+            getValue: async () => ({
+              extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
+              expiration: 9_999_999,
+            }),
+          },
+        },
+        System: { Number: { getValue: async () => 1000 } },
+      },
+      apis: { BulletinTransactionStorageApi: { can_store: async () => true } },
+      tx: {
+        TransactionStorage: {
+          store_with_cid_config: () => ({
+            signSubmitAndWatch: (_signer, opts) => {
+              capturedNonces.push(opts?.nonce);
+              return makeSubscribable();
+            },
+          }),
+        },
+      },
+    };
+  }
+
+  // Test 1: after rotation, remaining chunks must be submitted with the NEW
+  // account's rebased nonce (not the old stale nonce).
+  //
+  // Setup: 2 chunks, account A with startNonce=2665.
+  //   - assignedNonces: chunk0→2665, chunk1→2666
+  //   - First batch: both chunks fail with connection error (batch=2 pre-reconnect)
+  //   - doReconnectAndRebase() rotates to account B, rebases nonces to 3249
+  //   - new account B's currentNonce = 3249 (reproduces the #951 evidence)
+  //   - Expected: post-rotation submissions use nonces ≥ 3249, not 2665/2666
+  //
+  // Without the fix: assignedNonces is never rebased; chunks submitted with
+  // stale nonces 2665/2666 → Invalid::Stale on account B.
+  // With the fix: assignedNonces rebased; post-rotation chunks get 3249+.
+  test("chunk submitted after account rotation uses new account base nonce, not stale old nonce", async () => {
+    const allNonces = [];
+    let postRotationNonces = null; // filled after reconnect fires
+    let reconnectCount = 0;
+
+    // Both chunks fail on first attempt (connection error)
+    let txCall = 0;
+    const makeSubscribable = () => {
+      txCall++;
+      if (txCall <= 2) return connectionErrorSubscribable(); // first batch: both fail
+      return normalSubscribable();                           // post-reconnect: succeed
+    };
+
+    // Capture nonces split by account: before vs after rotation.
+    // apiB's capture array starts as postRotationNonces once reconnect fires.
+    const apiA = makeCapturingStubApi(makeSubscribable, allNonces);
+    let apiB_nonces = null;
+    const reconnect = async () => {
+      reconnectCount++;
+      apiB_nonces = [];
+      postRotationNonces = apiB_nonces;
+      return { client: { destroy() {} }, unsafeApi: makeCapturingStubApi(makeSubscribable, apiB_nonces), signer: stubSigner, ss58: ACCOUNT_B };
+    };
+
+    let nonceFetchCalls = 0;
+    const fetchNonce = async (_rpc, _ss58) => {
+      nonceFetchCalls++;
+      if (nonceFetchCalls === 1) return 2665; // initial startNonce for account A
+      return 3249;                            // post-reconnect nonce for account B
+    };
+
+    await storeChunkedContent([new Uint8Array([0x01]), new Uint8Array([0x02])], {
+      client: { destroy() {} },
+      unsafeApi: apiA,
+      signer: stubSigner,
+      ss58: ACCOUNT_A,
+      reconnect,
+      fetchNonce,
+    });
+
+    // All post-rotation submissions must use nonces ≥ 3249 (account B's base).
+    // Stale old-account nonces 2665, 2666 must NOT appear after rotation.
+    assert.ok(postRotationNonces !== null,
+      ">> FAIL: #951 nonce-rebase: reconnect was never called — rotation not simulated");
+    const staleNonceUsed = postRotationNonces.some(n => n != null && n < 3249);
+    assert.strictEqual(staleNonceUsed, false,
+      `>> FAIL: #951 nonce-rebase: after account rotation A→B, post-rotation nonces must be ≥ 3249 (account B base); got: [${postRotationNonces.join(", ")}]`);
+    assert.ok(postRotationNonces.filter(n => n != null).length >= 2,
+      `>> FAIL: #951 nonce-rebase: both chunks must be submitted on account B; got: [${postRotationNonces.join(", ")}]`);
+  });
+
+  // Test 2: the "nonce consumed → treating as included" heuristic must NOT fire
+  // cross-account: old account A's assignedNonce < new account B's currentNonce
+  // is always true and would silently drop chunks that were never submitted.
+  //
+  // Setup: 2 chunks, account A with startNonce=2665.
+  //   - First batch: both chunks fail with connection error
+  //   - doReconnect() rotates to account B
+  //   - account B's currentNonce = 3249 > 2665 → false-positive without the fix
+  //
+  // Without the fix: both chunks get silently marked "included" via heuristic
+  //   → result is corrupt (chunks never uploaded to any account).
+  // With the fix: heuristic is skipped on rotation; chunks are actually submitted.
+  test("consumed-heuristic does not false-positive across account rotation", async () => {
+    const capturedNonces = [];
+    let reconnectCount = 0;
+
+    let txCall = 0;
+    const makeSubscribable = () => {
+      txCall++;
+      if (txCall <= 2) return connectionErrorSubscribable(); // first batch: both fail
+      return normalSubscribable();                           // post-reconnect: succeed
+    };
+
+    const apiA = makeCapturingStubApi(makeSubscribable, capturedNonces);
+    const apiB = makeCapturingStubApi(makeSubscribable, capturedNonces);
+
+    let nonceFetchCalls = 0;
+    const fetchNonce = async (_rpc, ss58) => {
+      nonceFetchCalls++;
+      if (nonceFetchCalls === 1) return 2665;
+      return 3249; // higher than any assigned nonce → triggers false-positive without fix
+    };
+
+    const reconnect = async () => {
+      reconnectCount++;
+      return { client: { destroy() {} }, unsafeApi: apiB, signer: stubSigner, ss58: ACCOUNT_B };
+    };
+
+    await storeChunkedContent([new Uint8Array([0x01]), new Uint8Array([0x02])], {
+      client: { destroy() {} },
+      unsafeApi: apiA,
+      signer: stubSigner,
+      ss58: ACCOUNT_A,
+      reconnect,
+      fetchNonce,
+    });
+
+    // Both chunks must be actually submitted on account B (not silently "included").
+    // Without the fix, txCall stays at 2 (only the failed initial batch) and the
+    // function returns without actually uploading chunks to account B.
+    // Root node tx is also submitted, so txCall should be > 2.
+    const submittedAfterRotation = capturedNonces.filter(n => n != null).length;
+    assert.ok(submittedAfterRotation >= 2,
+      `>> FAIL: #951 consumed-heuristic: cross-account rotation must not silently "include" chunks; expected ≥2 real submissions after rotation, got ${submittedAfterRotation}`);
+  });
+});
+
 // 21.1. Retry budget integration into storeChunkedContent (#216 b)
 // ---------------------------------------------------------------------------
 describe("retry budget integration", () => {

@@ -496,9 +496,18 @@ jobs:
     needs: select-env
     if: always() && needs.select-env.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    # Raised from 20 to 58 to accommodate the publish.yml human-approval wait
+    # (up to ~45 min) on release triggers. The 60-min ceiling (safety-net test)
+    # is still respected: 45-min publish-wait cap + ~1-2 min npm poll (post-
+    # approval) + setup/fixture overhead all fit under 58.
+    timeout-minutes: 58
     permissions:
       contents: read
+      # actions:read is required to list workflow runs via the Actions REST API
+      # (/repos/.../actions/workflows/publish.yml/runs) in the publish-wait step.
+      actions: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       test-version: ${{ steps.version.outputs.test-version }}
       deploy-tag: ${{ steps.version.outputs.deploy-tag }}
@@ -555,25 +564,89 @@ jobs:
           echo "deploy-tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "polkadot-app-deploy-ref=$REF" >> "$GITHUB_OUTPUT"
           echo "Resolved: test-version='$V', deploy-tag='$TAG', polkadot-app-deploy-ref='$REF' (event=$EVENT)"
+      - name: Wait for publish.yml to complete
+        # Only on release: publish.yml fires on `release: created` (the same event
+        # that fired us) but it pauses behind a `environment: release` human-
+        # approval gate. The RC is not on npm until a maintainer approves and the
+        # automation publish step runs — which can take 20-60+ min. Polling npm
+        # directly from the start meant this job timed out waiting (10-min budget
+        # exhausted before approval), causing the gating E2E to fail with zero
+        # scenarios run. We now wait for publish.yml to complete first, then do a
+        # short npm poll for the automation lag (~1-2 min post-approval).
+        #
+        # Guard is `github.event_name == 'release'` — NOT `test-version != ''`.
+        # workflow_dispatch with a version string also sets test-version, but there
+        # is no live publish.yml run in that case (re-testing an already-published
+        # RC). Using the wrong guard would spin the whole 45-min cap hunting a run
+        # that will never exist.
+        if: github.event_name == 'release'
+        timeout-minutes: 47
+        env:
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          gh_get() {
+            curl -fsSL \
+              -H "Authorization: bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$1"
+          }
+          TAG="${{ github.event.release.tag_name }}"
+          echo "Waiting for publish.yml run triggered by release $TAG (head_sha=$HEAD_SHA)..."
+
+          # publish.yml fires on `release: created` from the same release event.
+          # Both workflows share the same tag commit (head_sha). Correlate by
+          # head_sha + event=release to find the right run.
+          #
+          # Cap at 270 iterations × 10s = 45 min. The first few iterations may
+          # return an empty list (webhook delivery skew) — that is not an error.
+          FOUND_RUN_ID=""
+          for i in $(seq 1 270); do
+            RUNS=$(gh_get "https://api.github.com/repos/$REPO/actions/workflows/publish.yml/runs?event=release&head_sha=$HEAD_SHA&per_page=5")
+            TOTAL=$(echo "$RUNS" | jq '.total_count // 0')
+            if [[ "$TOTAL" -gt "0" ]]; then
+              FOUND_RUN_ID=$(echo "$RUNS" | jq -r '.workflow_runs[0].id')
+              STATUS=$(echo "$RUNS" | jq -r '.workflow_runs[0].status')
+              CONCLUSION=$(echo "$RUNS" | jq -r '.workflow_runs[0].conclusion // "null"')
+              echo "  attempt $i: publish.yml run $FOUND_RUN_ID status=$STATUS conclusion=$CONCLUSION"
+              if [[ "$STATUS" == "completed" ]]; then
+                if [[ "$CONCLUSION" == "success" ]]; then
+                  echo "publish.yml completed successfully — proceeding to npm poll"
+                  exit 0
+                else
+                  echo "::error::publish.yml run $FOUND_RUN_ID completed with conclusion=$CONCLUSION (tag=$TAG). The release may have been rejected or failed. Check the publish.yml run for details."
+                  exit 1
+                fi
+              fi
+            else
+              echo "  attempt $i: no publish.yml run found yet for head_sha=$HEAD_SHA — waiting for webhook delivery"
+            fi
+            sleep 10
+          done
+          echo "::error::Timed out after 45 min waiting for publish.yml to complete for tag=$TAG (head_sha=$HEAD_SHA). The human approval may still be pending or the run never appeared."
+          exit 1
       - name: Wait for polkadot-app-deploy@$V on npm
-        # release fires alongside publish.yml, so the just-published version may
-        # not be on the registry yet when nightly legs start. Poll up to 10 min.
+        # After publish.yml completes (human approval → automation publish), the
+        # package typically appears on npm within 1-2 min. Cap at 5 min (30 × 10s)
+        # — the old 10-min budget absorbed the approval wait, which is now handled
+        # upstream by the publish.yml wait step above.
         # Skipped when test-version is empty (schedule trigger uses @latest).
         if: steps.version.outputs.test-version != ''
-        timeout-minutes: 12
+        timeout-minutes: 7
         env:
           V: ${{ steps.version.outputs.test-version }}
         run: |
           echo "Waiting for @parity/polkadot-app-deploy@$V on npm registry..."
-          for i in $(seq 1 60); do
+          for i in $(seq 1 30); do
             if npm view "@parity/polkadot-app-deploy@$V" version >/dev/null 2>&1; then
               echo "Found @parity/polkadot-app-deploy@$V on attempt $i"
               exit 0
             fi
-            echo "  attempt $i/60: not yet available, sleeping 10s"
+            echo "  attempt $i/30: not yet available, sleeping 10s"
             sleep 10
           done
-          echo "::error::Timed out waiting for @parity/polkadot-app-deploy@$V on npm after 10 minutes"
+          echo "::error::Timed out waiting for @parity/polkadot-app-deploy@$V on npm after 5 minutes (publish.yml completed but npm automation has not surfaced the package). This may be a transient registry delay — re-run the E2E workflow manually once the package appears."
           exit 1
       - name: Mutate fixture into build/
         id: prep

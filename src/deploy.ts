@@ -43,6 +43,8 @@ import {
   getSlotSignerProvider,
   BulletinSlotAuthError,
 } from "./storage-signer.js";
+import { resolveStorageSigner } from "./deploy-actors.js";
+import { requestResourceAllocation, createSlotAccountSigner, BULLETIN_RESOURCE } from "./auth/index.js";
 
 export interface DeployResult {
   domainName: string;
@@ -482,11 +484,15 @@ export function shouldHandoverName(
 
 /**
  * Produce the one-line storage-signer status printed at resolution time. Exported for unit testing.
- *   Success: "   Storage signer: allowance slot <ss58>"
- *   Fallback: "   Storage signer: pool fallback (<reason>)"
+ *   User-owned slot: "   Storage signer: your allowance slot <ss58>"  (owned=true)
+ *   Explicit slot:   "   Storage signer: allowance slot <ss58>"        (owned=false or omitted)
+ *   Fallback:        "   Storage signer: pool fallback (<reason>)"
  */
-export function formatStorageSignerLine(slotAddress: string | null, failReason?: string): string {
-  if (slotAddress) return `   Storage signer: allowance slot ${slotAddress}`;
+export function formatStorageSignerLine(slotAddress: string | null, failReason?: string, owned?: boolean): string {
+  if (slotAddress) {
+    const prefix = owned ? "your allowance slot" : "allowance slot";
+    return `   Storage signer: ${prefix} ${slotAddress}`;
+  }
   return `   Storage signer: pool fallback (${failReason ?? "no session"})`;
 }
 
@@ -2677,45 +2683,43 @@ export async function deploy(content: DeployContent, domainName: string | null =
     }
   }
 
-  // Resolve slot-account signer for Bulletin storage for ALL callers.
-  // Programmatic callers are expected to pass storageSigner directly; if they
-  // don't (or if their slot account is not yet authorized), we try to obtain
-  // one via the host-papp allowance service.
+  // Resolve user-owned slot-account signer for Bulletin storage (#19).
+  // Precedence: storageSigner (explicit, pre-built) > signer (external PolkadotSigner) >
+  //   mnemonic (direct) > session-derived slot (new, this block) > pool.
   //
-  // host-papp's getBulletinSigner sends callingProductId = DOT_PRODUCT_ID.
-  // Identity is now unified (DOT_PRODUCT_ID === DOT_DAPP_ID === adapter.appId ===
-  // "polkadot-app-deploy", #885), so this productId matches both the QR-pairing
-  // product and the terminal allowance cache — the historical productId≠appId
-  // mismatch that forced this host-papp path is gone. (Follow-up: this read could
-  // move to the terminal-cache reader createSlotAccountSigner, same as login step 2.)
+  // resolveStorageSigner handles steps 3–4:
+  //   3. Cache-hit: adapter.allowance.getBulletinSigner → user's own Bulletin slot.
+  //   4. Cache-miss (NotAvailable/Rejected): prompt then requestResourceAllocation
+  //      ([BulletInAllowance]) → newly-allocated slot. Ctrl-C → pool.
   //
+  // Layer-3 isolation: when resolvedUserSession is null (no session file, no --suri),
+  // resolveStorageSigner returns null immediately — the SSO stack is never loaded.
   // Pool is always the final fallback; nothing here aborts the deploy.
   if (!options.storageSigner) {
-    let storageLine: string | null = null;
-    try {
-      if (resolvedUserSession?.userSession && resolvedUserSession?.adapter) {
-        const { ss58Encode } = await import("@parity/product-sdk-address");
-        const signerResult = await resolvedUserSession.adapter.allowance.getBulletinSigner(
-          resolvedUserSession.userSession.id,
-          DOT_PRODUCT_ID,
-        );
-        if (signerResult.isOk()) {
-          const slotSigner = signerResult.value;
-          const slotAddress = ss58Encode(slotSigner.publicKey);
-          options = { ...options, storageSigner: slotSigner, storageSignerAddress: slotAddress };
-          storageLine = formatStorageSignerLine(slotAddress);
-        } else {
-          // On Err (NoSession / Rejected / NotAvailable / UnexpectedResponse) — fall through to pool.
-          storageLine = formatStorageSignerLine(null, signerResult.error.reason);
-        }
-      } else {
-        storageLine = formatStorageSignerLine(null);
-      }
-    } catch {
-      // getBulletinSigner threw (rare) — fall back to pool silently.
-      storageLine = formatStorageSignerLine(null, "error");
+    const { ss58Encode } = await import("@parity/product-sdk-address");
+    const slotResult = await resolveStorageSigner(
+      resolvedUserSession ?? null,
+      {
+        getBulletinSigner: (sessionId, productId, adapter) =>
+          adapter.allowance.getBulletinSigner(sessionId, productId),
+        requestResourceAllocation,
+        createSlotAccountSigner,
+        ss58Encode: (pk) => ss58Encode(pk),
+        promptBeforeAllocation: () => {
+          console.log(
+            `\n⚠  Your account has no Bulletin allowance. ` +
+            `Approve one on your phone to deploy with your own account, ` +
+            `or press Ctrl-C to use the shared pool.`,
+          );
+        },
+      },
+    );
+    if (slotResult) {
+      options = { ...options, storageSigner: slotResult.signer, storageSignerAddress: slotResult.slotAddress };
+      console.log(formatStorageSignerLine(slotResult.slotAddress, undefined, slotResult.owned));
+    } else {
+      console.log(formatStorageSignerLine(null, resolvedUserSession ? "no allowance" : undefined));
     }
-    if (storageLine) console.log(storageLine);
   }
 
   initTelemetry();

@@ -18000,3 +18000,211 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// User-first storage signer (#19)
+// ---------------------------------------------------------------------------
+// Tests for resolveStorageSigner (deploy-actors.ts) and related helpers.
+// These cover the table from the spec:
+//   (no session)                          → null (pool)
+//   (session, cache-hit)                  → user slot signer
+//   (session, miss, user approves)        → user slot signer
+//   (session, miss, user declines)        → null (pool)
+//   (session, getBulletinSigner throws)   → null (pool, non-fatal)
+//   formatStorageSignerLine user-owned    → "your allowance slot <addr>"
+//   formatStorageSignerLine explicit      → "allowance slot <addr>"
+//   formatStorageSignerLine no session    → "pool fallback (no session)"
+//   formatStorageSignerLine custom reason → "pool fallback (<reason>)"
+//   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
+// ---------------------------------------------------------------------------
+import { resolveStorageSigner } from "../dist/deploy-actors.js";
+import { chooseSignerInput, formatStorageSignerLine } from "../dist/deploy.js";
+
+describe("resolveStorageSigner (user-first storage signer, #19)", () => {
+  const fakeSigner = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) };
+  const SLOT_ADDR = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  const SESSION_ID = "test-session-id";
+
+  // Helper: build a minimal session mock
+  function makeSession() {
+    return {
+      userSession: { id: SESSION_ID },
+      adapter: {
+        allowance: {
+          getBulletinSigner: async () => ({ isOk: () => true, isErr: () => false, value: fakeSigner }),
+        },
+      },
+    };
+  }
+
+  // Helper: build Ok result for getBulletinSigner
+  function ok(signer) {
+    return { isOk: () => true, isErr: () => false, value: signer };
+  }
+
+  // Helper: build Err result for getBulletinSigner
+  function err(reason) {
+    return { isOk: () => false, isErr: () => true, error: { reason } };
+  }
+
+  // (no session) → null
+  test("no session → null (pool fallback)", async () => {
+    const result = await resolveStorageSigner(null, {
+      getBulletinSigner: async () => { throw new Error("should not be called"); },
+      requestResourceAllocation: async () => { throw new Error("should not be called"); },
+      ss58Encode: () => SLOT_ADDR,
+      promptBeforeAllocation: () => {},
+    });
+    assert.strictEqual(result, null,
+      ">> FAIL: resolveStorageSigner no-session: must return null (pool) when no session present");
+  });
+
+  // (session, cache-hit) → user slot signer
+  test("session cache-hit → user slot signer", async () => {
+    const session = makeSession();
+    const result = await resolveStorageSigner(session, {
+      getBulletinSigner: async (sessionId, productId) => {
+        assert.strictEqual(sessionId, SESSION_ID, ">> FAIL: resolveStorageSigner cache-hit: must call getBulletinSigner with correct sessionId");
+        return ok(fakeSigner);
+      },
+      requestResourceAllocation: async () => { throw new Error("should not be called on cache-hit"); },
+      ss58Encode: () => SLOT_ADDR,
+      promptBeforeAllocation: () => { throw new Error("should not prompt on cache-hit"); },
+    });
+    assert.ok(result !== null,
+      ">> FAIL: resolveStorageSigner cache-hit: must return a slot signer, not null");
+    assert.strictEqual(result.slotAddress, SLOT_ADDR,
+      ">> FAIL: resolveStorageSigner cache-hit: slotAddress must match ss58Encode output");
+    assert.strictEqual(result.signer, fakeSigner,
+      ">> FAIL: resolveStorageSigner cache-hit: signer must match the getBulletinSigner result");
+    assert.strictEqual(result.owned, true,
+      ">> FAIL: resolveStorageSigner cache-hit: owned flag must be true (user's own allowance)");
+  });
+
+  // (session, miss, user approves) → slot signer
+  test("session miss + approve → user slot signer via requestResourceAllocation", async () => {
+    let promptCalled = false;
+    const session = makeSession();
+    const result = await resolveStorageSigner(session, {
+      getBulletinSigner: async () => err("NotAvailable"),
+      requestResourceAllocation: async (userSession, adapter, resources) => {
+        assert.ok(resources.some(r => r.tag === "BulletInAllowance"),
+          ">> FAIL: resolveStorageSigner miss+approve: requestResourceAllocation must request BulletInAllowance");
+        return [{ tag: "Allocated", value: { slotAccountKey: new Uint8Array(64) } }];
+      },
+      ss58Encode: () => SLOT_ADDR,
+      createSlotAccountSigner: async () => fakeSigner,
+      promptBeforeAllocation: () => { promptCalled = true; },
+    });
+    assert.ok(promptCalled,
+      ">> FAIL: resolveStorageSigner miss+approve: promptBeforeAllocation must be called before requestResourceAllocation");
+    assert.ok(result !== null,
+      ">> FAIL: resolveStorageSigner miss+approve: must return slot signer after successful allocation");
+    assert.strictEqual(result.owned, true,
+      ">> FAIL: resolveStorageSigner miss+approve: owned flag must be true for newly-allocated slot");
+  });
+
+  // (session, miss, user declines) → null (pool)
+  test("session miss + decline (Rejected) → null (pool fallback)", async () => {
+    const session = makeSession();
+    const result = await resolveStorageSigner(session, {
+      getBulletinSigner: async () => err("NotAvailable"),
+      requestResourceAllocation: async () => [{ tag: "Rejected", value: undefined }],
+      ss58Encode: () => SLOT_ADDR,
+      createSlotAccountSigner: async () => null,
+      promptBeforeAllocation: () => {},
+    });
+    assert.strictEqual(result, null,
+      ">> FAIL: resolveStorageSigner miss+decline: Rejected outcome must return null (pool fallback)");
+  });
+
+  // (session, getBulletinSigner throws) → null (non-fatal)
+  test("getBulletinSigner throws → null (non-fatal pool fallback)", async () => {
+    const session = makeSession();
+    const result = await resolveStorageSigner(session, {
+      getBulletinSigner: async () => { throw new Error("unexpected SDK error"); },
+      requestResourceAllocation: async () => { throw new Error("should not be called"); },
+      ss58Encode: () => SLOT_ADDR,
+      promptBeforeAllocation: () => {},
+    });
+    assert.strictEqual(result, null,
+      ">> FAIL: resolveStorageSigner throw: must return null (pool) when getBulletinSigner throws unexpectedly");
+  });
+
+  // (session, NoSession error) → null, no prompt (session invalid — don't re-auth)
+  test("NoSession error → null without prompt (session expired, don't prompt)", async () => {
+    let promptCalled = false;
+    const session = makeSession();
+    const result = await resolveStorageSigner(session, {
+      getBulletinSigner: async () => err("NoSession"),
+      requestResourceAllocation: async () => { throw new Error("should not be called on NoSession"); },
+      ss58Encode: () => SLOT_ADDR,
+      promptBeforeAllocation: () => { promptCalled = true; },
+    });
+    assert.strictEqual(result, null,
+      ">> FAIL: resolveStorageSigner NoSession: must return null without prompting on a NoSession error");
+    assert.strictEqual(promptCalled, false,
+      ">> FAIL: resolveStorageSigner NoSession: must NOT prompt when the error is NoSession (session is invalid)");
+  });
+});
+
+describe("formatStorageSignerLine (user-first storage signer, #19)", () => {
+  const ADDR = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+
+  test("user-owned slot → 'your allowance slot <addr>'", () => {
+    const line = formatStorageSignerLine(ADDR, undefined, true);
+    assert.match(line, /your allowance slot/,
+      ">> FAIL: formatStorageSignerLine user-owned: must contain 'your allowance slot' for owned=true");
+    assert.ok(line.includes(ADDR),
+      ">> FAIL: formatStorageSignerLine user-owned: must include the slot address");
+  });
+
+  test("explicit slot (owned=false or omitted) → 'allowance slot <addr>' (not 'your')", () => {
+    const line = formatStorageSignerLine(ADDR, undefined, false);
+    assert.ok(line.includes("allowance slot"),
+      ">> FAIL: formatStorageSignerLine explicit: must contain 'allowance slot'");
+    assert.ok(!line.includes("your allowance slot"),
+      ">> FAIL: formatStorageSignerLine explicit: must NOT contain 'your allowance slot' for owned=false");
+    assert.ok(line.includes(ADDR),
+      ">> FAIL: formatStorageSignerLine explicit: must include the slot address");
+  });
+
+  test("no address, no reason → 'pool fallback (no session)'", () => {
+    const line = formatStorageSignerLine(null);
+    assert.match(line, /pool fallback.*no session/,
+      ">> FAIL: formatStorageSignerLine pool-no-session: must produce 'pool fallback (no session)'");
+  });
+
+  test("no address + custom reason → 'pool fallback (<reason>)'", () => {
+    const line = formatStorageSignerLine(null, "allowance declined");
+    assert.match(line, /pool fallback.*allowance declined/,
+      ">> FAIL: formatStorageSignerLine pool-reason: must include the provided reason");
+  });
+});
+
+describe("chooseSignerInput Layer-3 isolation (#19)", () => {
+  // Core invariant: no session + no --suri → 'pool' (no adapter loaded, Layer-3 preserved).
+  test("no session + no --suri → 'pool' (headless/CI never loads SSO stack)", () => {
+    const choice = chooseSignerInput({ mnemonic: undefined, suri: undefined, hasInjectedSigner: false, hasSession: false });
+    assert.strictEqual(choice, "pool",
+      ">> FAIL: chooseSignerInput Layer-3: no session + no --suri must choose pool, never loading the SSO adapter");
+  });
+
+  test("session present → 'resolve' (SSO adapter loaded)", () => {
+    const choice = chooseSignerInput({ mnemonic: undefined, suri: undefined, hasInjectedSigner: false, hasSession: true });
+    assert.strictEqual(choice, "resolve",
+      ">> FAIL: chooseSignerInput Layer-3: session present must choose resolve path (SSO adapter)");
+  });
+
+  test("--suri present, no session → 'resolve' (dev signer, loads adapter)", () => {
+    const choice = chooseSignerInput({ mnemonic: undefined, suri: "//Alice", hasInjectedSigner: false, hasSession: false });
+    assert.strictEqual(choice, "resolve",
+      ">> FAIL: chooseSignerInput Layer-3: --suri alone must choose resolve without requiring session");
+  });
+
+  test("mnemonic present → 'mnemonic' (independent of session)", () => {
+    const choice = chooseSignerInput({ mnemonic: "bottom drive obey lake curtain smoke basket hold race lonely fit walk", suri: undefined, hasInjectedSigner: false, hasSession: false });
+    assert.strictEqual(choice, "mnemonic",
+      ">> FAIL: chooseSignerInput Layer-3: mnemonic must always choose mnemonic path");
+  });
+});

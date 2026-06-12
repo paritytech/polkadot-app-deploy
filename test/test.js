@@ -17932,3 +17932,71 @@ No contract entries here, just prose.
       ">> FAIL: parseDeployments empty section: subsequent real section must still parse correctly");
   });
 });
+
+// ---------------------------------------------------------------------------
+// nonce-collision re-upload loop connection-error recovery (#946)
+// ---------------------------------------------------------------------------
+describe("nonce-collision re-upload loop has connection-error recovery (#946)", () => {
+  const src = fs.readFileSync(new URL("../src/deploy.ts", import.meta.url), "utf-8");
+
+  test("proactive wsHaltDetected guard runs before nonce-collision re-upload outer loop", () => {
+    // Region: from the deploy.pool.nonce_collision_missing setAttribute to the outer for-of loop
+    const startMarker = "deploy.pool.nonce_collision_missing";
+    const endMarker = "for (const m of missingResults)";
+    const startIdx = src.indexOf(startMarker);
+    const endIdx = src.indexOf(endMarker, startIdx);
+    assert.ok(startIdx !== -1 && endIdx !== -1, ">> FAIL: nonce-collision proactive guard markers not found: sentinels missing from deploy.ts");
+    const region = src.slice(startIdx, endIdx);
+    assert.ok(
+      /wsHaltDetected\s*&&\s*reconnect\s*&&\s*reconnectionsUsed\s*<\s*MAX_RECONNECTIONS/.test(region),
+      ">> FAIL: nonce-collision proactive guard: expected wsHaltDetected && reconnect && reconnectionsUsed < MAX_RECONNECTIONS guard before nonce-collision re-upload loop"
+    );
+  });
+
+  test("nonce-collision re-upload catch block calls doReconnect on connection error", () => {
+    // Region: from the outer for-of loop to deploy.pool.nonce_collision_reupload_count
+    const startMarker = "for (const m of missingResults)";
+    const endMarker = "deploy.pool.nonce_collision_reupload_count";
+    const startIdx = src.indexOf(startMarker);
+    const endIdx = src.indexOf(endMarker, startIdx);
+    assert.ok(startIdx !== -1 && endIdx !== -1, ">> FAIL: nonce-collision catch recovery markers not found: sentinels missing from deploy.ts");
+    const region = src.slice(startIdx, endIdx);
+    assert.ok(
+      /isConnectionError\(e\)\s*&&\s*reconnect\s*&&\s*reconnectionsUsed\s*<\s*MAX_RECONNECTIONS/.test(region),
+      ">> FAIL: nonce-collision catch recovery: expected isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS in catch block"
+    );
+    assert.ok(
+      /await\s+doReconnect\(\)/.test(region),
+      ">> FAIL: nonce-collision catch recovery: expected await doReconnect() call in catch block"
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// GRANDPA finality re-upload loop connection-error recovery (#946)
+// ---------------------------------------------------------------------------
+describe("GRANDPA finality re-upload loop has connection-error recovery (#946)", () => {
+  const src = fs.readFileSync(new URL("../src/deploy.ts", import.meta.url), "utf-8");
+
+  test("GRANDPA round loop has connection-error recovery with phaseALiveProvider.reconnect", () => {
+    // Region: from GRANDPA_REUPLOAD_MAX_ROUNDS to finality_miss_reupload_count
+    const startMarker = "for (let round = 1; round <= GRANDPA_REUPLOAD_MAX_ROUNDS";
+    const endMarker = "deploy.probe.finality_miss_reupload_count";
+    const startIdx = src.indexOf(startMarker);
+    const endIdx = src.indexOf(endMarker, startIdx);
+    assert.ok(startIdx !== -1 && endIdx !== -1, ">> FAIL: GRANDPA round loop recovery markers not found: sentinels missing from deploy.ts");
+    const region = src.slice(startIdx, endIdx);
+    assert.ok(
+      /isConnectionError\(e\)\s*&&\s*phaseALiveProvider\.reconnect/.test(region),
+      ">> FAIL: GRANDPA round loop recovery: expected isConnectionError(e) && phaseALiveProvider.reconnect in catch block"
+    );
+    assert.ok(
+      /phaseALiveProvider\.client.*destroy\(\)/.test(region),
+      ">> FAIL: GRANDPA round loop recovery: expected phaseALiveProvider.client!.destroy() before reconnect"
+    );
+    assert.ok(
+      /phaseALiveProvider\s*=\s*\{.*phaseALiveProvider.*fresh/.test(region) || /phaseALiveProvider\s*=\s*\{.*fresh/.test(region),
+      ">> FAIL: GRANDPA round loop recovery: expected phaseALiveProvider reassignment with fresh provider fields"
+    );
+  });
+});

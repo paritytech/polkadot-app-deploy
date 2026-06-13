@@ -69,6 +69,16 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    * resolves. `attempt` >= 2 means a re-sign (principle 4).
    */
   confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number }) => Promise<void>;
+  /**
+   * True when the injected signer is a real phone/session signer that needs the
+   * human-ready gate (`_awaitPhoneReady`). False (default) for local workers used
+   * in transfer mode and mnemonic signers — those sign in-process with no phone.
+   *
+   * Fixes #50: `_usesExternalSigner` is true for the local transfer-worker too,
+   * so it cannot distinguish phone-backed from in-process. This flag is the
+   * transfer-aware predicate that `isPhoneSignerActive` in deploy.ts already uses.
+   */
+  phoneSigner?: boolean;
 }
 export interface OwnershipResult { owned: boolean; owner: string | null; }
 
@@ -1488,6 +1498,8 @@ export class DotNS {
   assetHubEndpoints: string[];
 
   private _usesExternalSigner = false;
+  /** True only when the signer is a real phone/session signer that needs `_awaitPhoneReady`. */
+  private _isPhoneSigner = false;
   private _localMnemonic: string | null = null;
   private _contracts: typeof CONTRACTS & { PUBLISHER?: string } = CONTRACTS;
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
@@ -1556,6 +1568,7 @@ export class DotNS {
     const rpc = options.rpc || process.env.DOTNS_RPC || this.assetHubEndpoints[0];
     this.rpc = rpc;
     this._usesExternalSigner = Boolean(options.signer && options.signerAddress);
+    this._isPhoneSigner = options.phoneSigner ?? false;
 
     if (this._usesExternalSigner) {
       this.signer = options.signer!;
@@ -2048,7 +2061,7 @@ export class DotNS {
       await this._awaitPhoneReady(phoneLabel);
     }
     return await withTimeout(
-      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, { rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset, isPhoneSigner: this._usesExternalSigner }),
+      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, { rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset, isPhoneSigner: this._isPhoneSigner }),
       OPERATION_TIMEOUT_MS,
       functionName,
     );
@@ -3377,7 +3390,7 @@ export class DotNS {
    * phone" notification) so the user knows the request is now being sent.
    */
   private async _awaitPhoneReady(label: string): Promise<void> {
-    if (!this._usesExternalSigner) return; // only external signers need the gate
+    if (!this._isPhoneSigner) return; // only phone/session signers need the gate; local workers (transfer mode) do not
     const attempt = (this._phoneSignatureAttempts.get(label) ?? 0) + 1;
     this._phoneSignatureAttempts.set(label, attempt);
     if (this._confirmPhoneReady) {
@@ -3393,6 +3406,7 @@ export class DotNS {
   disconnect(): void {
     if (this.client) { this.client.destroy(); this.client = null; this.clientWrapper = null; this.connected = false; }
     this._usesExternalSigner = false;
+    this._isPhoneSigner = false;
     this._onPhoneSigningRequired = undefined;
     this._confirmPhoneReady = undefined;
     this._phoneSignatureTotal = 0;

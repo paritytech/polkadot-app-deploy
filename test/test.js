@@ -18023,6 +18023,7 @@ describe("human-first phone signing", () => {
 
     dotns._confirmPhoneReady = confirmPhoneReady;
     dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true; // phone/session signer — gate must run
     dotns._phoneSignatureTotal = 1;
     dotns._phoneSignatureAttempts = new Map();
 
@@ -18045,6 +18046,7 @@ describe("human-first phone signing", () => {
     // The gate must be purely opt-in: absent confirmPhoneReady → proceed, never throw.
     const dotns = new DotNS();
     dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true; // genuine phone signer — gate must run (opt-in path)
     dotns._confirmPhoneReady = undefined;
     dotns._phoneSignatureTotal = 1;
     dotns._phoneSignatureAttempts = new Map();
@@ -18073,6 +18075,7 @@ describe("human-first phone signing", () => {
   test("re-sign path: attempt counter increments and confirmPhoneReady receives attempt >= 2 on second call", async () => {
     const dotns = new DotNS();
     dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true; // phone/session signer — re-sign gate must run
     dotns._phoneSignatureTotal = 1;
     dotns._phoneSignatureAttempts = new Map();
 
@@ -18130,6 +18133,68 @@ describe("human-first phone signing", () => {
       "src/deploy.ts must not call readline.createInterface >> FAIL: human-first phone signing: readline usage found in deploy.ts");
     assert.doesNotMatch(deploySource, /process\.stdin/,
       "src/deploy.ts must not use process.stdin >> FAIL: human-first phone signing: process.stdin found in deploy.ts");
+  });
+
+  // ---------------------------------------------------------------------------
+  // #50: transfer-mode phone gate regression tests
+  // ---------------------------------------------------------------------------
+
+  test("transfer mode (phoneSigner=false): _awaitPhoneReady issues NO confirmPhoneReady call and NO onPhoneSigningRequired", async () => {
+    // Regression guard for #50: in transfer mode the local worker signer has
+    // _usesExternalSigner=true, but phoneSigner=false. _awaitPhoneReady must
+    // exit immediately — no gate, no notification. Pressing Y on a spurious
+    // prompt is not fatal, but a non-TTY transfer deploy stalls forever.
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true; // local worker: external signer IS set
+    dotns._isPhoneSigner = false;     // but NOT a phone signer — transfer mode
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    let confirmPhoneCalls = 0;
+    let onPhoneSigningRequiredCalls = 0;
+    dotns._confirmPhoneReady = async () => { confirmPhoneCalls++; };
+    dotns._onPhoneSigningRequired = () => { onPhoneSigningRequiredCalls++; };
+
+    await dotns._awaitPhoneReady("Commitment");
+    await dotns._awaitPhoneReady("Register");
+
+    assert.strictEqual(confirmPhoneCalls, 0,
+      `confirmPhoneReady must not be called in transfer mode — got ${confirmPhoneCalls} calls >> FAIL: #50 transfer-mode phone gate: confirmPhoneReady fired`);
+    assert.strictEqual(onPhoneSigningRequiredCalls, 0,
+      `onPhoneSigningRequired must not fire in transfer mode — got ${onPhoneSigningRequiredCalls} calls >> FAIL: #50 transfer-mode phone gate: onPhoneSigningRequired fired`);
+  });
+
+  test("genuine phone signer (phoneSigner=true): _awaitPhoneReady DOES call confirmPhoneReady and onPhoneSigningRequired", async () => {
+    // Positive test: a real phone/session signer with phoneSigner=true must still
+    // gate correctly — both confirmPhoneReady and onPhoneSigningRequired must fire.
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true; // real phone signer — gate must run
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    let confirmPhoneCalls = 0;
+    let onPhoneSigningRequiredCalls = 0;
+    dotns._confirmPhoneReady = async () => { confirmPhoneCalls++; };
+    dotns._onPhoneSigningRequired = () => { onPhoneSigningRequiredCalls++; };
+
+    await dotns._awaitPhoneReady("Link content");
+
+    assert.strictEqual(confirmPhoneCalls, 1,
+      `confirmPhoneReady must be called once for a phone signer — got ${confirmPhoneCalls} >> FAIL: #50 transfer-mode phone gate: confirmPhoneReady not called for phone signer`);
+    assert.strictEqual(onPhoneSigningRequiredCalls, 1,
+      `onPhoneSigningRequired must fire once for a phone signer — got ${onPhoneSigningRequiredCalls} >> FAIL: #50 transfer-mode phone gate: onPhoneSigningRequired not fired for phone signer`);
+  });
+
+  test("deploy.ts passes phoneSigner=true to ownerDotns.connect and phoneSigner=phoneSignerActive to dotns.connect", () => {
+    // Structural guard: deploy.ts must wire the explicit phoneSigner flag at both
+    // DotNS connect call sites so the gate state is driven by isPhoneSignerActive,
+    // not the transfer-mode-conflating _usesExternalSigner. Fixes #50.
+    const deploySource = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.match(deploySource, /phoneSigner:\s*true/,
+      "deploy.ts must pass phoneSigner: true to ownerDotns.connect >> FAIL: #50 transfer-mode phone gate: phoneSigner:true missing from ownerDotns.connect");
+    assert.match(deploySource, /phoneSigner:\s*phoneSignerActive/,
+      "deploy.ts must pass phoneSigner: phoneSignerActive to dotns.connect >> FAIL: #50 transfer-mode phone gate: phoneSigner:phoneSignerActive missing from dotns.connect");
   });
 });
 

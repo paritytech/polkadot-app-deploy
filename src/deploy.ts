@@ -3162,6 +3162,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           await ownerDotns.connect({
             ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
             confirmPhoneReady: options.confirmPhoneReady,
+            phoneSigner: true, // owner path is always a real phone/session signer
           });
           const willPublish = !!(options.publish && parsed && preflightPublishNeeded !== false);
           // Wire total so confirmPhoneReady gets the right count.
@@ -3179,6 +3180,9 @@ export async function deploy(content: DeployContent, domainName: string | null =
         await dotns.connect({
           ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
           confirmPhoneReady: options.confirmPhoneReady,
+          // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
+          // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.
+          phoneSigner: phoneSignerActive,
         });
         if (phoneSignerActive) {
           dotns.setPhoneSignatureTotal(computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded).length);

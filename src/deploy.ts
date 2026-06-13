@@ -26,7 +26,8 @@ import { mirrorToGitHubPages, MirrorSkipped, pollMirrorFreshness } from "./gh-pa
 import type { MirrorResult } from "./gh-pages-mirror.js";
 import { keccak256, toBytes } from "viem";
 import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI } from "./dotns.js";
-import type { ParsedDomainName, DotnsPreflightResult } from "./dotns.js";
+import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep } from "./dotns.js";
+export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, detectTestnet } from "./pool.js";
 import type { PoolAuthorization } from "./pool.js";
@@ -2324,6 +2325,21 @@ export interface DeployOptions {
    * CLI: --contract <KEY>=<0xADDRESS> (repeatable).
    */
   contracts?: Record<string, string>;
+  /**
+   * Plan of phone signatures this deploy will need. Fired once, at preflight,
+   * BEFORE storage. Notification only; used by the CLI bin to print the
+   * "Have your phone ready" banner up front.
+   */
+  onPhoneSignaturePlan?: (steps: PhoneSignatureStep[]) => void;
+  /**
+   * Human-ready gate. Awaited immediately BEFORE each phone signature request
+   * is sent. Resolve when the human is at their phone and ready; reject/throw
+   * to abort. The per-signature operation timeout starts only AFTER this
+   * resolves. `attempt` >= 2 means a re-sign.
+   * Absent + non-TTY → fail fast (NonRetryableError).
+   * Absent + TTY → CLI bin must supply the hook; core does not readline.
+   */
+  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number }) => Promise<void>;
 }
 
 // Resolve the DeployOptions that affect DotNS authentication into the shape
@@ -2915,18 +2931,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
         }
       }
 
-      // Phone signing summary — only for a phone-backed signer (see phoneSignerActive).
+      // Phone signature plan — fire the opt-in hook at preflight, BEFORE storage.
+      // The CLI bin uses this to print the "Have your phone ready" banner up front;
+      // library consumers (playground-cli) ignore it or use their own UI.
       if (phoneSignerActive) {
         const steps = computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded);
-        if (steps.length === 1) {
-          console.log(`\nHave your phone ready — 1 signature needed (${steps[0].toLowerCase()})`);
-        } else if (steps.length > 1) {
-          const display = steps.flatMap((s, i) =>
-            s === "Register" && steps[i - 1] === "Commitment" ? ["(wait)", s] : [s]
-          );
-          console.log(`\nHave your phone ready — ${steps.length} signatures needed`);
-          console.log(`   ${display.map(s => s.toLowerCase()).join(" · ")}`);
-        }
+        options.onPhoneSignaturePlan?.(steps as PhoneSignatureStep[]);
       }
 
       // Storage provider selection: signer > mnemonic > pool (mirrors resolveDotnsConnectOptions precedence).
@@ -3151,14 +3161,11 @@ export async function deploy(content: DeployContent, domainName: string | null =
           };
           await ownerDotns.connect({
             ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
-            onPhoneSigningRequired: (label: string) => console.log(`\n   Check your phone → ${label}`),
+            confirmPhoneReady: options.confirmPhoneReady,
           });
-          // Publish (if requested) needs a second owner signature; reflect that in the
-          // heads-up so the count matches the phone taps that follow.
           const willPublish = !!(options.publish && parsed && preflightPublishNeeded !== false);
-          console.log(willPublish
-            ? `\nHave your phone ready — 2 signatures needed (link content · publish)`
-            : `\nHave your phone ready — 1 signature needed (link content)`);
+          // Wire total so confirmPhoneReady gets the right count.
+          ownerDotns.setPhoneSignatureTotal(willPublish ? 2 : 1);
           const contenthashHex = `0x${encodeContenthash(cid as string)}`;
           // #885: the owner is the PGAS-funded session account; elect PGAS for the
           // AH fee so a zero-native owner can update content faucet-free.
@@ -3171,12 +3178,11 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const dotns = new DotNS();
         await dotns.connect({
           ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
-          // Per-step "check your phone" reminder — only for a phone-backed signer
-          // (see phoneSignerActive); a transfer-mode local worker signs locally.
-          ...(phoneSignerActive
-            ? { onPhoneSigningRequired: (label: string) => console.log(`\n   Check your phone → ${label}`) }
-            : {}),
+          confirmPhoneReady: options.confirmPhoneReady,
         });
+        if (phoneSignerActive) {
+          dotns.setPhoneSignatureTotal(computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded).length);
+        }
 
         // Track whether THIS run freshly registered the name. The transfer-to-
         // signed-in-user handover below only fires on a fresh registration (#928):

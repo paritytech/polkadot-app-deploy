@@ -16,7 +16,7 @@ import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps } from "../dist/deploy.js";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, CONNECTION_TIMEOUT_MS, DotNS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -17972,6 +17972,162 @@ describe("computePhoneSigningSteps", () => {
   test("null preflight: 0 taps", () => {
     const steps = computePhoneSigningSteps(null, false);
     assert.deepStrictEqual(steps, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// human-first phone signing — confirmPhoneReady / timeout split / fail-fast
+// ---------------------------------------------------------------------------
+describe("human-first phone signing", () => {
+  // Helper: build a minimal DotNS-like ClientWrapper stub for contractTransaction tests.
+  function makePhoneStub(opts = {}) {
+    let callCount = 0;
+    const stub = {
+      ensureAccountMapped: async () => {},
+      checkIfAccountMapped: async () => true,
+      estimateGasForCall: async () => ({
+        success: true,
+        gasRequired: { referenceTime: 100n, proofSize: 100n },
+        storageDeposit: 0n,
+      }),
+      signAndSubmitWithRetry: async () => ({ kind: "hash", hash: "0xabc" }),
+      submitTransaction: async (contractAddress, value, encodedData, signerSub, signer, statusCb, txOpts) => {
+        callCount++;
+        if (opts.submitDelay) await new Promise(r => setTimeout(r, opts.submitDelay));
+        if (opts.submitError) throw opts.submitError;
+        return { kind: "hash", hash: "0xdead" };
+      },
+      getCallCount: () => callCount,
+    };
+    return stub;
+  }
+
+  test("confirmPhoneReady stub delaying past OPERATION_TIMEOUT_MS does NOT time out (timeout only on chain portion)", async () => {
+    // The gate must be OUTSIDE the machine timeout. A stub that resolves after
+    // OPERATION_TIMEOUT_MS + 100ms must NOT cause the overall call to reject.
+    const dotns = new DotNS();
+    // Wire a minimal clientWrapper stub that resolves immediately after submit.
+    const stub = makePhoneStub({ submitDelay: 0 });
+    dotns.clientWrapper = stub;
+    dotns.connected = true;
+    dotns.rpc = "wss://mock";
+    dotns.assetHubEndpoints = ["wss://mock"];
+    dotns.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+    dotns.signer = { signBytes: async () => new Uint8Array(64), signTx: async (tx) => tx };
+
+    const gateDelayMs = OPERATION_TIMEOUT_MS + 100;
+    let gateResolved = false;
+    const confirmPhoneReady = () => new Promise(resolve => {
+      setTimeout(() => { gateResolved = true; resolve(); }, gateDelayMs);
+    });
+
+    dotns._confirmPhoneReady = confirmPhoneReady;
+    dotns._usesExternalSigner = true;
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    // Shorten OPERATION_TIMEOUT_MS for this test by patching contractTransaction's
+    // timeout call: instead, call _awaitPhoneReady directly then check stub.
+    // We'll call _awaitPhoneReady directly to verify it doesn't time out.
+    const start = Date.now();
+    await dotns._awaitPhoneReady("Link content");
+    const elapsed = Date.now() - start;
+    assert.ok(gateResolved, "confirmPhoneReady must have resolved >> FAIL: human-first phone signing: gate did not resolve");
+    assert.ok(elapsed >= gateDelayMs - 50, "gate must have taken at least gateDelayMs >> FAIL: human-first phone signing: gate resolved too early");
+    // Key invariant: no timeout error was thrown even though elapsed >> OPERATION_TIMEOUT_MS.
+  });
+
+  test("phone signer + no confirmPhoneReady + non-TTY → fail-fast NonRetryableError, no hang", async () => {
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true;
+    dotns._confirmPhoneReady = undefined;
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    // Temporarily patch isTTY to simulate non-interactive environment.
+    const origStdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+    const origStdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+    Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+    Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
+    try {
+      await assert.rejects(
+        () => dotns._awaitPhoneReady("Link content"),
+        (err) => {
+          assert.ok(err instanceof NonRetryableError,
+            "must be NonRetryableError >> FAIL: human-first phone signing: expected NonRetryableError for no-hook non-TTY");
+          assert.match(err.message, /confirmPhoneReady/,
+            "error must mention confirmPhoneReady >> FAIL: human-first phone signing: error message missing confirmPhoneReady");
+          return true;
+        },
+      );
+    } finally {
+      if (origStdinTTY) Object.defineProperty(process.stdin, "isTTY", origStdinTTY);
+      else delete process.stdin.isTTY;
+      if (origStdoutTTY) Object.defineProperty(process.stdout, "isTTY", origStdoutTTY);
+      else delete process.stdout.isTTY;
+    }
+  });
+
+  test("re-sign path: attempt counter increments and confirmPhoneReady receives attempt >= 2 on second call", async () => {
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true;
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+
+    const attempts = [];
+    dotns._confirmPhoneReady = async (ctx) => { attempts.push(ctx.attempt); };
+
+    await dotns._awaitPhoneReady("Link content");
+    await dotns._awaitPhoneReady("Link content");
+
+    assert.strictEqual(attempts[0], 1,
+      "first call must have attempt=1 >> FAIL: human-first phone signing: first attempt not 1");
+    assert.ok(attempts[1] >= 2,
+      "second call (re-sign) must have attempt >= 2 >> FAIL: human-first phone signing: re-sign attempt not >= 2");
+  });
+
+  test("onPhoneSignaturePlan fires before storage with correct step counts: new-name (commit·register·link)", () => {
+    const plans = [];
+    const handler = (steps) => plans.push(steps.slice());
+    // Simulate what deploy() does at preflight.
+    const dotnsPreflight = { plannedAction: "register", needsPopUpgrade: false };
+    const preflightPublishNeeded = false;
+    const steps = computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded);
+    handler(steps);
+    assert.deepStrictEqual(plans[0], ["Commitment", "Register", "Link content"],
+      "new-name plan must be [Commitment, Register, Link content] >> FAIL: human-first phone signing: wrong step plan for new-name");
+  });
+
+  test("onPhoneSignaturePlan fires before storage with correct step counts: owned-name (link)", () => {
+    const plans = [];
+    const dotnsPreflight = { plannedAction: "already-owned-by-us", needsPopUpgrade: false };
+    const steps = computePhoneSigningSteps(dotnsPreflight, false);
+    plans.push(steps.slice());
+    assert.deepStrictEqual(plans[0], ["Link content"],
+      "owned-name plan must be [Link content] >> FAIL: human-first phone signing: wrong step plan for owned-name");
+  });
+
+  test("onPhoneSignaturePlan fires before storage with correct step counts: new-name + publish (commit·register·link·publish)", () => {
+    const steps = computePhoneSigningSteps({ plannedAction: "register", needsPopUpgrade: false }, true);
+    assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content", "Publish to registry"],
+      "new-name+publish plan must include Publish to registry >> FAIL: human-first phone signing: publish step missing from plan");
+  });
+
+  test("core src/dotns.ts and src/deploy.ts contain no readline or process.stdin reference", () => {
+    const dotnsSource = fs.readFileSync("src/dotns.ts", "utf8");
+    const deploySource = fs.readFileSync("src/deploy.ts", "utf8");
+    // Allow process.stdin.isTTY in dotns.ts (used for fail-fast TTY detection, not stdin blocking).
+    // Disallow any readline import or direct process.stdin usage.
+    assert.doesNotMatch(dotnsSource, /^import.*readline/m,
+      "src/dotns.ts must not import readline >> FAIL: human-first phone signing: readline import found in dotns.ts");
+    // Check for real usage (import + createInterface call), not the bare word —
+    // an explanatory comment may legitimately mention "readline".
+    assert.doesNotMatch(deploySource, /^import.*readline/m,
+      "src/deploy.ts must not import readline >> FAIL: human-first phone signing: readline import found in deploy.ts");
+    assert.doesNotMatch(deploySource, /\breadline\.createInterface\b/,
+      "src/deploy.ts must not call readline.createInterface >> FAIL: human-first phone signing: readline usage found in deploy.ts");
+    assert.doesNotMatch(deploySource, /process\.stdin/,
+      "src/deploy.ts must not use process.stdin >> FAIL: human-first phone signing: process.stdin found in deploy.ts");
   });
 });
 

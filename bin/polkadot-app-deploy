@@ -13,6 +13,7 @@ import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../di
 import { loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
 import { loadEnvironments, listEnvironments, formatEnvironmentTable, DEFAULT_ENV_ID } from "../dist/environments.js";
 import * as fs from "fs";
+import * as readline from "readline";
 
 // Install early so anything printed during flag parsing / preflight is
 // available to the bug-report log tail.
@@ -475,6 +476,41 @@ try {
     publish: flags.publish,
     failOnPublishError: flags.failOnPublishError,
     transferToSignedInUser: !flags.noTransferToSignedinUser,
+    // Human-first phone signing hooks (spec: 2026-06-13-human-first-phone-signing-design).
+    onPhoneSignaturePlan: (steps) => {
+      if (steps.length === 1) {
+        console.log(`\nHave your phone ready — 1 signature needed (${steps[0].toLowerCase()})`);
+      } else if (steps.length > 1) {
+        const display = steps.flatMap((s, i) =>
+          s === "Register" && steps[i - 1] === "Commitment" ? ["(wait)", s] : [s]
+        );
+        console.log(`\nHave your phone ready — ${steps.length} signatures needed`);
+        console.log(`   ${display.map(s => s.toLowerCase()).join(" · ")}`);
+      }
+    },
+    confirmPhoneReady: ({ label, attempt }) => new Promise((resolve, reject) => {
+      if (attempt >= 2) {
+        console.log(`\n   Re-sign needed (attempt ${attempt}) — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
+      } else {
+        console.log(`\n   Check your phone → ${label}`);
+        console.log(`   Press Y when ready (Ctrl-C to abort):`);
+      }
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      let settled = false;
+      const settle = (fn) => { if (!settled) { settled = true; rl.close(); fn(); } };
+      rl.on("close", () => settle(reject.bind(null, new Error("aborted by user"))));
+      const ask = () => {
+        rl.question("   > ", (line) => {
+          const answer = line.trim().toLowerCase();
+          if (answer === "y" || answer === "") {
+            settle(resolve);
+          } else {
+            ask();
+          }
+        });
+      };
+      ask();
+    }),
   });
 
   const output = process.env.GITHUB_OUTPUT;

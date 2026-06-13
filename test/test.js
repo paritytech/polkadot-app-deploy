@@ -18037,28 +18037,30 @@ describe("human-first phone signing", () => {
     // Key invariant: no timeout error was thrown even though elapsed >> OPERATION_TIMEOUT_MS.
   });
 
-  test("phone signer + no confirmPhoneReady + non-TTY → fail-fast NonRetryableError, no hang", async () => {
+  test("external signer + no confirmPhoneReady + non-TTY → must NOT throw (gate is opt-in only; in-process signers need no phone gate)", async () => {
+    // Regression guard: rc.1 introduced a fail-fast that threw NonRetryableError for any
+    // _usesExternalSigner call with no confirmPhoneReady hook in a non-TTY. This broke
+    // S-ext-signer and S9 (injected PolkadotSigner / mnemonic) because _usesExternalSigner
+    // cannot distinguish phone signers from in-process external signers.
+    // The gate must be purely opt-in: absent confirmPhoneReady → proceed, never throw.
     const dotns = new DotNS();
     dotns._usesExternalSigner = true;
     dotns._confirmPhoneReady = undefined;
     dotns._phoneSignatureTotal = 1;
     dotns._phoneSignatureAttempts = new Map();
 
-    // Temporarily patch isTTY to simulate non-interactive environment.
+    // Temporarily patch isTTY to simulate non-interactive environment (CI / E2E).
     const origStdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
     const origStdoutTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
     Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
     Object.defineProperty(process.stdout, "isTTY", { value: false, configurable: true });
     try {
-      await assert.rejects(
-        () => dotns._awaitPhoneReady("Link content"),
-        (err) => {
-          assert.ok(err instanceof NonRetryableError,
-            "must be NonRetryableError >> FAIL: human-first phone signing: expected NonRetryableError for no-hook non-TTY");
-          assert.match(err.message, /confirmPhoneReady/,
-            "error must mention confirmPhoneReady >> FAIL: human-first phone signing: error message missing confirmPhoneReady");
-          return true;
-        },
+      // Must resolve without throwing — no hook + non-TTY is a valid state for in-process signers.
+      await dotns._awaitPhoneReady("Link content");
+      // If we reach here the gate did not throw — correct behavior.
+    } catch (err) {
+      assert.fail(
+        `_awaitPhoneReady must not throw when no confirmPhoneReady hook is provided — got ${err.constructor.name}: ${err.message} >> FAIL: human-first phone signing: opt-in gate threw for in-process external signer`,
       );
     } finally {
       if (origStdinTTY) Object.defineProperty(process.stdin, "isTTY", origStdinTTY);

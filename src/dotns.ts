@@ -3369,26 +3369,22 @@ export class DotNS {
    *
    * Behaviour:
    * - confirmPhoneReady provided → await it (counts re-signs via attempt map).
-   * - not provided + non-TTY → fail fast (NonRetryableError).
-   * - not provided + TTY → no-op (bin must have supplied the hook; if it did
-   *   not, the caller proceeds without a gate — backward-compat for library
-   *   consumers that supply neither hook nor TTY check).
+   * - not provided → proceed without a gate (opt-in only; an in-process
+   *   external signer, e.g. injected PolkadotSigner or mnemonic, needs no
+   *   phone gate — _usesExternalSigner alone cannot distinguish phone from
+   *   in-process).
    * After the gate resolves, fires onPhoneSigningRequired (the "check your
    * phone" notification) so the user knows the request is now being sent.
    */
   private async _awaitPhoneReady(label: string): Promise<void> {
-    if (!this._usesExternalSigner) return; // only phone signers need the gate
+    if (!this._usesExternalSigner) return; // only external signers need the gate
     const attempt = (this._phoneSignatureAttempts.get(label) ?? 0) + 1;
     this._phoneSignatureAttempts.set(label, attempt);
     if (this._confirmPhoneReady) {
       await this._confirmPhoneReady({ label, attempt, total: this._phoneSignatureTotal });
-    } else if (!(process.stdout.isTTY && process.stdin.isTTY)) {
-      throw new NonRetryableError(
-        "phone signer active but no confirmPhoneReady hook provided and not running in a TTY — " +
-        "re-run interactively or provide the confirmPhoneReady option",
-      );
     }
-    // TTY + no hook → proceed; bin always supplies the hook for the CLI path.
+    // No hook → proceed; in-process external signers (injected PolkadotSigner,
+    // mnemonic) need no human gate. Phone signers must supply confirmPhoneReady.
     // Fire "check your phone" notification AFTER gate resolves, immediately
     // before the chain request goes out.
     this._onPhoneSigningRequired?.(label);

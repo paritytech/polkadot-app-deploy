@@ -3161,7 +3161,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           };
           await ownerDotns.connect({
             ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
-            ...(options.confirmPhoneReady ? { confirmPhoneReady: options.confirmPhoneReady } : {}),
+            confirmPhoneReady: options.confirmPhoneReady,
           });
           const willPublish = !!(options.publish && parsed && preflightPublishNeeded !== false);
           // Wire total so confirmPhoneReady gets the right count.
@@ -3178,7 +3178,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const dotns = new DotNS();
         await dotns.connect({
           ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
-          ...(options.confirmPhoneReady ? { confirmPhoneReady: options.confirmPhoneReady } : {}),
+          confirmPhoneReady: options.confirmPhoneReady,
         });
         if (phoneSignerActive) {
           dotns.setPhoneSignatureTotal(computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded).length);

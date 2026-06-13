@@ -63,11 +63,6 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    */
   onPhoneSigningRequired?: (label: string) => void;
   /**
-   * Plan of phone signatures this deploy will need. Fired once, at preflight,
-   * BEFORE any long work. Notification only; no awaiting.
-   */
-  onPhoneSignaturePlan?: (steps: PhoneSignatureStep[]) => void;
-  /**
    * Human-ready gate. Awaited immediately BEFORE each phone signature request
    * is sent. Resolve when the human is at their phone and ready; reject/throw
    * to abort. The per-signature operation timeout starts only AFTER this
@@ -3405,7 +3400,7 @@ export class DotNS {
     this._onPhoneSigningRequired = undefined;
     this._confirmPhoneReady = undefined;
     this._phoneSignatureTotal = 0;
-    this._phoneSignatureAttempts = new Map();
+    this._phoneSignatureAttempts.clear();
   }
 }
 

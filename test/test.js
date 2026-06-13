@@ -18453,3 +18453,33 @@ describe("chooseSignerInput Layer-3 isolation (#19)", () => {
       ">> FAIL: chooseSignerInput Layer-3: mnemonic must always choose mnemonic path");
   });
 });
+
+// ---------------------------------------------------------------------------
+// localStorage warning suppression — real bin spawn (#35)
+// The prior fix installed the process.emitWarning suppressor inline in
+// bin/polkadot-app-deploy, but inline code runs AFTER static ESM imports are
+// evaluated. The "@parity/product-sdk-logger" module accesses localStorage at
+// module-init time, which fires the warning during `import "../dist/deploy.js"`
+// — before the inline suppressor exists. The fix: install the suppressor in a
+// separate module imported FIRST so it runs before any SDK module-init code.
+// This test spawns the real built bin (not a synthetic re-emit) to cover the
+// import-order timing gap that the prior in-isolation test missed.
+// ---------------------------------------------------------------------------
+describe("localStorage warning suppression (real bin)", () => {
+  // Use --list-environments, not --version. --version calls process.exit(0) synchronously
+  // before the nextTick-queued warning can flush; --list-environments does an await
+  // (loadEnvironments) before exit, which drains the nextTick and surfaces the warning
+  // if the suppressor was not installed before the SDK module-init code ran.
+  test("polkadot-app-deploy --list-environments emits no localStorage warning on stderr", () => {
+    const binPath = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkadot-app-deploy");
+    const result = spawnSync(process.execPath, [binPath, "--list-environments"], {
+      encoding: "utf8",
+      env: { ...process.env, PAD_TELEMETRY: "0", PAD_UPDATE_CHECK: "0" },
+      timeout: 15000,
+    });
+    assert.ok(
+      !/local ?storage/i.test(result.stderr ?? ""),
+      `>> FAIL: localStorage warning suppression: polkadot-app-deploy --list-environments must not emit a localStorage warning on stderr.\nActual stderr: ${result.stderr}`,
+    );
+  });
+});

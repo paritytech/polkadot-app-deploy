@@ -10411,6 +10411,26 @@ describe("incremental-stats v3 summary", () => {
     assert.match(src, /Trusted: \$\{trustedCount\} chunks skipped without re-probe \(chunks /);
   });
 
+  test("storeChunkedContent counter never exceeds total on reconnect retries (#932 regression guard)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // On connection-error retries the same chunk index re-enters the batch loop.
+    // uploadEmittedIndices guards against double-counting: only increment
+    // uploadEmitted the first time a given chunk index is submitted.
+    assert.match(src, /uploadEmittedIndices/,
+      ">> FAIL: #932 guard: uploadEmittedIndices Set must exist to prevent counter overrun on retry");
+    assert.match(src, /uploadEmittedIndices\.has\(i\)/,
+      ">> FAIL: #932 guard: must check uploadEmittedIndices.has(i) before incrementing uploadEmitted");
+  });
+
+  test("already-owned-by-recipient preflight prints owner-phone note (#983 regression guard)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // When a name is already owned by the signed-in recipient, the DotNS phase
+    // re-acquires the owner's session signer and triggers a phone tap. The preflight
+    // section must print a note so the user isn't surprised by the phone prompt.
+    assert.match(src, /already-owned-by-recipient.*DotNS signer.*owner|DotNS signer.*owner.*already-owned-by-recipient/s,
+      ">> FAIL: #983 guard: preflight must emit 'DotNS signer: owner…' note when plannedAction=already-owned-by-recipient");
+  });
+
   test("Upload line appears when chunksUploaded > 0 (#510 regression guard)", () => {
     // Regression for the chunksUploaded=0 bug: with Phase A + Phase B coords
     // combined, a deploy that uploads any chunk must emit an Upload: line.
@@ -17924,6 +17944,41 @@ describe("makeRetryStatusFilter", () => {
       `>> FAIL: makeRetryStatusFilter: finalized must reach sink — received: ${JSON.stringify(received)}`
     );
   });
+
+  test("deduplicates 'included': repeated txBestBlocksState found=true events emit 'included' only once (#891)", () => {
+    // papi's txBestBlocksState subscription can emit found=true multiple times as
+    // the tx appears/reappears across best-block updates. Without dedup the status
+    // line would print twice (one per emit).
+    const received = [];
+    const filter = makeRetryStatusFilter((s) => received.push(s));
+    filter.callback("signing");
+    filter.callback("broadcasting");
+    filter.callback("included"); // first txBestBlocksState found=true
+    filter.callback("included"); // second txBestBlocksState found=true (reorg/reappear)
+    filter.callback("finalized");
+    assert.deepStrictEqual(
+      received,
+      ["signing", "broadcasting", "included", "finalized"],
+      `>> FAIL: makeRetryStatusFilter #891: duplicate 'included' must be deduplicated — received: ${JSON.stringify(received)}`
+    );
+  });
+
+  test("'included' dedup resets on reset(): a new attempt can emit 'included' again (#891)", () => {
+    const received = [];
+    const filter = makeRetryStatusFilter((s) => received.push(s));
+    // Attempt 1: included (then fails, retried)
+    filter.callback("included");
+    filter.callback("failed");
+    filter.reset();
+    // Attempt 2: included again (new attempt — must pass through)
+    filter.callback("included");
+    filter.callback("finalized");
+    const includedCount = received.filter((s) => s === "included").length;
+    assert.strictEqual(
+      includedCount, 2,
+      `>> FAIL: makeRetryStatusFilter #891: after reset(), 'included' on a new attempt must pass through — received: ${JSON.stringify(received)}`
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -18647,6 +18702,17 @@ describe("formatStorageSignerLine (user-first storage signer, #19)", () => {
     const line = formatStorageSignerLine(null, "allowance declined");
     assert.match(line, /pool fallback.*allowance declined/,
       ">> FAIL: formatStorageSignerLine pool-reason: must include the provided reason");
+  });
+
+  test("transfer mode reason → 'pool fallback (transfer mode …)' (not '(no session)') (#892)", () => {
+    // In transfer mode the worker is a local signer; the user IS logged in but
+    // resolvedUserSession is null for storage purposes. The reason string must
+    // mention transfer mode, not "(no session)", to avoid misleading a logged-in user.
+    const line = formatStorageSignerLine(null, "transfer mode — worker signs storage");
+    assert.match(line, /pool fallback.*transfer mode/,
+      ">> FAIL: formatStorageSignerLine #892: transfer-mode reason must appear in the output");
+    assert.doesNotMatch(line, /no session/,
+      ">> FAIL: formatStorageSignerLine #892: transfer-mode line must NOT say 'no session'");
   });
 });
 

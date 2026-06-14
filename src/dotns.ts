@@ -332,6 +332,12 @@ export function shouldRetryTxAttempt(
  *  through immediately. Call `reset()` at the top of each retry attempt to
  *  discard a buffered "failed" from the previous attempt.
  *
+ *  Also deduplicates "included": papi's txBestBlocksState subscription can fire
+ *  with found=true multiple times (tx can appear/reappear across best-block
+ *  updates), so without dedup the status line prints twice (#891). "included" is
+ *  passed through only once per attempt; reset() clears the seen flag so the
+ *  next attempt can emit it again if it succeeds through a different path.
+ *
  *  Closes two leak paths (issue #704):
  *  1. Retry-recovered: attempt N emits "failed" before throwing; a later attempt
  *     succeeds → reset() at the top of the next iteration discards the buffer,
@@ -346,13 +352,18 @@ export function makeRetryStatusFilter(sink: (status: string) => void): {
   reset: () => void;
 } {
   let buffered = false;
+  let includedSeen = false;
   return {
     callback: (status: string) => {
       if (status === "failed") { buffered = true; return; }
+      if (status === "included") {
+        if (includedSeen) return; // deduplicate: txBestBlocksState can fire multiple times
+        includedSeen = true;
+      }
       sink(status);
     },
     flush: () => { if (buffered) sink("failed"); },
-    reset: () => { buffered = false; },
+    reset: () => { buffered = false; includedSeen = false; },
   };
 }
 

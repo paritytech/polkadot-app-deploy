@@ -952,6 +952,11 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     // reconnect path only re-tries existing stored[]===null entries; it never
     // introduces new ones, so this value is stable across reconnects.
     const uploadTotal = stored.filter((s) => s === null).length;
+    // uploadEmittedIndices tracks which chunk indices have already been counted
+    // in the [N/M] progress line. On connection-error retries the same chunk
+    // index re-enters the batch loop — without this guard uploadEmitted would
+    // exceed uploadTotal (e.g. [3/2], [4/2] …) (#932).
+    const uploadEmittedIndices = new Set<number>();
     let uploadEmitted = 0;
     const nonceAdvanceIndices = new Set<number>();
 
@@ -978,8 +983,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       const batchPromises = batchChunks.map((chunkData: Uint8Array, j: number) => {
         const i = batchIndices[j];
         const nonce = assignedNonces.get(i)!;
-        uploadEmitted++;
-        console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})`);
+        const isRetry = uploadEmittedIndices.has(i);
+        if (!isRetry) { uploadEmittedIndices.add(i); uploadEmitted++; }
+        console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
         return storeChunk(unsafeApi, signer as PolkadotSigner, chunkData, nonce, ss58 as string, { fetchNonce: fetchNonceOverride });
       });
 
@@ -2771,7 +2777,16 @@ export async function deploy(content: DeployContent, domainName: string | null =
       options = { ...options, storageSigner: slotResult.signer, storageSignerAddress: slotResult.slotAddress };
       console.log(formatStorageSignerLine(slotResult.slotAddress, undefined, slotResult.owned));
     } else {
-      console.log(formatStorageSignerLine(null, resolvedUserSession ? "no allowance" : undefined));
+      // In transfer mode the worker is a local/dev signer; the login session (if
+      // any) is only used to derive the recipient H160 and is never wired into the
+      // Bulletin storage path. So resolvedUserSession is null even when the user IS
+      // signed in — don't say "(no session)" in that case (#892).
+      const storageFailReason = resolvedUserSession
+        ? "no allowance"
+        : options.transferTo
+          ? "transfer mode — worker signs storage"
+          : undefined;
+      console.log(formatStorageSignerLine(null, storageFailReason));
     }
   }
 
@@ -2922,6 +2937,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
           const fromName = popStatusName(dotnsPreflight.userStatus);
           console.log(`   Your PoP: ${fromName}`);
           console.log(`   Domain: ${alreadyOwned ? "owned by you" : "available"}`);
+          // #983: the Worker/Storage header above reflects the storage/worker path
+          // only. On an already-owned name the DotNS phase re-acquires the owner's
+          // session signer (not the dev worker), so a phone tap will be needed for
+          // the content-link step. Make this clear at preflight so the user isn't
+          // surprised when the phone prompt appears.
+          if (dotnsPreflight.plannedAction === "already-owned-by-recipient") {
+            console.log(`   DotNS signer: owner identity (phone signature required for content update)`);
+          }
         }
 
         if (!dotnsPreflight.canProceed) {

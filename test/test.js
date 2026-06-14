@@ -18276,11 +18276,20 @@ describe("deploy.ts worker banner (issue 1 — owned-domain 'will transfer' remo
     );
   });
 
-  test("deploy.ts source contains 'final owner' wording in the worker banner (replacement present)", () => {
+  test("deploy.ts worker banner states only the storage role, not a transfer/owner claim (#60)", () => {
+    // Supersedes the earlier "final owner" wording: the up-front banner prints
+    // before preflight knows ownership, so it must claim neither a transfer nor a
+    // final owner — only the worker's certain role. The transfer-vs-owned reality
+    // is announced at preflight via formatTransferModeDotnsLine (#60).
     const src = fs.readFileSync("src/deploy.ts", "utf8");
     assert.ok(
-      src.includes("final owner"),
-      "Expected 'final owner' wording in src/deploy.ts worker banner (replacement for 'will transfer') >> FAIL: Issue 1 banner replacement not found"
+      src.includes("signs Bulletin storage"),
+      ">> FAIL: #60: worker banner must state only the storage role ('signs Bulletin storage')"
+    );
+    const bannerLine = src.match(/console\.log\(`   Worker: \$\{actors\.worker\.source\} signer \$\{actors\.worker\.address\}[^`]*`\)/);
+    assert.ok(
+      bannerLine && !bannerLine[0].includes("final owner") && !bannerLine[0].includes("will transfer"),
+      ">> FAIL: #60: worker banner must not claim a transfer or a final owner (ownership is unknown at banner time)"
     );
   });
 });

@@ -10482,13 +10482,18 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: #932 guard: must check uploadEmittedIndices.has(i) before incrementing uploadEmitted");
   });
 
-  test("already-owned-by-recipient preflight prints owner-phone note (#983 regression guard)", () => {
+  test("owned-name update preflight announces the owner phone signature; header drops the transfer claim (#60 regression guard)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // When a name is already owned by the signed-in recipient, the DotNS phase
-    // re-acquires the owner's session signer and triggers a phone tap. The preflight
-    // section must print a note so the user isn't surprised by the phone prompt.
-    assert.match(src, /already-owned-by-recipient.*DotNS signer.*owner|DotNS signer.*owner.*already-owned-by-recipient/s,
-      ">> FAIL: #983 guard: preflight must emit 'DotNS signer: owner…' note when plannedAction=already-owned-by-recipient");
+    // When a name is already owned, the DotNS content update is signed by the
+    // owner's phone. The preflight must announce this — via formatTransferModeDotnsLine,
+    // whose already-owned branch says "needs your phone signature (no transfer)" —
+    // so the user isn't surprised by the phone prompt (#60). The up-front worker
+    // header no longer claims a transfer (it prints before ownership is known);
+    // it states only the worker's storage role.
+    assert.match(src, /formatTransferModeDotnsLine\(alreadyOwned,/,
+      ">> FAIL: #60 guard: preflight must call formatTransferModeDotnsLine(alreadyOwned, …) so an owned update announces the owner phone signature");
+    assert.match(src, /signs Bulletin storage/,
+      ">> FAIL: #60 guard: the transfer-mode worker header must state only the storage role ('signs Bulletin storage'), not a definite transfer");
   });
 
   test("Upload line appears when chunksUploaded > 0 (#510 regression guard)", () => {
@@ -18456,11 +18461,20 @@ describe("deploy.ts worker banner (issue 1 — owned-domain 'will transfer' remo
     );
   });
 
-  test("deploy.ts source contains 'final owner' wording in the worker banner (replacement present)", () => {
+  test("deploy.ts worker banner states only the storage role, not a transfer/owner claim (#60)", () => {
+    // Supersedes the earlier "final owner" wording: the up-front banner prints
+    // before preflight knows ownership, so it must claim neither a transfer nor a
+    // final owner — only the worker's certain role. The transfer-vs-owned reality
+    // is announced at preflight via formatTransferModeDotnsLine (#60).
     const src = fs.readFileSync("src/deploy.ts", "utf8");
     assert.ok(
-      src.includes("final owner"),
-      "Expected 'final owner' wording in src/deploy.ts worker banner (replacement for 'will transfer') >> FAIL: Issue 1 banner replacement not found"
+      src.includes("signs Bulletin storage"),
+      ">> FAIL: #60: worker banner must state only the storage role ('signs Bulletin storage')"
+    );
+    const bannerLine = src.match(/console\.log\(`   Worker: \$\{actors\.worker\.source\} signer \$\{actors\.worker\.address\}[^`]*`\)/);
+    assert.ok(
+      bannerLine && !bannerLine[0].includes("final owner") && !bannerLine[0].includes("will transfer"),
+      ">> FAIL: #60: worker banner must not claim a transfer or a final owner (ownership is unknown at banner time)"
     );
   });
 });
@@ -18726,7 +18740,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine } from "../dist/deploy.js";
 
 describe("resolveStorageSigner (user-first storage signer, #19)", () => {
   const fakeSigner = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) };
@@ -18898,6 +18912,30 @@ describe("formatStorageSignerLine (user-first storage signer, #19)", () => {
       ">> FAIL: formatStorageSignerLine #892: transfer-mode reason must appear in the output");
     assert.doesNotMatch(line, /no session/,
       ">> FAIL: formatStorageSignerLine #892: transfer-mode line must NOT say 'no session'");
+  });
+});
+
+describe("formatTransferModeDotnsLine (transfer-vs-owned announcement, #60)", () => {
+  const RECIP = "0xb646bc6e0000000000000000000000000000beef";
+
+  test("new name → 'will register … and transfer it to your account <recipient>'", () => {
+    const line = formatTransferModeDotnsLine(false, "example.dot", RECIP);
+    assert.match(line, /will register example\.dot and transfer it to your account/,
+      ">> FAIL: formatTransferModeDotnsLine new-name: must say it will register + transfer the name");
+    assert.ok(line.includes(RECIP),
+      ">> FAIL: formatTransferModeDotnsLine new-name: must name the recipient account");
+  });
+
+  test("already owned → 'you already own … phone signature (no transfer)' and names no recipient/transfer-to", () => {
+    const line = formatTransferModeDotnsLine(true, "example.dot", RECIP);
+    assert.match(line, /you already own example\.dot/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must say the user already owns the name");
+    assert.match(line, /phone signature/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must state a phone signature is needed for the update");
+    assert.match(line, /no transfer/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must make clear no transfer happens (#60)");
+    assert.doesNotMatch(line, /will register|transfer it to/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must NOT imply a register/transfer for an already-owned name (the #60 bug)");
   });
 });
 

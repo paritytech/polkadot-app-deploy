@@ -968,7 +968,14 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       // before submitting any chunks against the destroyed one.
       if (wsHaltDetected && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
         wsHaltDetected = false;
-        await doReconnect();
+        // doReconnectAndRebase (not bare doReconnect): this guard runs *before*
+        // the assignedNonces submission loop below, so a pool-account rotation
+        // here must rebase assignedNonces to the new account's nonce base —
+        // else chunks submit with stale old-account nonces (isValid:false), which
+        // is not a connection error so the per-failure retry never reconnects and
+        // the consumed-heuristic false-"includes" never-stored chunks (#32).
+        // Return value unused: no in-flight chunks at the loop top, only the rebase matters.
+        await doReconnectAndRebase();
       }
       const batchSize = reconnectionsUsed > 0 ? BATCH_SIZE_RECOVERY : BATCH_SIZE_INITIAL;
       // Only submit chunks that haven't been stored yet (relevant after reconnection)

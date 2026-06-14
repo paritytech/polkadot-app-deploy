@@ -15,7 +15,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler } from "../dist/deploy.js";
+import { WsEvent } from "polkadot-api/ws";
 import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
@@ -11385,6 +11386,76 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
     const submittedAfterRotation = capturedNonces.filter(n => n != null).length;
     assert.ok(submittedAfterRotation >= 2,
       `>> FAIL: #951 consumed-heuristic: cross-account rotation must not silently "include" chunks; expected ≥2 real submissions after rotation, got ${submittedAfterRotation}`);
+  });
+
+  // Test 3 (#32): the PROACTIVE between-batches WS-halt guard (top of the batch
+  // loop) must ALSO rebase on rotation. Before the fix it called doReconnect()
+  // directly (not doReconnectAndRebase), so a rotation there left assignedNonces
+  // keyed to the OLD account → the next batch submitted stale old-account nonces
+  // (isValid:false). Since that's NOT a connection error, the per-failure retry
+  // never reconnects and the consumed-heuristic false-positives. Unlike #951's
+  // tests (connection-error path), this drives the halt via the real Bulletin
+  // status handler firing a WS ERROR between batches with no chunk error.
+  test("between-batches WS-halt guard rebases nonces on account rotation (#32)", async () => {
+    const noncesA = [];
+    const noncesB = [];
+    let target = noncesA; // submissions land on A until reconnect rotates to B
+    let halted = false;
+
+    const makeApi = () => ({
+      query: {
+        TransactionStorage: {
+          Authorizations: {
+            getValue: async () => ({
+              extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
+              expiration: 9_999_999,
+            }),
+          },
+        },
+        System: { Number: { getValue: async () => 1000 } },
+      },
+      apis: { BulletinTransactionStorageApi: { can_store: async () => true } },
+      tx: {
+        TransactionStorage: {
+          store_with_cid_config: () => ({
+            signSubmitAndWatch: (_signer, opts) => {
+              target.push(opts?.nonce);
+              if (!halted) {
+                halted = true;
+                // Real wiring: a WS ERROR fires the registered _onWsHalt callback.
+                makeBulletinStatusHandler("wss://primary")({ type: WsEvent.ERROR });
+              }
+              return normalSubscribable();
+            },
+          }),
+        },
+      },
+    });
+
+    let fetchCalls = 0;
+    const fetchNonce = async () => { fetchCalls++; return fetchCalls === 1 ? 100 : 3249; };
+
+    const reconnect = async () => {
+      target = noncesB; // post-rotation submissions land on account B
+      return { client: { destroy() {} }, unsafeApi: makeApi(), signer: stubSigner, ss58: ACCOUNT_B };
+    };
+
+    // 3 chunks → batch 1 = {0,1} (halt fires here), batch 2 = {2} after the guard reconnects.
+    await storeChunkedContent([new Uint8Array([0x01]), new Uint8Array([0x02]), new Uint8Array([0x03])], {
+      client: { destroy() {} },
+      unsafeApi: makeApi(),
+      signer: stubSigner,
+      ss58: ACCOUNT_A,
+      reconnect,
+      fetchNonce,
+    });
+
+    assert.ok(halted, ">> FAIL: #32: WS halt was never fired — between-batches guard not exercised");
+    assert.ok(noncesB.length >= 1,
+      `>> FAIL: #32: expected ≥1 submission on account B after the between-batches guard reconnected; got [${noncesB.join(", ")}]`);
+    const stale = noncesB.filter(n => n != null && n < 3249);
+    assert.deepStrictEqual(stale, [],
+      `>> FAIL: #32: the between-batches WS-halt guard must rebase assignedNonces on rotation — post-rotation submissions must use account B's base (≥3249), not stale account-A nonces; got [${noncesB.join(", ")}]`);
   });
 });
 

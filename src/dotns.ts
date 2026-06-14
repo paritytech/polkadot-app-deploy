@@ -265,6 +265,10 @@ export const WS_HEARTBEAT_TIMEOUT_MS: number = 300_000;
 // concurrent jobs off the same retry tick), NOT more attempts: the old loop retried
 // back-to-back with zero delay, so the burst re-collided on the same nonce each time.
 export const DOTNS_TX_MAX_ATTEMPTS: number = 3;
+// Chain-time budget for verifyEffect polling loops. 60s gives a phone-signed tx
+// more patience before declaring "not observable" — reducing spurious retries
+// that would demand an extra phone tap (#38). Non-phone paths benefit too.
+export const VERIFY_EFFECT_CHAIN_SECONDS: number = 60;
 
 /**
  * Thrown by signAndSubmitExtrinsic when the transaction watcher goes silent
@@ -325,6 +329,17 @@ export function shouldRetryTxAttempt(
   decision: "retry" | "abort",
 ): boolean {
   return decision === "retry" && attempt < maxAttempts;
+}
+
+/**
+ * Whether to pause for the human-ready gate before a retry RE-SIGN (#39).
+ * Only a phone/session signer re-sign needs another tap, so the re-gate fires
+ * only on attempt ≥ 2 (a re-sign, not the first sign) AND when the signer is a
+ * phone signer. Local/dev workers re-sign locally and must NOT pause. Pure so
+ * the decision is unit-testable without driving a real retry.
+ */
+export function shouldRegateBeforeResign(attempt: number, isPhoneSigner: boolean | undefined): boolean {
+  return attempt >= 2 && isPhoneSigner === true;
 }
 
 /** Wraps `sink` so that "failed" status events are buffered and only forwarded
@@ -1140,11 +1155,18 @@ class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
       filter.reset(); // discard any buffered "failed" from the previous attempt
+      // Re-gate before each retry re-sign: a phone signer needs the human-ready
+      // gate on EVERY sign, not just the first. Without this, a verifyEffect
+      // false-negative triggers a silent re-sign — unexpected extra phone tap
+      // with no "check your phone" reminder (#39).
+      if (shouldRegateBeforeResign(attempt, opts.isPhoneSigner)) {
+        await opts.onResign?.(attempt);
+      }
       try {
         // Rebuilt + re-signed each attempt → papi reads a fresh on-chain nonce
         // (retries never reuse the stale one).
@@ -1225,7 +1247,7 @@ class ReviveClientWrapper {
     signerSubstrateAddress: string,
     signer: PolkadotSigner,
     statusCallback: (status: string) => void,
-    { rpcs, useNoncePolling, functionName, args, contracts, verifyEffect, feeAsset, isPhoneSigner }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean },
+    { rpcs, useNoncePolling, functionName, args, contracts, verifyEffect, feeAsset, isPhoneSigner, onResign }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> },
   ): Promise<TxResolution> {
     await this.ensureAccountMapped(signerSubstrateAddress, signer);
     // For register specifically, re-check mapping immediately before the dry-run.
@@ -1262,7 +1284,7 @@ class ReviveClientWrapper {
       "chain.tx.submit",
       `sign+submit ${functionName ?? "Revive.call"}`,
       { "chain.function_name": functionName ?? "Revive.call", "chain.use_nonce_polling": Boolean(useNoncePolling) },
-      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner }),
+      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner, onResign }),
     );
   }
 
@@ -2072,7 +2094,16 @@ export class DotNS {
       await this._awaitPhoneReady(phoneLabel);
     }
     return await withTimeout(
-      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, { rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset, isPhoneSigner: this._isPhoneSigner }),
+      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, {
+        rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset,
+        // Re-gate phone-signer retries (#39): a verifyEffect false-negative
+        // makes signAndSubmitWithRetry re-sign; for a phone signer that needs
+        // another tap, so pause via _awaitPhoneReady ("Re-sign needed … Check
+        // your phone / Press Y") before re-signing. Both _awaitPhoneReady and the
+        // retry-loop guard no-op for non-phone signers (local/dev workers).
+        isPhoneSigner: this._isPhoneSigner,
+        onResign: phoneLabel !== undefined ? () => this._awaitPhoneReady(phoneLabel) : undefined,
+      }),
       OPERATION_TIMEOUT_MS,
       functionName,
     );
@@ -2187,7 +2218,7 @@ export class DotNS {
       // _authorised → NotAuthorised, 0x1648fd01). Polls checkSubdomainOwnership
       // until the subnode is queryable, using the same chain-time budget as
       // setContenthash. See setContenthash (line ~1937) for the pattern this mirrors.
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // Capture clientWrapper once; bail if session torn down (same guard as
@@ -2356,7 +2387,7 @@ export class DotNS {
       }
       setDeployAttribute("deploy.dotns.contenthash_unchanged", "false");
 
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // verifyEffect is awaited from a recursive-setTimeout poller in
@@ -2486,7 +2517,7 @@ export class DotNS {
       // Without this, a sibling parallel job consuming Alice's expected nonce
       // caused the nonce-advance path to declare success; the 90s post-hoc poll
       // below then threw "Post-set verification failed" with no retry attempted.
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const TEXT_POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // Capture wrapper once; bail if session torn down (same guard as
@@ -2639,7 +2670,7 @@ export class DotNS {
         return { status: "already-published" as const };
       }
 
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const PUBLISH_POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // Capture wrapper once; bail if session torn down (same guard as
@@ -2719,7 +2750,7 @@ export class DotNS {
         return { status: "already-unpublished" as const };
       }
 
-      const MAX_VERIFY_CHAIN_SECONDS = 30;
+      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
       const UNPUBLISH_POLL_INTERVAL_MS = 2_000;
       const verifyEffect = async (): Promise<boolean> => {
         // Capture wrapper once; bail if session torn down (same guard as

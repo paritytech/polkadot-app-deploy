@@ -16,7 +16,7 @@ import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps } from "../dist/deploy.js";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -781,6 +781,38 @@ describe("DOTNS_TX_MAX_ATTEMPTS", () => {
   test("is exported and >= 2 (so at least one retry actually happens)", () => {
     assert.ok(DOTNS_TX_MAX_ATTEMPTS >= 2, "must allow at least one retry");
     assert.ok(DOTNS_TX_MAX_ATTEMPTS <= 10, "must bound retries to avoid runaway loops");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// shouldRegateBeforeResign (#39 — pause for phone before a retry re-sign)
+// ---------------------------------------------------------------------------
+describe("shouldRegateBeforeResign", () => {
+  test("first sign (attempt 1) never re-gates, even for a phone signer", () => {
+    assert.strictEqual(shouldRegateBeforeResign(1, true), false,
+      ">> FAIL: shouldRegateBeforeResign: attempt 1 is the first sign (already gated upstream), must not re-gate");
+  });
+  test("phone-signer re-sign (attempt >= 2) re-gates so the user is prompted before re-signing", () => {
+    assert.strictEqual(shouldRegateBeforeResign(2, true), true,
+      ">> FAIL: shouldRegateBeforeResign: a phone-signer retry re-sign must pause for the human (the #39 bug: it didn't)");
+    assert.strictEqual(shouldRegateBeforeResign(3, true), true,
+      ">> FAIL: shouldRegateBeforeResign: attempt 3 phone re-sign must also re-gate");
+  });
+  test("non-phone signer never re-gates (local/dev worker re-signs without a tap)", () => {
+    assert.strictEqual(shouldRegateBeforeResign(2, false), false,
+      ">> FAIL: shouldRegateBeforeResign: non-phone re-sign must not pause");
+    assert.strictEqual(shouldRegateBeforeResign(2, undefined), false,
+      ">> FAIL: shouldRegateBeforeResign: undefined isPhoneSigner must be treated as non-phone (no pause)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// VERIFY_EFFECT_CHAIN_SECONDS (#38 — widened verify window cuts spurious retries)
+// ---------------------------------------------------------------------------
+describe("VERIFY_EFFECT_CHAIN_SECONDS", () => {
+  test("verify window is widened past the old 30s so an already-landed tx is not spuriously retried", () => {
+    assert.ok(VERIFY_EFFECT_CHAIN_SECONDS >= 60,
+      `>> FAIL: VERIFY_EFFECT_CHAIN_SECONDS: must be widened from the old 30s (got ${VERIFY_EFFECT_CHAIN_SECONDS}) so a phone-signed tx that finalises late is not re-signed (#38)`);
   });
 });
 
@@ -18144,6 +18176,61 @@ describe("human-first phone signing", () => {
       "first call must have attempt=1 >> FAIL: human-first phone signing: first attempt not 1");
     assert.ok(attempts[1] >= 2,
       "second call (re-sign) must have attempt >= 2 >> FAIL: human-first phone signing: re-sign attempt not >= 2");
+  });
+
+  test("retry re-gate wiring (#39): contractTransaction passes a working onResign that re-gates the phone before a retry re-sign", async () => {
+    // The #39 regression class is a WIRING bug: contractTransaction builds the
+    // retry loop's onResign callback but fails to pass it down, so a
+    // verifyEffect-false-negative retry re-signs SILENTLY (no second phone gate,
+    // no "Re-sign needed" prompt). The pure shouldRegateBeforeResign unit test
+    // stays green even with that wiring gone — so this drives the real
+    // contractTransaction and asserts the wiring end-to-end.
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d._isPhoneSigner = true; // phone signer → the retry loop must re-gate before a re-sign
+    d._phoneSignatureTotal = 1;
+    d._phoneSignatureAttempts = new Map();
+    const gateCalls = [];
+    d._confirmPhoneReady = async ({ label, attempt }) => { gateCalls.push({ label, attempt }); };
+
+    let captured;
+    d.clientWrapper = {
+      submitTransaction: async (_addr, _v, _data, _sub, _signer, _cb, options) => {
+        captured = options;
+        // Faithfully replay the real signAndSubmitWithRetry contract: on a
+        // verifyEffect false-negative the loop re-gates via onResign BEFORE the
+        // re-sign. Simulate one retry (attempt 2) exactly as the loop would.
+        if (shouldRegateBeforeResign(2, options.isPhoneSigner)) {
+          await options.onResign?.(2);
+        }
+        return "0xdead";
+      },
+    };
+
+    await d.contractTransaction(
+      "0x732C38082CFAebed505A46e4e2D6414154694580",
+      0n,
+      [{ inputs: [], name: "register", outputs: [], stateMutability: "nonpayable", type: "function" }],
+      "register",
+      [],
+      () => {},
+      { phoneLabel: "Link content" },
+    );
+
+    // Wiring (the property that broke): contractTransaction must hand the retry loop
+    // both the phone-signer flag and a callable onResign.
+    assert.strictEqual(captured.isPhoneSigner, true,
+      ">> FAIL: #39 wiring: contractTransaction must pass isPhoneSigner:true so the retry loop re-gates phone re-signs");
+    assert.strictEqual(typeof captured.onResign, "function",
+      ">> FAIL: #39 wiring: contractTransaction must pass a defined onResign — without it a retry re-signs silently");
+    // End-to-end: initial gate (attempt 1, 'Check your phone') + re-sign gate
+    // (attempt 2 → bin renders 'Re-sign needed (attempt 2)').
+    assert.deepStrictEqual(gateCalls.map((c) => c.attempt), [1, 2],
+      ">> FAIL: #39: a phone-signer retry must re-invoke the human gate with attempt 2 (so the consumer renders 'Re-sign needed'); got " + JSON.stringify(gateCalls.map((c) => c.attempt)));
+    assert.strictEqual(gateCalls[1].label, "Link content",
+      ">> FAIL: #39: the re-gate must reuse the step's phoneLabel");
   });
 
   test("onPhoneSignaturePlan fires before storage with correct step counts: new-name (commit·register·link)", () => {

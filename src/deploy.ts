@@ -3363,7 +3363,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       console.log("=".repeat(60));
       console.log("\nCheck it out here:");
       console.log(`   ${browserUrlFor(name, envId)}`);
-      console.log(`   ${name}.dot  (in a Polkadot-aware browser)`);
+      console.log(`   ${name}.dot  (in a Polkadot app: mobile or desktop)`);
       console.log("\n" + "=".repeat(60) + "\n");
       return { domainName: name, fullDomain: `${name}.dot`, cid: cid as string, ipfsCid };
     } finally {

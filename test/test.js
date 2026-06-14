@@ -18541,7 +18541,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine } from "../dist/deploy.js";
 
 describe("resolveStorageSigner (user-first storage signer, #19)", () => {
   const fakeSigner = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) };
@@ -18713,6 +18713,30 @@ describe("formatStorageSignerLine (user-first storage signer, #19)", () => {
       ">> FAIL: formatStorageSignerLine #892: transfer-mode reason must appear in the output");
     assert.doesNotMatch(line, /no session/,
       ">> FAIL: formatStorageSignerLine #892: transfer-mode line must NOT say 'no session'");
+  });
+});
+
+describe("formatTransferModeDotnsLine (transfer-vs-owned announcement, #60)", () => {
+  const RECIP = "0xb646bc6e0000000000000000000000000000beef";
+
+  test("new name → 'will register … and transfer it to your account <recipient>'", () => {
+    const line = formatTransferModeDotnsLine(false, "example.dot", RECIP);
+    assert.match(line, /will register example\.dot and transfer it to your account/,
+      ">> FAIL: formatTransferModeDotnsLine new-name: must say it will register + transfer the name");
+    assert.ok(line.includes(RECIP),
+      ">> FAIL: formatTransferModeDotnsLine new-name: must name the recipient account");
+  });
+
+  test("already owned → 'you already own … phone signature (no transfer)' and names no recipient/transfer-to", () => {
+    const line = formatTransferModeDotnsLine(true, "example.dot", RECIP);
+    assert.match(line, /you already own example\.dot/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must say the user already owns the name");
+    assert.match(line, /phone signature/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must state a phone signature is needed for the update");
+    assert.match(line, /no transfer/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must make clear no transfer happens (#60)");
+    assert.doesNotMatch(line, /will register|transfer it to/,
+      ">> FAIL: formatTransferModeDotnsLine owned: must NOT imply a register/transfer for an already-owned name (the #60 bug)");
   });
 });
 

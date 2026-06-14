@@ -497,6 +497,20 @@ export function formatStorageSignerLine(slotAddress: string | null, failReason?:
   return `   Storage signer: pool fallback (${failReason ?? "no session"})`;
 }
 
+/**
+ * #60: the transfer-mode DotNS announcement, printed at preflight once ownership
+ * is known. The up-front worker header states only the worker's storage role (it
+ * can't know ownership yet); this line states the transfer-vs-owned-update reality:
+ *   New name:      "   DotNS: will register <name> and transfer it to your account <recipient>"
+ *   Already owned: "   DotNS: you already own <name> — content update needs your phone signature (no transfer)"
+ * Exported for unit testing.
+ */
+export function formatTransferModeDotnsLine(alreadyOwned: boolean, dotName: string, recipient: string): string {
+  return alreadyOwned
+    ? `   DotNS: you already own ${dotName} — content update needs your phone signature (no transfer)`
+    : `   DotNS: will register ${dotName} and transfer it to your account ${recipient}`;
+}
+
 function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
   if (options.storageSigner && options.storageSignerAddress) {
     // Committed-signer: once the slot provider fails on the first attempt,
@@ -2691,7 +2705,11 @@ export async function deploy(content: DeployContent, domainName: string | null =
       sessionCleanup = actors.worker.destroy.bind(actors.worker);
       if (actors.worker.source === "session") resolvedUserSession = actors.worker;
       if (actors.recipientH160) {
-        console.log(`   Worker: ${actors.worker.source} signer ${actors.worker.address} (final owner: ${actors.recipientH160})`);
+        // #60: state only the worker's certain role here — it signs Bulletin
+        // storage. Whether a transfer happens depends on ownership, which isn't
+        // known until the DotNS preflight below; the transfer-vs-owned-update
+        // reality is announced there (formatTransferModeDotnsLine).
+        console.log(`   Worker: ${actors.worker.source} signer ${actors.worker.address} (signs Bulletin storage)`);
       } else {
         console.log(`   Using ${actors.worker.source} signer: ${actors.worker.address}`);
       }
@@ -2937,13 +2955,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
           const fromName = popStatusName(dotnsPreflight.userStatus);
           console.log(`   Your PoP: ${fromName}`);
           console.log(`   Domain: ${alreadyOwned ? "owned by you" : "available"}`);
-          // #983: the Worker/Storage header above reflects the storage/worker path
-          // only. On an already-owned name the DotNS phase re-acquires the owner's
-          // session signer (not the dev worker), so a phone tap will be needed for
-          // the content-link step. Make this clear at preflight so the user isn't
-          // surprised when the phone prompt appears.
-          if (dotnsPreflight.plannedAction === "already-owned-by-recipient") {
-            console.log(`   DotNS signer: owner identity (phone signature required for content update)`);
+          // #60: announce the transfer-vs-owned-update reality now that preflight
+          // knows ownership. The worker header above states only the storage role
+          // (it can't know ownership yet). In transfer mode a NEW name is registered
+          // + transferred to the recipient; an already-owned name is just
+          // content-updated, signed by the owner's phone (no transfer, an extra
+          // phone tap). Only meaningful in transfer mode (recipient set).
+          if (options.transferTo) {
+            console.log(formatTransferModeDotnsLine(alreadyOwned, `${name}.dot`, options.transferTo));
           }
         }
 

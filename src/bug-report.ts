@@ -213,8 +213,24 @@ function applyCoreLabels(issueUrl: string): boolean {
   }
 }
 
+/**
+ * True for deploy failures caused by user input rather than a code defect, so
+ * the bug-report prompt is NOT offered for them (#63). Scoped to DotNS name
+ * validation: a malformed or reserved label ("Invalid domain label …",
+ * "… reserves base names of N chars …") is something the user fixes by choosing
+ * a different name — filing it as a bug just creates noise. The actionable error
+ * message has already been printed to the user. Exported for unit testing.
+ */
+export function isUserInputError(error: Error): boolean {
+  const msg = error?.message ?? "";
+  return /Invalid domain label|reserves base names of/i.test(msg);
+}
+
 export async function offerBugReport(error: Error): Promise<void> {
   if (!isInteractive()) return;
+  // #63: user-input errors (e.g. an invalid/reserved DotNS label) are not bugs —
+  // don't offer to file one. The actionable guidance was already printed.
+  if (isUserInputError(error)) return;
 
   const yes = await promptYesNo("\n   This looks like a bug. Open an issue with debug info? [Y/n] ");
   if (!yes) return;

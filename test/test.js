@@ -41,7 +41,7 @@ import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
 import { encodeErrorResult } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
-import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail } from "../dist/bug-report.js";
+import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { parseGitRemoteUrl, resolveOwnerRepo, normalizeDomainFilename, mirrorUrl, buildManifest, GH_PAGES_MIRROR_MAX_BYTES, MIRROR_BOT_GIT_OVERRIDES } from "../dist/gh-pages-mirror.js";
 import { PassThrough } from "node:stream";
 
@@ -6269,6 +6269,28 @@ describe("buildTitle", () => {
 
   test("preserves short messages", () => {
     assert.strictEqual(buildTitle(new Error("oops")), "[deploy-bug] oops");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 27b. isUserInputError — suppress the bug-report prompt for user-input errors (#63)
+// ---------------------------------------------------------------------------
+describe("isUserInputError (#63 — DotNS names are not bugs)", () => {
+  test("invalid/reserved DotNS label is a user-input error (no bug prompt)", () => {
+    assert.strictEqual(
+      isUserInputError(new Error('Invalid domain label "later": Base name is 5 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules). Use a base name of 6+ chars')),
+      true,
+      ">> FAIL: isUserInputError: a reserved/invalid DotNS label must be treated as user input, not a bug to file");
+  });
+  test("plain 'Invalid domain label' message is a user-input error", () => {
+    assert.strictEqual(isUserInputError(new Error("Invalid domain label: cannot start or end with hyphen")), true,
+      ">> FAIL: isUserInputError: invalid-label messages must be treated as user input");
+  });
+  test("genuine runtime/network failures are NOT user-input errors (bug prompt still offered)", () => {
+    assert.strictEqual(isUserInputError(new Error("WebSocket connection lost: ECONNREFUSED")), false,
+      ">> FAIL: isUserInputError: a connection failure must still be eligible for a bug report");
+    assert.strictEqual(isUserInputError(new Error("Post-deploy verification failed: on-chain contenthash mismatch")), false,
+      ">> FAIL: isUserInputError: a real deploy failure must still be eligible for a bug report");
   });
 });
 

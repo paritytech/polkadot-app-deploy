@@ -4899,7 +4899,12 @@ describe("DotNS.setTextRecord", () => {
 
     // Build a DotNS instance and a fresh clientWrapper with a timestamp that:
     //   - first call: returns T0 (startChainMs = 1_000_000)
-    //   - subsequent calls: returns T0 + 35s (exceeds 30s MAX_VERIFY_CHAIN_SECONDS budget)
+    //   - subsequent calls: returns T0 + (budget+5)s, i.e. just past the
+    //     VERIFY_EFFECT_CHAIN_SECONDS budget, so the loop trips the timeout on
+    //     its first elapsed check. Budget-relative (not a hardcoded 35s) so the
+    //     test stays correct if the budget changes — a hardcoded value below the
+    //     budget makes the constant-timestamp loop poll forever (#38 regression).
+    const PAST_BUDGET_MS = 1_000_000n + BigInt((VERIFY_EFFECT_CHAIN_SECONDS + 5) * 1000);
     let tsCall = 0;
     const makeWrapper = () => ({
       client: {
@@ -4908,7 +4913,7 @@ describe("DotNS.setTextRecord", () => {
             Now: {
               getValue: async () => {
                 tsCall++;
-                return tsCall === 1 ? 1_000_000n : 1_035_000n;
+                return tsCall === 1 ? 1_000_000n : PAST_BUDGET_MS;
               },
             },
           },
@@ -4942,7 +4947,7 @@ describe("DotNS.setTextRecord", () => {
     assert.ok(capturedVerifyEffect !== null, "verifyEffect must be captured");
 
     // Now install a FRESH clientWrapper for the verifyEffect call below:
-    // first read → startChainMs, second read → startChainMs + 35s (> 30s budget)
+    // first read → startChainMs, second read → startChainMs + (budget+5)s (> budget)
     tsCall = 0;
     d.clientWrapper = makeWrapper();
 

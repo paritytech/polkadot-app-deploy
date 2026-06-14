@@ -10422,13 +10422,18 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: #932 guard: must check uploadEmittedIndices.has(i) before incrementing uploadEmitted");
   });
 
-  test("already-owned-by-recipient preflight prints owner-phone note (#983 regression guard)", () => {
+  test("owned-name update preflight announces the owner phone signature; header drops the transfer claim (#60 regression guard)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // When a name is already owned by the signed-in recipient, the DotNS phase
-    // re-acquires the owner's session signer and triggers a phone tap. The preflight
-    // section must print a note so the user isn't surprised by the phone prompt.
-    assert.match(src, /already-owned-by-recipient.*DotNS signer.*owner|DotNS signer.*owner.*already-owned-by-recipient/s,
-      ">> FAIL: #983 guard: preflight must emit 'DotNS signer: owner…' note when plannedAction=already-owned-by-recipient");
+    // When a name is already owned, the DotNS content update is signed by the
+    // owner's phone. The preflight must announce this — via formatTransferModeDotnsLine,
+    // whose already-owned branch says "needs your phone signature (no transfer)" —
+    // so the user isn't surprised by the phone prompt (#60). The up-front worker
+    // header no longer claims a transfer (it prints before ownership is known);
+    // it states only the worker's storage role.
+    assert.match(src, /formatTransferModeDotnsLine\(alreadyOwned,/,
+      ">> FAIL: #60 guard: preflight must call formatTransferModeDotnsLine(alreadyOwned, …) so an owned update announces the owner phone signature");
+    assert.match(src, /signs Bulletin storage/,
+      ">> FAIL: #60 guard: the transfer-mode worker header must state only the storage role ('signs Bulletin storage'), not a definite transfer");
   });
 
   test("Upload line appears when chunksUploaded > 0 (#510 regression guard)", () => {

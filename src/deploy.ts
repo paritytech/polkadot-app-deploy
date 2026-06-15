@@ -498,6 +498,18 @@ export function formatStorageSignerLine(slotAddress: string | null, failReason?:
 }
 
 /**
+ * Storage-signer status line for transfer mode. In transfer mode the local
+ * worker (Alice / --suri) signs the whole deploy, INCLUDING Bulletin storage —
+ * so it is NOT a pool fallback. The old line said "pool fallback (transfer mode
+ * — worker signs storage)", which contradicted the very next "Using external
+ * signer: <worker>" line. State plainly that the worker signs storage. Exported
+ * for unit testing.
+ */
+export function formatTransferModeStorageSignerLine(workerAddress: string): string {
+  return `   Storage signer: worker ${workerAddress} (transfer mode)`;
+}
+
+/**
  * #60: the transfer-mode DotNS announcement, printed at preflight once ownership
  * is known. The up-front worker header states only the worker's storage role (it
  * can't know ownership yet); this line states the transfer-vs-owned-update reality:
@@ -2801,16 +2813,17 @@ export async function deploy(content: DeployContent, domainName: string | null =
     if (slotResult) {
       options = { ...options, storageSigner: slotResult.signer, storageSignerAddress: slotResult.slotAddress };
       console.log(formatStorageSignerLine(slotResult.slotAddress, undefined, slotResult.owned));
+    } else if (options.transferTo && options.signerAddress) {
+      // Transfer mode: the local worker signs the whole deploy, including Bulletin
+      // storage — it is NOT a pool fallback. Label it as the worker so the line
+      // agrees with the "Using external signer: <worker>" line that follows, and
+      // doesn't mislead a signed-in user (supersedes the #892 "pool fallback
+      // (transfer mode …)" wording, which read as a contradiction).
+      console.log(formatTransferModeStorageSignerLine(options.signerAddress));
     } else {
-      // In transfer mode the worker is a local/dev signer; the login session (if
-      // any) is only used to derive the recipient H160 and is never wired into the
-      // Bulletin storage path. So resolvedUserSession is null even when the user IS
-      // signed in — don't say "(no session)" in that case (#892).
-      const storageFailReason = resolvedUserSession
-        ? "no allowance"
-        : options.transferTo
-          ? "transfer mode — worker signs storage"
-          : undefined;
+      // Non-transfer fallback: a logged-in user whose slot allocation failed sees
+      // "no allowance"; an anonymous pool deploy sees "(no session)" (#892).
+      const storageFailReason = resolvedUserSession ? "no allowance" : undefined;
       console.log(formatStorageSignerLine(null, storageFailReason));
     }
   }

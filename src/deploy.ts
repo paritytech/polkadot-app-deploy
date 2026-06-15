@@ -1045,7 +1045,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           for (const idx of batchIndices) {
             const chunkNonce = assignedNonces.get(idx);
             if (chunkNonce !== undefined && chunkNonce < currentNonce && stored[idx] === null) {
-              console.log(`   Chunk ${idx + 1}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
+              console.log(`   Chunk ${idx}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
               stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
               nonceAdvanceIndices.add(idx);
               assignedNonces.delete(idx);
@@ -1075,7 +1075,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           probeFailedCids.has(failCid.toString()) &&
           fail.error?.message?.includes("isValid:false")
         ) {
-          console.log(`   Chunk ${fail.index + 1}: isValid:false but CID was probe-failed — treating as already on chain`);
+          console.log(`   Chunk ${fail.index}: isValid:false but CID was probe-failed — treating as already on chain`);
           captureWarning("isValid:false treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
           stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
           continue;
@@ -1083,13 +1083,13 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         captureWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
         const isExpiryFailure = fail.error?.message?.includes("isValid:false");
         if (isExpiryFailure) {
-          console.log(`   Chunk ${fail.index + 1}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
+          console.log(`   Chunk ${fail.index}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
         }
         let retried = false;
         for (let attempt = 1; attempt <= MAX_CHUNK_RETRIES; attempt++) {
           recordRecoveryAndCheckBudget("chunk_retry");
           const retryDelay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
-          console.log(`   Retrying chunk ${fail.index + 1} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
+          console.log(`   Retrying chunk ${fail.index} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
           await new Promise(r => setTimeout(r, retryDelay));
           // If this was a connection error, reconnect before retrying.
           // Use doReconnectAndRebase so that a pool account rotation (new ss58)
@@ -1112,7 +1112,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             // the comparison is not meaningful until the new account actually
             // advances its nonce (#951).
             if (!perRetryChanged && originalNonce !== undefined && originalNonce < currentNonce) {
-              console.log(`   Chunk ${fail.index + 1}: nonce ${originalNonce} consumed (current=${currentNonce}), treating as included`);
+              console.log(`   Chunk ${fail.index}: nonce ${originalNonce} consumed (current=${currentNonce}), treating as included`);
               stored[fail.index] = { cid: createCID(fail.chunkData, CID_CONFIG.codec, 0x12), len: fail.chunkData.length, viaFallback: true };
               nonceAdvanceIndices.add(fail.index);
               assignedNonces.delete(fail.index);
@@ -1138,7 +1138,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               probeFailedCids.has(failCid.toString()) &&
               e?.message?.includes("isValid:false")
             ) {
-              console.log(`   Chunk ${fail.index + 1}: retry isValid:false but CID was probe-failed — treating as already on chain`);
+              console.log(`   Chunk ${fail.index}: retry isValid:false but CID was probe-failed — treating as already on chain`);
               captureWarning("isValid:false retry treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
               stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
               assignedNonces.delete(fail.index);
@@ -1160,7 +1160,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           if (isConnectionError(fail.error) && reconnectionsUsed >= MAX_RECONNECTIONS) {
             throw new Error(`Connection lost and max reconnections (${MAX_RECONNECTIONS}) exhausted`);
           }
-          throw new Error(`Chunk ${fail.index + 1} failed after ${MAX_CHUNK_RETRIES} retries: ${fail.error?.message?.slice(0, 100)}`);
+          throw new Error(`Chunk ${fail.index} failed after ${MAX_CHUNK_RETRIES} retries: ${fail.error?.message?.slice(0, 100)}`);
         }
       }
       b += batchSize;
@@ -1192,7 +1192,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       for (const m of missingResults) {
         const idx = cidToIndex.get(m.cid)!;
         for (let attempt = 1; attempt <= MAX_REPROBE_RETRIES; attempt++) {
-          console.log(`   Nonce-collision re-upload: chunk ${idx + 1} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
+          console.log(`   Nonce-collision re-upload: chunk ${idx} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
           try {
             const freshNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
             const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
@@ -1208,7 +1208,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
             }
             if (attempt === MAX_REPROBE_RETRIES) {
-              throw new Error(`Nonce-collision re-upload of chunk ${idx + 1} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
+              throw new Error(`Nonce-collision re-upload of chunk ${idx} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
             }
           }
         }
@@ -1233,7 +1233,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     for (let i = 0; i < chunks.length; i++) {
       const expectedCid = createCID(chunks[i], CID_CONFIG.codec, 0x12);
       if (verifiedStored[i].cid.toString() !== expectedCid.toString()) {
-        throw new Error(`Chunk verification failed: chunk ${i + 1} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
+        throw new Error(`Chunk verification failed: chunk ${i} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
       }
     }
     console.log(`   All ${chunks.length} chunks verified ✓`);

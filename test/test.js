@@ -10482,6 +10482,24 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: #932 guard: must check uploadEmittedIndices.has(i) before incrementing uploadEmitted");
   });
 
+  test("storeChunkedContent chunk-index display is 0-based everywhere (no batch/retry off-by-one)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // The batch upload line shows `chunk ${i}` (0-based). The retry / consumed /
+    // nonce-collision re-upload / verify-mismatch lines must use the SAME 0-based
+    // index — NOT `${fail.index + 1}` / `${idx + 1}` / `${i + 1}`. Otherwise the
+    // same chunk shows under two numbers (a retrying chunk N looked like a phantom
+    // "chunk N+1" colliding with the trusted chunk N+1). The [K/U] progress
+    // counter is a count and legitimately stays 1-based.
+    assert.match(src, /chunk \$\{i\}/,
+      ">> FAIL: chunk-numbering: the batch upload line must display the 0-based chunk index `chunk ${i}`");
+    assert.doesNotMatch(src, /chunk \$\{fail\.index \+ 1\}/,
+      ">> FAIL: chunk-numbering: retry/consumed lines must use 0-based `${fail.index}`, not `${fail.index + 1}` (off-by-one vs the batch line)");
+    assert.doesNotMatch(src, /chunk \$\{idx \+ 1\}/,
+      ">> FAIL: chunk-numbering: nonce-collision re-upload lines must use 0-based `${idx}`, not `${idx + 1}`");
+    assert.doesNotMatch(src, /chunk \$\{i \+ 1\} CID mismatch/,
+      ">> FAIL: chunk-numbering: the verify-mismatch error must use 0-based `${i}`, not `${i + 1}`");
+  });
+
   test("owned-name update preflight announces the owner phone signature; header drops the transfer claim (#60 regression guard)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
     // When a name is already owned, the DotNS content update is signed by the

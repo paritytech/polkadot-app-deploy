@@ -18740,7 +18740,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine } from "../dist/deploy.js";
 
 describe("resolveStorageSigner (user-first storage signer, #19)", () => {
   const fakeSigner = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) };
@@ -18903,15 +18903,22 @@ describe("formatStorageSignerLine (user-first storage signer, #19)", () => {
       ">> FAIL: formatStorageSignerLine pool-reason: must include the provided reason");
   });
 
-  test("transfer mode reason → 'pool fallback (transfer mode …)' (not '(no session)') (#892)", () => {
-    // In transfer mode the worker is a local signer; the user IS logged in but
-    // resolvedUserSession is null for storage purposes. The reason string must
-    // mention transfer mode, not "(no session)", to avoid misleading a logged-in user.
-    const line = formatStorageSignerLine(null, "transfer mode — worker signs storage");
-    assert.match(line, /pool fallback.*transfer mode/,
-      ">> FAIL: formatStorageSignerLine #892: transfer-mode reason must appear in the output");
+  test("transfer mode → worker storage line (NOT 'pool fallback', NOT 'no session') (#892 + storage-wording fix)", () => {
+    // In transfer mode the local worker signs Bulletin storage (it signs the whole
+    // deploy). The line must say so — not "pool fallback" (it doesn't use the pool;
+    // that contradicted the very next "Using external signer: <worker>" line) and
+    // not "(no session)" (the user IS logged in, #892). Transfer mode now uses
+    // formatTransferModeStorageSignerLine, not formatStorageSignerLine.
+    const WORKER = "5DfhGyQdFobKM8NsWvEeAKk5EQQgYe9AydgJ7rMB6E1EqRzV";
+    const line = formatTransferModeStorageSignerLine(WORKER);
+    assert.match(line, /worker 5DfhGyQ/,
+      ">> FAIL: transfer-mode storage line must name the worker that signs storage");
+    assert.match(line, /transfer mode/,
+      ">> FAIL: transfer-mode storage line must indicate transfer mode");
+    assert.doesNotMatch(line, /pool fallback/,
+      ">> FAIL: transfer mode does NOT use the pool — must not say 'pool fallback' (contradicts the 'Using external signer' line)");
     assert.doesNotMatch(line, /no session/,
-      ">> FAIL: formatStorageSignerLine #892: transfer-mode line must NOT say 'no session'");
+      ">> FAIL: transfer-mode storage line must NOT say 'no session' for a signed-in user (#892)");
   });
 });
 

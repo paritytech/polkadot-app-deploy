@@ -50,8 +50,30 @@ export async function resolveDeployActors(
     // whole deploy, so the mobile never signs.
     const worker = await resolveSigner(authClient, { suri: suri ?? DEFAULT_WORKER_SURI });
     // Recipient = signed-in product H160, derived locally (no mobile popup).
-    const handle = await authClient.getSessionSigner();
-    if (!handle) throw new Error("transfer mode active but no session resolved; pass --no-transfer-to-signedin-user.");
+    // The on-disk probe (hasPersistedSession) said a session exists, but the SSO
+    // stack is what actually loads it — and the two can disagree.
+    let handle: Awaited<ReturnType<AuthClient["getSessionSigner"]>> = null;
+    try {
+      handle = await authClient.getSessionSigner();
+    } catch {
+      // An errored load is treated the same as an unloadable session (below).
+      handle = null;
+    }
+    if (!handle) {
+      // #35 (Defect 2 Part 1): the session file is present on disk (sessionPresent)
+      // but the SSO stack could not load a usable signer — it may be stale / written
+      // by an older version, have lost the 3s waitForSessions race (a valid session
+      // whose async disk-flush hasn't settled), or its localStorage-backed store
+      // isn't readable in Node. Do NOT hard-fail transfer mode — fall back to a
+      // normal non-transfer deploy where the resolved worker signs directly.
+      // (mainnet + no --suri already threw MainnetDefaultWorkerError above, so this
+      // fallback only applies on testnet or when --suri was given.)
+      console.error(
+        "⚠  Found a login session on disk but couldn't load it — deploying without transfer " +
+        "(the worker signs directly). Log in again if you meant to transfer to your account.",
+      );
+      return { worker };
+    }
     try {
       return { worker, recipientH160: handle.addresses.productH160 };
     } finally {

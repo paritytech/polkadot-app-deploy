@@ -1,8 +1,8 @@
 {
   "domain": "e2epoolns01.dot",
-  "cid": "bafybeibnpbze3spwocyigielmicmefp62ziputro5mlvrmgxx47ef3bplu",
+  "cid": "bafybeihh6hfpk35fw4pfelheovouwyso6lyccbfctqkez6uzasqby3p5b4",
   "toolVersion": "0.11.0",
-  "deployedAt": "2026-06-17T16:34:35.590Z",
+  "deployedAt": "2026-06-18T16:24:12.753Z",
   "encrypted": false,
   "bulletinRpc": "wss://paseo-bulletin-next-rpc.polkadot.io",
   "sourceRepo": "paritytech/polkadot-app-deploy",

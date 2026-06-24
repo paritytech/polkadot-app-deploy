@@ -81,7 +81,7 @@
     "polkadot-api": "^2.1.3",
     "verifiablejs": "1.3.0-beta.4",
     "viem": "^2.30.5",
-    "ws": "^8.20.1"
+    "ws": "^8.21.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

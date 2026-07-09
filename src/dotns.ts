@@ -1274,15 +1274,15 @@ export class ReviveClientWrapper {
       } catch (e: any) {
         lastError = e;
 
-        // Phone-signer / no-event case: the watcher went silent before any
-        // blockchain event arrived — the user never approved on their phone.
-        // Fail fast; the confirmPhoneReady gate in contractTransaction is the
-        // right place to handle re-sign prompts.
-        if (e instanceof WatcherSilentNoEventError && opts.isPhoneSigner === true) {
+        // Phone-signer no-event fast-fail (#990): checked BEFORE the default
+        // retry classification so it pre-empts retry/backoff entirely — a
+        // silent watcher that never saw a prior event means the phone never
+        // approved, and retrying just pays another ~90s of silence for the
+        // same non-outcome.
+        const fastFail = classifyWatcherSilentFastFail(e, opts.isPhoneSigner);
+        if (fastFail) {
           filter.flush();
-          throw new NonRetryableError(
-            "No signature received from the phone — re-run when you can approve on your phone.",
-          );
+          throw fastFail;
         }
 
         const decision = classifyTxRetryDecision(e);

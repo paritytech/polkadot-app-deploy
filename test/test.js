@@ -15,9 +15,9 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -27,11 +27,11 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, _resetTestnetCacheForTests } from "../dist/pool.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
-import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest } from "../dist/chunk-probe.js";
+import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest, classifyFinalityGap, probeFinalityGap, getBestBlockNumber } from "../dist/chunk-probe.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
@@ -45,6 +45,26 @@ import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, prompt
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { parseGitRemoteUrl, resolveOwnerRepo, normalizeDomainFilename, mirrorUrl, buildManifest, GH_PAGES_MIRROR_MAX_BYTES, MIRROR_BOT_GIT_OVERRIDES } from "../dist/gh-pages-mirror.js";
 import { PassThrough } from "node:stream";
+
+// ---------------------------------------------------------------------------
+// Shared workflow-YAML helper: slices out one job's block of text from a
+// GitHub Actions workflow file, keyed by its top-level job id. Treats the
+// YAML as text (regex over indentation) rather than parsing it, matching
+// this file's existing jobBlock-style helpers for workflow assertions.
+// Module-scoped so every describe that needs it (workflow safety nets,
+// nightly-report per-env status, paseo-next-v2 E2E harness wiring) shares
+// one definition instead of each re-declaring an identical copy.
+// ---------------------------------------------------------------------------
+function jobBlock(text, jobName) {
+  const jobsMatch = text.match(/^jobs:\s*$/m);
+  assert.ok(jobsMatch, "workflow has no jobs: block");
+  const jobsSection = text.slice(jobsMatch.index + jobsMatch[0].length);
+  const headerRe = /^ {2}([\w-]+):\s*$/gm;
+  const matches = [...jobsSection.matchAll(headerRe)];
+  const matchIndex = matches.findIndex(m => m[1] === jobName);
+  assert.notStrictEqual(matchIndex, -1, `workflow has no ${jobName} job`);
+  return jobsSection.slice(matches[matchIndex].index, matches[matchIndex + 1]?.index ?? jobsSection.length);
+}
 
 // ---------------------------------------------------------------------------
 // Test fixture: PopSelfServeConfig shapes used across helper tests
@@ -1312,6 +1332,29 @@ describe("classifyErrorKind", () => {
   test("naming.contract_unavailable: Cannot decode zero data from ABI call", () => {
     assert.strictEqual(
       classifyErrorKind('Cannot decode zero data ("0x") with ABI parameters.\n\nVersion: viem@2.51.3'),
+      "naming.contract_unavailable",
+    );
+  });
+
+  // Issue #1060: contractCall's own empty-data wrapper (post-#729) throws an
+  // actionable message instead of the raw viem string above — but that wrapper
+  // message wasn't in any rule, so it fell into "unknown". These two messages
+  // are the exact strings contractCall throws for hasCode===false and
+  // hasCode===true/null respectively (see src/dotns.ts).
+  test("naming.contract_unavailable: 'No contract deployed at' wrapper message (hasCode=false)", () => {
+    assert.strictEqual(
+      classifyErrorKind(
+        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. Check environments.json / --contract config for this network.",
+      ),
+      "naming.contract_unavailable",
+    );
+  });
+
+  test("naming.contract_unavailable: 'Contract call returned empty data' wrapper message (hasCode=true/null)", () => {
+    assert.strictEqual(
+      classifyErrorKind(
+        "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=isBaseNameReserved. The address has contract code but the call returned no bytes, which is unexpected for this read. Investigate the contract/ABI rather than masking it with a default.",
+      ),
       "naming.contract_unavailable",
     );
   });
@@ -2908,6 +2951,67 @@ describe("DotNS initial state", () => {
     await assert.rejects(
       () => dNoCode.getUserPopStatus(),
       /No contract deployed at|Could not read DotNS Personhood status/,
+    );
+  });
+
+  // Issue #1060 acceptance criteria: "when [0x] isn't [valid], the error names
+  // the contract/address/env". contractCall's empty-data messages already name
+  // contract+address+function; env was missing. Exercise contractCall directly
+  // (not through a wrapper like getUserPopStatus) so the env id in the thrown
+  // message isn't obscured by an outer "Could not read ..." wrapper.
+  const EMPTY_DATA_LABELHASH = "0x" + "11".repeat(32);
+  function makeEmptyDataDotNS(hasContractCode) {
+    const d = new DotNS();
+    d.connected = true;
+    d.evmAddress = "0x1111111111111111111111111111111111111111";
+    d.substrateAddress = "5Signer";
+    d._environmentId = "paseo-next-v2";
+    d.clientWrapper = {
+      performDryRunCall: async () => ({
+        result: { isOk: true, value: { data: "0x" } },
+        gasConsumed: { referenceTime: 1n, proofSize: 2n },
+        gasRequired: { referenceTime: 3n, proofSize: 4n },
+        storageDeposit: { value: 0n },
+      }),
+      hasContractCode: async () => hasContractCode,
+    };
+    return d;
+  }
+
+  test("contractCall empty-data error (no contract code) names the environment", async () => {
+    const d = makeEmptyDataDotNS(false);
+    await assert.rejects(
+      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      (err) => {
+        assert.match(err.message, /No contract deployed at/);
+        assert.match(err.message, /env=paseo-next-v2/, `expected env id in message, got: ${err.message}`);
+        return true;
+      },
+    );
+  });
+
+  test("contractCall empty-data error (has contract code, unexpected empty) names the environment", async () => {
+    const d = makeEmptyDataDotNS(true);
+    await assert.rejects(
+      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      (err) => {
+        assert.match(err.message, /Contract call returned empty data/);
+        assert.match(err.message, /env=paseo-next-v2/, `expected env id in message, got: ${err.message}`);
+        return true;
+      },
+    );
+  });
+
+  test("contractCall empty-data error falls back to a placeholder env when unset", async () => {
+    const d = makeEmptyDataDotNS(false);
+    d._environmentId = null;
+    await assert.rejects(
+      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      (err) => {
+        assert.doesNotMatch(err.message, /env=null/, `must not leak literal 'null', got: ${err.message}`);
+        assert.match(err.message, /env=/, `expected an env= field even when unset, got: ${err.message}`);
+        return true;
+      },
     );
   });
 
@@ -4771,7 +4875,9 @@ describe("DotNS.setTextRecord", () => {
       calls.push({ type: "tx", functionName, args });
       return { kind: "hash", hash: txHash };
     };
-    d.contractCall = async (_address, _abi, functionName, args) => {
+    // #1060: the post-hoc poll reads via contractCallNullable (not contractCall)
+    // so an unset/not-yet-finalized text key doesn't throw on the first read.
+    d.contractCallNullable = async (_address, _abi, functionName, args) => {
       calls.push({ type: "call", functionName, args });
       return value;
     };
@@ -4806,7 +4912,7 @@ describe("DotNS.setTextRecord", () => {
       },
     };
     d.contractTransaction = async () => ({ kind: "hash", hash: "0xabc123" });
-    d.contractCall = async () => reads.shift() ?? value;
+    d.contractCallNullable = async () => reads.shift() ?? value;
 
     const result = await d.setTextRecord(domain, key, value);
 
@@ -4820,13 +4926,16 @@ describe("DotNS.setTextRecord", () => {
 
     const d = makeDotnsForTextRecord();
     d.contractTransaction = async () => ({ kind: "hash", hash: "0xdef456" });
-    d.contractCall = async () => "Different";
+    d.contractCallNullable = async () => "Different";
     await assert.rejects(
       () => d.setTextRecord(domain, key, value),
       /verification failed/i,
     );
   });
 
+  // #1060: exercises the exact null-tolerant path the fix introduced — an unset
+  // text key reads back `null` from contractCallNullable, and the post-hoc poll
+  // must coerce that to "" instead of throwing on it.
   test("treats contract text null value as empty string for comparison", async () => {
     const domain = "myapp";
     const key = "name";
@@ -4834,9 +4943,30 @@ describe("DotNS.setTextRecord", () => {
 
     const d = makeDotnsForTextRecord();
     d.contractTransaction = async () => ({ kind: "hash", hash: "0xghi789" });
-    d.contractCall = async () => null;
+    d.contractCallNullable = async () => null;
     const result = await d.setTextRecord(domain, key, value);
     assert.strictEqual(result.value, "");
+  });
+
+  // #1060: on a fresh key, the FIRST poll iteration can legitimately still read
+  // back empty (`0x` → null from contractCallNullable) before the just-submitted
+  // tx is visible. This must be tolerated (treated as "" and re-polled), not
+  // thrown on — that's the exact failure class (real consumer deploys aborting
+  // with "Cannot decode zero data") issue #1060 reports.
+  test("post-hoc poll tolerates a null first read (fresh key still finalizing) then succeeds", async () => {
+    const domain = "myapp";
+    const key = "name";
+    const value = "My App";
+    const reads = [null, value];
+    const d = makeDotnsForTextRecord();
+    d.clientWrapper = {
+      client: { query: { Timestamp: { Now: { getValue: async () => 1_000_000 } } } },
+    };
+    d.contractTransaction = async () => ({ kind: "hash", hash: "0xfreshkey" });
+    d.contractCallNullable = async () => reads.shift() ?? value;
+
+    const result = await d.setTextRecord(domain, key, value);
+    assert.deepStrictEqual(result, { value, txHash: "0xfreshkey" });
   });
 
   test("passes a verifyEffect function to contractTransaction", async () => {
@@ -4854,7 +4984,7 @@ describe("DotNS.setTextRecord", () => {
       capturedOpts.push(opts);
       return { kind: "hash", hash: "0xverify123" };
     };
-    d.contractCall = async () => value;
+    d.contractCallNullable = async () => value;
 
     await d.setTextRecord(domain, key, value);
 
@@ -4874,9 +5004,8 @@ describe("DotNS.setTextRecord", () => {
       capturedVerifyEffect = opts?.verifyEffect ?? null;
       return { kind: "hash", hash: "0xverify456" };
     };
-    d.contractCall = async () => value; // post-hoc poll returns the written value
-
-    // Stub contractCallNullable for the verifyEffect closure to use
+    // Stub contractCallNullable for both the verifyEffect closure and the
+    // post-hoc poll to use — both read the same text(node, key) now (#1060).
     d.contractCallNullable = async (_addr, _abi, fn, args) => {
       assert.strictEqual(fn, "text", "verifyEffect must read the 'text' function");
       assert.strictEqual(args[1], key, "verifyEffect must pass the correct key");
@@ -4927,8 +5056,14 @@ describe("DotNS.setTextRecord", () => {
     d.rpc = null;
     d.clientWrapper = makeWrapper();
 
-    // contractCallNullable always returns the stale value (wrong)
-    d.contractCallNullable = async () => "stale-value";
+    // contractCallNullable serves BOTH the post-hoc poll inside setTextRecord()
+    // (#1060: it now reads via contractCallNullable, not contractCall) and the
+    // verifyEffect closure invoked manually below — same stub, different phase.
+    // Start it returning the expected value so the post-hoc poll inside
+    // setTextRecord() below succeeds immediately instead of hanging; flip it to
+    // "stale-value" right before exercising verifyEffect in isolation.
+    let onChainStub = value;
+    d.contractCallNullable = async () => onChainStub;
 
     // Capture verifyEffect by stubbing contractTransaction
     let capturedVerifyEffect = null;
@@ -4936,10 +5071,6 @@ describe("DotNS.setTextRecord", () => {
       capturedVerifyEffect = opts?.verifyEffect ?? null;
       return { kind: "hash", hash: "0xverifyfail" };
     };
-
-    // contractCall (for post-hoc poll) must return the expected value immediately
-    // so setTextRecord itself completes without hanging
-    d.contractCall = async () => value;
 
     // Replace clientWrapper with a fresh one BEFORE calling setTextRecord so the
     // post-hoc poll uses separate timestamps from the verifyEffect invocation below.
@@ -4951,6 +5082,7 @@ describe("DotNS.setTextRecord", () => {
     // first read → startChainMs, second read → startChainMs + (budget+5)s (> budget)
     tsCall = 0;
     d.clientWrapper = makeWrapper();
+    onChainStub = "stale-value";
 
     const result = await capturedVerifyEffect();
     assert.strictEqual(result, false,
@@ -4968,7 +5100,7 @@ describe("DotNS.setTextRecord", () => {
       capturedVerifyEffect = opts?.verifyEffect ?? null;
       return { kind: "hash", hash: "0xverifyteardown" };
     };
-    d.contractCall = async () => value;
+    d.contractCallNullable = async () => value;
 
     await d.setTextRecord(domain, key, value);
 
@@ -5008,9 +5140,11 @@ describe("DotNS.setTextRecords (batching)", () => {
         query: { Timestamp: { Now: { getValue: async () => { const v = chainMs; chainMs += 100_000n; return v; } } } },
       },
     };
-    // Stub the post-write verification reads.
-    d.contractCall = async (_addr, _abi, fn, args) => {
-      if (fn !== "text") throw new Error(`unexpected contractCall: ${fn}`);
+    // Stub the post-write verification reads. #1060: the batched post-hoc poll
+    // reads via contractCallNullable (not contractCall) so an unset key doesn't
+    // throw on an early read.
+    d.contractCallNullable = async (_addr, _abi, fn, args) => {
+      if (fn !== "text") throw new Error(`unexpected contractCallNullable: ${fn}`);
       const [, key] = args;
       return verifyValues?.[key] ?? "";
     };
@@ -5063,6 +5197,59 @@ describe("DotNS.setTextRecords (batching)", () => {
       ]),
       /Post-set verification failed for text\[description\]/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 19b-iii. Issue #1060 — empty-`0x` reads must not abort a deploy when empty is
+// a valid ("unset") state: resolver(node) with no resolver, contenthash(node)
+// on a first-time deploy, text(node, key) for an unset key. These reads used
+// the throwing `contractCall`; switched to the non-throwing
+// `contractCallNullable` (#421) — see docs-internal/superpowers/plans/
+// 2026-07-06-issue-1060.md for the full per-site audit.
+// ---------------------------------------------------------------------------
+describe("DotNS empty-read tolerance (#1060)", () => {
+  function makeEmptyReadDotNS() {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.evmAddress = "0x1111111111111111111111111111111111111111";
+    d.clientWrapper = {
+      // Every dry-run call in this suite replies isOk:true with empty `0x` data
+      // — the exact chain response a fresh/unset name produces.
+      performDryRunCall: async () => ({
+        result: { isOk: true, value: { data: "0x" } },
+        gasConsumed: { referenceTime: 1n, proofSize: 2n },
+        gasRequired: { referenceTime: 3n, proofSize: 4n },
+        storageDeposit: { value: 0n },
+      }),
+    };
+    return d;
+  }
+
+  test("getContenthash returns the '0x' sentinel (not a throw, not the string 'null') on a first-time deploy with no prior contenthash", async () => {
+    const d = makeEmptyReadDotNS();
+    const result = await d.getContenthash("freshname");
+    assert.strictEqual(result, "0x");
+  });
+
+  test("ensureContentResolver proceeds to setResolver (does not throw) when resolver(node) reads back empty", async () => {
+    const d = makeEmptyReadDotNS();
+    let txCalled = null;
+    d.contractTransaction = async (_addr, _amount, _abi, functionName, args) => {
+      txCalled = { functionName, args };
+      return { kind: "hash", hash: "0xresolversethash" };
+    };
+    const result = await d.ensureContentResolver("freshname");
+    assert.deepStrictEqual(result, { changed: true });
+    assert.ok(txCalled, "setResolver must be called when the current resolver read is empty");
+    assert.strictEqual(txCalled.functionName, "setResolver");
+  });
+
+  test("getTextRecord returns '' (not a throw) for an unset text key", async () => {
+    const d = makeEmptyReadDotNS();
+    const result = await d.getTextRecord("freshname", "some-key");
+    assert.strictEqual(result, "");
   });
 });
 
@@ -6948,6 +7135,187 @@ describe("accountsNeedingAuthorization", () => {
 });
 
 // ---------------------------------------------------------------------------
+// accountsNeedingReauthorization — #1059 proactive (<24h-to-expiry) pre-check
+// ---------------------------------------------------------------------------
+describe("accountsNeedingReauthorization", () => {
+  const BLOCK = 100_000;
+
+  function mkPoolAuth(index, expiration) {
+    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, bytes: 0n };
+  }
+
+  test("account far from expiry (> buffer away) is excluded", () => {
+    const auths = [mkPoolAuth(0, BLOCK + BULLETIN_BLOCKS_PER_DAY * 7)]; // ~7 days out
+    const needs = accountsNeedingReauthorization(auths, BLOCK, BULLETIN_BLOCKS_PER_DAY);
+    assert.strictEqual(needs.length, 0,
+      ">> FAIL: accountsNeedingReauthorization: account 7 days from expiry should not need reauth on a 24h buffer");
+  });
+
+  test("account expiring within the 24h buffer is included", () => {
+    const auths = [mkPoolAuth(0, BLOCK + BULLETIN_BLOCKS_PER_DAY - 1)]; // < 24h out
+    const needs = accountsNeedingReauthorization(auths, BLOCK, BULLETIN_BLOCKS_PER_DAY);
+    assert.strictEqual(needs.length, 1,
+      ">> FAIL: accountsNeedingReauthorization: account expiring in <24h must be flagged for reauth");
+    assert.strictEqual(needs[0].index, 0,
+      ">> FAIL: accountsNeedingReauthorization: returned wrong account");
+  });
+
+  test("already-expired account is included (proactive check subsumes the reactive one)", () => {
+    const auths = [mkPoolAuth(0, BLOCK - 1)];
+    const needs = accountsNeedingReauthorization(auths, BLOCK, BULLETIN_BLOCKS_PER_DAY);
+    assert.strictEqual(needs.length, 1,
+      ">> FAIL: accountsNeedingReauthorization: an already-expired account must still be flagged");
+  });
+
+  test("default bufferBlocks is BULLETIN_BLOCKS_PER_DAY (24h) when omitted", () => {
+    const auths = [mkPoolAuth(0, BLOCK + BULLETIN_BLOCKS_PER_DAY - 1)];
+    const needs = accountsNeedingReauthorization(auths, BLOCK); // no explicit buffer
+    assert.strictEqual(needs.length, 1,
+      ">> FAIL: accountsNeedingReauthorization: default buffer must be 24h-equivalent, not 0");
+  });
+
+  test("bufferBlocks=0 reduces to exactly accountsNeedingAuthorization's behavior", () => {
+    const auths = [
+      mkPoolAuth(0, BLOCK + 500),  // active, far → excluded either way
+      mkPoolAuth(1, BLOCK - 1),    // expired → included either way
+      mkPoolAuth(2, 0),            // never authorized → included either way
+    ];
+    const viaReauth = accountsNeedingReauthorization(auths, BLOCK, 0).map(a => a.index);
+    const viaLegacy = accountsNeedingAuthorization(auths, BLOCK).map(a => a.index);
+    assert.deepStrictEqual(viaReauth, viaLegacy,
+      ">> FAIL: accountsNeedingReauthorization(buffer=0) must match accountsNeedingAuthorization exactly");
+  });
+
+  test("mixed set: only near-expiry + already-expired accounts are returned", () => {
+    const auths = [
+      mkPoolAuth(0, BLOCK + BULLETIN_BLOCKS_PER_DAY * 7), // far → excluded
+      mkPoolAuth(1, BLOCK - 1),                           // expired → included
+      mkPoolAuth(2, BLOCK + 100),                         // <24h out → included
+      mkPoolAuth(3, BLOCK + BULLETIN_BLOCKS_PER_DAY * 2), // far → excluded
+    ];
+    const needs = accountsNeedingReauthorization(auths, BLOCK, BULLETIN_BLOCKS_PER_DAY);
+    assert.deepStrictEqual(needs.map(a => a.index), [1, 2],
+      ">> FAIL: accountsNeedingReauthorization: expected exactly accounts [1, 2] to need reauth");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// isAutoReauthorizeAllowed — #1059 testnet-only hard guard
+// ---------------------------------------------------------------------------
+describe("isAutoReauthorizeAllowed", () => {
+  test("testnet env shaped like preview/paseo-next-v2 (flag true, network testnet) is allowed", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ network: "testnet", bulletinAutoAuthorize: true }),
+      true,
+      ">> FAIL: isAutoReauthorizeAllowed: testnet env with bulletinAutoAuthorize:true must be allowed",
+    );
+  });
+
+  test("mainnet env shaped like polkadot/kusama (no flag) is never allowed", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ network: "mainnet" }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: mainnet env must never be allowed",
+    );
+  });
+
+  test("mainnet env with the flag mistakenly set to true is STILL never allowed", () => {
+    // This is the maintainer's explicit hard constraint (#1059): the
+    // network check is a second gate on top of the flag, not redundant
+    // with it — it must survive a future config mistake.
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ network: "mainnet", bulletinAutoAuthorize: true }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: a mainnet env must be rejected even if bulletinAutoAuthorize is mistakenly true",
+    );
+  });
+
+  test("testnet env missing the flag (e.g. paseo-next, not e2eEligible) defaults closed", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ network: "testnet" }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: absent bulletinAutoAuthorize must default to disallowed, not allowed",
+    );
+  });
+
+  test("undefined/null env is never allowed", () => {
+    assert.strictEqual(isAutoReauthorizeAllowed(undefined), false,
+      ">> FAIL: isAutoReauthorizeAllowed: undefined env must not be allowed");
+    assert.strictEqual(isAutoReauthorizeAllowed(null), false,
+      ">> FAIL: isAutoReauthorizeAllowed: null env must not be allowed");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1054 — per-leg pool account = DotNS owner; per-leg domain
+// ---------------------------------------------------------------------------
+describe("#1054 pool-leg DotNS-owner isolation", () => {
+  test("poolAccountDerivationPath matches derivePoolAccounts' path scheme", () => {
+    const accts = derivePoolAccounts(8);
+    for (const a of accts) {
+      assert.strictEqual(
+        poolAccountDerivationPath(a.index),
+        a.path,
+        `>> FAIL: #1054: poolAccountDerivationPath(${a.index}) must equal derivePoolAccounts path so the E2E DotNS signer resolves to the same pinned pool account used for Bulletin storage`,
+      );
+      assert.strictEqual(a.path, `${DEPLOY_PATH_PREFIX}/${a.index}`,
+        ">> FAIL: #1054: derivation path must be ${DEPLOY_PATH_PREFIX}/<index>");
+    }
+  });
+
+  test("per-leg domain label e2epoolleg<NN> survives sanitizeDomainLabel unchanged and is registerable-length", () => {
+    for (let i = 0; i < 10; i++) {
+      const label = `e2epoolleg${String(i).padStart(2, "0")}`;
+      assert.strictEqual(
+        sanitizeDomainLabel(label),
+        label,
+        `>> FAIL: #1054: per-leg label ${label} must round-trip through sanitizeDomainLabel unchanged (the trailing-2-digit run must NOT be dropped, else all legs collapse to one domain)`,
+      );
+      // Base (before the 2-digit suffix) is "e2epoolleg" = 10 chars ≥ 9 → a
+      // NoStatus pool account can register it without full PoP, and > 5 so it is
+      // not Reserved.
+      assert.ok("e2epoolleg".length >= 9,
+        ">> FAIL: #1054: per-leg base must be ≥9 chars for NoStatus registration");
+    }
+  });
+
+  test("assetHubTopUpAmount tops up to target only when below threshold", () => {
+    const THRESH = 100n, TARGET = 300n;
+    // Above/at threshold → no transfer.
+    assert.strictEqual(assetHubTopUpAmount(100n, THRESH, TARGET), 0n,
+      ">> FAIL: #1054: balance at threshold must not trigger a top-up (avoids draining Alice)");
+    assert.strictEqual(assetHubTopUpAmount(500n, THRESH, TARGET), 0n,
+      ">> FAIL: #1054: balance above threshold must not trigger a top-up");
+    // Below threshold → transfer up to target.
+    assert.strictEqual(assetHubTopUpAmount(40n, THRESH, TARGET), 260n,
+      ">> FAIL: #1054: below-threshold balance must top up to target (target - balance)");
+    assert.strictEqual(assetHubTopUpAmount(0n, THRESH, TARGET), 300n,
+      ">> FAIL: #1054: empty account must top up the full target");
+  });
+
+  test("assetHubTopUpAmount matches ensurePoolAccountsFundedOnAssetHub's default 1 PAS / 2 PAS thresholds", () => {
+    const PAS = 10_000_000_000n;
+    const THRESHOLD = 1n * PAS;
+    const TARGET = 2n * PAS;
+    assert.strictEqual(assetHubTopUpAmount(0n, THRESHOLD, TARGET), 2n * PAS,
+      ">> FAIL: #1054: an empty pool account must be topped up to the full 2 PAS default target");
+    assert.strictEqual(assetHubTopUpAmount(15n * PAS / 10n, THRESHOLD, TARGET), 0n,
+      ">> FAIL: #1054: a pool account already above the 1 PAS default threshold must not be topped up");
+    assert.strictEqual(assetHubTopUpAmount(5n * PAS / 10n, THRESHOLD, TARGET), 15n * PAS / 10n,
+      ">> FAIL: #1054: a pool account below the 1 PAS default threshold must be topped up to the 2 PAS default target");
+  });
+
+  test("isAutoReauthorizeAllowed gates the Asset Hub funder to cleared testnets only", () => {
+    assert.strictEqual(isAutoReauthorizeAllowed({ network: "mainnet", bulletinAutoAuthorize: true }), false,
+      ">> FAIL: #1054: the Asset Hub funder must never run on mainnet, even if bulletinAutoAuthorize is mistakenly set");
+    assert.strictEqual(isAutoReauthorizeAllowed({ network: "testnet" }), false,
+      ">> FAIL: #1054: the Asset Hub funder must not run when bulletinAutoAuthorize is unset");
+    assert.strictEqual(isAutoReauthorizeAllowed({ network: "testnet", bulletinAutoAuthorize: true }), true,
+      ">> FAIL: #1054: the Asset Hub funder must run when both the testnet check and the flag clear the environment");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ensureAuthorized — existence/expiry gate
 // ---------------------------------------------------------------------------
 describe("ensureAuthorized quota awareness", () => {
@@ -7668,8 +8036,11 @@ describe("parseDomainName", () => {
 // 30. CHUNK_MORTALITY_PERIOD (Issue #168 — duplicate-tx fix, #553 env-var override)
 // ---------------------------------------------------------------------------
 describe("CHUNK_MORTALITY_PERIOD", () => {
-  test("is 16 by default", () => {
-    assert.strictEqual(CHUNK_MORTALITY_PERIOD, 16);
+  // #1051: raised 16 → 64 after finding the mortality comment assumed the
+  // wrong block time (24s instead of the actual 6s) — period:16 was really
+  // only ~96s, under the 90-240s inclusion stalls observed on this path.
+  test("is 64 by default", () => {
+    assert.strictEqual(CHUNK_MORTALITY_PERIOD, 64);
   });
 
   test("BULLETIN_CHUNK_MORTALITY_PERIOD env var overrides the default", () => {
@@ -7686,10 +8057,10 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
         cwd: process.cwd(),
       }
     );
-    assert.strictEqual(out.trim(), "2", "BULLETIN_CHUNK_MORTALITY_PERIOD=2 should override default 16");
+    assert.strictEqual(out.trim(), "2", "BULLETIN_CHUNK_MORTALITY_PERIOD=2 should override default 64");
   });
 
-  test("BULLETIN_CHUNK_MORTALITY_PERIOD falls back to 16 on invalid value", () => {
+  test("BULLETIN_CHUNK_MORTALITY_PERIOD falls back to 64 on invalid value", () => {
     const out = execSync(
       `node --input-type=module`,
       {
@@ -7699,7 +8070,7 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
         cwd: process.cwd(),
       }
     );
-    assert.strictEqual(out.trim(), "16", "invalid BULLETIN_CHUNK_MORTALITY_PERIOD should fall back to 16");
+    assert.strictEqual(out.trim(), "64", "invalid BULLETIN_CHUNK_MORTALITY_PERIOD should fall back to 64");
   });
 });
 
@@ -7796,6 +8167,19 @@ function poolRejectSubscribable() {
   return {
     subscribe({ next }) {
       setImmediate(() => next({ type: "txBestBlocksState", found: false, isValid: false }));
+      return { unsubscribe() {} };
+    },
+  };
+}
+
+// Subscribable that emits a single dispatch-error event (found:true, ok:false).
+// Not a connection error and not isValid:false — models a tx-level failure
+// (e.g. the #1051 timeout path standing in for a real 180s watchTransaction
+// timeout) that must fall through to the per-chunk MAX_CHUNK_RETRIES loop.
+function dispatchErrorSubscribable() {
+  return {
+    subscribe({ next }) {
+      setImmediate(() => next({ type: "txBestBlocksState", found: true, ok: false }));
       return { unsubscribe() {} };
     },
   };
@@ -8384,6 +8768,26 @@ describe("verifyNonceAdvanced source structure (issue #153, AC#1)", () => {
     );
   });
 
+  // bootstrapPool opens its own Bulletin client internally (no injectable
+  // `api`), so the #1059 testnet-only guard can't be exercised via a mocked
+  // chain call in a unit test — accountsNeedingReauthorization and
+  // isAutoReauthorizeAllowed (tested directly above) cover the decision
+  // logic. This asserts the guard is actually wired into bootstrapPool's
+  // control flow, ahead of any authorizer resolution or tx submission.
+  test("src/pool.ts: bootstrapPool throws before resolving an authorizer when reauth is needed but not allowed", () => {
+    const src = fs.readFileSync("src/pool.ts", "utf-8");
+    const needsAuthIdx = src.indexOf("const needsAuth = accountsNeedingReauthorization(");
+    const guardIdx = src.indexOf("reauthBufferBlocks > 0 && !opts.allowAutoReauthorize");
+    const authorizerIdx = src.indexOf("--- Step 3: resolve authorizer ---");
+    assert.ok(needsAuthIdx !== -1, "bootstrapPool must compute needsAuth via accountsNeedingReauthorization");
+    assert.ok(guardIdx !== -1, "bootstrapPool must check reauthBufferBlocks > 0 && !opts.allowAutoReauthorize");
+    assert.ok(authorizerIdx !== -1, "bootstrapPool must still have a Step 3 authorizer-resolution block");
+    assert.ok(
+      needsAuthIdx < guardIdx && guardIdx < authorizerIdx,
+      "the #1059 guard must run after computing needsAuth but before Step 3 resolves an authorizer or submits any tx",
+    );
+  });
+
   test("verifyNonceAdvanced: all endpoints unreachable → returns { advanced: false } (all settle rejected)",
     { timeout: 20_000 },
     async () => {
@@ -8491,17 +8895,6 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         usesReusable,
       };
     });
-  }
-
-  function jobBlock(text, jobName) {
-    const jobsMatch = text.match(/^jobs:\s*$/m);
-    assert.ok(jobsMatch, "workflow has no jobs: block");
-    const jobsSection = text.slice(jobsMatch.index + jobsMatch[0].length);
-    const headerRe = /^ {2}([\w-]+):\s*$/gm;
-    const matches = [...jobsSection.matchAll(headerRe)];
-    const matchIndex = matches.findIndex(m => m[1] === jobName);
-    assert.notStrictEqual(matchIndex, -1, `workflow has no ${jobName} job`);
-    return jobsSection.slice(matches[matchIndex].index, matches[matchIndex + 1]?.index ?? jobsSection.length);
   }
 
   function parseOnEvent(text, eventName) {
@@ -9850,6 +10243,290 @@ describe("chunk-probe (incremental-upload-v2)", () => {
     const r = await probeChunks([PROBE_CID1, PROBE_CID2], { client });
     assert.equal(r[0].present, true);
     assert.equal(r[1].present, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// classifyFinalityGap (#1049) — pure function, no chain I/O.
+// ---------------------------------------------------------------------------
+describe("classifyFinalityGap (#1049)", () => {
+  test("chunk present at best-block, absent at finalised head -> lagging, zero re-uploads", () => {
+    // This is the exact #1049 regression: a chunk missing at finalised head
+    // that is actually present in best-block must NEVER be re-uploaded.
+    const missingAtFinalized = ["cidA"];
+    const bestBlockResults = [{ cid: "cidA", present: true, block: 10, index: 0 }];
+    const { reallyMissing, lagging } = classifyFinalityGap(missingAtFinalized, bestBlockResults);
+    assert.deepEqual(lagging, ["cidA"]);
+    assert.deepEqual(reallyMissing, [], ">> FAIL: classifyFinalityGap: chunk present at best-block must produce zero re-uploads");
+  });
+
+  test("chunk absent at both best-block and finalised head -> reallyMissing (genuinely dropped)", () => {
+    const missingAtFinalized = ["cidB"];
+    const bestBlockResults = [{ cid: "cidB", present: false }];
+    const { reallyMissing, lagging } = classifyFinalityGap(missingAtFinalized, bestBlockResults);
+    assert.deepEqual(reallyMissing, ["cidB"]);
+    assert.deepEqual(lagging, []);
+  });
+
+  test("mixed set: correctly splits lagging vs genuinely-missing", () => {
+    const missingAtFinalized = ["cidA", "cidB", "cidC"];
+    const bestBlockResults = [
+      { cid: "cidA", present: true, block: 10, index: 0 },
+      { cid: "cidB", present: false },
+      { cid: "cidC", present: true, block: 11, index: 2 },
+    ];
+    const { reallyMissing, lagging } = classifyFinalityGap(missingAtFinalized, bestBlockResults);
+    assert.deepEqual(reallyMissing, ["cidB"]);
+    assert.deepEqual(lagging, ["cidA", "cidC"]);
+  });
+
+  test("indeterminate best-block result (present: null) is treated as reallyMissing, not lagging", () => {
+    // Safer default: an RPC hiccup at best-block must not silently exempt
+    // a chunk from re-upload consideration.
+    const missingAtFinalized = ["cidD"];
+    const bestBlockResults = [{ cid: "cidD", present: null, failureReason: "rpc_error" }];
+    const { reallyMissing, lagging } = classifyFinalityGap(missingAtFinalized, bestBlockResults);
+    assert.deepEqual(reallyMissing, ["cidD"]);
+    assert.deepEqual(lagging, []);
+  });
+
+  test("cid with no matching best-block result at all is treated as reallyMissing", () => {
+    const missingAtFinalized = ["cidE"];
+    const { reallyMissing, lagging } = classifyFinalityGap(missingAtFinalized, []);
+    assert.deepEqual(reallyMissing, ["cidE"]);
+    assert.deepEqual(lagging, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// probeFinalityGap (#1049) — composite probe+retry+classify, mock chain client.
+// ---------------------------------------------------------------------------
+describe("probeFinalityGap (#1049)", () => {
+  const PFG_CID1 = createCID(new Uint8Array([0x11, 0x22, 0x33])).toString();
+  const PFG_CID2 = createCID(new Uint8Array([0x44, 0x55, 0x66])).toString();
+
+  function makeValidHex(block, index) {
+    const buf = Buffer.alloc(8);
+    buf.writeUInt32LE(block, 0);
+    buf.writeUInt32LE(index, 4);
+    return "0x" + buf.toString("hex");
+  }
+
+  test("empty input returns empty buckets without any RPC call", async () => {
+    let called = false;
+    const client = { _request: async () => { called = true; return [{ changes: [] }]; } };
+    const { reallyMissing, lagging } = await probeFinalityGap([], { client });
+    assert.deepEqual(reallyMissing, []);
+    assert.deepEqual(lagging, []);
+    assert.equal(called, false);
+  });
+
+  test("cid present at best-block on first probe -> lagging, zero re-uploads (direct #1049 regression)", async () => {
+    _resetProbeSession(); _bypassMetadataCheckForTest();
+    let callCount = 0;
+    const client = {
+      _request: async (method, params) => {
+        if (method !== "state_queryStorageAt") throw new Error(`unexpected: ${method}`);
+        callCount++;
+        const keys = params[0];
+        if (callCount === 1) return [{ changes: [[keys[0], makeValidHex(500, 1)]] }];
+        return [{ changes: [[keys[0], null]] }]; // cross-validation call — non-fatal
+      },
+    };
+    const { reallyMissing, lagging } = await probeFinalityGap([PFG_CID1], { client });
+    assert.deepEqual(lagging, [PFG_CID1]);
+    assert.deepEqual(reallyMissing, [], ">> FAIL: probeFinalityGap: best-block-present chunk must never be re-uploaded");
+  });
+
+  test("indeterminate (null) first probe is retried once, then classified from the retry result", async () => {
+    _resetProbeSession(); _bypassMetadataCheckForTest();
+    let attempt = 0;
+    const client = {
+      _request: async (method, params) => {
+        if (method !== "state_queryStorageAt") throw new Error(`unexpected: ${method}`);
+        attempt++;
+        if (attempt === 1) throw new Error("transient rpc hiccup"); // -> present: null on first probe
+        const keys = params[0];
+        if (attempt === 2) return [{ changes: [[keys[0], makeValidHex(700, 2)]] }]; // retry succeeds -> present: true
+        return [{ changes: [[keys[0], null]] }]; // cross-validation call — non-fatal
+      },
+    };
+    const { reallyMissing, lagging } = await probeFinalityGap([PFG_CID2], { client });
+    assert.deepEqual(lagging, [PFG_CID2], ">> FAIL: probeFinalityGap: a retried best-block probe that succeeds must classify as lagging");
+    assert.deepEqual(reallyMissing, []);
+    assert.ok(attempt >= 2, ">> FAIL: probeFinalityGap: must retry once on an indeterminate (present:null) best-block result");
+  });
+
+  test("indeterminate on both attempts falls back to reallyMissing (safe default)", async () => {
+    _resetProbeSession();
+    const client = { _request: async () => { throw new Error("still down"); } };
+    const { reallyMissing, lagging } = await probeFinalityGap([PFG_CID1], { client });
+    assert.deepEqual(reallyMissing, [PFG_CID1]);
+    assert.deepEqual(lagging, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getBestBlockNumber (#1051) — chain-liveness gate for the initial
+// chunk-upload retry loop.
+// ---------------------------------------------------------------------------
+describe("getBestBlockNumber (#1051)", () => {
+  test("decodes a hex header.number into a height", async () => {
+    const client = { _request: async (method) => {
+      assert.strictEqual(method, "chain_getHeader");
+      return { number: "0x1a" }; // 26
+    } };
+    assert.strictEqual(await getBestBlockNumber(client), 26);
+  });
+
+  test("returns null when header.number is missing", async () => {
+    const client = { _request: async () => ({}) };
+    assert.strictEqual(await getBestBlockNumber(client), null, ">> FAIL: getBestBlockNumber: malformed header must yield null, not throw or NaN");
+  });
+
+  test("returns null on RPC failure (fail-open contract for callers)", async () => {
+    const client = { _request: async () => { throw new Error("connection reset"); } };
+    assert.strictEqual(await getBestBlockNumber(client), null, ">> FAIL: getBestBlockNumber: RPC failure must yield null, never throw");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reconcileTimedOutChunk (#1051) — pure reconcile-before-resubmit decision.
+// ---------------------------------------------------------------------------
+describe("reconcileTimedOutChunk (#1051)", () => {
+  test("CID present at best-block alone is sufficient, even if nonce heuristic is invalid", () => {
+    assert.strictEqual(reconcileTimedOutChunk({
+      originalNonce: 100, currentNonce: 100, nonceHeuristicValid: false, cidPresentAtBest: true,
+    }), true, ">> FAIL: reconcileTimedOutChunk: CID-present must short-circuit to included regardless of nonce state");
+  });
+
+  test("nonce advance alone is sufficient when the heuristic is valid", () => {
+    assert.strictEqual(reconcileTimedOutChunk({
+      originalNonce: 100, currentNonce: 101, nonceHeuristicValid: true, cidPresentAtBest: null,
+    }), true);
+  });
+
+  test("nonce advance is ignored when the heuristic is invalid (#951 account rotation)", () => {
+    assert.strictEqual(reconcileTimedOutChunk({
+      originalNonce: 100, currentNonce: 101, nonceHeuristicValid: false, cidPresentAtBest: null,
+    }), false, ">> FAIL: reconcileTimedOutChunk: nonce heuristic must be ignored after an account rotation, else #951 false-positive returns");
+  });
+
+  test("neither signal present -> not included, resubmit is warranted", () => {
+    assert.strictEqual(reconcileTimedOutChunk({
+      originalNonce: 100, currentNonce: 100, nonceHeuristicValid: true, cidPresentAtBest: false,
+    }), false);
+    assert.strictEqual(reconcileTimedOutChunk({
+      originalNonce: 100, currentNonce: 100, nonceHeuristicValid: true, cidPresentAtBest: null,
+    }), false);
+  });
+
+  test("undefined originalNonce never falsely reports inclusion via the nonce path", () => {
+    assert.strictEqual(reconcileTimedOutChunk({
+      originalNonce: undefined, currentNonce: 5, nonceHeuristicValid: true, cidPresentAtBest: null,
+    }), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// waitForChainLiveness (#1051) — bounded poll for best-block height to
+// advance before the retry loop resubmits into a possibly-frozen chain.
+// ---------------------------------------------------------------------------
+describe("waitForChainLiveness (#1051)", () => {
+  test("null lastHeight (no baseline) returns immediately without polling", async () => {
+    let calls = 0;
+    const client = { _request: async () => { calls++; return { number: "0x5" }; } };
+    const result = await __waitForChainLivenessForTest(client, null, 5000, 10);
+    assert.strictEqual(result, 5);
+    assert.strictEqual(calls, 1, ">> FAIL: waitForChainLiveness: null baseline should fetch once (delegates to getBestBlockNumber), not poll in a loop");
+  });
+
+  test("height advances on the second poll -> returns as soon as it's seen, without waiting out the full timeout", async () => {
+    let calls = 0;
+    const client = { _request: async () => {
+      calls++;
+      return { number: calls === 1 ? "0xa" : "0xc" }; // 10, then 12
+    } };
+    const start = Date.now();
+    const result = await __waitForChainLivenessForTest(client, 10, 5000, 10);
+    assert.strictEqual(result, 12, ">> FAIL: waitForChainLiveness: must return the new height once it advances past lastHeight");
+    assert.ok(Date.now() - start < 4000, ">> FAIL: waitForChainLiveness: must return promptly on advance, not block for the full timeout");
+  });
+
+  test("frozen for the whole bounded wait: returns the last-seen (unchanged) height, never throws", async () => {
+    const client = { _request: async () => ({ number: "0x7" }) }; // always 7 — chain never advances
+    const result = await __waitForChainLivenessForTest(client, 7, 40, 10);
+    assert.strictEqual(result, 7, ">> FAIL: waitForChainLiveness: a stall for the entire wait window must resolve with the frozen height, not hang or throw");
+  });
+
+  test("RPC failure mid-wait (getBestBlockNumber -> null) returns immediately, fails open", async () => {
+    let calls = 0;
+    const client = { _request: async () => { calls++; throw new Error("peer unreachable"); } };
+    const result = await __waitForChainLivenessForTest(client, 7, 5000, 10);
+    assert.strictEqual(result, 7, ">> FAIL: waitForChainLiveness: an RPC failure mid-wait must fail open (return last-known height) rather than hang");
+    assert.strictEqual(calls, 1, ">> FAIL: waitForChainLiveness: must stop polling immediately on an RPC failure instead of retrying within the same wait");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// storeChunkedContent reconcile-before-resubmit regression (#1051): a chunk
+// whose tx fails at the WS layer (dispatch error — not a connection error,
+// not isValid:false) must be reconciled via a best-block CID probe before
+// the per-chunk retry loop spends a resubmit on it. If the probe finds the
+// CID already present, storeChunk must NOT be called a second time — a
+// resubmit here would be a duplicate content write and, on a real chain, the
+// same-nonce collision #1051 exists to prevent.
+// ---------------------------------------------------------------------------
+describe("reconcile-before-resubmit avoids duplicate chunk writes (#1051)", () => {
+  test("chunk reconciled as already-included via best-block CID probe is not resubmitted", async () => {
+    _resetProbeSession();
+    _bypassMetadataCheckForTest();
+
+    function makeValidHex(block, index) {
+      const buf = Buffer.alloc(8);
+      buf.writeUInt32LE(block, 0);
+      buf.writeUInt32LE(index, 4);
+      return "0x" + buf.toString("hex");
+    }
+
+    // Keyed by the actual storage key requested, not call order: the reconcile
+    // probe AND the post-loop nonceAdvanceIndices reprobe (#1051 marks
+    // CID-reconciled chunks the same as nonce-reconciled ones) both query the
+    // same CID's key and must both see it present. Cross-validation queries a
+    // different (Transactions-map) key — always answer that with `null`
+    // (non-fatal per chunk-probe.ts's crossValidateFirstHit).
+    let confirmedKey = null;
+    const client = {
+      destroy() {},
+      _request: async (method, params) => {
+        if (method !== "state_queryStorageAt") throw new Error(`unexpected: ${method}`);
+        const key = params[0][0];
+        if (confirmedKey === null) confirmedKey = key;
+        if (key === confirmedKey) return [{ changes: [[key, makeValidHex(500, 1)]] }];
+        return [{ changes: [[key, null]] }];
+      },
+    };
+
+    let submitCalls = 0;
+    const unsafeApi = makeStubApi(() => { submitCalls++; return dispatchErrorSubscribable(); });
+    let reconnectCalled = false;
+    const reconnect = async () => {
+      reconnectCalled = true;
+      return { client, unsafeApi, signer: stubSigner, ss58: STUB_SS58 };
+    };
+
+    await storeChunkedContent([ONE_BYTE_CHUNK], {
+      client,
+      unsafeApi,
+      signer: stubSigner,
+      ss58: STUB_SS58,
+      reconnect,
+      fetchNonce: async () => 100,
+      skipRootStore: true,
+    });
+
+    assert.strictEqual(submitCalls, 1, ">> FAIL: reconcile-before-resubmit: chunk was found already-included via CID probe but was resubmitted anyway (duplicate write)");
+    assert.strictEqual(reconnectCalled, false, ">> FAIL: reconcile-before-resubmit: a tx-level dispatch error must not trigger a WS reconnect");
   });
 });
 
@@ -12003,16 +12680,10 @@ describe("automatic mirror absent", () => {
 });
 
 describe("paseo-next-v2 E2E harness wiring", () => {
-  function workflowJobBlock(text, jobName) {
-    const jobsMatch = text.match(/^jobs:\s*$/m);
-    assert.ok(jobsMatch, "workflow has no jobs: block");
-    const jobsSection = text.slice(jobsMatch.index + jobsMatch[0].length);
-    const headerRe = /^ {2}([\w-]+):\s*$/gm;
-    const matches = [...jobsSection.matchAll(headerRe)];
-    const matchIndex = matches.findIndex(m => m[1] === jobName);
-    assert.notStrictEqual(matchIndex, -1, `workflow has no ${jobName} job`);
-    return jobsSection.slice(matches[matchIndex].index, matches[matchIndex + 1]?.index ?? jobsSection.length);
-  }
+  // Local alias to the module-level jobBlock helper (see top of file) — kept
+  // under this describe's existing name so its many call sites below don't
+  // need renaming; this used to be its own byte-identical copy of jobBlock.
+  const workflowJobBlock = jobBlock;
 
   function assertNoStatusLabel(label) {
     assert.strictEqual(
@@ -13580,6 +14251,67 @@ describe("reproveAliasToAccount (mock APIs)", () => {
     assert.ok(capturedArgs[0].ident.startsWith("0x"), "ident must be 0x-prefixed");
     assert.ok(capturedArgs[0].key.startsWith("0x"), "memberKey must be 0x-prefixed");
   });
+
+  // Issue #1057: S-REPROVE was failing deterministically on the `preview` env
+  // with a generic "reprove_alias_account dispatched but failed in-block"
+  // message. The dispatchError was already captured on the thrown
+  // ReproveAliasError, but never rendered into the message, so operators
+  // could not see WHY the extrinsic reverted. This test locks in that the
+  // decoded pallet + error variant now appear in the message for a pallet
+  // that isn't one of the three already-special-cased AliasAccounts variants
+  // (BadProof / ReproveMismatch / AliasAccountAlreadySet) — i.e. any module
+  // error, not just the ones narrowDispatchError() already recognizes.
+  test("in-block failure: surfaces decoded pallet + variant in the error message, not just 'failed in-block'", async () => {
+    const dispatchError = {
+      type: "Module",
+      value: { type: "PoolAssets", value: { type: "NoPermission" } },
+    };
+    const { peopleUnsafeApi, ahUnsafeApi: baseAh } = buildReproveApis();
+    const ahUnsafeApi = {
+      ...baseAh,
+      tx: {
+        AliasAccounts: {
+          reprove_alias_account: () => ({
+            signSubmitAndWatch: () => ({
+              subscribe: ({ next }) => {
+                Promise.resolve().then(() => {
+                  next({ type: "broadcasted" });
+                  next({ type: "txBestBlocksState", found: true, ok: false, dispatchError });
+                });
+                return { unsubscribe: () => {} };
+              },
+            }),
+          }),
+        },
+      },
+    };
+
+    await assert.rejects(
+      reproveAliasToAccount({
+        peopleUnsafeApi,
+        ahUnsafeApi,
+        account: MOCK_ALICE,
+        memberKey: MOCK_MEMBER_KEY,
+        signCall: makeSigner(),
+        buildRingProof: buildRingProofOk,
+      }),
+      (err) => {
+        assert.ok(
+          err.message.includes("PoolAssets"),
+          `>> FAIL: reprove-dispatch-error-surfaced: expected pallet name "PoolAssets" in error message, got: ${err.message}`,
+        );
+        assert.ok(
+          err.message.includes("NoPermission"),
+          `>> FAIL: reprove-dispatch-error-surfaced: expected error variant "NoPermission" in error message, got: ${err.message}`,
+        );
+        assert.equal(err.kind, "DispatchError",
+          `>> FAIL: reprove-dispatch-error-surfaced: unrecognized pallet/variant should still narrow to "DispatchError", got: ${err.kind}`);
+        assert.deepEqual(err.dispatchError, dispatchError,
+          ">> FAIL: reprove-dispatch-error-surfaced: raw dispatchError must still be attached to the thrown error for telemetry");
+        return true;
+      },
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -14783,6 +15515,116 @@ describe("GRANDPA finality probe (post-Phase-B, full scope)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// GRANDPA finality-lag re-upload fix (#1049)
+// ---------------------------------------------------------------------------
+describe("GRANDPA finality-check probes best-block before re-upload (#1049)", () => {
+  const src = fs.readFileSync("src/deploy.ts", "utf8");
+
+  test("deploy.ts imports probeFinalityGap from chunk-probe.js", () => {
+    assert.ok(
+      /import\s*\{[^}]*probeFinalityGap[^}]*\}\s*from\s*["']\.\/chunk-probe\.js["']/.test(src),
+      ">> FAIL: #1049: deploy.ts must import probeFinalityGap from ./chunk-probe.js"
+    );
+  });
+
+  test("probeFinalityGap(stillMissing, ...) runs BEFORE the re-upload round loop", () => {
+    const bestBlockIdx = src.search(/probeFinalityGap\(\s*stillMissing\s*,/);
+    const roundLoopIdx = src.indexOf("for (let round = 1; round <= GRANDPA_REUPLOAD_MAX_ROUNDS");
+    assert.ok(bestBlockIdx !== -1, ">> FAIL: #1049: deploy.ts must call probeFinalityGap(stillMissing, ...) before re-upload");
+    assert.ok(roundLoopIdx !== -1, ">> FAIL: #1049: GRANDPA re-upload round loop must still exist");
+    assert.ok(bestBlockIdx < roundLoopIdx, ">> FAIL: #1049: probeFinalityGap must run BEFORE the re-upload round loop, not after");
+  });
+
+  test("probeFinalityGap result gates what gets re-uploaded (missingCids reassigned to reallyMissing)", () => {
+    assert.ok(
+      /const\s*\{\s*reallyMissing\s*,\s*lagging\s*\}\s*=\s*await probeFinalityGap\(\s*stillMissing/.test(src),
+      ">> FAIL: #1049: deploy.ts must destructure { reallyMissing, lagging } from probeFinalityGap(stillMissing, ...)"
+    );
+    assert.ok(
+      /missingCids\s*=\s*new Set\(reallyMissing\)/.test(src),
+      ">> FAIL: #1049: deploy.ts must narrow missingCids to reallyMissing before the re-upload loop runs"
+    );
+  });
+
+  test("lagging chunks are logged and never enter the re-upload path", () => {
+    assert.ok(
+      /will NOT re-upload/.test(src),
+      ">> FAIL: #1049: deploy.ts must log that lagging chunks will NOT be re-uploaded"
+    );
+    assert.ok(
+      /laggingCids\s*=\s*new Set\(lagging\)/.test(src),
+      ">> FAIL: #1049: deploy.ts must track lagging cids separately from missingCids"
+    );
+  });
+
+  test("deploy.probe.finality_lagging_count seeded in telemetry.ts and set in deploy.ts", () => {
+    const tel = fs.readFileSync("src/telemetry.ts", "utf8");
+    assert.ok(
+      /deploy\.probe\.finality_lagging_count.*:\s*0/.test(tel),
+      ">> FAIL: #1049: telemetry.ts must seed deploy.probe.finality_lagging_count as 0"
+    );
+    assert.ok(
+      /setDeployAttribute\("deploy\.probe\.finality_lagging_count"/.test(src),
+      ">> FAIL: #1049: deploy.ts must call setDeployAttribute(\"deploy.probe.finality_lagging_count\", ...)"
+    );
+  });
+
+  test("final hard-failure throw fires only for genuinely-missing chunks, not lagging ones", () => {
+    // The throw must still check missingCids (now scoped to reallyMissing
+    // post-classification) — lagging chunks were removed from missingCids
+    // before this check, so they can never trigger it.
+    assert.ok(
+      /if \(missingCids\.size > 0\) \{\s*\n\s*const stuck = \[\.\.\.missingCids\]\[0\];\s*\n\s*throw new Error/.test(src),
+      ">> FAIL: #1049: the hard-failure throw must remain gated on missingCids (reallyMissing), unchanged mechanics"
+    );
+  });
+
+  test("GRANDPA wait/timeout constants are env-overridable with the raised/new defaults (#1049)", () => {
+    // Table-driven: one structural invariant (CONST: number = parseInt(process.env.VAR ?? "default", 10))
+    // checked against three constant/env-var/default triples.
+    const cases = [
+      ["GRANDPA_REUPLOAD_TIMEOUT_MS", "BULLETIN_GRANDPA_REUPLOAD_TIMEOUT_MS", "120000"],
+      ["GRANDPA_NATURAL_WAIT_MS", "BULLETIN_GRANDPA_NATURAL_WAIT_MS", "210000"],
+      ["GRANDPA_LAGGING_WAIT_MS", "BULLETIN_GRANDPA_LAGGING_WAIT_MS", "90000"],
+    ];
+    for (const [constName, envVar, def] of cases) {
+      const re = new RegExp(`${constName}:\\s*number\\s*=\\s*parseInt\\(process\\.env\\.${envVar}\\s*\\?\\?\\s*"${def}"`);
+      assert.ok(re.test(src), `>> FAIL: #1049: ${constName} must read from ${envVar} (default ${def})`);
+    }
+  });
+
+  test("a deploy with only lagging chunks (zero genuinely missing) never re-uploads, and does not print the re-upload success line", () => {
+    assert.ok(
+      /No chunks genuinely missing from best-block — skipped re-upload entirely/.test(src),
+      ">> FAIL: #1049: deploy.ts must report success without re-upload when all missing chunks are best-block-present"
+    );
+  });
+
+  test("pollUntilFinalized is shared by all three GRANDPA wait loops (natural wait, reupload, lagging)", () => {
+    const callSites = src.match(/await pollUntilFinalized\(/g) ?? [];
+    assert.ok(
+      callSites.length >= 3,
+      `>> FAIL: #1049: expected pollUntilFinalized to be called at least 3 times (natural/reupload/lagging waits); found ${callSites.length}`
+    );
+  });
+
+  test("second (pre-setContenthash) root re-check also tolerates finality-lag via probeFinalityGap, not a bare hard-throw", () => {
+    // #1049 belt-and-suspenders gap: the standalone root re-check right
+    // before setContenthash used to hard-throw on any present:false at
+    // finalized head — including a root that's merely lagging (present in
+    // best-block), which would silently undo the GRANDPA phase's tolerance.
+    const finalCheckIdx = src.indexOf("Final root check:");
+    assert.ok(finalCheckIdx !== -1, ">> FAIL: #1049: 'Final root check' block must still exist");
+    const region = src.slice(finalCheckIdx, finalCheckIdx + 1200);
+    assert.ok(
+      /probeFinalityGap\(\s*\[\s*storageCid\s*\]/.test(region),
+      ">> FAIL: #1049: the final root re-check must route a present:false result through probeFinalityGap([storageCid], ...) " +
+        "instead of throwing unconditionally"
+    );
+  });
+});
+
 
 // ---------------------------------------------------------------------------
 // Nonce-advance collision probe
@@ -15793,6 +16635,149 @@ describe("signAndSubmitExtrinsic deadline poller", () => {
     );
   });
 });
+
+
+// ---------------------------------------------------------------------------
+// WatcherSilentNoEventError + classifyWatcherSilentFastFail (#990 — backport
+// the phone-signer no-event fast-fail from polkadot-app-deploy). Complementary
+// to #970/#971 (verifyEffect false-negative retry re-gate) and distinct from
+// #833 (verifyEffectWithGrace): this is the case where the watcher NEVER saw a
+// single prior event (phone never approved), not a late-arriving false negative.
+// ---------------------------------------------------------------------------
+describe("WatcherSilentNoEventError (#990)", () => {
+  test("is an Error subclass with name WatcherSilentNoEventError", () => {
+    const err = new WatcherSilentNoEventError(95_000);
+    assert.ok(err instanceof Error, ">> FAIL: WatcherSilentNoEventError: must be an Error subclass");
+    assert.strictEqual(err.name, "WatcherSilentNoEventError",
+      ">> FAIL: WatcherSilentNoEventError: err.name must be 'WatcherSilentNoEventError'");
+  });
+  test("message reports the silence duration in seconds", () => {
+    const err = new WatcherSilentNoEventError(95_000);
+    assert.ok(/95s/.test(err.message),
+      `>> FAIL: WatcherSilentNoEventError: message must report the floored silence duration, got "${err.message}"`);
+  });
+});
+
+describe("classifyWatcherSilentFastFail (#990)", () => {
+  test("phone signer + WatcherSilentNoEventError -> NonRetryableError with the phone-approval message", () => {
+    const result = classifyWatcherSilentFastFail(new WatcherSilentNoEventError(95_000), true);
+    assert.ok(result instanceof NonRetryableError,
+      `>> FAIL: classifyWatcherSilentFastFail: phone signer + no-event silence must fast-fail with NonRetryableError, got ${result?.constructor?.name}`);
+    assert.strictEqual(result.message, "No signature received from the phone — re-run when you can approve on your phone.",
+      ">> FAIL: classifyWatcherSilentFastFail: fast-fail message must match the #990 acceptance criteria exactly");
+  });
+  test("non-phone signer (false) + WatcherSilentNoEventError -> null (unchanged default retry path)", () => {
+    assert.strictEqual(classifyWatcherSilentFastFail(new WatcherSilentNoEventError(95_000), false), null,
+      ">> FAIL: classifyWatcherSilentFastFail: a non-phone signer must not fast-fail — the default retry/backoff loop must still run");
+  });
+  test("undefined isPhoneSigner + WatcherSilentNoEventError -> null (treated as non-phone)", () => {
+    assert.strictEqual(classifyWatcherSilentFastFail(new WatcherSilentNoEventError(95_000), undefined), null,
+      ">> FAIL: classifyWatcherSilentFastFail: undefined isPhoneSigner must be treated as non-phone (no fast-fail)");
+  });
+  test("phone signer + plain Error (watcher silent WITH a prior event) -> null (not the typed no-event class)", () => {
+    // Reproduces the "went silent after signed/broadcasted" case: a real event
+    // did arrive, so signAndSubmitExtrinsic throws a plain Error, not
+    // WatcherSilentNoEventError. Must stay on the ordinary retry path.
+    const err = new Error("transaction watcher silent for 90s after signed");
+    assert.strictEqual(classifyWatcherSilentFastFail(err, true), null,
+      ">> FAIL: classifyWatcherSilentFastFail: a plain Error (prior event existed) must not fast-fail even for a phone signer");
+  });
+  test("phone signer + unrelated error -> null", () => {
+    assert.strictEqual(classifyWatcherSilentFastFail(new Error("InsufficientBalance"), true), null,
+      ">> FAIL: classifyWatcherSilentFastFail: unrelated errors must not fast-fail");
+  });
+});
+
+describe("signAndSubmitExtrinsic silent-watcher branch wiring (#990)", () => {
+  test("src/dotns.ts: no-progress branch throws WatcherSilentNoEventError only when lastEventType is '(none)'", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    const marker = "const silentMs = Date.now() - lastEventAt;";
+    const idx = src.indexOf(marker);
+    assert.ok(idx >= 0, ">> FAIL: #990 wiring: could not locate the silent-watcher branch in src/dotns.ts");
+    const branch = src.slice(idx, idx + 700);
+    assert.ok(/lastEventType === "\(none\)"/.test(branch),
+      ">> FAIL: #990 wiring: silent-watcher branch must distinguish lastEventType === \"(none)\" (no prior event) from the with-event case");
+    assert.ok(/new WatcherSilentNoEventError\(/.test(branch),
+      ">> FAIL: #990 wiring: silent-watcher branch must throw WatcherSilentNoEventError for the no-prior-event case");
+  });
+
+  test("src/dotns.ts: signAndSubmitWithRetry's catch calls classifyWatcherSilentFastFail before classifyTxRetryDecision", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    const idx = src.indexOf("async signAndSubmitWithRetry(");
+    assert.ok(idx >= 0, ">> FAIL: #990 wiring: could not locate signAndSubmitWithRetry in src/dotns.ts");
+    const body = src.slice(idx, idx + 2000);
+    const fastFailIdx = body.indexOf("classifyWatcherSilentFastFail(");
+    const retryDecisionIdx = body.indexOf("classifyTxRetryDecision(");
+    assert.ok(fastFailIdx >= 0, ">> FAIL: #990 wiring: signAndSubmitWithRetry must call classifyWatcherSilentFastFail");
+    assert.ok(retryDecisionIdx >= 0, ">> FAIL: #990 wiring: signAndSubmitWithRetry must still call classifyTxRetryDecision for the default path");
+    assert.ok(fastFailIdx < retryDecisionIdx,
+      ">> FAIL: #990 wiring: the no-event phone fast-fail must be checked BEFORE the default retry classification, so it pre-empts retry/backoff entirely");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verifyEffectWithGrace: nonce-advance fallback should not retry a tx just
+// because the queried node is a block or two behind (#833)
+// ---------------------------------------------------------------------------
+describe("verifyEffectWithGrace (#833)", () => {
+  test("verifyEffect true on first call resolves true immediately (no delay, single call)", async () => {
+    let calls = 0;
+    const verifyEffect = async () => { calls++; return true; };
+    const start = Date.now();
+    const result = await verifyEffectWithGrace(verifyEffect, { retries: 3, intervalMs: 2_000 });
+    const elapsedMs = Date.now() - start;
+    assert.strictEqual(result, true, ">> FAIL: verifyEffectWithGrace: expected true when verifyEffect succeeds on first call");
+    assert.strictEqual(calls, 1, ">> FAIL: verifyEffectWithGrace: expected exactly 1 call when the first call already succeeds");
+    assert.ok(elapsedMs < 500, `>> FAIL: verifyEffectWithGrace: expected no grace-period delay on immediate success, took ${elapsedMs}ms`);
+  });
+
+  test("verifyEffect false-then-true within the grace window resolves true (no tx retry, #833)", async () => {
+    // Reproduces the real-world scenario from #833: the queried node is a block
+    // or two behind, so the first (and second) verifyEffect call misses the
+    // already-included effect, then a later re-poll observes it. This must
+    // resolve true so signAndSubmitExtrinsic does NOT throw and trigger a
+    // duplicate, fee-paying tx retry.
+    let calls = 0;
+    const verifyEffect = async () => { calls++; return calls >= 3; };
+    const result = await verifyEffectWithGrace(verifyEffect, { retries: 3, intervalMs: 5 });
+    assert.strictEqual(result, true, ">> FAIL: verifyEffectWithGrace: expected true once a re-poll observes the effect within the grace window");
+    assert.strictEqual(calls, 3, ">> FAIL: verifyEffectWithGrace: expected to stop re-polling as soon as verifyEffect succeeds (got calls=" + calls + ")");
+  });
+
+  test("verifyEffect false for every call (initial + all retries) resolves false (#833)", async () => {
+    // Genuine absence case: the effect never lands (a different tx of ours
+    // consumed the nonce, or a reorg). Must still resolve false so the
+    // caller's tx-retry path fires.
+    let calls = 0;
+    const verifyEffect = async () => { calls++; return false; };
+    const result = await verifyEffectWithGrace(verifyEffect, { retries: 3, intervalMs: 5 });
+    assert.strictEqual(result, false, ">> FAIL: verifyEffectWithGrace: expected false when the effect is never observed");
+    assert.strictEqual(calls, 4, ">> FAIL: verifyEffectWithGrace: expected exactly 1 initial call + 3 retries = 4 total calls, got " + calls);
+  });
+
+  test("verifyEffectWithGrace defaults to NONCE_ADVANCE_VERIFY_RETRIES/_INTERVAL_MS when no options passed", async () => {
+    assert.ok(NONCE_ADVANCE_VERIFY_RETRIES >= 1, ">> FAIL: verifyEffectWithGrace: NONCE_ADVANCE_VERIFY_RETRIES must allow at least one re-poll");
+    assert.ok(NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS > 0, ">> FAIL: verifyEffectWithGrace: NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS must be positive");
+    let calls = 0;
+    const verifyEffect = async () => { calls++; return true; };
+    const result = await verifyEffectWithGrace(verifyEffect);
+    assert.strictEqual(result, true, ">> FAIL: verifyEffectWithGrace: expected true with default options and a first-call success");
+    assert.strictEqual(calls, 1, ">> FAIL: verifyEffectWithGrace: expected exactly 1 call with default options and a first-call success");
+  });
+
+  test("src/dotns.ts: nonce-advance fallback branch calls verifyEffectWithGrace, not a bare opts.verifyEffect() (#833)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    // Find the nonce-advance branch (guards on nonce.advanced) and confirm it
+    // routes through verifyEffectWithGrace rather than calling opts.verifyEffect()
+    // directly and throwing on a single false.
+    const nonceAdvanceBranch = src.slice(src.indexOf("if (nonce.advanced)"), src.indexOf("if (nonce.advanced)") + 600);
+    assert.ok(
+      /verifyEffectWithGrace\(opts\.verifyEffect\)/.test(nonceAdvanceBranch),
+      "dotns.ts: nonce-advance branch must call verifyEffectWithGrace(opts.verifyEffect), not opts.verifyEffect() directly >> FAIL: #833 regression guard - single-shot verifyEffect call would retry the tx on a lagging node"
+    );
+  });
+});
+
 
 describe("36. CAR dump is opt-in (#549)", () => {
   test("CAR dump: no write when env and option both unset", () => {
@@ -18758,7 +19743,39 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason } from "../dist/deploy.js";
+import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
+
+// #1058: describeSlotFallbackReason is the extracted, unit-testable reason
+// formatter used by selectStorageReconnect's pool-fallback console.warn (and
+// the deploy.signer.fallback_reason telemetry attribute) so a pool fallback
+// always carries an explicit, human-readable reason instead of degrading
+// silently.
+describe("describeSlotFallbackReason (#1058)", () => {
+  test("BulletinSlotAuthError expired with expiration → 'expired at block N'", () => {
+    const reason = describeSlotFallbackReason(new BulletinSlotAuthErrorForReasonTest("expired", "5Grw...", 12345));
+    assert.equal(reason, "expired at block 12345",
+      ">> FAIL: describeSlotFallbackReason: expired-with-expiration must produce 'expired at block N'");
+  });
+
+  test("BulletinSlotAuthError missing → 'no on-chain authorization found'", () => {
+    const reason = describeSlotFallbackReason(new BulletinSlotAuthErrorForReasonTest("missing", "5Grw..."));
+    assert.equal(reason, "no on-chain authorization found",
+      ">> FAIL: describeSlotFallbackReason: missing must produce 'no on-chain authorization found'");
+  });
+
+  test("generic Error → its message", () => {
+    const reason = describeSlotFallbackReason(new Error("WS connection timed out"));
+    assert.equal(reason, "WS connection timed out",
+      ">> FAIL: describeSlotFallbackReason: a generic Error must surface its .message verbatim");
+  });
+
+  test("non-Error thrown value → String(e)", () => {
+    const reason = describeSlotFallbackReason("some string error");
+    assert.equal(reason, "some string error",
+      ">> FAIL: describeSlotFallbackReason: a non-Error thrown value must be stringified");
+  });
+});
 
 describe("resolveStorageSigner (user-first storage signer, #19)", () => {
   const fakeSigner = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) };
@@ -19018,5 +20035,50 @@ describe("localStorage warning suppression (real bin)", () => {
       !/local ?storage/i.test(result.stderr ?? ""),
       `>> FAIL: localStorage warning suppression: polkadot-app-deploy --list-environments must not emit a localStorage warning on stderr.\nActual stderr: ${result.stderr}`,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1108 — best-block resolution: DotNS writes resolve on best-block inclusion +
+// a confirmed on-chain effect, WITHOUT waiting for GRANDPA finality. Guards the
+// exact fix for the rc.4 transient (setContenthash "timed out after 300000ms"
+// during a finality-lag window while the tx was already included). Deterministic:
+// a fake papi extrinsic drives the watcher's event stream; no chain.
+// ---------------------------------------------------------------------------
+describe("#1108 best-block resolution (transient finality hardening)", () => {
+  // Engage the best-block short-circuit immediately (no finality grace window) so
+  // these deterministic tests resolve on the first ~6s poll tick instead of the
+  // 60s production default. signAndSubmitExtrinsic reads this env per-call.
+  process.env.BULLETIN_DOTNS_BESTBLOCK_GRACE_MS = "0";
+  // The poll loop reads only Timestamp.Now; a constant keeps chain-time budget at 0.
+  const fakeClient = () => ({ query: { Timestamp: { Now: { getValue: async () => 1000n } } } });
+  // A fake extrinsic whose signSubmitAndWatch replays `events` to the observer.
+  const fakeExtrinsic = (events) => ({
+    signSubmitAndWatch() {
+      return { subscribe(observer) { for (const ev of events) queueMicrotask(() => observer.next(ev)); return { unsubscribe() {} }; } };
+    },
+  });
+  const bestBlock = { type: "txBestBlocksState", found: true, txHash: { toString: () => "0xabc" } };
+  const finalized = { type: "finalized", ok: true, block: { hash: "0xdef", number: 42 }, txHash: { toString: () => "0xabc" } };
+
+  test("resolves best-block on inclusion + verifyEffect=true, without any finalized event", async () => {
+    const w = new ReviveClientWrapper(fakeClient());
+    const res = await w.signAndSubmitExtrinsic(fakeExtrinsic([bestBlock]), {}, () => {}, { verifyEffect: async () => true });
+    assert.strictEqual(res.kind, TX_KIND_BEST_BLOCK,
+      ">> FAIL: #1108: a tx in a best block whose effect is confirmed on-chain must resolve best-block, not hang waiting for finality (this is the rc.4 setContenthash timeout).");
+  });
+
+  test("does NOT false-resolve when verifyEffect=false; falls through to finalized", async () => {
+    const w = new ReviveClientWrapper(fakeClient());
+    const res = await w.signAndSubmitExtrinsic(fakeExtrinsic([bestBlock, finalized]), {}, () => {}, { verifyEffect: async () => false });
+    assert.strictEqual(res.kind, TX_KIND_HASH,
+      ">> FAIL: #1108: a best-block inclusion whose effect is NOT observable must wait for finalized, never report false success (reorg safety).");
+  });
+
+  test("without verifyEffect, best-block inclusion alone does not resolve; waits for finalized", async () => {
+    const w = new ReviveClientWrapper(fakeClient());
+    const res = await w.signAndSubmitExtrinsic(fakeExtrinsic([bestBlock, finalized]), {}, () => {}, {});
+    assert.strictEqual(res.kind, TX_KIND_HASH,
+      ">> FAIL: #1108: with no verifyEffect there is no effect to confirm, so best-block must NOT short-circuit — only finalized resolves.");
   });
 });

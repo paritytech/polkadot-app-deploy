@@ -9,7 +9,7 @@ import { buildManifestSidecar } from "./helpers/e2e-manifest-fixture.js";
 import { runBulletinDeploy } from "./helpers/e2e-cli.js";
 import { resolveContenthashOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
-import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, loadEnvironments, resolveEndpoints, deploy } from "@parity/polkadot-app-deploy";
+import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, loadEnvironments, resolveEndpoints, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 import { encodeContenthash } from "@parity/polkadot-app-deploy/deploy";
 import { fetchManifestRoundtrip } from "@parity/polkadot-app-deploy/manifest-roundtrip";
@@ -147,6 +147,9 @@ function pickStableLabel() {
   if (SIGNER === "direct") {
     return signerPopStatus >= 2 ? "e2edirect" : "e2edirect01";
   }
+  // #1054: a pinned pool leg owns its own per-leg domain (e2epoolleg<NN>).
+  const perLeg = perLegPoolLabel();
+  if (perLeg) return perLeg;
   // E2E_POOL_LABEL lets nightly-pr-coverage use a dedicated pool fixture domain
   // (e2eprpool01) so it doesn't contend with nightly-s1-pool on e2epoolns01.
   if (process.env.E2E_POOL_LABEL) return process.env.E2E_POOL_LABEL;
@@ -171,12 +174,38 @@ function poolLegSuffix() {
   if (!Number.isInteger(n) || n < 0 || n > 99) return null;
   return String(n).padStart(2, "0");
 }
+// #1054: when a pool leg is pinned to a pool account (BULLETIN_POOL_ACCOUNT_INDEX),
+// that account is the DotNS OWNER too (not bare Alice), so concurrent legs stop
+// sharing Alice's single Asset Hub nonce (the `Invalid: Stale` collision class).
+function poolLegIndex() {
+  const idx = process.env.BULLETIN_POOL_ACCOUNT_INDEX;
+  if (idx == null || idx === "") return null;
+  const n = Number(idx);
+  return Number.isInteger(n) && n >= 0 && n <= 99 ? n : null;
+}
+// Per-leg DotNS domain owned by that leg's pool account. Base "e2epoolleg" (10 chars,
+// ≥9 so a NoStatus account can register it) + zero-padded 2-digit index. Round-trips
+// through sanitizeDomainLabel unchanged (asserted in test/test.js).
+function perLegPoolLabel() {
+  const n = poolLegIndex();
+  return n == null ? null : `e2epoolleg${String(n).padStart(2, "0")}`;
+}
+// DotNS-owner CLI args for a pinned pool leg: sign DotNS ops as //deploy/<index>
+// (the SAME account used for Bulletin storage), not the default bare Alice.
+function poolOwnerArgs() {
+  const n = poolLegIndex();
+  return n == null ? [] : ["--mnemonic", ALICE_MNEMONIC, "--derivation-path", poolAccountDerivationPath(n)];
+}
 function pickIncLabel() {
+  const perLeg = perLegPoolLabel();
+  if (perLeg) return perLeg;
   const suf = poolLegSuffix();
   if (signerPopStatus >= 2) return suf ? `e2einc${suf}` : "e2einc";
   return suf ? `e2eincpool${suf}` : "e2eincpool01";
 }
 function pickRotLabel() {
+  const perLeg = perLegPoolLabel();
+  if (perLeg) return perLeg;
   const suf = poolLegSuffix();
   if (signerPopStatus >= 2) return suf ? `e2erot${suf}` : "e2erot";
   return suf ? `e2erotpool${suf}` : "e2erotpool01";
@@ -228,6 +257,10 @@ function buildArgs(fixtureDir, label) {
     args.push("--mnemonic", ALICE_MNEMONIC);
     const deriv = directSignerDerivationPath();
     if (deriv) args.push("--derivation-path", deriv);
+  } else {
+    // #1054: a pinned pool leg signs DotNS as its own pool account (//deploy/<index>),
+    // which owns its per-leg domain — no more shared bare-Alice Asset Hub nonce.
+    args.push(...poolOwnerArgs());
   }
   // Manifest sidecar is restricted to the scenarios where the manifest path is
   // load-bearing for coverage (s1 happy-path, s-inc incremental). Running it
@@ -250,6 +283,9 @@ function buildInputCarArgs(dumpPath, label) {
     args.push("--mnemonic", ALICE_MNEMONIC);
     const deriv = directSignerDerivationPath();
     if (deriv) args.push("--derivation-path", deriv);
+  } else {
+    // #1054: a pinned pool leg signs DotNS as its own pool account (//deploy/<index>).
+    args.push(...poolOwnerArgs());
   }
   return args;
 }
@@ -1250,13 +1286,24 @@ describe("e2e", { skip: !ENABLED }, () => {
         assertDeploySucceeded(rB, { scenario: "S9", step: "deploy B" });
 
         const combined = rA.stdout + rA.stderr + rB.stdout + rB.stderr;
+        // Accept ANY of the deploy's nonce-collision-recovery signals — not just
+        // the "consumed → included" heuristic (deploy.ts nonce-advance fallback /
+        // consumed-heuristic logs), but crucially the "Nonce-collision re-upload"
+        // line (deploy.ts:1346), which is the DEFINITIVE evidence the resilience
+        // path engaged: it only fires when a chunk's nonce advanced under it AND
+        // the chunk was actually missing, forcing a fresh-nonce re-upload. The
+        // earlier grep missed this — #1100 saw a run emit "Nonce-collision
+        // re-upload" 34× (both deploys succeeded, recovery worked) while the old
+        // regex's phrases appeared 0× → false red. This is a stronger signal, not
+        // a weaker assertion.
         assert.match(
           combined,
-          /nonce (advanced past \d+|consumed \(current=|\d+ consumed)/i,
-          ">> FAIL: S9: expected at least one nonce-advance log across the two parallel deploys " +
-            "(both use //e2e-direct, so Bulletin chunk txs share a nonce counter). " +
-            "If this fails, the deploys may have run sequentially or fixture overlap was insufficient — " +
-            "not necessarily a code defect; check timestamps in output.",
+          /(nonce (advanced past \d+|consumed \(current=|\d+ consumed)|Nonce-collision re-upload|nonce-advance collision)/i,
+          ">> FAIL: S9: neither parallel deploy logged any nonce-collision-recovery signal " +
+            "(expected one of: 'Nonce-collision re-upload', 'nonce advanced past N', or 'nonce N consumed (current=...)'). " +
+            "Both use the same signer, so their Bulletin chunk txs share a nonce counter and MUST contend. " +
+            "If this fails, the deploys ran sequentially / fixture overlap was insufficient (the race did not stage) — " +
+            "widen makeMultiChunkFixture rather than weakening this check; not necessarily a product defect (check timestamps).",
         );
       } finally {
         fs.rmSync(fixA, { recursive: true, force: true });
@@ -1265,13 +1312,21 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
   });
 
-  describe("S-GRANDPA-REUPLOAD — stale finalized head forces chunk re-upload path", { skip: SCENARIO !== "s-grandpa-reupload", concurrency: false }, () => {
+  describe("S-GRANDPA-REUPLOAD — stale finalized head must NOT trigger re-upload (#1049)", { skip: SCENARIO !== "s-grandpa-reupload", concurrency: false }, () => {
     // staleDurationMs (15s) > NATURAL_WAIT_MS (10s): the proxy stale window
-    // outlasts the natural wait so the re-upload path fires reliably.
+    // outlasts the natural wait, so the finality-lag path fires reliably.
+    //
+    // Pre-#1049 this scenario asserted the OLD (buggy) behavior: a re-upload
+    // fired and succeeded. That was the exact regression the issue reports —
+    // the proxy only freezes chain_getFinalizedHead; chunks are genuinely
+    // present in best-block the entire time. Post-#1049, the correct
+    // behavior is to detect best-block presence and skip re-upload entirely,
+    // then let GRANDPA catch up (bounded) once the stale window ends.
     const STALE_DURATION_MS = 15_000;
     const NATURAL_WAIT_MS = 10_000;
+    const LAGGING_WAIT_MS = 20_000;
 
-    test("stale chain_getFinalizedHead forces re-upload path, deploy exits 0", { timeout: DEPLOY_TIMEOUT_MS + STALE_DURATION_MS + 60_000 }, async () => {
+    test("stale chain_getFinalizedHead does not trigger re-upload; deploy exits 0", { timeout: DEPLOY_TIMEOUT_MS + STALE_DURATION_MS + 60_000 }, async () => {
       const rpc = await resolveE2eBulletinRpc();
       const proxy = await startFaultProxy({
         mode: "stale-finalized-head",
@@ -1294,6 +1349,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           env: {
             BULLETIN_RPC: proxy.url,
             BULLETIN_GRANDPA_NATURAL_WAIT_MS: String(NATURAL_WAIT_MS),
+            BULLETIN_GRANDPA_LAGGING_WAIT_MS: String(LAGGING_WAIT_MS),
           },
           timeoutMs: DEPLOY_TIMEOUT_MS + STALE_DURATION_MS,
         });
@@ -1301,12 +1357,12 @@ describe("e2e", { skip: !ENABLED }, () => {
         if (result.code !== 0) {
           failWith({
             scenario: "S-GRANDPA-REUPLOAD",
-            message: `deploy must exit 0 after GRANDPA re-upload; got exit ${result.code}`,
+            message: `deploy must exit 0 despite stale finalized head; got exit ${result.code}`,
             context: result.stderr,
-            keywords: ["Error", "finalised", "missing", "re-upload"],
-            hint: "Proxy held a stale chain_getFinalizedHead hash for 15s so chunks appear absent at finalized head. " +
-              "Code must wait (natural wait=10s) then re-upload and confirm. " +
-              "Non-zero exit means re-upload failed or was never attempted.",
+            keywords: ["Error", "finalised", "missing", "lagging"],
+            hint: "Proxy held a stale chain_getFinalizedHead hash for 15s so chunks appear absent at finalized head, " +
+              "but they are genuinely present in best-block the whole time. Code must detect best-block presence, " +
+              "skip re-upload, and succeed once GRANDPA catches up (or after the bounded lagging wait).",
           });
         }
 
@@ -1324,14 +1380,15 @@ describe("e2e", { skip: !ENABLED }, () => {
         );
         assert.match(
           combined,
-          /(?:still missing after wait|re-upload(?:ed|ing))/i,
-          ">> FAIL: S-GRANDPA-REUPLOAD: expected re-upload log — natural wait expired but re-upload was not attempted",
+          /finality-lagging/i,
+          ">> FAIL: S-GRANDPA-REUPLOAD: expected a 'finality-lagging' log — deploy.ts did not detect best-block " +
+            "presence for chunks missing only at (stale) finalized head",
         );
-        assert.match(
+        assert.doesNotMatch(
           combined,
-          /chunks? finalised after re-upload/i,
-          ">> FAIL: S-GRANDPA-REUPLOAD: expected 'chunks finalised after re-upload' success line; " +
-            "re-upload ran but chunks were not confirmed — timeout too short or proxy stale window too long",
+          /re-upload(?:ed|ing)/i,
+          ">> FAIL: S-GRANDPA-REUPLOAD: a re-upload fired even though chunks were present in best-block the whole " +
+            "time — this is exactly the #1049 regression (stale finalized head must never cause a re-upload)",
         );
       } finally {
         await proxy.close();

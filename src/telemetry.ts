@@ -319,6 +319,10 @@ const DEPLOY_SEED_STORAGE: Record<string, string | number> = {
 const DEPLOY_SEED_PROBE: Record<string, number> = {
   "deploy.probe.finality_miss_count": 0,
   "deploy.probe.finality_miss_reupload_count": 0,
+  // #1049: chunks present at best-block but not yet at finalised head.
+  // These are NEVER re-uploaded — only tracked so we can see finality lag
+  // without conflating it with genuinely-dropped (re-uploaded) chunks.
+  "deploy.probe.finality_lagging_count": 0,
 };
 
 // Pool layer: eligible pool size + nonce-advance collision probe counters.
@@ -499,6 +503,12 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   [/requires ProofOfPersonhood(?:Full|Lite|Light),\s*but this signer is NoStatus/i, 'naming.pop_required'],
   [/requires NoStatus,\s*but this signer is ProofOfPersonhood/i, 'naming.nostatus_required'],
   [/Cannot decode zero data.*with ABI parameters/i, 'naming.contract_unavailable'],
+  // Issue #1060: contractCall's own empty-`0x`-data guard (src/dotns.ts, #729) throws
+  // an actionable wrapper instead of letting the raw viem message above reach a
+  // caller. Same failure family (a DotNS contract read came back empty) — classify
+  // it the same way instead of letting it fall into 'unknown'.
+  [/No contract deployed at .+ returned empty success data/i, 'naming.contract_unavailable'],
+  [/Contract call returned empty data — contract=/i, 'naming.contract_unavailable'],
   [/Domain\s+\S+\.dot\s+is already owned by\s+0x[a-fA-F0-9]+/i, 'naming.already_owned'],
   [/Cannot deploy\s+[\w.-]+\.dot:\s*parent\s+[\w.-]+\.dot\s+is owned by/i, 'naming.subdomain_orphan'],
   [/Post-deploy verification failed for .+: on-chain contenthash is /i, 'verify.contenthash_mismatch'],

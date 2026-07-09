@@ -366,7 +366,11 @@ export const reproveAliasToAccount = async ({
           if (ev.ok === false) {
             fail(
               new ReproveAliasError(
-                "reprove_alias_account dispatched but failed in-block",
+                // Issue #1057: this used to be a bare, unqualified string —
+                // the real ModuleError (pallet + variant) was captured on
+                // `dispatchError` but never rendered, so a preview-specific
+                // revert looked identical to every other in-block failure.
+                `reprove_alias_account dispatched but failed in-block: ${formatDispatchError(ev.dispatchError)}`,
                 {
                   kind: narrowDispatchError(ev.dispatchError),
                   dispatchError: ev.dispatchError,
@@ -382,7 +386,7 @@ export const reproveAliasToAccount = async ({
           if (ev.ok === false) {
             fail(
               new ReproveAliasError(
-                "reprove_alias_account failed at finalization",
+                `reprove_alias_account failed at finalization: ${formatDispatchError(ev.dispatchError)}`,
                 {
                   kind: narrowDispatchError(ev.dispatchError),
                   dispatchError: ev.dispatchError,
@@ -410,6 +414,32 @@ export const reproveAliasToAccount = async ({
   });
 
   return { blockHash, oldRevision: storedRevision, newRevision };
+};
+
+// Issue #1057: renders a papi 2.x dispatchError object into a readable
+// string (pallet + error variant) instead of the default typed-enum
+// `.toString()` which returns "[object Object]". This is what makes the
+// actual on-chain revert reason (e.g. a module error other than the three
+// AliasAccounts variants narrowDispatchError() special-cases below) visible
+// in CLI logs/telemetry rather than swallowed into a generic "failed
+// in-block" message. src/dotns.ts has an identical exported helper of the
+// same name — kept as a separate local copy here rather than unified into a
+// shared module, to keep this fix scoped to reprove.ts per the issue's
+// lane boundaries. Follow-up: dedup formatDispatchError (reprove.ts +
+// dotns.ts, and the equivalent unrendered-dispatchError gap in
+// bind-personal-id.ts / bind-paid-alias.ts / claim-pgas.ts) into a shared
+// leaf module — tracked, not done here.
+const formatDispatchError = (dispatchError: unknown): string => {
+  if (dispatchError === undefined || dispatchError === null) return "dispatch error";
+  if (typeof dispatchError === "string") return dispatchError;
+  try {
+    const out = JSON.stringify(dispatchError, (_k, v) =>
+      typeof v === "bigint" ? v.toString() : v,
+    );
+    return typeof out === "string" ? out : "dispatch error";
+  } catch {
+    return String(dispatchError);
+  }
 };
 
 // Narrow an AliasAccounts dispatch error to a kind string.

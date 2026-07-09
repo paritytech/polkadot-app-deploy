@@ -52,6 +52,19 @@ test("classifyForRetry: new infra-flake patterns return exit 75", () => {
   }
 });
 
+test("classifyForRetry: chain/block-inclusion timeout patterns return exit 75 (#1050)", () => {
+  const chainTimeouts = [
+    "Deployment failed: chunk(nonce:15594) timed out after 180s waiting for block confirmation",
+    "transaction watcher silent for 60s, aborting",
+    "chunk(nonce:203) not included after 120s of chain progress (budget=180s)",
+    "Deployment did not settle within 300s wall-clock ceiling",
+  ];
+  for (const output of chainTimeouts) {
+    assert.strictEqual(classifyForRetry(output), 75,
+      `expected exit 75 (retry-eligible) for output containing: ${output.slice(0, 60)}`);
+  }
+});
+
 test("wrapper reads stdout — flake pattern on stdout triggers exit 75", async () => {
   const exitCode = await new Promise((resolve) => {
     const child = spawn(process.execPath, [

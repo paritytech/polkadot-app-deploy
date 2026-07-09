@@ -84,11 +84,19 @@ export interface OwnershipResult { owned: boolean; owner: string | null; }
 
 export const TX_KIND_HASH = "hash" as const;
 export const TX_KIND_NONCE_ADVANCED = "nonce-advanced" as const;
+// #1108: resolved on best-block inclusion + a confirmed on-chain effect, WITHOUT
+// waiting for GRANDPA finality. Mirrors the storage best-block posture (#1049) and
+// the nonce-advance fallback below — a verified write that isn't finalised yet is
+// success, because finality is eventual and every DotNS write is idempotent (a
+// reorg is re-applied by the next deploy). Callers treat any non-hash kind the
+// same way (no on-chain block hash to report), so this needs no consumer changes.
+export const TX_KIND_BEST_BLOCK = "best-block" as const;
 export const ATTR_TX_RESOLUTION_KIND = "deploy.dotns.tx_resolution_kind";
 
 export type TxResolution =
   | { kind: typeof TX_KIND_HASH; hash: string; block?: { hash: string; number: number } }
-  | { kind: typeof TX_KIND_NONCE_ADVANCED; rpc: string };
+  | { kind: typeof TX_KIND_NONCE_ADVANCED; rpc: string }
+  | { kind: typeof TX_KIND_BEST_BLOCK };
 export interface PriceValidationResult { priceWei: bigint; requiredStatus: number; userStatus: number; message: string; }
 export interface ParsedDomainName {
   isSubdomain: boolean;
@@ -251,6 +259,15 @@ export const TX_WALL_CLOCK_CEILING_MS: number = 240_000;
 // + dead WS) and the promise rejects with a 'transaction watcher silent for Ns
 // after <lastEvent>' error that signAndSubmitWithRetry can retry.
 export const TX_NO_PROGRESS_MS: number = 90_000;
+// #1108: grace window before the best-block short-circuit engages. Give GRANDPA
+// finality a fair chance first — so a healthy deploy (Asset Hub finality is
+// typically ~12–40s) still resolves via the "finalized" event with a real tx
+// hash + block number (preserving existing telemetry/logs). Only when finality
+// is genuinely LAGGING past this window does an already-included + verified write
+// resolve on best-block instead of timing out at OPERATION_TIMEOUT_MS (300s).
+// Mirrors the #1049 storage posture (bounded finality wait, then best-block).
+// Env-overridable for tests (0 = engage immediately) and slow chains.
+export const DOTNS_BEST_BLOCK_GRACE_MS: number = parseInt(process.env.BULLETIN_DOTNS_BESTBLOCK_GRACE_MS ?? "60000", 10);
 // WS heartbeat timeout for the DotNS (Asset Hub) provider. Matches the
 // Bulletin-chain provider (src/deploy.ts). Without this, polkadot-api's
 // default heartbeat window is much tighter and "WS halt" errors terminate
@@ -269,6 +286,30 @@ export const DOTNS_TX_MAX_ATTEMPTS: number = 3;
 // more patience before declaring "not observable" — reducing spurious retries
 // that would demand an extra phone tap (#38). Non-phone paths benefit too.
 export const VERIFY_EFFECT_CHAIN_SECONDS: number = 60;
+// Grace-period re-polls for the nonce-advance fallback's verifyEffect check (#833).
+// A single false from verifyEffect() can mean the queried RPC is just a block
+// or two behind the one that actually included our tx — not that the effect is
+// genuinely absent. These few extra re-polls give a lagging node time to catch
+// up before signAndSubmitExtrinsic concludes the tx must be retried (which would
+// pay fees twice for the same content write).
+export const NONCE_ADVANCE_VERIFY_RETRIES: number = 3;
+export const NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS: number = 2_000;
+
+// Re-polls opts.verifyEffect() a few times before concluding the nonce-advance
+// fallback's effect is genuinely absent. Returns true as soon as any call
+// succeeds (including the first — the common case pays no grace-period delay).
+// Returns false only once every call, initial plus all retries, has failed.
+export async function verifyEffectWithGrace(
+  verifyEffect: () => Promise<boolean>,
+  { retries = NONCE_ADVANCE_VERIFY_RETRIES, intervalMs = NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS }: { retries?: number; intervalMs?: number } = {},
+): Promise<boolean> {
+  if (await verifyEffect()) return true;
+  for (let attempt = 0; attempt < retries; attempt++) {
+    await new Promise((r) => setTimeout(r, intervalMs));
+    if (await verifyEffect()) return true;
+  }
+  return false;
+}
 
 /**
  * Thrown by signAndSubmitExtrinsic when the transaction watcher goes silent
@@ -300,6 +341,25 @@ export function classifyTxRetryDecision(err: unknown): "retry" | "abort" {
   if (lower.includes("timed out") || lower.includes("timeout")) return "retry";
   if (lower.includes("transaction watcher silent")) return "retry";
   return "abort";
+}
+
+/**
+ * Phone-signer no-event fast-fail (#990, backported from polkadot-app-deploy).
+ * WatcherSilentNoEventError means the watcher never saw a single prior event —
+ * the phone never approved the request — which is a materially different
+ * situation from a WS stall after signing. For a phone signer, retrying pays
+ * another ~90s of silence for no better odds (the phone still won't have
+ * approved); fail immediately with a clear, actionable message instead.
+ * Non-phone signers, or a WatcherSilentNoEventError instance not present (e.g.
+ * a plain "watcher silent" Error where a prior event DID arrive), fall through
+ * to the default classifyTxRetryDecision/retry path unchanged. Pure so the
+ * decision is unit-testable without driving a real retry loop.
+ */
+export function classifyWatcherSilentFastFail(err: unknown, isPhoneSigner: boolean | undefined): NonRetryableError | null {
+  if (err instanceof WatcherSilentNoEventError && isPhoneSigner === true) {
+    return new NonRetryableError("No signature received from the phone — re-run when you can approve on your phone.");
+  }
+  return null;
 }
 
 // Jittered exponential backoff for DotNS tx retries. Bursty nonce contention
@@ -966,7 +1026,7 @@ function parsePersonhoodStatusResult(result: unknown): number {
   return normalizeProofOfPersonhoodStatus(status);
 }
 
-class ReviveClientWrapper {
+export class ReviveClientWrapper {
   static DRY_RUN_STORAGE_LIMIT: bigint = 18446744073709551615n;
   static DRY_RUN_WEIGHT_LIMIT: { ref_time: bigint; proof_size: bigint } = { ref_time: 18446744073709551615n, proof_size: 18446744073709551615n };
 
@@ -1038,7 +1098,10 @@ class ReviveClientWrapper {
     const isMapped = await this.checkIfAccountMapped(substrateAddress);
     if (isMapped) { this.mappedAccounts.add(substrateAddress); return; }
     try {
-      await this.signAndSubmitWithRetry(() => this.client.tx.Revive.map_account(), signer, () => {}, "Revive.map_account");
+      // #1108: verifyEffect = the SAME checkIfAccountMapped read used above, so
+      // map_account resolves on best-block inclusion (not just finality). Idempotent
+      // (a re-run sees isMapped and returns early), so a reorg self-heals.
+      await this.signAndSubmitWithRetry(() => this.client.tx.Revive.map_account(), signer, () => {}, "Revive.map_account", { verifyEffect: () => this.checkIfAccountMapped(substrateAddress) });
       this.mappedAccounts.add(substrateAddress);
     } catch (error: any) {
       const errorMessage = error?.message || String(error);
@@ -1070,6 +1133,21 @@ class ReviveClientWrapper {
       let lastEventAt = Date.now();
       let lastEventType: string = "(none)";
       let startChainTimeMs: number | null = null;
+      // #1108: set once the tx is seen in a best block. The poll loop then
+      // verifies the on-chain effect and resolves without waiting for GRANDPA
+      // finality — so a finality-lag window can't time out an already-landed write.
+      let bestBlockIncluded = false;
+      // Per-call read so tests / slow chains can override without a reimport.
+      // Explicit empty/null check (not `|| default`) so "0" — engage immediately —
+      // is honoured rather than falling back to the default. Clamped below
+      // TX_NO_PROGRESS_MS so the best-block branch always gets a poll tick before
+      // the silence-rejection pre-empts it (an over-large override is otherwise a
+      // footgun that disables best-block resolution entirely).
+      const graceRawEnv = process.env.BULLETIN_DOTNS_BESTBLOCK_GRACE_MS;
+      const bestBlockGraceMs = Math.min(
+        graceRawEnv != null && graceRawEnv !== "" ? parseInt(graceRawEnv, 10) : DOTNS_BEST_BLOCK_GRACE_MS,
+        TX_NO_PROGRESS_MS - 5_000,
+      );
 
       const poll = async (): Promise<void> => {
         if (settled) return;
@@ -1079,7 +1157,7 @@ class ReviveClientWrapper {
             if (nonce.advanced) {
               if (opts.verifyEffect) {
                 statusCallback("verifying");
-                const observed = await opts.verifyEffect();
+                const observed = await verifyEffectWithGrace(opts.verifyEffect);
                 if (!observed) {
                   statusCallback("failed");
                   finish(reject)(new Error(`nonce-advance fallback: nonce moved past ${opts.nonceFallback.expectedNonce} but expected on-chain effect not observable (likely a different tx of ours consumed the nonce, or our tx was reorged out)`));
@@ -1090,6 +1168,23 @@ class ReviveClientWrapper {
               finish(resolve)({ kind: "nonce-advanced", rpc: nonce.witnessRpc });
               return;
             }
+          }
+          // #1108: best-block inclusion + confirmed effect resolves WITHOUT waiting
+          // for GRANDPA finality — the same posture as the nonce-advance branch
+          // above and storage's #1049 best-block gate. A single verifyEffect read
+          // per tick (the loop retries every 6s); once the write is observable
+          // on-chain we're done, finality catches up in the background. Idempotent
+          // writes make a subsequent reorg self-healing (re-applied next deploy).
+          if (bestBlockIncluded && opts.verifyEffect && Date.now() - startWallClockMs > bestBlockGraceMs) {
+            statusCallback("verifying");
+            if (await opts.verifyEffect()) {
+              console.log(`      finality lagging (${Math.floor((Date.now() - startWallClockMs) / 1000)}s) — resolving on best-block inclusion (effect verified on-chain)`);
+              statusCallback("included");
+              finish(resolve)({ kind: TX_KIND_BEST_BLOCK });
+              return;
+            }
+            // Included but effect not observable yet (RPC state lag / reorg in
+            // flight): fall through and re-check next tick, or let "finalized" win.
           }
           if (Date.now() - startWallClockMs > TX_WALL_CLOCK_CEILING_MS) {
             statusCallback("failed");
@@ -1132,7 +1227,12 @@ class ReviveClientWrapper {
               case "signed": statusCallback("signing"); break;
               case "broadcasted": statusCallback("broadcasting"); break;
               case "txBestBlocksState":
-                if (event.found) statusCallback("included");
+                // #1108: track best-block membership BOTH ways. found=false is a
+                // reorg eviction — withdraw the best-block claim so the poll loop
+                // won't resolve on a tx that's no longer in the canonical best
+                // chain (verifyEffect is the second guard; this is the first).
+                if (event.found) { statusCallback("included"); bestBlockIncluded = true; }
+                else bestBlockIncluded = false;
                 break;
               case "finalized": {
                 if (event.dispatchError || event.ok === false) { statusCallback("failed"); finish(reject)(new Error(`Transaction failed: ${formatDispatchError(event.dispatchError)}`)); return; }
@@ -1351,10 +1451,13 @@ function logTxResolution(res: TxResolution): void {
   setDeployAttribute(ATTR_TX_RESOLUTION_KIND, res.kind);
   if (res.kind === TX_KIND_HASH) {
     console.log(`   Tx: ${res.hash}`);
-  } else {
+  } else if (res.kind === TX_KIND_NONCE_ADVANCED) {
     let rpcHost = res.rpc;
     try { rpcHost = new URL(res.rpc).host; } catch { /* fallback to raw */ }
     console.log(`   Tx: confirmed via nonce-advance on ${rpcHost}`);
+  } else {
+    // #1108: TX_KIND_BEST_BLOCK — included + effect verified, finality eventual.
+    console.log(`   Tx: confirmed via best-block inclusion (effect verified; finality pending)`);
   }
 }
 
@@ -2019,18 +2122,19 @@ export class DotNS {
     if (rawData.length <= 2) {
       const hasCode = await this.clientWrapper!.hasContractCode(contractAddress);
       const name = dotnsContractName(contractAddress, this._contracts);
+      const env = this._environmentId ?? "(unset)";
       if (hasCode === false) {
         throw new Error(
-          `No contract deployed at ${contractAddress} (${name}) — the dry-run call to ${functionName} returned empty success data, which on pallet-revive means the target address has no contract code. Check environments.json / --contract config for this network.`,
+          `No contract deployed at ${contractAddress} (${name}) env=${env} — the dry-run call to ${functionName} returned empty success data, which on pallet-revive means the target address has no contract code. Check environments.json / --contract config for this network.`,
         );
       }
       if (hasCode === null) {
         throw new Error(
-          `Contract call returned empty data — contract=${name} (${contractAddress}) functionName=${functionName}. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.`,
+          `Contract call returned empty data — contract=${name} (${contractAddress}) env=${env} functionName=${functionName}. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.`,
         );
       }
       throw new Error(
-        `Contract call returned empty data — contract=${name} (${contractAddress}) functionName=${functionName}. The address has contract code but the call returned no bytes, which is unexpected for this read. Investigate the contract/ABI rather than masking it with a default.`,
+        `Contract call returned empty data — contract=${name} (${contractAddress}) env=${env} functionName=${functionName}. The address has contract code but the call returned no bytes, which is unexpected for this read. Investigate the contract/ABI rather than masking it with a default.`,
       );
     }
     return decodeFunctionResult({ abi: contractAbi, functionName, data: rawData as `0x${string}` });
@@ -2476,7 +2580,11 @@ export class DotNS {
     const target = this._contracts.DOTNS_CONTENT_RESOLVER;
     let current: unknown = null;
     try {
-      current = await this.contractCall(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "resolver", [node]);
+      // #1060: resolver(node) legitimately returns empty `0x` for a name that
+      // has no resolver registered yet — contractCallNullable returns null for
+      // that instead of throwing. The try/catch stays as a defense-in-depth net
+      // for genuinely unexpected errors (e.g. a transient RPC failure).
+      current = await this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "resolver", [node]);
     } catch {
       // Treat unreadable resolver as unset and fall through to the write.
     }
@@ -2484,7 +2592,18 @@ export class DotNS {
       return { changed: false };
     }
     console.log(`   Redirecting resolver for ${domainName}.dot to content resolver ${target}…`);
-    await this.contractTransaction(this._contracts.DOTNS_REGISTRY, 0n, DOTNS_REGISTRY_ABI, "setResolver", [node, target], (s) => console.log(`      ${s}`), { useNoncePolling: true });
+    // #1108: verifyEffect lets the write resolve on best-block inclusion (not
+    // just GRANDPA finality) — reuses the SAME proven resolver(node) read this
+    // method already does for its pre-check, so it carries no new false-positive
+    // risk. Idempotent (setResolver against the same target is a no-op), so a
+    // reorg is self-healing on the next publish.
+    const verifyResolverSet = async (): Promise<boolean> => {
+      try {
+        const r = await this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "resolver", [node]);
+        return typeof r === "string" && r.toLowerCase() === target.toLowerCase();
+      } catch { return false; }
+    };
+    await this.contractTransaction(this._contracts.DOTNS_REGISTRY, 0n, DOTNS_REGISTRY_ABI, "setResolver", [node, target], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect: verifyResolverSet });
     return { changed: true };
   }
 
@@ -2492,7 +2611,10 @@ export class DotNS {
   async getTextRecord(domainName: string, key: string): Promise<string> {
     this.ensureConnected();
     const node = namehash(`${domainName}.dot`);
-    const result = await this.contractCall(
+    // #1060: an unset key legitimately returns empty `0x` — contractCallNullable
+    // (not the throwing contractCall) so this keeps the "" contract the doc above
+    // promises instead of throwing.
+    const result = await this.contractCallNullable(
       this._contracts.DOTNS_CONTENT_RESOLVER,
       DOTNS_TEXT_RESOLVER_ABI,
       "text",
@@ -2556,7 +2678,11 @@ export class DotNS {
       let onChainValue = "";
       let lastPrintedElapsed = -1;
       while (true) {
-        const onChain = await withTimeout(this.contractCall(this._contracts.DOTNS_CONTENT_RESOLVER, DOTNS_TEXT_RESOLVER_ABI, "text", [node, key]), 30000, "text");
+        // #1060: same read as the verifyEffect closure above (which already uses
+        // contractCallNullable) — a not-yet-finalized fresh key legitimately reads
+        // back empty on an early poll iteration. The `?? ""` below was already
+        // written for a nullable result; contractCall (throwing) never satisfied it.
+        const onChain = await withTimeout(this.contractCallNullable(this._contracts.DOTNS_CONTENT_RESOLVER, DOTNS_TEXT_RESOLVER_ABI, "text", [node, key]), 30000, "text");
         onChainValue = onChain ?? "";
         if (onChainValue === value) break;
         const nowChainMs = Number(await this.clientWrapper!.client.query.Timestamp.Now.getValue());
@@ -2625,8 +2751,10 @@ export class DotNS {
       const startChainMs = Number(await this.clientWrapper!.client.query.Timestamp.Now.getValue());
       let lastResults: { key: string; expected: string; onChain: string }[] = [];
       while (true) {
+        // #1060: same nullable-read fix as setTextRecord's post-hoc poll — an
+        // unset/not-yet-finalized key legitimately reads back empty.
         lastResults = await Promise.all(entries.map((e) =>
-          withTimeout(this.contractCall(this._contracts.DOTNS_CONTENT_RESOLVER, DOTNS_TEXT_RESOLVER_ABI, "text", [node, e.key]), 30000, "text")
+          withTimeout(this.contractCallNullable(this._contracts.DOTNS_CONTENT_RESOLVER, DOTNS_TEXT_RESOLVER_ABI, "text", [node, e.key]), 30000, "text")
             .then((onChain) => ({ key: e.key, expected: e.value, onChain: onChain ?? "" }))));
         if (lastResults.every((v) => v.onChain === v.expected)) break;
         const nowChainMs = Number(await this.clientWrapper!.client.query.Timestamp.Now.getValue());
@@ -2806,11 +2934,22 @@ export class DotNS {
   async getContenthash(domainName: string): Promise<string> {
     this.ensureConnected();
     const node = namehash(`${domainName}.dot`);
+    // #1060: a first-time deploy (no contenthash ever set) legitimately reads
+    // back empty `0x` here. getContenthash has callers with no try/catch around
+    // this call (verifyEffect's poll loop and the final read-back in
+    // setContenthash) — the throwing contractCall used to propagate that as an
+    // unhandled rejection instead of the "0x" every caller's own `|| "0x"`
+    // fallback already expects. contractCallNullable returns null instead.
     const result = await withTimeout(
-      this.contractCall(this._contracts.DOTNS_CONTENT_RESOLVER, DOTNS_CONTENT_RESOLVER_ABI, "contenthash", [node]),
+      this.contractCallNullable(this._contracts.DOTNS_CONTENT_RESOLVER, DOTNS_CONTENT_RESOLVER_ABI, "contenthash", [node]),
       30000,
       "contenthash",
     );
+    // Explicit null check: `result?.toString?.() ?? String(result)` would
+    // otherwise evaluate to the *string* "null" for a null result (optional
+    // chaining short-circuits toString?.() to undefined, then `?? String(null)`
+    // yields "null") — not the "0x" sentinel every caller expects.
+    if (result === null) return "0x";
     return typeof result === "string" ? result : result?.toString?.() ?? String(result);
   }
 
@@ -2853,7 +2992,18 @@ export class DotNS {
   async submitCommitment(commitment: any): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Submitting commitment...`);
-    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, DOTNS_REGISTRAR_CONTROLLER_ABI, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment" });
+    // #1108: verifyEffect reads the on-chain commitment timestamp so commit
+    // resolves on best-block inclusion (not just finality). commit is idempotent
+    // (re-committing the same hash before it matures is a no-op/overwrite), and
+    // waitForCommitmentAge below reads this same timestamp — so best-block
+    // resolution here is safe and self-consistent.
+    const verifyCommitted = async (): Promise<boolean> => {
+      try {
+        const ts = await this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "commitments", [commitment]);
+        return ts != null && BigInt(ts as any) > 0n;
+      } catch { return false; }
+    };
+    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, DOTNS_REGISTRAR_CONTROLLER_ABI, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment", verifyEffect: verifyCommitted });
     logTxResolution(commitTxRes);
     console.log(`   Committed at: ${new Date().toISOString()}`);
   }
@@ -2964,7 +3114,19 @@ export class DotNS {
     setDeployAttribute("deploy.payment_wei", priceWei.toString());
     console.log(`   Oracle price: ${formatEther(priceWei)} PAS`);
     console.log(`   Paying: ${formatEther(bufferedPaymentWei)} PAS`);
-    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, DOTNS_REGISTRAR_CONTROLLER_ABI, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register" });
+    // #1108: verifyEffect = the SAME ownerOf(tokenId) read verifyOwnership() runs
+    // immediately after this — reused so register resolves on best-block inclusion
+    // (not just GRANDPA finality), which is the S1-direct "register/setContenthash
+    // timed out under finality lag" class. register is idempotent from our side
+    // (a re-run sees already-owned-by-us and skips), so a reorg self-heals.
+    const registeredLabel = registration.label;
+    const verifyRegistered = async (): Promise<boolean> => {
+      try {
+        const owner = await this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [computeDomainTokenId(registeredLabel)]);
+        return typeof owner === "string" && owner.toLowerCase() === this.evmAddress!.toLowerCase();
+      } catch { return false; }
+    };
+    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, DOTNS_REGISTRAR_CONTROLLER_ABI, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register", verifyEffect: verifyRegistered });
     logTxResolution(registerTxRes);
     if (registerTxRes.kind === TX_KIND_HASH) {
       setDeployAttribute("deploy.register.tx", registerTxRes.hash);

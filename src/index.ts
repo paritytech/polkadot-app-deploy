@@ -1,7 +1,8 @@
 export { deploy } from "./deploy.js";
 export type { DeployResult, DeployContent, DeployOptions } from "./deploy.js";
-export { derivePoolAccounts, selectAccount, fetchPoolAuthorizations, ensureAuthorized, bootstrapPool } from "./pool.js";
-export type { PoolAccount, PoolAuthorization } from "./pool.js";
+export { derivePoolAccounts, selectAccount, fetchPoolAuthorizations, ensureAuthorized, bootstrapPool, accountsNeedingReauthorization, isAutoReauthorizeAllowed, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, ensurePoolAccountsFundedOnAssetHub } from "./pool.js";
+export type { EnsurePoolFundedOptions } from "./pool.js";
+export type { PoolAccount, PoolAuthorization, BootstrapPoolOptions, AutoReauthorizeEnv } from "./pool.js";
 export { DotNS, parseDomainName, DEFAULT_MNEMONIC, sanitizeDomainLabel } from "./dotns.js";
 export type { DotNSConnectOptions, OwnershipResult, PriceValidationResult, ParsedDomainName } from "./dotns.js";
 export { merkleizeJS, merkleizeWithStableOrder } from "./merkle.js";

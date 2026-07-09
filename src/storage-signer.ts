@@ -279,33 +279,90 @@ export async function waitForBulletinAuthorization(
 }
 
 /**
+ * Generic retry wrapper for a single flaky step. Retries any thrown error
+ * EXCEPT `BulletinSlotAuthError` up to `retries` times (default 2, i.e. 3
+ * total attempts) with `delayMs` between attempts (default 1000ms).
+ *
+ * `BulletinSlotAuthError` ("missing" | "expired") is a definitive on-chain
+ * fact, not a network blip — retrying it would just re-read the same state
+ * and waste time, so it always propagates on the first attempt.
+ *
+ * Extracted for #1058: getSlotSignerProvider's connect + Authorizations
+ * probe is a single WS round-trip performed once per deploy; a transient
+ * WS/RPC hiccup on that one attempt used to permanently commit the whole
+ * upload to the pool-account fallback (selectStorageReconnect in
+ * src/deploy.ts never retries the slot path once it has failed once).
+ * Mirrors the existing "a flaky read is NOT unauthorized" tolerance already
+ * used by pollUntilBulletinAuthorized (login path), bounded to a much
+ * shorter budget appropriate for a synchronous deploy-time connect.
+ */
+export async function withTransientRetry<T>(
+  attempt: () => Promise<T>,
+  opts: { retries?: number; delayMs?: number } = {},
+): Promise<T> {
+  const { retries = 2, delayMs = 1000 } = opts;
+  const debug = Boolean(process.env.DOT_DEBUG);
+  let lastErr: unknown;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await attempt();
+    } catch (e) {
+      if (e instanceof BulletinSlotAuthError) throw e;
+      lastErr = e;
+      if (i < retries) {
+        if (debug) {
+          console.error(
+            `[slot-signer] transient error (attempt ${i + 1}/${retries + 1}): ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+        await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+/**
  * Create a Bulletin WS connection for the slot-account signer.
- * Checks on-chain authorization (single probe — no poll). Throws BulletinSlotAuthError
- * with reason "missing" | "expired" so callers can distinguish and produce targeted messages.
+ * Checks on-chain authorization. A transient connect/query error (WS blip,
+ * RPC timeout) is retried up to twice via withTransientRetry before giving
+ * up; a clean read that is definitively missing/expired throws
+ * BulletinSlotAuthError immediately (no retry — see withTransientRetry) so
+ * callers can distinguish and produce targeted messages.
  */
 export async function getSlotSignerProvider(
   signer: PolkadotSigner,
   ss58: string,
 ): Promise<{ client: any; unsafeApi: any; signer: PolkadotSigner; ss58: string }> {
-  const primary = BULLETIN_ENDPOINTS[0];
-  console.log(`   Connecting to Bulletin (slot signer): ${primary}`);
-  const client = createPolkadotClient(getWsProvider(
-    BULLETIN_ENDPOINTS,
-    { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, onStatusChanged: makeBulletinStatusHandler(primary) },
-  ));
-  const unsafeApi: any = client.getUnsafeApi();
+  return withTransientRetry(async () => {
+    const primary = BULLETIN_ENDPOINTS[0];
+    console.log(`   Connecting to Bulletin (slot signer): ${primary}`);
+    const client = createPolkadotClient(getWsProvider(
+      BULLETIN_ENDPOINTS,
+      { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, onStatusChanged: makeBulletinStatusHandler(primary) },
+    ));
+    const unsafeApi: any = client.getUnsafeApi();
 
-  const [auth, currentBlock] = await Promise.all([
-    unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
-    client.getFinalizedBlock(),
-  ]);
-  const result = isBulletinAuthActive(auth, currentBlock.number);
-  if (!result.active) {
-    client.destroy();
-    throw new BulletinSlotAuthError(result.reason, ss58, result.expiration);
-  }
-  console.log(`   Using slot signer: ${ss58} (authorized until block ${result.expiration})`);
-  setDeployAttribute("deploy.signer.mode", "slot");
-  setDeployAttribute("deploy.signer.address", truncateAddress(ss58) as string);
-  return { client, unsafeApi, signer, ss58 };
+    let auth: any;
+    let currentBlock: any;
+    try {
+      [auth, currentBlock] = await Promise.all([
+        unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+        client.getFinalizedBlock(),
+      ]);
+    } catch (e) {
+      client.destroy();
+      throw e; // transient connect/query failure — retried by withTransientRetry
+    }
+    const result = isBulletinAuthActive(auth, currentBlock.number);
+    if (!result.active) {
+      client.destroy();
+      throw new BulletinSlotAuthError(result.reason, ss58, result.expiration);
+    }
+    console.log(`   Using slot signer: ${ss58} (authorized until block ${result.expiration})`);
+    setDeployAttribute("deploy.signer.mode", "slot");
+    setDeployAttribute("deploy.signer.address", truncateAddress(ss58) as string);
+    return { client, unsafeApi, signer, ss58 };
+  });
 }

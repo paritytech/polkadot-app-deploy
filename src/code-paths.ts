@@ -20,6 +20,11 @@ export const CODE_PATHS = {
   // true  → automated mapping via EVM key derivation
   // false → standard check (already-mapped or manually register)
   DOTNS_AUTO_MAPPING:   "dotns.auto-mapping",
+  // NOTE (issue #706): marked "exempt" in tools/check-code-path-coverage.py's
+  // CODE_PATHS mirror — it's a real fallback for external DotNS library
+  // callers, but Parity-internal telemetry never sees that population, so
+  // it always reads 0 hits here regardless of real-world usage. Confirmed
+  // non-dead in PR #756 and again for #706; keep the branch and the ID.
   DOTNS_MANUAL_MAPPING: "dotns.manual-mapping",
 } as const;
 

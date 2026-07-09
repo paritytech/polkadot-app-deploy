@@ -223,6 +223,82 @@ export async function probeChunks(cids: string[], options: ChainProbeOptions): P
   return results;
 }
 
+/**
+ * Splits cids that are missing at finalised head into two buckets, using a
+ * best-block probe result for each cid:
+ *   - `lagging`: present at best-block. GRANDPA just hasn't caught up yet
+ *     (#1049) — these were never lost and must NEVER be re-uploaded.
+ *   - `reallyMissing`: absent at best-block too (or the best-block probe
+ *     itself failed, `present === null`) — genuinely dropped, or we
+ *     couldn't determine presence at all. Either way, re-upload is the
+ *     safe default: treating an indeterminate result as "lagging" risks
+ *     silently skipping a chunk that's actually gone.
+ *
+ * Pure function — no chain I/O — so it's directly unit-testable against a
+ * mocked ChunkProbeResult array without a client.
+ */
+export function classifyFinalityGap(
+  missingAtFinalized: string[],
+  bestBlockResults: ChunkProbeResult[]
+): { reallyMissing: string[]; lagging: string[] } {
+  const presentAtBest = new Set(
+    bestBlockResults.filter((r) => r.present === true).map((r) => r.cid)
+  );
+  const lagging: string[] = [];
+  const reallyMissing: string[] = [];
+  for (const cid of missingAtFinalized) {
+    if (presentAtBest.has(cid)) lagging.push(cid);
+    else reallyMissing.push(cid);
+  }
+  return { reallyMissing, lagging };
+}
+
+/**
+ * Composite, chain-touching version of classifyFinalityGap (#1049): probes
+ * `missingAtFinalized` at best-block, retries once on an indeterminate
+ * result (present === null), then classifies. Any caller that finds cids
+ * missing at finalised head should route through this — not re-implement
+ * the probe/retry/classify sequence inline — so the "finalised-head absence
+ * is not proof of loss" policy stays consistent everywhere it's checked
+ * (the GRANDPA finality-check phase and the pre-setContenthash root
+ * re-check both use it).
+ */
+export async function probeFinalityGap(
+  missingAtFinalized: string[],
+  options: ChainProbeOptions
+): Promise<{ reallyMissing: string[]; lagging: string[] }> {
+  if (missingAtFinalized.length === 0) return { reallyMissing: [], lagging: [] };
+  let bestBlockResults = await probeChunks(missingAtFinalized, { ...options, atFinalized: false });
+  const indeterminate = bestBlockResults.filter((r) => r.present === null).map((r) => r.cid);
+  if (indeterminate.length > 0) {
+    const retry = await probeChunks(indeterminate, { ...options, atFinalized: false });
+    const retryByCid = new Map(retry.map((r) => [r.cid, r]));
+    bestBlockResults = bestBlockResults.map((r) => (r.present === null ? (retryByCid.get(r.cid) ?? r) : r));
+  }
+  return classifyFinalityGap(missingAtFinalized, bestBlockResults);
+}
+
+/**
+ * Best (non-finalised) block height, via `chain_getHeader`. Used by the
+ * initial chunk-upload retry loop (#1051) to detect a frozen chain — no new
+ * blocks since the last check — so it can wait instead of resubmitting into
+ * a stall (which just manufactures same-nonce collisions once the chain
+ * resumes). Returns `null` on any RPC failure or malformed response; callers
+ * must treat `null` as "can't tell" and fail open (proceed as if live)
+ * rather than blocking forever on a single bad peer.
+ */
+export async function getBestBlockNumber(client: any): Promise<number | null> {
+  try {
+    const header = await client._request("chain_getHeader", []);
+    const hex = header?.number;
+    if (typeof hex !== "string") return null;
+    const n = parseInt(hex, 16);
+    return Number.isFinite(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Reset session-level caches. Used in tests only. */
 export function _resetProbeSession(): void {
   _metadataChecked = false;

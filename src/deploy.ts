@@ -20,7 +20,7 @@ import { merkleizeJS, merkleizeWithStableOrder, rebuildOrderedCarFromBytes } fro
 import { extractManifestFromCar, fetchPreviousManifest, writePersistentLocalManifest } from "./manifest-fetch.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./manifest-embed.js";
 import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
-import { probeChunks } from "./chunk-probe.js";
+import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
 import { mirrorToGitHubPages, MirrorSkipped, pollMirrorFreshness } from "./gh-pages-mirror.js";
 import type { MirrorResult } from "./gh-pages-mirror.js";
@@ -140,18 +140,38 @@ const CHUNK_SIZE: number = 2 * 1024 * 1024;
 const MAX_FILE_SIZE: number = 8 * 1024 * 1024;
 const MAX_RECONNECTIONS: number = parseInt(process.env.BULLETIN_MAX_RECONNECTIONS ?? "3", 10);
 const CHUNK_TIMEOUT_MS: number = parseInt(process.env.BULLETIN_CHUNK_TIMEOUT_MS ?? "180000", 10);
-// Chunk tx mortality window. At 24s/block, period:16 ≈ 6.4 min.
-// With CHUNK_TIMEOUT_MS=180s and MAX_CHUNK_RETRIES=3, worst-case retry
-// span is ~9 min — exceeding the window. This is intentional: by retry 2+
-// the original tx has expired by construction, so there is never a live
-// duplicate-tx for the same nonce. (storeFile and root-node stay at
-// period:256 — they have no retry loop that could produce duplicates.)
-// Overridable via BULLETIN_CHUNK_MORTALITY_PERIOD (integer, default 16).
+// Chunk tx mortality window. The comment here used to say "24s/block,
+// period:16 ≈ 6.4 min" — that block time was wrong. The Bulletin chain's
+// actual block time is 6s (empirically measured via
+// tools/bulletin-retention-probe.mjs, see
+// docs-internal/superpowers/plans/2026-05-07-incremental-upload-v2.md), so
+// period:16 was really only ~96s — under the 90-240s inclusion stalls
+// #1048's Sentry cluster shows for this path. Raised to 64 (6s × 64 = 384s
+// ≈ 6.4min, the duration originally intended) so a slow-but-eventual
+// inclusion survives the stall instead of expiring into AncientBirth/BadProof.
+// Widening this used to risk a live duplicate-tx at the same nonce (the old
+// design relied on the ORIGINAL tx expiring before a resubmit could collide
+// with it) — that risk is now covered by reconcileTimedOutChunk() (#1051),
+// which checks nonce-advance + CID-at-best-block before every resubmit, so
+// mortality no longer needs to be kept artificially short to avoid collisions.
+// (storeFile and root-node stay at period:256 — no retry loop, no duplicate risk.)
+// Overridable via BULLETIN_CHUNK_MORTALITY_PERIOD (integer, default 64).
 // Tests set a short period (e.g. 2) to exercise the expiry-retry path.
 export const CHUNK_MORTALITY_PERIOD: number = (() => {
   const v = parseInt(process.env.BULLETIN_CHUNK_MORTALITY_PERIOD ?? "", 10);
-  return Number.isFinite(v) && v > 0 ? v : 16;
+  return Number.isFinite(v) && v > 0 ? v : 64;
 })();
+
+// Chain-liveness gate for the chunk-upload retry loop (#1051). On a
+// chunk-tx timeout, before spending a retry attempt on a resubmit, wait up
+// to this long for the best-block height to advance past what it was when
+// the timeout fired. A frozen chain means resubmitting would just pile up a
+// same-nonce collision once it resumes — waiting is strictly better.
+// Bounded so a single dead/lagging RPC peer can't hang a retry forever;
+// `waitForChainLiveness` fails open (proceeds as if live) when it can't
+// determine height at all. Overridable via BULLETIN_CHUNK_LIVENESS_MAX_WAIT_MS.
+const CHUNK_LIVENESS_MAX_WAIT_MS: number = parseInt(process.env.BULLETIN_CHUNK_LIVENESS_MAX_WAIT_MS ?? "60000", 10);
+const CHUNK_LIVENESS_POLL_MS: number = 5_000;
 const RETRY_BASE_DELAY_MS: number = 2_000;
 const RETRY_MAX_DELAY_MS: number = 15_000;
 export const WS_HEARTBEAT_TIMEOUT_MS: number = 300_000;
@@ -160,14 +180,44 @@ export const WS_HEARTBEAT_TIMEOUT_MS: number = 300_000;
 // Phase B's just-uploaded chunks (especially the root, the last extrinsic
 // submitted) are in best chain but not yet at finalised head — give them
 // time to finalise naturally before assuming something went wrong.
-const GRANDPA_NATURAL_WAIT_MS: number = parseInt(process.env.BULLETIN_GRANDPA_NATURAL_WAIT_MS ?? "90000", 10);
+// Default raised from 90s to 210s (#1049): paseo-next-v2 has been observed
+// lagging finality by 90-240s in production; 90s was routinely too short,
+// which pushed chunks that were merely finality-lagging into the re-upload
+// path below (that path is now best-block-gated, but a longer natural wait
+// keeps it from firing at all on a healthy-but-slow chain).
+const GRANDPA_NATURAL_WAIT_MS: number = parseInt(process.env.BULLETIN_GRANDPA_NATURAL_WAIT_MS ?? "210000", 10);
 const GRANDPA_REUPLOAD_POLL_MS: number = 5_000;
 // 120s: paseo-next-v2 has 12s block times; a re-uploaded chunk needs inclusion
 // (~12s) + 2 finality rounds (~24s) = ~36s minimum. 120s gives 3× headroom.
-const GRANDPA_REUPLOAD_TIMEOUT_MS: number = 120_000;
+// Overridable via BULLETIN_GRANDPA_REUPLOAD_TIMEOUT_MS (#1049) for chains
+// with slower finality than paseo-next-v2's baseline.
+const GRANDPA_REUPLOAD_TIMEOUT_MS: number = parseInt(process.env.BULLETIN_GRANDPA_REUPLOAD_TIMEOUT_MS ?? "120000", 10);
 // Up to 3 re-upload rounds: a re-uploaded tx can land in a block that gets
 // forked off; retrying submits a fresh tx on the canonical chain.
 const GRANDPA_REUPLOAD_MAX_ROUNDS: number = 3;
+// Bounded extra wait for chunks confirmed present at best-block but still
+// not finalised after GRANDPA_NATURAL_WAIT_MS (#1049). These are NEVER
+// re-uploaded — this wait is purely to let GRANDPA catch up before we
+// report success. If it expires, the deploy still succeeds: best-block
+// presence is sufficient (finality is a best-effort/async confirmation).
+const GRANDPA_LAGGING_WAIT_MS: number = parseInt(process.env.BULLETIN_GRANDPA_LAGGING_WAIT_MS ?? "90000", 10);
+
+// Polls `cids` at finalised head every GRANDPA_REUPLOAD_POLL_MS, mutating
+// the Set in place by deleting cids as they finalise, until either the Set
+// is empty or `timeoutMs` elapses. Shared by all three GRANDPA wait loops
+// (natural wait, post-re-upload wait, and the #1049 finality-lagging wait)
+// so a future change to polling behaviour (backoff, batching, etc.) only
+// needs to happen once.
+async function pollUntilFinalized(cids: Set<string>, timeoutMs: number, client: any): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs && cids.size > 0) {
+    await new Promise((r) => setTimeout(r, GRANDPA_REUPLOAD_POLL_MS));
+    const poll = await probeChunks([...cids], { client, atFinalized: true });
+    for (const r of poll) {
+      if (r.present === true) cids.delete(r.cid);
+    }
+  }
+}
 
 // Per-deploy retry budget (#216). Bounds peak in-flight allocation during
 // WS-halt storms: each chunk-retry and reconnect adds ~2 MB encoded
@@ -523,11 +573,32 @@ export function formatTransferModeDotnsLine(alreadyOwned: boolean, dotName: stri
     : `   DotNS: will register ${dotName} and transfer it to your account ${recipient}`;
 }
 
+/**
+ * Produce an actionable reason string for the pool-fallback warning + telemetry
+ * attribute. BulletinSlotAuthError carries a typed reason; other errors
+ * (WS/connection, still possible after withTransientRetry's bounded retries
+ * are exhausted — see storage-signer.ts) use their message. Extracted from
+ * selectStorageReconnect so it's unit-testable without a real WS connection
+ * (#1058: pool fallbacks must always carry an explicit, visible reason).
+ */
+export function describeSlotFallbackReason(e: unknown): string {
+  if (e instanceof BulletinSlotAuthError) {
+    return e.reason === "expired" && e.expiration != null
+      ? `expired at block ${e.expiration}`
+      : "no on-chain authorization found";
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
 function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
   if (options.storageSigner && options.storageSignerAddress) {
     // Committed-signer: once the slot provider fails on the first attempt,
     // every subsequent reconnect uses pool. Prevents signer drift mid-upload
     // (nonce/attribution would break if storage switched signers between chunks).
+    // Note: getSlotSignerProvider itself now retries transient connect/query
+    // errors internally (withTransientRetry in storage-signer.ts) before
+    // giving up, so reaching this catch means the slot is genuinely
+    // unavailable (or retries were exhausted) — not a single WS blip.
     let useSlot = true;
     return async () => {
       if (!useSlot) return getProvider();
@@ -536,17 +607,8 @@ function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderR
       } catch (e) {
         useSlot = false;
         setDeployAttribute("deploy.signer.mode", "pool-fallback");
-        // Produce an actionable reason string for the user-visible warning.
-        // BulletinSlotAuthError carries a typed reason; other errors (WS/connection) use their message.
-        let reason: string;
-        if (e instanceof BulletinSlotAuthError) {
-          reason =
-            e.reason === "expired" && e.expiration != null
-              ? `expired at block ${e.expiration}`
-              : "no on-chain authorization found";
-        } else {
-          reason = e instanceof Error ? e.message : String(e);
-        }
+        const reason = describeSlotFallbackReason(e);
+        setDeployAttribute("deploy.signer.fallback_reason", reason);
         console.warn(
           `⚠  Bulletin allowance slot not usable: ${reason}\n` +
           `   Falling back to the shared pool account for storage (fine on testnet).\n` +
@@ -649,6 +711,61 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
     });
   });
 }
+
+/**
+ * Reconcile-before-resubmit (#1051). Pure decision function — no chain I/O —
+ * so it's directly unit-testable. Decides whether a timed-out chunk tx
+ * should be treated as already included (skip the resubmit, avoid a
+ * duplicate content write) based on two independent signals:
+ *   - nonce advance: the account's nonce moved past the chunk's assigned
+ *     nonce. Only meaningful when `nonceHeuristicValid` — false after a pool
+ *     account rotation, where the old nonce baseline belongs to a different
+ *     account (#951).
+ *   - CID presence at best-block: a direct probe of the chunk's own content
+ *     hash, independent of account/nonce bookkeeping entirely. Catches
+ *     inclusion the nonce heuristic can miss (e.g. the endpoint used for the
+ *     nonce fetch is briefly behind a peer that already saw the tx land).
+ * Either signal alone is sufficient.
+ */
+export function reconcileTimedOutChunk(opts: {
+  originalNonce: number | undefined;
+  currentNonce: number;
+  nonceHeuristicValid: boolean;
+  cidPresentAtBest: boolean | null;
+}): boolean {
+  const { originalNonce, currentNonce, nonceHeuristicValid, cidPresentAtBest } = opts;
+  if (cidPresentAtBest === true) return true;
+  if (nonceHeuristicValid && originalNonce !== undefined && originalNonce < currentNonce) return true;
+  return false;
+}
+
+/**
+ * Chain-liveness gate (#1051). Polls `getBestBlockNumber` every
+ * CHUNK_LIVENESS_POLL_MS until height advances past `lastHeight`, or until
+ * `timeoutMs` elapses. Returns the last-observed height either way — never
+ * throws. `lastHeight === null` (couldn't determine a baseline) returns
+ * immediately without waiting: there's nothing to compare against, so
+ * waiting would just delay a resubmit decision for no benefit. A `null`
+ * result from `getBestBlockNumber` mid-wait (RPC failure) also returns
+ * immediately — fail open toward resubmitting rather than hanging on a dead
+ * peer.
+ */
+async function waitForChainLiveness(client: any, lastHeight: number | null, timeoutMs: number, pollMs: number = CHUNK_LIVENESS_POLL_MS): Promise<number | null> {
+  if (lastHeight == null) return getBestBlockNumber(client);
+  const deadline = Date.now() + timeoutMs;
+  let height: number | null = lastHeight;
+  while (Date.now() < deadline) {
+    const h = await getBestBlockNumber(client);
+    if (h == null) return height;
+    height = h;
+    if (height > lastHeight) return height;
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  return height;
+}
+
+/** Test-only alias — exported for unit tests that inject a short timeout/poll. */
+export const __waitForChainLivenessForTest = waitForChainLiveness;
 
 async function storeChunk(unsafeApi: any, signer: PolkadotSigner, chunkBytes: Uint8Array, nonce: number, ss58: string, opts: { fetchNonce?: WatchTransactionOptions["fetchNonce"] } = {}): Promise<StoredChunk> {
   const cid = createCID(chunkBytes, CID_CONFIG.codec, CID_CONFIG.hashCode);
@@ -1119,12 +1236,21 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           try {
             const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
             const originalNonce = assignedNonces.get(fail.index);
+            // Reconcile before resubmit (#1051): probe the chunk's own CID at
+            // best-block in addition to the nonce heuristic below. Probe
+            // failures/absence (present !== true) are non-fatal — fall
+            // through to the nonce check, then to a real resubmit.
+            let cidPresentAtBest: boolean | null = null;
+            try {
+              const [probe] = await probeChunks([failCid.toString()], { client });
+              cidPresentAtBest = probe.present === true ? true : null;
+            } catch { /* probe errors are non-fatal — treat as indeterminate */ }
             // "nonce consumed → included" heuristic: only valid on same account.
             // On rotation, originalNonce is the new account's rebased value and
             // the comparison is not meaningful until the new account actually
             // advances its nonce (#951).
-            if (!perRetryChanged && originalNonce !== undefined && originalNonce < currentNonce) {
-              console.log(`   Chunk ${fail.index}: nonce ${originalNonce} consumed (current=${currentNonce}), treating as included`);
+            if (reconcileTimedOutChunk({ originalNonce, currentNonce, nonceHeuristicValid: !perRetryChanged, cidPresentAtBest })) {
+              console.log(`   Chunk ${fail.index}: reconcile found it already included (nonce ${originalNonce}→${currentNonce}${cidPresentAtBest ? ", CID present at best-block" : ""}) — skipping resubmit`);
               stored[fail.index] = { cid: createCID(fail.chunkData, CID_CONFIG.codec, 0x12), len: fail.chunkData.length, viaFallback: true };
               nonceAdvanceIndices.add(fail.index);
               assignedNonces.delete(fail.index);
@@ -1133,6 +1259,16 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               recoveryHistory.length = 0;
               retried = true;
               break;
+            }
+            // Gate resubmit on chain liveness (#1051): a resubmit into a
+            // frozen chain just piles up a same-nonce collision once it
+            // resumes. Wait (bounded) for a new best-block before spending
+            // this attempt on a resubmit; fails open (proceeds immediately)
+            // if height can't be determined at all.
+            const heightBefore = await getBestBlockNumber(client);
+            const heightAfter = await waitForChainLiveness(client, heightBefore, CHUNK_LIVENESS_MAX_WAIT_MS);
+            if (heightBefore != null && heightAfter != null && heightAfter <= heightBefore) {
+              console.log(`   Chunk ${fail.index}: chain still frozen at block ${heightBefore} after ${(CHUNK_LIVENESS_MAX_WAIT_MS / 1000).toFixed(0)}s wait — resubmitting anyway`);
             }
             const retryNonce = originalNonce ?? currentNonce;
             const result = await storeChunk(unsafeApi, signer as PolkadotSigner, fail.chunkData, retryNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
@@ -2023,6 +2159,7 @@ export async function storeDirectoryV2(
     setDeployAttribute("deploy.probe.finality_miss_count", missingCids.size);
 
     let reuploadCount = 0;
+    let laggingFinalityCount = 0;
     if (missingCids.size === 0) {
       console.log(`   ✓ All ${grandpaCids.length} chunks finalised`);
     } else {
@@ -2032,20 +2169,32 @@ export async function storeDirectoryV2(
       console.log(`   ${missingCids.size} chunks not yet finalised — waiting up to ${GRANDPA_NATURAL_WAIT_MS / 1000}s for natural finalisation`);
       for (const cid of missingCids) console.log(`      ${cid.slice(0, 20)}…`);
       const waitStart = Date.now();
-      while (Date.now() - waitStart < GRANDPA_NATURAL_WAIT_MS && missingCids.size > 0) {
-        await new Promise(r => setTimeout(r, GRANDPA_REUPLOAD_POLL_MS));
-        const poll = await probeChunks([...missingCids], { client: phaseALiveProvider.client!, atFinalized: true });
-        for (const r of poll) {
-          if (r.present === true) missingCids.delete(r.cid);
-        }
-      }
+      await pollUntilFinalized(missingCids, GRANDPA_NATURAL_WAIT_MS, phaseALiveProvider.client!);
 
       if (missingCids.size === 0) {
         const elapsed = Math.round((Date.now() - waitStart) / 1000);
         console.log(`   ✓ All ${grandpaCids.length} chunks finalised (waited ${elapsed}s)`);
       } else {
-        // Step 3: re-upload anything still missing, including root if needed.
-        // Root uses DAG-PB codec (0x70); chunks use raw codec (0x55).
+        // Step 3 (#1049): before treating anything as "missing" and
+        // re-uploading it, probe at BEST-BLOCK. A chunk present in
+        // best-block was never lost — GRANDPA just hasn't caught up yet —
+        // so re-uploading it is both unnecessary and actively harmful (the
+        // re-upload tx can itself time out, failing an otherwise-successful
+        // deploy). Only chunks absent from best-block too are genuinely
+        // missing and eligible for re-upload below.
+        const stillMissing = [...missingCids];
+        const { reallyMissing, lagging } = await probeFinalityGap(stillMissing, { client: phaseALiveProvider.client! });
+        const laggingCids = new Set(lagging);
+        laggingFinalityCount = laggingCids.size;
+        missingCids = new Set(reallyMissing);
+        setDeployAttribute("deploy.probe.finality_lagging_count", laggingFinalityCount);
+        if (laggingCids.size > 0) {
+          console.log(`   ${laggingCids.size} chunk(s) present in best-block but finality-lagging — will NOT re-upload, waiting for GRANDPA (bounded)`);
+        }
+
+        // Re-upload anything genuinely missing (absent from best-block too),
+        // including root if needed. Root uses DAG-PB codec (0x70); chunks
+        // use raw codec (0x55).
 
         // Pre-compute DAG-PB root bytes — same encoding as computeStorageCid.
         const rootHashCode = 0x12;
@@ -2115,14 +2264,7 @@ export async function storeDirectoryV2(
             throw e;
           }
 
-          const reuploadStart = Date.now();
-          while (Date.now() - reuploadStart < GRANDPA_REUPLOAD_TIMEOUT_MS && missingCids.size > 0) {
-            await new Promise(r => setTimeout(r, GRANDPA_REUPLOAD_POLL_MS));
-            const poll = await probeChunks([...missingCids], { client: phaseALiveProvider.client!, atFinalized: true });
-            for (const r of poll) {
-              if (r.present === true) missingCids.delete(r.cid);
-            }
-          }
+          await pollUntilFinalized(missingCids, GRANDPA_REUPLOAD_TIMEOUT_MS, phaseALiveProvider.client!);
         }
 
         if (missingCids.size > 0) {
@@ -2132,7 +2274,29 @@ export async function storeDirectoryV2(
             `(first: ${stuck.slice(0, 20)}…). The chain may have dropped chunks due to a persistent fork. Re-run deploy.`
           );
         }
-        console.log(`   ✓ All ${grandpaCids.length} chunks finalised after re-upload`);
+        if (reuploadCount > 0) {
+          console.log(`   ✓ All ${grandpaCids.length - laggingFinalityCount} chunks finalised after re-upload`);
+        } else {
+          console.log(`   ✓ No chunks genuinely missing from best-block — skipped re-upload entirely`);
+        }
+
+        // Bounded extra wait for finality-lagging chunks (#1049). They are
+        // NEVER re-uploaded — best-block already confirms them — this wait
+        // is purely to let GRANDPA catch up before reporting. If it
+        // expires, the deploy still succeeds: best-block presence of the
+        // full chunk set + root is sufficient; finality remains a
+        // best-effort/async confirmation.
+        if (laggingCids.size > 0) {
+          await pollUntilFinalized(laggingCids, GRANDPA_LAGGING_WAIT_MS, phaseALiveProvider.client!);
+          if (laggingCids.size === 0) {
+            console.log(`   ✓ finality-lagging chunk(s) caught up`);
+          } else {
+            console.warn(
+              `   ⚠ ${laggingCids.size} chunk(s) still not finalised after extended wait, but confirmed present ` +
+              `in best-block — deploy succeeds; finality pending asynchronously`
+            );
+          }
+        }
       }
     }
     setDeployAttribute("deploy.probe.finality_miss_reupload_count", reuploadCount);
@@ -2240,20 +2404,26 @@ export async function storeDirectoryV2(
   // was finalised at the GRANDPA probe above but became absent before the
   // caller writes the contenthash. Implausible on a healthy chain.
   //
-  // Tolerance: this fires only on a DEFINITIVE absent (probe returned
-  // present:false). Probe-failure (present:null, e.g. transient RPC error)
-  // is treated as "unverifiable but the GRANDPA probe seconds ago said
-  // present, so trust that" — same policy as the GRANDPA block, which
-  // filters missing as `r.present === false` only.
+  // Tolerance: a DEFINITIVE absent (present:false) does NOT fail immediately
+  // — #1049 applies here too: the root may simply still be finality-lagging
+  // (e.g. it was in the GRANDPA block's `lagging` set and the bounded wait
+  // there expired without catching up). Route through the same
+  // probeFinalityGap policy as the GRANDPA phase — only a root absent from
+  // BEST-BLOCK too is genuinely evicted. Probe-failure (present:null, e.g.
+  // transient RPC error) is treated as "unverifiable but the GRANDPA probe
+  // seconds ago said present, so trust that".
   console.log(`   Final root check: ${storageCid}`);
   const rootProbe = await probeChunks([storageCid], { client: phaseALiveProvider.client!, atFinalized: true });
   if (rootProbe[0]?.present === false) {
-    throw new Error(
-      `Deploy verification failed: DAG-PB root ${storageCid.slice(0, 20)}… not finalised. ` +
-      `The chain may have evicted the root extrinsic. Re-run deploy.`
-    );
-  }
-  if (rootProbe[0]?.present === true) {
+    const { reallyMissing } = await probeFinalityGap([storageCid], { client: phaseALiveProvider.client! });
+    if (reallyMissing.length > 0) {
+      throw new Error(
+        `Deploy verification failed: DAG-PB root ${storageCid.slice(0, 20)}… not finalised and not present in best-block. ` +
+        `The chain may have evicted the root extrinsic. Re-run deploy.`
+      );
+    }
+    console.log(`   Root confirmed present in best-block (finality-lagging, #1049) — treating as success.`);
+  } else if (rootProbe[0]?.present === true) {
     console.log(`   ✓ Root finalised on chain`);
   } else {
     console.log(`   Root re-check inconclusive (RPC error) — GRANDPA probe above already verified; continuing.`);

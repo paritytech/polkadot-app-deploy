@@ -30,32 +30,31 @@
       }
     },
     {
-      "id": "summit",
-      "name": "Summit",
+      "id": "devnet",
+      "name": "Products Devnet",
       "network": "testnet",
-      "description": "Web3 Summit Network",
+      "description": "Paseo system chains (Asset Hub 1000 / People 1004 / Bulletin 1010)",
       "e2eEligible": false,
-      "ipfs": "https://summit-ipfs.polkadot.io",
+      "ipfs": "https://devnet-ipfs.api.polkadotcommunity.foundation",
       "autoAccountMapping": true,
       "nativeToEthRatio": 100000000,
       "registerStorageDeposit": 2000000000000,
       "contracts": {
-        "DOTNS_PROTOCOL_REGISTRY": "0x09f1AE947950eA2d1f010fE2abC00fDd5A745820",
-        "DOTNS_REGISTRAR": "0xf3969bCBE60463302306663C62A6A8ef91ab9aA5",
-        "DOTNS_REGISTRAR_CONTROLLER": "0xA68a5b2A6be6d014be0dB07c0ed4bacc4A6A570A",
-        "DOTNS_REGISTRY": "0xFb7AB7E142ED0248D77198CA8722D67C1930D783",
-        "DOTNS_POP_CONTROLLER": "0xC7DD78B145ed109092A2d1E79324E5FE219B9518",
-        "ROOT_GATEWAY_DISPATCHER": "0x22362162032ED2442b43f5902b3421be5aCF1b60",
-        "DOTNS_RESOLVER": "0xC7f1C3B16BFd0c5910EE37a4a2033f4506AcE94d",
-        "DOTNS_CONTENT_RESOLVER": "0xf110e5799c3f0adb8ED885C02c45Ecfe7fD86226",
-        "DOTNS_REVERSE_RESOLVER": "0x5aa444C6cbA9bd703d1a0B5E5C643FB886F80bB4",
-        "DOTNS_POP_RESOLVER": "0x03FD2ed7B1b848c59A2428224162dE00D11a8133",
-        "DOTNS_NAME_ESCROW": "0xDbE911007f8cd9876D384b8c025d3BB157DCCcA4",
-        "POP_RULES": "0x6331e51C9AfC73BfE12562fd160BA2c66A73f984",
-        "STORE_FACTORY": "0x2947af3CBFb45b89610524a25921C32cB65C4C39",
-        "LABEL_STORE_BEACON": "0x670Dab225ea4f2EeB0e6Df2e49AA595aB2CAa5cb",
-        "USER_STORE_BEACON": "0x31e392736889c973A25509861C7D6E6F2EaD951C",
-        "MULTICALL3": "0x1C1044BEa5bDe0F435436bB52A8340fBE1D59847"
+        "DOTNS_PROTOCOL_REGISTRY": "0xEdb3e17649ABccc69e6fab4cc640bc578C47AbeA",
+        "DOTNS_REGISTRAR": "0x7f0dF075cc8B7FE7218E90fFC5a553450dB120F3",
+        "DOTNS_REGISTRAR_CONTROLLER": "0x45fDEa4Ad7b8607Fc22DBC3DBE3cD8b350F8bede",
+        "DOTNS_REGISTRY": "0x527b08a640b527a3dae0C4BE04D7344E430B6E50",
+        "DOTNS_POP_CONTROLLER": "0x1884819F6747576883805Cb2b7BB68d29484d1b0",
+        "ROOT_GATEWAY_DISPATCHER": "0x63d7F768e2B2Fa6A270E0fc7b93738a18cb8E73A",
+        "DOTNS_RESOLVER": "0xC28796526Bf3E9295f09655a1001F30f77AfCF0D",
+        "DOTNS_CONTENT_RESOLVER": "0x326bdE29315199c814B1c58b431D84D16EA5cE41",
+        "DOTNS_REVERSE_RESOLVER": "0xfd2594FcF920B38A970011C486e1E3041563147F",
+        "DOTNS_POP_RESOLVER": "0x92Fd4195Be40A266d2914FB64C63cC50715dB1D8",
+        "DOTNS_NAME_ESCROW": "0xfEdBe7a7F32017F6bCAA3109bE2EaC7D59E319E5",
+        "POP_RULES": "0x2181a14081fF2D4477BAA8FB1aEB4C9c44F5F2b0",
+        "STORE_FACTORY": "0xD81DC23FAa69B311C1FC553Ea63798772e7D253D",
+        "LABEL_STORE_BEACON": "0xc7E86B8DE97AF57F937201d8d372F75ED4BE6633",
+        "USER_STORE_BEACON": "0x5924A0dDBb550514A744407F4Ec4b4B7BB6CD736"
       }
     }
   ],
@@ -68,8 +67,13 @@
           "wss": "wss://paseo-rpc.n.dwellir.com",
           "uptimeUrl": "https://stats.uptimerobot.com/UrEXbl6Xyt"
         },
-        "summit": {
-          "wss": "wss://summit-rpc.polkadot.io"
+        "devnet": {
+          "wss": [
+            "wss://paseo-rpc.n.dwellir.com",
+            "wss://paseo-v2.rpc.turboflakes.io",
+            "wss://rpc-paseo.stakeworld.io",
+            "wss://rpc.interweb-it.com/paseo"
+          ]
         }
       }
     },
@@ -81,8 +85,12 @@
           "wss": "wss://paseo-asset-hub-next-rpc.polkadot.io",
           "parachainId": 1500
         },
-        "summit": {
-          "wss": "wss://summit-asset-hub-rpc.polkadot.io"
+        "devnet": {
+          "wss": [
+            "wss://asset-hub-paseo-rpc.n.dwellir.com",
+            "wss://sys.turboflakes.io/asset-hub-paseo"
+          ],
+          "parachainId": 1000
         }
       }
     },
@@ -94,8 +102,13 @@
           "wss": "wss://paseo-people-next-system-rpc.polkadot.io",
           "parachainId": 1502
         },
-        "summit": {
-          "wss": "wss://summit-people-rpc.polkadot.io"
+        "devnet": {
+          "wss": [
+            "wss://people-paseo.rotko.net",
+            "wss://rpc.interweb-it.com/people-paseo",
+            "wss://people-paseo.gatotech.network"
+          ],
+          "parachainId": 1004
         }
       }
     },
@@ -107,8 +120,12 @@
           "wss": "wss://paseo-bulletin-next-rpc.polkadot.io",
           "parachainId": 1501
         },
-        "summit": {
-          "wss": "wss://summit-bulletin-rpc.polkadot.io"
+        "devnet": {
+          "wss": [
+            "wss://bulletin-paseo.tservices.es:8443",
+            "wss://bullet.sik.rocks"
+          ],
+          "parachainId": 1010
         }
       }
     }

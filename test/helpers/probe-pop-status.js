@@ -4,10 +4,13 @@
  * Extracted from the e2e before() hook so it is unit-testable with an injected
  * DotNS factory.
  *
- * COUPLING NOTE: the `//e2e-direct` derivation path used here when
- * `signer === "direct"` and `bulletinDeployEnv` is null must match the
- * `--derivation-path` flag passed by `buildArgs` in test/e2e.test.js (~line
- * 177-180). If one changes, change both.
+ * COUPLING NOTE: the derivation path applied here comes from the caller via
+ * `opts.derivationPath` — it must match whatever the scenario actually deploys
+ * with (see `directSignerDerivationPath()` / `buildArgs` in test/e2e.test.js).
+ * If a caller omits `derivationPath` entirely, this falls back to the legacy
+ * default: `//e2e-direct` when `signer === "direct"`, none otherwise. Passing
+ * an explicit `null` means "probe the bare mnemonic account" and is distinct
+ * from omitting the option.
  *
  * @param {object} opts
  * @param {() => object} opts.dotnsFactory      — returns a fresh DotNS-like instance
@@ -16,27 +19,40 @@
  * @param {() => Promise<object>} opts.resolveEnvConnectOptions — resolves extra connect
  *   options from environments.json when bulletinDeployEnv is set
  * @param {string}       opts.defaultMnemonic    — DEFAULT_MNEMONIC constant from the module
+ * @param {string|null}  [opts.derivationPath]   — explicit derivation path for the actual
+ *   per-scenario signer (see COUPLING NOTE above); omit to get the legacy default
  * @returns {Promise<number>} PoP status as a plain JS number; 0 on any failure
  */
-export async function probeSignerPopStatus({
-  dotnsFactory,
-  signer,
-  bulletinDeployEnv,
-  resolveEnvConnectOptions,
-  defaultMnemonic,
-}) {
+export async function probeSignerPopStatus(opts) {
+  const {
+    dotnsFactory,
+    signer,
+    bulletinDeployEnv,
+    resolveEnvConnectOptions,
+    defaultMnemonic,
+  } = opts;
+  // Distinguish "caller passed derivationPath (including explicit null = bare
+  // mnemonic)" from "caller omitted it (legacy default)".
+  const derivationPath = "derivationPath" in opts
+    ? opts.derivationPath
+    : (signer === "direct" ? "//e2e-direct" : null);
+
   const dotns = dotnsFactory();
   try {
     // Build connect options. When bulletinDeployEnv is set, use env-resolved
-    // options (unchanged from the original hook). When it is null we are on the
-    // default paseo-next environment; if SIGNER is "direct" we must derive with
-    // //e2e-direct so the probed H160 matches what buildArgs passes via
-    // --derivation-path (see COUPLING NOTE above).
+    // options (unchanged from the original hook); otherwise use the default
+    // paseo-next environment. In both cases, layer the resolved derivation
+    // path on top so the probed H160 matches the actual per-scenario signer
+    // (see COUPLING NOTE above).
     const connectOptions = bulletinDeployEnv
-      ? { mnemonic: defaultMnemonic, ...(await resolveEnvConnectOptions()) }
+      ? {
+          mnemonic: defaultMnemonic,
+          ...(await resolveEnvConnectOptions()),
+          ...(derivationPath ? { derivationPath } : {}),
+        }
       : {
           mnemonic: defaultMnemonic,
-          ...(signer === "direct" ? { derivationPath: "//e2e-direct" } : {}),
+          ...(derivationPath ? { derivationPath } : {}),
         };
 
     await dotns.connect(connectOptions);

@@ -17305,6 +17305,51 @@ describe("probeSignerPopStatus", () => {
     assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-direct",
       ">> FAIL: case 6: connect must be called with derivationPath '//e2e-direct' when signer=direct; if buildArgs changes this path, probe-pop-status must change too");
   });
+
+  test("case 7: explicit derivationPath overrides the signer=direct default -> connect called with caller's path", async () => {
+    const mock = makeMock({ popStatus: 0 });
+    await probeSignerPopStatus({
+      ...defaultArgs,
+      signer: "direct",
+      bulletinDeployEnv: null,
+      derivationPath: "//e2e-s9",
+      dotnsFactory: () => mock,
+    });
+    assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 7: connect must be called exactly once");
+    assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-s9",
+      ">> FAIL: case 7: an explicitly-passed derivationPath must win over the signer=direct default, so isolated per-scenario signers (e.g. //e2e-s9) get probed instead of //e2e-direct");
+  });
+
+  test("case 8: explicit derivationPath=null -> connect called with NO derivationPath key (bare mnemonic)", async () => {
+    const mock = makeMock({ popStatus: 2n });
+    await probeSignerPopStatus({
+      ...defaultArgs,
+      signer: "direct",
+      bulletinDeployEnv: null,
+      derivationPath: null,
+      dotnsFactory: () => mock,
+    });
+    assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 8: connect must be called exactly once");
+    assert.ok(!("derivationPath" in mock.connectCalls[0]),
+      ">> FAIL: case 8: an explicit null derivationPath must probe the bare mnemonic account (no derivationPath key), not silently fall back to //e2e-direct");
+  });
+
+  test("case 9: explicit derivationPath is applied even when bulletinDeployEnv is set (env-resolved branch)", async () => {
+    const mock = makeMock({ popStatus: 0 });
+    await probeSignerPopStatus({
+      ...defaultArgs,
+      signer: "direct",
+      bulletinDeployEnv: "paseo-next-v2",
+      resolveEnvConnectOptions: async () => ({ rpc: "wss://example" }),
+      derivationPath: "//e2e-sgrandpa",
+      dotnsFactory: () => mock,
+    });
+    assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 9: connect must be called exactly once");
+    assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-sgrandpa",
+      ">> FAIL: case 9: an isolated scenario's derivationPath must be layered onto the env-resolved connect options too, or S9/s-grandpa-reupload probe the wrong (bare-Alice) signer on a custom BULLETIN_DEPLOY_ENV/PAD_ENV");
+    assert.strictEqual(mock.connectCalls[0].rpc, "wss://example",
+      ">> FAIL: case 9: env-resolved options (e.g. rpc) must still pass through unchanged");
+  });
 });
 
 // ---------------------------------------------------------------------------

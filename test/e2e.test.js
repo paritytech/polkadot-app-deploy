@@ -329,6 +329,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       bulletinDeployEnv: PAD_ENV,
       resolveEnvConnectOptions: resolveDotnsEnvConnectOptions,
       defaultMnemonic: DEFAULT_MNEMONIC,
+      derivationPath: directSignerDerivationPath(),
     });
   });
 

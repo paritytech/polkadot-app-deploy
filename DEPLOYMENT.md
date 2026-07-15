@@ -48,7 +48,7 @@ An environment entry provides:
 - **`autoAccountMapping`** — whether the chain maps accounts to H160 automatically on first tx.
 - **`ipfs`** — the gateway that serves deployed content.
 
-Use the `paseo-next-v2` and `summit` entries in `assets/environments.json` as worked examples to copy.
+Use the `paseo-next-v2` and `devnet` entries in `assets/environments.json` as worked examples to copy.
 
 ## 2. Authorize Bulletin storage
 

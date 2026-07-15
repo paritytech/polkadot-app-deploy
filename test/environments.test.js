@@ -355,8 +355,9 @@ describe("e2eEligible flag", () => {
   });
 
   // The protected property is "no env outside the two intended ones runs E2E".
-  // An explicit `e2eEligible: false` (e.g. summit-net, #900) satisfies that just as
-  // absence does — the flag is opt-in, so anything other than `true` means not-eligible.
+  // An explicit `e2eEligible: false` (e.g. the community `devnet`, #900) satisfies
+  // that just as absence does — the flag is opt-in, so anything other than `true`
+  // means not-eligible.
   test("no other env is e2eEligible (explicit false is allowed, only true opts in)", () => {
     for (const env of envDoc.environments) {
       if (env.id === "preview" || env.id === "paseo-next-v2") continue;
@@ -364,6 +365,61 @@ describe("e2eEligible flag", () => {
         env.e2eEligible,
         true,
         `>> FAIL: e2eEligible-${env.id}: ${env.id} must not be e2e-eligible (opt-in flag; only preview + paseo-next-v2). Got e2eEligible=${env.e2eEligible}`,
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// devnet preset (#112) + summit removal
+// ---------------------------------------------------------------------------
+
+describe("devnet environment (Paseo system chains)", () => {
+  test("devnet resolves end-to-end from the bundled catalog", async () => {
+    const { doc } = await loadEnvironments({ warn: () => {} });
+    const resolved = resolveEndpoints(doc, "devnet");
+
+    assert.equal(resolved.network, "testnet", ">> FAIL: devnet-network: devnet must be a testnet");
+    // Register-canonical endpoint first (papi failover order from the issue).
+    assert.equal(
+      resolved.bulletin[0],
+      "wss://bulletin-paseo.tservices.es:8443",
+      ">> FAIL: devnet-bulletin: register-canonical Bulletin endpoint must resolve first",
+    );
+    assert.equal(
+      resolved.assetHub[0],
+      "wss://asset-hub-paseo-rpc.n.dwellir.com",
+      ">> FAIL: devnet-assethub: Asset Hub endpoint must resolve",
+    );
+    assert.equal(
+      resolved.ipfs,
+      "https://devnet-ipfs.api.polkadotcommunity.foundation",
+      ">> FAIL: devnet-ipfs: community IPFS gateway must resolve",
+    );
+  });
+
+  test("every devnet contract address is well-formed", () => {
+    const envDoc = JSON.parse(fsSync.readFileSync("assets/environments.json", "utf-8"));
+    const devnet = envDoc.environments.find((e) => e.id === "devnet");
+    assert.ok(devnet, ">> FAIL: devnet-present: devnet environment must exist in the catalog");
+    for (const [name, addr] of Object.entries(devnet.contracts)) {
+      assert.ok(
+        isValidContractAddress(addr),
+        `>> FAIL: devnet-contract-${name}: ${name}=${addr} is not a valid 0x-address (typo in the pasted deployment?)`,
+      );
+    }
+  });
+
+  test("summit environment is fully removed (env + every chain endpoint)", () => {
+    const envDoc = JSON.parse(fsSync.readFileSync("assets/environments.json", "utf-8"));
+    assert.ok(
+      !envDoc.environments.some((e) => e.id === "summit"),
+      ">> FAIL: summit-env-gone: the retired summit environment must not appear in environments[]",
+    );
+    for (const chain of envDoc.chains) {
+      assert.ok(
+        !("summit" in chain.endpoints),
+        `>> FAIL: summit-endpoint-gone: chain '${chain.id}' still carries a summit endpoint`,
       );
     }
   });

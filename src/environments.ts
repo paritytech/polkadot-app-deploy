@@ -378,7 +378,7 @@ export function resolveEndpoints(
     throw new NonRetryableError(
       `Bulletin chain not yet available on environment '${envId}'. ` +
         `The selected environment has no bulletin endpoint in its environments.json entry. ` +
-        `Pick an environment that defines a bulletin endpoint (e.g. paseo-next-v2 or summit).`,
+        `Pick an environment that defines a bulletin endpoint (e.g. paseo-next-v2 or devnet).`,
     );
   }
 

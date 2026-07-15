@@ -11,6 +11,16 @@
 
 The Bulletin chain has **no fee model**. Storage access is gated by the `TransactionStorage` pallet's authorization quota, not account balance. Each pool account must be authorized with a transaction count and byte budget. `polkadot-app-bootstrap` inspects and grants that quota.
 
+### Community- or third-party-operated environments
+
+`--authorizer` defaults to `//Alice` **only** on chains where that well-known dev key actually holds authorization authority (Parity-run testnets such as `paseo-next-v2`). On an environment operated by someone else — for example the community `devnet` preset, run by the Polkadot Community Foundation — `//Alice` is **not** the authorizer, so relying on the default will fail even though the environment is a testnet. Always pass the key that holds `TransactionStorage` authorization authority on that chain explicitly:
+
+```bash
+polkadot-app-bootstrap --env devnet --authorizer "<your authorizer seed or mnemonic>"
+```
+
+The same applies to `--mnemonic`: pass the pool root mnemonic whose `//deploy/N` accounts your deploys actually use, so bootstrap authorizes the accounts the deploy path will address.
+
 ## Usage
 
 ```bash

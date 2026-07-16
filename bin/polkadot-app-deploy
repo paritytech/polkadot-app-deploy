@@ -457,6 +457,23 @@ try {
   const _versionInfo = await _versionCheckPromise;
   if (handlePreflightVersionCheck(_versionInfo) === "abort") process.exit(1);
 
+  // Frontloaded manifest preflight (#125): when a product config applies
+  // (--config or discoverable via walk-up), validate it + its referenced
+  // icon/executable files BEFORE any storage or chain work, so config errors
+  // fail fast up front instead of after merkleize + upload. No-op (returns
+  // null) for contenthash-only deploys with no config.
+  try {
+    const { preflightProductConfig } = await import("../dist/index.js");
+    // config-load resolves a relative cwd internally, so no node:path here
+    // (it's only dynamically imported later, in the publish block).
+    await preflightProductConfig(
+      flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
+    );
+  } catch (err) {
+    console.error(`Error: ${err?.message ?? err}`);
+    process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
+  }
+
   const result = await deploy(buildDir, domain, {
     mnemonic: flags.mnemonic,
     derivationPath: flags.derivationPath,

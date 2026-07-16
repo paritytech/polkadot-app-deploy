@@ -2307,12 +2307,33 @@ jobs:
           # Use curl (always present on runner) rather than gh CLI, which is
           # absent on ubuntu-latest runners and silently fails with exit 127.
           BODY=$(cat /tmp/issue-body.md)
-          curl -fsSL \
-            -X POST \
+          # Dedup: this report job re-runs on every run_attempt, so re-running a
+          # failed nightly used to open a SECOND identical issue (attempt 1 +
+          # attempt 2 → two "Nightly E2E failure: <date>"). Find an existing OPEN
+          # issue with this exact title; if present, comment the re-run link
+          # instead of creating a duplicate. (has(pull_request) filters out PRs,
+          # which the issues endpoint also returns.)
+          EXISTING=$(curl -fsSL \
             -H "Authorization: bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "$API_URL/repos/$REPO/issues" \
-            -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" '{title: $title, body: $body}')"
+            "$API_URL/repos/$REPO/issues?state=open&per_page=100" \
+            | jq -r --arg t "$TITLE" 'map(select(.title == $t and (has("pull_request") | not))) | (.[0].number // empty)')
+          if [ -n "$EXISTING" ]; then
+            echo "Existing open issue #$EXISTING titled \"$TITLE\" — commenting instead of duplicating."
+            curl -fsSL \
+              -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/issues/$EXISTING/comments" \
+              -d "$(jq -n --arg body "Re-run also failed: $RUN_URL" '{body: $body}')"
+          else
+            curl -fsSL \
+              -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/issues" \
+              -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" '{title: $title, body: $body}')"
+          fi
 
   # ---- Post-nightly Sentry assertion harness (#181 Proposal 1) -----------
 

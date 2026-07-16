@@ -30,6 +30,17 @@ const FLAKE_PATTERNS = [
   "Account mapping did not take effect",     // Revive mapping race
   "requires Node.js >=22",                   // parity-default runner downgrade (Node v18) — infra flake
   "received a shutdown signal",              // runner process killed mid-job — CI infra flake
+  // Chain/block-inclusion timeouts — top transient error class on
+  // paseo-next-v2 during the 2026-07 finality-lag incidents (#1050).
+  "waiting for block confirmation",
+  "transaction watcher silent for",
+  "of chain progress (budget=",
+  "did not settle within",
+  // Asset Hub runtime-call (EVM address resolution) timeout — the paseo-next-v2
+  // AH node degrades under concurrent E2E matrix load and times out ReviveApi.address
+  // (#1131). A fresh CI retry lands in a recovered window. Not retried before, so a
+  // single bad window failed the whole scenario (shifting failure sets across reruns).
+  "ReviveApi.address timed out",
 ];
 
 // output: combined stdout+stderr text from the child. Any flake pattern

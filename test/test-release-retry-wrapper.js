@@ -65,6 +65,17 @@ test("classifyForRetry: chain/block-inclusion timeout patterns return exit 75 (#
   }
 });
 
+test("classifyForRetry: AH ReviveApi.address timeout is retry-eligible (#1131)", () => {
+  const ahTimeouts = [
+    "Deployment failed: DotNS connect: failed to resolve EVM address from 5HbjRq... via ReviveApi.address (ReviveApi.address timed out after 30000ms); RPC: wss://paseo-asset-hub-next-rpc.polkadot.io",
+    "Error: ReviveApi.address timed out after 30000ms",
+  ];
+  for (const output of ahTimeouts) {
+    assert.strictEqual(classifyForRetry(output), 75,
+      `expected exit 75 (retry-eligible) for AH-RPC ReviveApi.address timeout: ${output.slice(0, 60)}`);
+  }
+});
+
 test("wrapper reads stdout — flake pattern on stdout triggers exit 75", async () => {
   const exitCode = await new Promise((resolve) => {
     const child = spawn(process.execPath, [

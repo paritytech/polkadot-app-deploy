@@ -17,7 +17,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -19034,6 +19034,79 @@ describe("DotNS tx retry backoff (nonce burst)", () => {
   test("REVIVE_ADDRESS_ATTEMPTS is a small positive integer (>1 so a transient blip retries)", () => {
     assert.ok(Number.isInteger(REVIVE_ADDRESS_ATTEMPTS) && REVIVE_ADDRESS_ATTEMPTS >= 2 && REVIVE_ADDRESS_ATTEMPTS <= 5,
       `>> FAIL: revive-attempts: expected 2..5, got ${REVIVE_ADDRESS_ATTEMPTS}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setContenthash read-back client refresh (#1131-follow-up): the final
+// read-back retry used to re-read this.getContenthash(domainName) up to
+// CONTENTHASH_VERIFY_ATTEMPTS times on the SAME this.client. paseo-next-v2's
+// Asset Hub RPC is a single load-balanced endpoint whose backends can serve
+// divergent/stale finalized state under E2E load — a sticky connection to one
+// stale backend returns the SAME wrong value all N attempts even though the
+// write actually finalized, false-failing an otherwise-successful deploy.
+// pickVerifyEndpoint is the pure endpoint-rotation seam (unit-tested directly
+// below); the wiring tests confirm the read-back and connect() actually route
+// through it + the shared recreateReviveClient helper (a source-regex check,
+// mirroring the pattern this file already uses for hard-to-mock chain paths —
+// see "DotNS tx/block hash attribute emission" above).
+// ---------------------------------------------------------------------------
+
+describe("DotNS read-back client refresh (sticky-client stale read, #1131-follow-up)", () => {
+  test("pickVerifyEndpoint: attempt 1 always resolves to the currently-connected rpc (no reconnect needed)", () => {
+    assert.equal(pickVerifyEndpoint(1, "rpcA", ["rpcA", "rpcB", "rpcC"]), "rpcA",
+      ">> FAIL: pickVerifyEndpoint-attempt1: the common path (no prior mismatch) must not rotate away from the current connection");
+  });
+
+  test("pickVerifyEndpoint: rotates through distinct endpoints on successive retry attempts", () => {
+    const endpoints = ["rpcA", "rpcB", "rpcC"];
+    const picked = [1, 2, 3].map((attempt) => pickVerifyEndpoint(attempt, "rpcA", endpoints));
+    assert.deepEqual(picked, ["rpcA", "rpcB", "rpcC"],
+      `>> FAIL: pickVerifyEndpoint-rotate: attempts 1..3 must visit distinct endpoints in order, got ${JSON.stringify(picked)} — a sticky/stale backend on attempt 1 must be escaped by attempt 2, not re-hit`);
+  });
+
+  test("pickVerifyEndpoint: wraps around when attempts exceed the endpoint count", () => {
+    const endpoints = ["rpcA", "rpcB"];
+    assert.equal(pickVerifyEndpoint(3, "rpcA", endpoints), "rpcA",
+      ">> FAIL: pickVerifyEndpoint-wrap: attempt 3 with 2 endpoints must wrap back to the first");
+  });
+
+  test("pickVerifyEndpoint: falls back to the current rpc when only one endpoint is configured", () => {
+    assert.equal(pickVerifyEndpoint(1, "only-rpc", ["only-rpc"]), "only-rpc",
+      ">> FAIL: pickVerifyEndpoint-single: attempt 1 must resolve to the only endpoint");
+    assert.equal(pickVerifyEndpoint(2, "only-rpc", ["only-rpc"]), "only-rpc",
+      ">> FAIL: pickVerifyEndpoint-single: with no other endpoint to rotate to, every attempt must fall back to the same rpc rather than throw");
+  });
+
+  test("pickVerifyEndpoint: falls back to assetHubEndpoints when rpc is null (never connected)", () => {
+    assert.equal(pickVerifyEndpoint(1, null, RPC_ENDPOINTS), RPC_ENDPOINTS[0],
+      ">> FAIL: pickVerifyEndpoint-nullrpc: with no rpc set yet, attempt 1 must fall back to the first configured asset-hub endpoint");
+    assert.equal(pickVerifyEndpoint(2, null, RPC_ENDPOINTS), RPC_ENDPOINTS[1],
+      ">> FAIL: pickVerifyEndpoint-nullrpc: attempt 2 must still rotate through assetHubEndpoints when rpc is null");
+  });
+
+  test("wiring: setContenthash's final read-back recreates the client against a rotated endpoint on retry (attempt > 1 only)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    const start = src.indexOf("Final read-back catches a rare post-finality reorg");
+    assert.ok(start >= 0, ">> FAIL: readback-wiring: could not locate the final read-back block in src/dotns.ts");
+    const end = src.indexOf("Post-deploy verification failed for", start);
+    assert.ok(end > start, ">> FAIL: readback-wiring: could not find the read-back block's end marker");
+    const block = src.slice(start, end);
+    assert.match(block, /if \(attempt > 1\)[\s\S]*?pickVerifyEndpoint\(attempt, this\.rpc, this\.assetHubEndpoints\)/,
+      ">> FAIL: readback-wiring: the read-back retry must call pickVerifyEndpoint(attempt, this.rpc, this.assetHubEndpoints) gated on attempt > 1 — this is the fix for the sticky-client stale read (a bare re-read on the same this.client will false-fail a finalized write)");
+    assert.match(block, /this\.recreateReviveClient\(endpoint\)/,
+      ">> FAIL: readback-wiring: the read-back retry must call this.recreateReviveClient(endpoint) to actually reconnect before re-reading — computing the rotated endpoint without reconnecting to it is a no-op fix");
+  });
+
+  test("wiring: connect() and the read-back share ONE recreateReviveClient helper — no inline duplicate left behind (/simplify)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    assert.match(src, /private recreateReviveClient\(endpoint: string\): void/,
+      ">> FAIL: recreate-dedup: expected a private recreateReviveClient(endpoint) helper — connect()'s destroy+createClient+wrapper sequence must be extracted, not copy-pasted into the read-back");
+    const createClientCallSites = (src.match(/createClient\(getWsProvider\(/g) || []).length;
+    assert.equal(createClientCallSites, 1,
+      `>> FAIL: recreate-dedup: expected exactly 1 createClient(getWsProvider(...)) call site (inside recreateReviveClient), found ${createClientCallSites} — connect() or the read-back kept an inline copy instead of calling the shared helper`);
+    assert.match(src, /this\.recreateReviveClient\(rpc\)/,
+      ">> FAIL: recreate-dedup: connect()'s ReviveApi.address retry must call the shared this.recreateReviveClient(rpc), not its own inline destroy+createClient");
   });
 });
 

@@ -254,6 +254,21 @@ export const REVIVE_ADDRESS_ATTEMPTS: number = 3;
 // landed; a single final read can still return a stale (pre-write) value under
 // AH-node finality lag, false-failing an otherwise-successful deploy.
 export const CONTENTHASH_VERIFY_ATTEMPTS: number = 3;
+// #1131-follow-up: the read-back retry above used to re-read on the SAME papi
+// client every attempt. paseo-next-v2's Asset Hub RPC is a single
+// load-balanced endpoint whose backends can serve divergent/stale finalized
+// state under E2E load — a sticky connection to one stale backend returns the
+// SAME wrong value all N attempts, even though the write actually finalized.
+// pickVerifyEndpoint rotates which endpoint a retry attempt reconnects to
+// (mirroring the failover idiom at contractTransaction's `rpcs` list), so a
+// later attempt can land on a backend that has caught up. Pure function: attempt
+// 1 always resolves to the currently-connected rpc (no reconnect needed — see
+// the `attempt > 1` gate at the call site); only attempt 2+ rotates.
+export function pickVerifyEndpoint(attempt: number, rpc: string | null, assetHubEndpoints: string[]): string {
+  const endpoints = rpc ? [rpc, ...assetHubEndpoints.filter((ep) => ep !== rpc)] : assetHubEndpoints;
+  if (endpoints.length === 0) throw new Error("pickVerifyEndpoint: no asset hub endpoints available");
+  return endpoints[(attempt - 1) % endpoints.length];
+}
 export const OPERATION_TIMEOUT_MS: number = 300_000;
 export const TX_TIMEOUT_MS: number = 90_000;
 // DotNS extrinsic deadline measured against **chain time**: if the chain has
@@ -1722,6 +1737,20 @@ export class DotNS {
 
   constructor() { this.client = null; this.clientWrapper = null; this.rpc = null; this.substrateAddress = null; this.evmAddress = null; this.signer = null; this.connected = false; this.assetHubEndpoints = RPC_ENDPOINTS; }
 
+  /**
+   * Tear down the current papi client (if any) and stand up a fresh WS
+   * connection + ReviveClientWrapper against `endpoint`. Escapes a
+   * wedged/slow/stale connection — used by connect()'s ReviveApi.address
+   * retry (#1131) and by setContenthash's post-deploy read-back retry
+   * (#1131-follow-up), which is the single reason this is a shared helper
+   * rather than two copies of the same three lines.
+   */
+  private recreateReviveClient(endpoint: string): void {
+    if (this.client) { try { this.client.destroy(); } catch { /* ignore teardown errors */ } }
+    this.client = createClient(getWsProvider(endpoint, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
+    this.clientWrapper = new ReviveClientWrapper(this.client.getUnsafeApi());
+  }
+
   async connect(options: DotNSConnectOptions = {}): Promise<this> {
     if (options.assetHubEndpoints && options.assetHubEndpoints.length > 0) {
       this.assetHubEndpoints = options.assetHubEndpoints;
@@ -1796,12 +1825,9 @@ export class DotNS {
       // rather than failing the whole deploy on one bad ~30s window.
       try {
         this.evmAddress = await withRetry(async (attempt) => {
-          if (this.client) { try { this.client.destroy(); } catch { /* ignore teardown errors */ } }
-          this.client = createClient(getWsProvider(rpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
-          const unsafeApi = this.client.getUnsafeApi();
-          this.clientWrapper = new ReviveClientWrapper(unsafeApi);
+          this.recreateReviveClient(rpc);
           const addr = await withTimeout(
-            this.clientWrapper.getEvmAddress(this.substrateAddress!),
+            this.clientWrapper!.getEvmAddress(this.substrateAddress!),
             CONNECTION_TIMEOUT_MS,
             "ReviveApi.address",
           );
@@ -2602,12 +2628,32 @@ export class DotNS {
       // (pre-write) value under AH-node finality lag (#1131) — re-read with
       // backoff and accept as soon as it matches; only fail if it still
       // mismatches after every attempt.
+      //
+      // #1131-follow-up: every retry attempt used to re-read on the SAME
+      // this.client. paseo-next-v2's AH RPC is a single load-balanced endpoint
+      // whose backends can serve divergent/stale finalized state — a sticky
+      // connection to one stale backend returns the SAME wrong value all N
+      // attempts even though the write finalized. From attempt 2 onward,
+      // recreate the client against a rotated endpoint (pickVerifyEndpoint)
+      // before re-reading, so a retry can escape the stale backend. Attempt 1
+      // reuses the existing connection — no reconnect cost on the common path.
       let finalOnChain = "0x";
       try {
-        await withRetry(async () => {
+        await withRetry(async (attempt) => {
+          if (attempt > 1) {
+            const endpoint = pickVerifyEndpoint(attempt, this.rpc, this.assetHubEndpoints);
+            this.recreateReviveClient(endpoint);
+          }
           finalOnChain = ((await this.getContenthash(domainName)) || "0x").toLowerCase();
           if (finalOnChain !== expected) throw new Error(`contenthash still ${finalOnChain}, awaiting ${expected}`);
-        }, { attempts: CONTENTHASH_VERIFY_ATTEMPTS });
+          if (attempt > 1) setDeployAttribute("deploy.contenthash.verify_attempts", String(attempt));
+        }, {
+          attempts: CONTENTHASH_VERIFY_ATTEMPTS,
+          onRetry: (attempt, e, backoff) => {
+            const inner = (e as any)?.message?.slice(0, 160) ?? String(e).slice(0, 160);
+            console.log(`      Read-back attempt ${attempt}/${CONTENTHASH_VERIFY_ATTEMPTS} saw a mismatch (${inner}) — retrying against a fresh connection in ${Math.round(backoff / 1000)}s…`);
+          },
+        });
       } catch { /* keep last finalOnChain for the error message below */ }
       if (finalOnChain !== expected) {
         throw new Error(

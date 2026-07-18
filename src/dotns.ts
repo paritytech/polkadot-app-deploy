@@ -243,6 +243,12 @@ const PERSONHOOD_CONTEXT = "0x646f746e730000000000000000000000000000000000000000
 export const DECIMALS: bigint = 12n;
 export const NATIVE_TO_ETH_RATIO: bigint = 1_000_000n;
 export const CONNECTION_TIMEOUT_MS: number = 30_000;
+// #1131: bounded retry for the ReviveApi.address (EVM-address resolution)
+// runtime call in connect(). The paseo-next-v2 Asset Hub node intermittently
+// times this out under load; a single attempt fails the whole deploy on a
+// transient blip. Retry a few times with backoff (fresh WS client each attempt)
+// so a later attempt lands after the node recovers.
+export const REVIVE_ADDRESS_ATTEMPTS: number = 3;
 export const OPERATION_TIMEOUT_MS: number = 300_000;
 export const TX_TIMEOUT_MS: number = 90_000;
 // DotNS extrinsic deadline measured against **chain time**: if the chain has
@@ -373,6 +379,41 @@ export function dotnsRetryBackoffMs(attempt: number, rand: () => number = Math.r
   const ceil = Math.min(DOTNS_RETRY_BASE_MS * 2 ** (attempt - 1), DOTNS_RETRY_MAX_MS);
   // full-ish jitter: 50–100% of the exponential ceiling
   return Math.round(ceil * (0.5 + rand() * 0.5));
+}
+
+/**
+ * Run `fn` up to `attempts` times, backing off between failures. Returns the
+ * first success; rethrows the LAST error if every attempt fails. `sleep` and
+ * `backoffMs` are injectable so the retry policy is unit-testable without real
+ * timers. Used for the ReviveApi.address resolution in connect() (#1131) — a
+ * generic seam so the "retry N times with backoff" behaviour is tested once,
+ * independent of the live-chain call it wraps.
+ */
+export async function withRetry<T>(
+  fn: (attempt: number) => Promise<T>,
+  opts: {
+    attempts: number;
+    onRetry?: (attempt: number, err: unknown, backoffMs: number) => void;
+    backoffMs?: (attempt: number) => number;
+    sleep?: (ms: number) => Promise<void>;
+  },
+): Promise<T> {
+  const backoffMs = opts.backoffMs ?? dotnsRetryBackoffMs;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= opts.attempts; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (e) {
+      lastErr = e;
+      if (attempt < opts.attempts) {
+        const b = backoffMs(attempt);
+        opts.onRetry?.(attempt, e, b);
+        await sleep(b);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 /**
@@ -1744,23 +1785,38 @@ export class DotNS {
     // runtime call that does NOT require the origin to be mapped. Set up the
     // polkadot-api client first since the wrapper holds the chain handle.
     return withSpan("deploy.dotns.connect", "dotns connect", {}, async () => {
+      // #1131: retry ReviveApi.address on transient AH-node timeouts. Recreate a
+      // fresh WS client each attempt (escapes a wedged/slow connection) and back
+      // off between tries so a later attempt can land after the node recovers,
+      // rather than failing the whole deploy on one bad ~30s window.
       try {
-        this.client = createClient(getWsProvider(rpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
-        const unsafeApi = this.client.getUnsafeApi();
-        this.clientWrapper = new ReviveClientWrapper(unsafeApi);
-        this.evmAddress = await withTimeout(
-          this.clientWrapper.getEvmAddress(this.substrateAddress!),
-          CONNECTION_TIMEOUT_MS,
-          "ReviveApi.address",
-        );
-        console.log(`   H160 Address: ${this.evmAddress}`);
+        this.evmAddress = await withRetry(async (attempt) => {
+          if (this.client) { try { this.client.destroy(); } catch { /* ignore teardown errors */ } }
+          this.client = createClient(getWsProvider(rpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
+          const unsafeApi = this.client.getUnsafeApi();
+          this.clientWrapper = new ReviveClientWrapper(unsafeApi);
+          const addr = await withTimeout(
+            this.clientWrapper.getEvmAddress(this.substrateAddress!),
+            CONNECTION_TIMEOUT_MS,
+            "ReviveApi.address",
+          );
+          if (attempt > 1) setDeployAttribute("deploy.dotns.revive_address_attempts", String(attempt));
+          return addr;
+        }, {
+          attempts: REVIVE_ADDRESS_ATTEMPTS,
+          onRetry: (attempt, e, backoff) => {
+            const inner = (e as any)?.message?.slice(0, 160) ?? String(e).slice(0, 160);
+            console.log(`   ReviveApi.address attempt ${attempt}/${REVIVE_ADDRESS_ATTEMPTS} failed (${inner}) — retrying in ${Math.round(backoff / 1000)}s…`);
+          },
+        });
       } catch (e: any) {
-        const inner = e.message?.slice(0, 200) ?? String(e).slice(0, 200);
+        const inner = e?.message?.slice(0, 200) ?? String(e).slice(0, 200);
         const rpcHint = inner.includes("timed out") ? `; RPC: ${rpc} — retry or set DOTNS_RPC to another endpoint` : "";
         throw new Error(
-          `DotNS connect: failed to resolve EVM address from ${this.substrateAddress} via ReviveApi.address (${inner})${rpcHint}`,
+          `DotNS connect: failed to resolve EVM address from ${this.substrateAddress} via ReviveApi.address after ${REVIVE_ADDRESS_ATTEMPTS} attempts (${inner})${rpcHint}`,
         );
       }
+      console.log(`   H160 Address: ${this.evmAddress}`);
       setDeployAttribute("deploy.dotns.rpc_used", rpc);
       setDeployAttribute("deploy.dotns.evm_address", this.evmAddress!);
       this.connected = true;

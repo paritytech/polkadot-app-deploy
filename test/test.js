@@ -17,7 +17,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -18981,6 +18981,59 @@ describe("DotNS tx retry backoff (nonce burst)", () => {
     assert.equal(dotnsRetryBackoffMs(1, () => 1), 400, ">> FAIL: retry-backoff: attempt 1 ceiling (100% of 400ms)");
     assert.ok(dotnsRetryBackoffMs(3, () => 0) > dotnsRetryBackoffMs(1, () => 0), ">> FAIL: retry-backoff: must grow with attempt");
     assert.ok(dotnsRetryBackoffMs(20, () => 1) <= 6000, ">> FAIL: retry-backoff: must be capped at 6s");
+  });
+
+  // #1131: withRetry wraps the ReviveApi.address resolution in connect().
+  test("withRetry: returns first success without retrying", async () => {
+    let calls = 0;
+    const sleeps = [];
+    const out = await withRetry(async () => { calls++; return "ok"; }, {
+      attempts: 3, sleep: async (ms) => { sleeps.push(ms); },
+    });
+    assert.equal(out, "ok");
+    assert.equal(calls, 1, ">> FAIL: withRetry-success: must not retry on first success");
+    assert.equal(sleeps.length, 0, ">> FAIL: withRetry-success: must not back off when the first attempt succeeds");
+  });
+
+  test("withRetry: retries transient failures then succeeds; backs off between", async () => {
+    let calls = 0;
+    const sleeps = [];
+    const retried = [];
+    const out = await withRetry(async (attempt) => {
+      calls++;
+      if (attempt < 3) throw new Error(`ReviveApi.address timed out after 30000ms (attempt ${attempt})`);
+      return "recovered";
+    }, {
+      attempts: 3,
+      backoffMs: (a) => a * 100,
+      sleep: async (ms) => { sleeps.push(ms); },
+      onRetry: (a) => { retried.push(a); },
+    });
+    assert.equal(out, "recovered");
+    assert.equal(calls, 3, ">> FAIL: withRetry-recover: must attempt exactly 3 times (2 fail + 1 success)");
+    assert.deepEqual(sleeps, [100, 200], ">> FAIL: withRetry-recover: must back off before each retry (attempts 1,2), not after the final");
+    assert.deepEqual(retried, [1, 2], ">> FAIL: withRetry-recover: onRetry must fire for each retried attempt");
+  });
+
+  test("withRetry: rethrows the LAST error after exhausting attempts (no backoff after final)", async () => {
+    let calls = 0;
+    const sleeps = [];
+    await assert.rejects(
+      () => withRetry(async (attempt) => { calls++; throw new Error(`fail ${attempt}`); }, {
+        attempts: REVIVE_ADDRESS_ATTEMPTS, backoffMs: () => 1, sleep: async (ms) => { sleeps.push(ms); },
+      }),
+      (e) => {
+        assert.match(e.message, new RegExp(`fail ${REVIVE_ADDRESS_ATTEMPTS}$`), ">> FAIL: withRetry-exhaust: must rethrow the LAST attempt's error");
+        return true;
+      },
+    );
+    assert.equal(calls, REVIVE_ADDRESS_ATTEMPTS, `>> FAIL: withRetry-exhaust: must attempt exactly ${REVIVE_ADDRESS_ATTEMPTS} times`);
+    assert.equal(sleeps.length, REVIVE_ADDRESS_ATTEMPTS - 1, ">> FAIL: withRetry-exhaust: must back off between attempts but not after the final one");
+  });
+
+  test("REVIVE_ADDRESS_ATTEMPTS is a small positive integer (>1 so a transient blip retries)", () => {
+    assert.ok(Number.isInteger(REVIVE_ADDRESS_ATTEMPTS) && REVIVE_ADDRESS_ATTEMPTS >= 2 && REVIVE_ADDRESS_ATTEMPTS <= 5,
+      `>> FAIL: revive-attempts: expected 2..5, got ${REVIVE_ADDRESS_ATTEMPTS}`);
   });
 });
 

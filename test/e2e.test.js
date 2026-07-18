@@ -211,21 +211,38 @@ function pickRotLabel() {
   return suf ? `e2erotpool${suf}` : "e2erotpool01";
 }
 
-function noStatusRunLabel(prefix) {
+export function noStatusRunLabel(prefix) {
   return sanitizeDomainLabel(`${prefix}${RUN_TOKEN}x00`);
 }
 
-function pickFreshRunLabel(prefix) {
+// Builds the sanitizer-safe label used by pickFreshRunLabel's PoP-Full branch.
+// Exported (with `tag` as an explicit param) so the fix is unit-testable in
+// test/test.js without depending on the module-level RUN_TAG/signerPopStatus
+// state, which is fixed at import time and can't vary across "invocations"
+// within one process.
+//
+// Root cause this guards against: RUN_TAG = `${run_id}-${sha7}`. When the
+// sha7 suffix happens to be all-decimal-digits (recorded failure:
+// "26648857693-2994449", sha7 = "2994449"), the *entire* post-prefix portion
+// of the raw string is digits/dashes, so sanitizeDomainLabel's trailing-digit
+// collapse strips it down to `<prefix>` + the last 2 digits of the ORIGINAL
+// sha (here "49") — a value that's IDENTICAL across every run that shares
+// that HEAD sha, e.g. "e2esub49" every nightly run in a row until `main`
+// advances. That's the nightly `@HEAD s-subdomain` collision: "Domain
+// e2esub49.dot is already owned by ...".
+//
+// Fix: anchor the trailing-digit run at exactly 2 by appending a non-digit
+// letter + fixed "00" (mirrors noStatusRunLabel's `x00` trick above).
+// sanitizeDomainLabel's `trailingDigitCount === 2` fast path then returns the
+// WHOLE string unchanged, so 100% of `tag`'s per-run entropy (run_id AND
+// sha) survives sanitization no matter how the sha happens to end.
+export function buildFreshLabelFromTag(prefix, tag) {
+  return sanitizeDomainLabel(`${prefix}${tag}x00`);
+}
+
+export function pickFreshRunLabel(prefix) {
   if (signerPopStatus < 2) return noStatusRunLabel(prefix);
-  // The currently-published rc.1 binary's sanitizeDomainLabel leaves
-  // trailing-1 labels unchanged; preflight then rejects them. RUN_TAG ends
-  // in a 7-char git short-SHA, which is a digit ~50% of the time. Drop the
-  // trailing single digit locally so this test passes against rc.1; rc.2's
-  // binary sanitizer handles this case natively (see PR · s1-smoke
-  // failure on run 26652530002).
-  let label = sanitizeDomainLabel(`${prefix}${RUN_TAG}`);
-  if (/[a-z]\d$/.test(label)) label = label.replace(/\d$/, "");
-  return label;
+  return buildFreshLabelFromTag(prefix, RUN_TAG);
 }
 
 // Burst-heavy re-upload scenarios get a DEDICATED derived signer so they don't

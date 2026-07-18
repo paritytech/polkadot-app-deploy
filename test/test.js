@@ -37,6 +37,7 @@ import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLoca
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
 import { buildFilesMap, detectFramework, applyManifestFetchAttributes } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
+import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e2e.test.js";
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
@@ -417,6 +418,87 @@ describe("sanitizeDomainLabel", () => {
       sanitizeDomainLabel("e2esub2664885769349"),
       "e2esub49",
       "Same input post-first-sanitization must produce the SAME output (idempotency)",
+    );
+  });
+});
+
+describe("pickFreshRunLabel (test/e2e.test.js) — sanitization-stable fresh labels", () => {
+  test("preserves full per-run entropy through sanitizeDomainLabel even when RUN_TAG's sha suffix is all-digit (nightly S-SUBDOMAIN collision)", () => {
+    // Root cause: pickFreshRunLabel's PoP-Full branch used to build
+    // `${prefix}${RUN_TAG}` (RUN_TAG = `${run_id}-${sha7}`) and sanitize it
+    // directly. When sha7 happens to be all-decimal-digits — as HEAD's short
+    // SHA was for several nightly runs in a row (recorded failure input:
+    // "e2esub26648857693-2994449", sha7 = "2994449") — the ENTIRE post-prefix
+    // portion of the raw string is digits/dashes, so sanitizeDomainLabel's
+    // trailing-digit collapse strips it to `<prefix>` plus the sha's own last
+    // 2 digits, discarding the run_id entirely. Every run sharing that HEAD
+    // sha collapsed to the SAME label ("e2esub49"), colliding with the prior
+    // run's on-chain registration: "Domain e2esub49.dot is already owned by
+    // 0x35cdb...". buildFreshLabelFromTag is the extracted, unit-testable
+    // core of the fix: it anchors the trailing-digit run at exactly 2 (via a
+    // trailing non-digit + "00"), which makes sanitizeDomainLabel return the
+    // whole string unchanged regardless of how the sha ends.
+    const sha7 = "2994449"; // the documented failure sha (all-digit)
+    const runIds = ["26648857693", "26652530002", "26700011234", "26855501122"];
+
+    const labels = runIds.map((runId) => buildFreshLabelFromTag("e2esub", `${runId}-${sha7}`));
+
+    const distinct = new Set(labels);
+    assert.equal(
+      distinct.size,
+      labels.length,
+      `>> FAIL: pickFreshRunLabel-fix: labels are not distinct across runs sharing an all-digit HEAD sha: ${JSON.stringify(labels)}. sanitizeDomainLabel must not collapse RUN_TAG's per-run entropy to a fixed constant.`,
+    );
+
+    for (const label of labels) {
+      assert.ok(
+        label.length >= 6,
+        `>> FAIL: pickFreshRunLabel-fix: generated label "${label}" is shorter than the 6-char DotNS base-name floor.`,
+      );
+      assert.notEqual(
+        label,
+        "e2esub49",
+        `>> FAIL: pickFreshRunLabel-fix: generated label collapsed to the fixed pre-fix constant "e2esub49" — sanitizeDomainLabel entropy was stripped.`,
+      );
+      assert.notEqual(
+        label,
+        "e2esub",
+        `>> FAIL: pickFreshRunLabel-fix: generated label collapsed to the bare prefix "e2esub" with zero per-run entropy.`,
+      );
+      // "over many invocations ... yields values that are ... sanitization
+      // stable": wrapping the already-sanitized label in another
+      // sanitizeDomainLabel call must be a no-op.
+      assert.equal(
+        sanitizeDomainLabel(label),
+        label,
+        `>> FAIL: pickFreshRunLabel-fix: sanitizeDomainLabel(pickFreshRunLabel output) is not stable/idempotent for "${label}".`,
+      );
+    }
+  });
+
+  test("also stays distinct across a spread of realistic hex short-SHAs (not just the all-digit regression case)", () => {
+    const runId = "26652530002";
+    const shas = ["a1b2cd9", "3fc11234", "deadbee", "0ffbeef", "cafe123", "abc0000", "111a2b3"];
+    const labels = shas.map((sha7) => buildFreshLabelFromTag("e2esub", `${runId}-${sha7}`));
+    assert.equal(
+      new Set(labels).size,
+      labels.length,
+      `>> FAIL: pickFreshRunLabel-fix: labels collided across distinct short-SHAs: ${JSON.stringify(labels)}.`,
+    );
+    for (const label of labels) {
+      assert.ok(label.length >= 6, `>> FAIL: pickFreshRunLabel-fix: generated label "${label}" is shorter than the 6-char DotNS base-name floor.`);
+    }
+  });
+
+  test("signerPopStatus < 2 still routes through noStatusRunLabel, unaffected by the fix", () => {
+    // Module-level signerPopStatus defaults to -1 in this unit-test process
+    // (no live PoP-status probe runs outside E2E), so pickFreshRunLabel must
+    // take the noStatusRunLabel path — confirming the buildFreshLabelFromTag
+    // fix is scoped to the PoP-Full (>=2) branch only.
+    assert.equal(
+      pickFreshRunLabel("e2esubcheck"),
+      noStatusRunLabel("e2esubcheck"),
+      ">> FAIL: pickFreshRunLabel-fix: NoStatus branch (signerPopStatus < 2) must be unaffected by the buildFreshLabelFromTag fix",
     );
   });
 });

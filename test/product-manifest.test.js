@@ -14,7 +14,10 @@ import {
   getTextRecordBudgetBytes,
   DEFAULT_TEXT_RECORD_BUDGET_BYTES,
   loadProductConfig,
+  preflightProductConfig,
+  checkProductConfigFilesExist,
 } from "../dist/index.js";
+import { NonRetryableError } from "../dist/errors.js";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -253,6 +256,98 @@ describe("validateProductConfig", () => {
 
 test("defineConfig returns its input unchanged", () => {
   assert.equal(defineConfig(VALID_CONFIG), VALID_CONFIG);
+});
+
+const EXEC_PATHS = ["dist/app", "dist/widget", "dist/worker"];
+async function mkTmp(prefix) { return await fs.mkdtemp(path.join(os.tmpdir(), prefix)); }
+async function seedFiles(dir, { icon = true, execs = EXEC_PATHS } = {}) {
+  if (icon) await fs.writeFile(path.join(dir, "icon.png"), "x");
+  for (const p of execs) await fs.mkdir(path.join(dir, p), { recursive: true });
+}
+
+describe("checkProductConfigFilesExist", () => {
+  test("returns [] when the icon + every executable path exist", async () => {
+    const dir = await mkTmp("pcfg-ok-");
+    await seedFiles(dir);
+    assert.deepEqual(await checkProductConfigFilesExist(VALID_CONFIG, dir), []);
+  });
+
+  test("flags a missing icon file", async () => {
+    const dir = await mkTmp("pcfg-noicon-");
+    await seedFiles(dir, { icon: false });
+    const errs = await checkProductConfigFilesExist(VALID_CONFIG, dir);
+    assert.equal(errs.length, 1, errs.join("; "));
+    assert.ok(errs[0].includes("icon.path"), errs[0]);
+  });
+
+  test("flags each missing executable path", async () => {
+    const dir = await mkTmp("pcfg-noexec-");
+    await seedFiles(dir, { execs: ["dist/app"] }); // widget + worker missing
+    const errs = await checkProductConfigFilesExist(VALID_CONFIG, dir);
+    assert.equal(errs.length, 2, errs.join("; "));
+    assert.ok(errs.some(e => e.includes("widget")));
+    assert.ok(errs.some(e => e.includes("worker")));
+  });
+
+  test("rejects an icon path that is a directory (must be a file)", async () => {
+    const dir = await mkTmp("pcfg-icondir-");
+    await fs.mkdir(path.join(dir, "icon.png"), { recursive: true });
+    for (const p of EXEC_PATHS) await fs.mkdir(path.join(dir, p), { recursive: true });
+    const errs = await checkProductConfigFilesExist(VALID_CONFIG, dir);
+    assert.ok(errs.some(e => e.includes("not a file")), errs.join("; "));
+  });
+});
+
+describe("preflightProductConfig", () => {
+  // Use an explicit `path:` (not walk-up discovery) so the test is agnostic to
+  // the repo's config filename (bulletin-deploy.config.* vs polkadot-app-deploy.config.*).
+  async function writeConfig(dir, cfg) {
+    const p = path.join(dir, "product.config.mjs");
+    await fs.writeFile(p, `export default ${JSON.stringify(cfg)};`);
+    return p;
+  }
+
+  test("returns null when no product config is present (contenthash-only deploy)", async () => {
+    const dir = await mkTmp("pfl-none-");
+    assert.equal(await preflightProductConfig({ cwd: dir }), null);
+  });
+
+  test("returns the loaded config when schema + files are all valid", async () => {
+    const dir = await mkTmp("pfl-ok-");
+    const cfgPath = await writeConfig(dir, VALID_CONFIG);
+    await seedFiles(dir);
+    const res = await preflightProductConfig({ path: cfgPath });
+    assert.ok(res, "expected a loaded config");
+    assert.equal(res.config.domain, "demoapp.dot");
+  });
+
+  test("throws up front (before deploy) when a referenced file is missing", async () => {
+    const dir = await mkTmp("pfl-missing-");
+    const cfgPath = await writeConfig(dir, VALID_CONFIG); // no icon / executables seeded
+    await assert.rejects(
+      () => preflightProductConfig({ path: cfgPath }),
+      (e) => {
+        assert.ok(e instanceof NonRetryableError, ">> FAIL: preflight-missing-file: expected NonRetryableError");
+        assert.match(e.message, /preflight failed/);
+        assert.match(e.message, /icon\.path/);
+        return true;
+      },
+    );
+  });
+
+  test("throws on invalid schema (domain without .dot) up front", async () => {
+    const dir = await mkTmp("pfl-badschema-");
+    const cfgPath = await writeConfig(dir, { ...VALID_CONFIG, domain: "demoapp" });
+    await seedFiles(dir);
+    await assert.rejects(
+      () => preflightProductConfig({ path: cfgPath }),
+      (e) => {
+        assert.ok(e instanceof NonRetryableError, ">> FAIL: preflight-bad-schema: expected NonRetryableError");
+        assert.match(e.message, /domain/);
+        return true;
+      },
+    );
+  });
 });
 
 describe("assertWithinBudget", () => {

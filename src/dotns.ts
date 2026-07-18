@@ -249,6 +249,11 @@ export const CONNECTION_TIMEOUT_MS: number = 30_000;
 // transient blip. Retry a few times with backoff (fresh WS client each attempt)
 // so a later attempt lands after the node recovers.
 export const REVIVE_ADDRESS_ATTEMPTS: number = 3;
+// #1131: re-read the post-deploy contenthash a few times before declaring a
+// verification mismatch. verifyEffect already confirms the setContenthash tx
+// landed; a single final read can still return a stale (pre-write) value under
+// AH-node finality lag, false-failing an otherwise-successful deploy.
+export const CONTENTHASH_VERIFY_ATTEMPTS: number = 3;
 export const OPERATION_TIMEOUT_MS: number = 300_000;
 export const TX_TIMEOUT_MS: number = 90_000;
 // DotNS extrinsic deadline measured against **chain time**: if the chain has
@@ -2592,13 +2597,24 @@ export class DotNS {
       console.log(`\n   Linking content...`);
       const txRes = await this.contractTransaction(this._contracts.DOTNS_CONTENT_RESOLVER, 0n, DOTNS_CONTENT_RESOLVER_ABI, "setContenthash", [node, contenthashHex], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect, feeAsset: opts.feeAsset, phoneLabel: "Link content" });
 
-      // Final read-back catches a rare post-finality reorg.
-      const finalOnChain = ((await this.getContenthash(domainName)) || "0x").toLowerCase();
+      // Final read-back catches a rare post-finality reorg. verifyEffect already
+      // confirmed the write landed, but a single read can return a stale
+      // (pre-write) value under AH-node finality lag (#1131) — re-read with
+      // backoff and accept as soon as it matches; only fail if it still
+      // mismatches after every attempt.
+      let finalOnChain = "0x";
+      try {
+        await withRetry(async () => {
+          finalOnChain = ((await this.getContenthash(domainName)) || "0x").toLowerCase();
+          if (finalOnChain !== expected) throw new Error(`contenthash still ${finalOnChain}, awaiting ${expected}`);
+        }, { attempts: CONTENTHASH_VERIFY_ATTEMPTS });
+      } catch { /* keep last finalOnChain for the error message below */ }
       if (finalOnChain !== expected) {
         throw new Error(
           `Post-deploy verification failed for ${domainName}.dot: on-chain contenthash is ${finalOnChain}, ` +
-          `not the ${expected} we just wrote. The setContenthash tx may have silently failed, ` +
-          `or another party overwrote the domain. Re-run the deploy to retry.`,
+          `not the ${expected} we just wrote (after ${CONTENTHASH_VERIFY_ATTEMPTS} read attempts). ` +
+          `The setContenthash tx may have silently failed, or another party overwrote the domain. ` +
+          `Re-run the deploy to retry.`,
         );
       }
       setDeployAttribute("deploy.dotns.tx_resolution", txRes.kind);

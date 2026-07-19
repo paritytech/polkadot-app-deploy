@@ -21,6 +21,20 @@ polkadot-app-bootstrap --env devnet --authorizer "<your authorizer seed or mnemo
 
 The same applies to `--mnemonic`: pass the pool root mnemonic whose `//deploy/N` accounts your deploys actually use, so bootstrap authorizes the accounts the deploy path will address.
 
+### Environment config: Browse Publisher contract
+
+Bootstrap grants **Bulletin storage** authorization only. Listing apps in **Browse** is a separate, Asset-Hub-side capability provided by the `Publisher` contract, and it is configured in `environments.json` — not by this CLI. When you stand up a new environment, check both.
+
+Make sure the env's `contracts` map in `environments.json` includes a **`PUBLISHER`** entry pointing at the Browse Publisher deployed on that environment's Asset Hub. If it is missing, `polkadot-app-deploy --publish --env <id>` prints `Publish: not supported on this environment — will be skipped` and silently does nothing: apps deploy but never appear in Browse.
+
+Checklist for a new environment:
+
+1. Confirm the Browse `Publisher` contract is deployed on the env's Asset Hub — there is bytecode at the address, `owner()` is the products deployer, and `isPublished(labelhash)` returns `true` for an already-listed app (and `false` for a control label).
+2. Add its address to the env's `contracts.PUBLISHER` in `environments.json`, alongside the other `contracts` entries. It must be a valid, non-zero EVM address (the deploy CLI validates the format).
+3. Verify: a deploy with `--publish --env <id>` lists the app and does **not** print the "not supported" message.
+
+(This was missing for the community `devnet` preset — see issue #130.)
+
 ## Usage
 
 ```bash

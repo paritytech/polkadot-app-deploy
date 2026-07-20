@@ -36,6 +36,7 @@
       "description": "Paseo system chains (Asset Hub 1000 / People 1004 / Bulletin 1010)",
       "e2eEligible": false,
       "ipfs": "https://devnet-ipfs.api.polkadotcommunity.foundation",
+      "webGateway": "dev-dot.li",
       "autoAccountMapping": true,
       "nativeToEthRatio": 100000000,
       "registerStorageDeposit": 2000000000000,

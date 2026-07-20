@@ -72,7 +72,7 @@
     "@polkadot-labs/hdkd-helpers": "^0.0.30",
     "@polkadot/keyring": "^14.0.3",
     "@polkadot/util-crypto": "^14.0.3",
-    "@sentry/node": "^9.14.0",
+    "@sentry/node": "^10.58.0",
     "ipfs-unixfs": "^11.2.0",
     "ipfs-unixfs-importer": "^16.1.4",
     "jiti": "^2.4.2",

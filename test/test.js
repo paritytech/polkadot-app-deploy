@@ -19239,6 +19239,35 @@ describe("browserUrlFor", () => {
       ">> FAIL: browserUrlFor: domain name must be preserved verbatim"
     );
   });
+
+  // #142: devnet-family deploys printed https://<name>.dot.li, but devnet
+  // names resolve on a different gateway host (dev-dot.li). The page loaded
+  // (HTTP 200) but resolved the name against the wrong network, so the
+  // just-deployed app never showed up. Fix: browserUrlFor takes an optional
+  // webGateway host, defaulting to "dot.li" when the env doesn't specify one.
+  test("webGateway arg uses the given gateway host", () => {
+    assert.strictEqual(
+      browserUrlFor("myapp", "devnet", "dev-dot.li"),
+      "https://myapp.dev-dot.li",
+      ">> FAIL: browserUrlFor: a webGateway arg must produce https://<name>.<gateway>, not the hardcoded dot.li host"
+    );
+  });
+
+  test("no webGateway arg falls back to dot.li", () => {
+    assert.strictEqual(
+      browserUrlFor("myapp", "paseo-next-v2", undefined),
+      "https://myapp.dot.li",
+      ">> FAIL: browserUrlFor: omitting webGateway must still default to dot.li"
+    );
+  });
+
+  test("preview env keeps ?network=previewnet even with a webGateway arg passed as undefined", () => {
+    assert.strictEqual(
+      browserUrlFor("myapp", "preview", undefined),
+      "https://myapp.dot.li?network=previewnet",
+      ">> FAIL: browserUrlFor: adding the webGateway param must not break the existing preview suffix behavior"
+    );
+  });
 });
 
 // import { shouldEmit } from "../tools/cache-savings-totals.mjs";

@@ -264,6 +264,21 @@ describe("bundled snapshot", () => {
       `>> FAIL: devnet-publisher: env '${devnet.id}' must define a valid PUBLISHER contract (Browse Publisher is deployed on the devnet Asset Hub); got ${JSON.stringify(publisher)}. Without it, 'pad --publish --env ${devnet.id}' silently skips (issue #130).`,
     );
   });
+
+  test("devnet env carries webGateway=dev-dot.li so the post-deploy link resolves the right network (issue #142)", async () => {
+    // dot.li (the default gateway) resolves DotNS names against paseo-next-v2/mainnet.
+    // devnet names are only resolvable via the dev-dot.li gateway. Without this field,
+    // deploy.ts's browserUrlFor() falls back to the hardcoded dot.li host and the
+    // "Check it out here" link loads (HTTP 200) but shows nothing for the just-deployed app.
+    const bundled = JSON.parse(await fs.readFile(defaultBundledPath(), "utf8"));
+    const devnet = bundled.environments.find(e => /devnet/i.test(e.id));
+    assert.ok(devnet, ">> FAIL: devnet-web-gateway: bundled snapshot must include a devnet-family env");
+    assert.equal(
+      devnet.webGateway,
+      "dev-dot.li",
+      `>> FAIL: devnet-web-gateway: env '${devnet.id}' must set webGateway to "dev-dot.li"; got ${JSON.stringify(devnet.webGateway)}. Without it the post-deploy link uses the wrong gateway host and resolves the devnet name against the wrong network (issue #142).`,
+    );
+  });
 });
 
 describe("isValidContractAddress", () => {

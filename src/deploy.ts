@@ -2699,15 +2699,23 @@ export async function unpublish(
 }
 
 /**
- * Returns the dot.li browser URL for the given domain name, optionally
- * suffixed with a network query parameter so the SPA opens the right chain.
+ * Returns the browser URL for the given domain name, optionally suffixed
+ * with a network query parameter so the SPA opens the right chain.
  * Currently only the "preview" env needs a suffix — the SPA defaults to
  * paseo-next-v2 which would show "no content" for preview deployments.
+ *
+ * The gateway host defaults to "dot.li" (issue #142: devnet-family names are
+ * NOT resolvable via dot.li — they're served by a different gateway, e.g.
+ * "dev-dot.li" — so callers must pass the resolved env's `webGateway` when
+ * one is set; otherwise the link loads but resolves the name against the
+ * wrong network).
  * @param name - the DotNS label (e.g. "myapp")
  * @param envId - the environment id from options.env ?? DEFAULT_ENV_ID
+ * @param webGateway - the resolved env's `webGateway`, if any (defaults to "dot.li")
  */
-export function browserUrlFor(name: string, envId: string | undefined): string {
-  const base = `https://${name}.dot.li`;
+export function browserUrlFor(name: string, envId: string | undefined, webGateway?: string): string {
+  const host = webGateway ?? "dot.li";
+  const base = `https://${name}.${host}`;
   return envId === "preview" ? `${base}?network=previewnet` : base;
 }
 
@@ -2803,6 +2811,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   let envNetwork: string | undefined;
   let envName: string | undefined;
   let envIpfs: string | undefined;
+  let envWebGateway: string | undefined;
   let envAutoAccountMapping = false;
   let envContracts: Record<string, string> = {};
   let envNativeToEthRatio: bigint | undefined;
@@ -2821,6 +2830,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envNetwork = resolved.network;
       envName = resolved.envName;
       envIpfs = resolved.ipfs;
+      envWebGateway = resolved.webGateway;
       envAutoAccountMapping = resolved.autoAccountMapping;
       envContracts = resolved.contracts;
       envNativeToEthRatio = resolved.nativeToEthRatio;
@@ -3571,7 +3581,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       console.log("DEPLOYMENT COMPLETE!");
       console.log("=".repeat(60));
       console.log("\nCheck it out here:");
-      console.log(`   ${browserUrlFor(name, envId)}`);
+      console.log(`   ${browserUrlFor(name, envId, envWebGateway)}`);
       console.log(`   ${name}.dot  (in a Polkadot app: mobile or desktop)`);
       console.log("\n" + "=".repeat(60) + "\n");
       return { domainName: name, fullDomain: `${name}.dot`, cid: cid as string, ipfsCid };

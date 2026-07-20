@@ -36,6 +36,13 @@ export interface Environment {
   badge?: string;
   backend?: string;
   ipfs?: string;
+  /**
+   * Host serving the browser SPA that resolves DotNS names for this env
+   * (issue #142). Defaults to "dot.li" when omitted — set this only when an
+   * env's names are NOT resolvable via the default gateway (e.g. devnet-family
+   * envs, which are served by "dev-dot.li").
+   */
+  webGateway?: string;
   uptimeUrl?: string;
   autoAccountMapping?: boolean;
   nativeToEthRatio?: number;
@@ -85,6 +92,7 @@ export interface ResolvedEndpoints {
   network: "testnet" | "mainnet";
   envName: string;
   ipfs?: string;
+  webGateway?: string;
   autoAccountMapping: boolean;
   contracts: Record<string, string>;
   nativeToEthRatio: bigint;
@@ -395,6 +403,7 @@ export function resolveEndpoints(
     network: env.network,
     envName: env.name,
     ipfs: env.ipfs,
+    webGateway: env.webGateway,
     autoAccountMapping: env.autoAccountMapping ?? false,
     contracts: env.contracts ?? {},
     nativeToEthRatio: BigInt(env.nativeToEthRatio ?? 1_000_000),

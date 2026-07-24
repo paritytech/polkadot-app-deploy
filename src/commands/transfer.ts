@@ -1,8 +1,11 @@
 // `bulletin-deploy transfer <label>` — stand-alone handover + recovery for a
 // deploy whose transfer step failed. Resolves the worker (current owner: Alice
 // or --mnemonic) and recipient (signed-in product H160 by default, else --to),
-// then calls the idempotent DotNS.transferName.
-import { DotNS, DEFAULT_MNEMONIC } from "../dotns.js";
+// then calls the idempotent DotNS.transferName. A subname argument (e.g.
+// `app.foo.dot`) is routed to DotNS.transferSubname instead, since subnames are
+// reassigned by the parent owner via setSubnodeOwner rather than transferred as
+// ERC-721 tokens.
+import { DotNS, DEFAULT_MNEMONIC, parseDomainName } from "../dotns.js";
 import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig } from "../environments.js";
 import { CLI_NAME } from "../cli-name.js";
 
@@ -27,10 +30,13 @@ export async function runTransfer(
   envId: string,
   opts: { label?: string; to?: string; mnemonic?: string },
 ): Promise<void> {
-  const label = (opts.label ?? "").replace(/\.dot$/, "");
-  if (!label) {
+  const rawLabel = (opts.label ?? "").trim();
+  if (!rawLabel) {
     throw new Error(`Usage: ${CLI_NAME} transfer <label> [--to <0xH160>] [--mnemonic <key>]`);
   }
+  // Detect a subname (e.g. `app.foo.dot`) vs a base name (`foo.dot`); each takes
+  // a different on-chain path (setSubnodeOwner vs ERC-721 transferFrom).
+  const parsed = parseDomainName(rawLabel);
 
   // Recipient from the signed-in session unless --to was given.
   let sessionH160: string | undefined;
@@ -60,11 +66,13 @@ export async function runTransfer(
     registerStorageDeposit: resolved.registerStorageDeposit,
   });
   try {
-    const result = await dotns.transferName(label, recipient, (s) => console.log(`   ${s}`));
+    const result = parsed.isSubdomain
+      ? await dotns.transferSubname(parsed.sublabel!, parsed.parentLabel!, recipient, (s) => console.log(`   ${s}`))
+      : await dotns.transferName(parsed.label, recipient, (s) => console.log(`   ${s}`));
     if (result.status === "skipped-already-owned") {
-      console.log(`✓ ${label}.dot is already owned by ${recipient}. Nothing to do.`);
+      console.log(`✓ ${parsed.fullName} is already owned by ${recipient}. Nothing to do.`);
     } else {
-      console.log(`✓ Transferred ${label}.dot to ${recipient}${result.txHash ? ` (tx ${result.txHash})` : ""}.`);
+      console.log(`✓ Transferred ${parsed.fullName} to ${recipient}${result.txHash ? ` (tx ${result.txHash})` : ""}.`);
     }
   } finally {
     dotns.disconnect();

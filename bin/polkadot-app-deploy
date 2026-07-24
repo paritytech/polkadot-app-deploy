@@ -231,7 +231,8 @@ Usage:
   polkadot-app-deploy login                     Sign in with your Polkadot mobile app
   polkadot-app-deploy logout                    Sign out and clear the session
   polkadot-app-deploy whoami                    Show the currently signed-in identity
-  polkadot-app-deploy transfer <domain.dot>     Hand a name you registered to the signed-in account (or --to)
+  polkadot-app-deploy transfer <domain.dot>     Hand a name you registered to the signed-in account (or --to).
+                                                Also reassigns a subname (e.g. app.foo.dot) if you own its parent.
 
 Aliases: pad (short), polkadot-app-deploy (full)
 

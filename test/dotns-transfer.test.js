@@ -60,6 +60,56 @@ test("transferName: transfers when worker owns it", async () => {
   assert.equal(r.feeWei, 10n * 10n ** 18n);
 });
 
+// transferSubname touches only contractCallNullable("owner", node) — three
+// times: parent owner, current subname owner, post-tx re-read — plus
+// contractTransaction(setSubnodeOwner). The node arg is ignored here; we drive
+// results by call order.
+function stubSubname({ parentOwner, evmAddress, currentSubOwner, afterOwner, txHash = "0xsub" }) {
+  const d = Object.create(DotNS.prototype);
+  d.connected = true;
+  d.evmAddress = evmAddress;
+  d._contracts = { DOTNS_REGISTRY: "0xRegistry" };
+  d.ensureConnected = () => {};
+  let ownerCalls = 0;
+  d.contractCallNullable = async (_addr, _abi, fn) => {
+    if (fn !== "owner") throw new Error("unexpected call " + fn);
+    ownerCalls += 1;
+    if (ownerCalls === 1) return parentOwner;
+    if (ownerCalls === 2) return currentSubOwner;
+    return afterOwner;
+  };
+  d.contractTransaction = async () => ({ kind: "hash", hash: txHash });
+  return d;
+}
+
+test("transferSubname: errors when the signer does not own the parent", async () => {
+  const d = stubSubname({ parentOwner: "0xPARENT", evmAddress: "0xWORKER" });
+  await assert.rejects(() => d.transferSubname("app", "foo", "0xRECIP"), /only the owner of the parent/i);
+});
+
+test("transferSubname: errors when the parent is not registered", async () => {
+  const d = stubSubname({ parentOwner: null, evmAddress: "0xOWNER" });
+  await assert.rejects(() => d.transferSubname("app", "foo", "0xRECIP"), /not registered/i);
+});
+
+test("transferSubname: no-op when the recipient already owns it", async () => {
+  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xRECIP" });
+  const r = await d.transferSubname("app", "foo", "0xrecip");
+  assert.equal(r.status, "skipped-already-owned");
+});
+
+test("transferSubname: reassigns via setSubnodeOwner when the signer owns the parent", async () => {
+  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xOLD", afterOwner: "0xRECIP" });
+  const r = await d.transferSubname("app", "foo", "0xRECIP");
+  assert.equal(r.status, "ok");
+  assert.equal(r.txHash, "0xsub");
+});
+
+test("transferSubname: throws when the reassignment does not land", async () => {
+  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xOLD", afterOwner: "0xOLD" });
+  await assert.rejects(() => d.transferSubname("app", "foo", "0xRECIP"), /did not land/i);
+});
+
 test("feeFloorFor: adds the transfer fee to the register floor", () => {
   const base = feeFloorFor("register", 2000000000000n, 0n, 0n);
   const withFee = feeFloorFor("register", 2000000000000n, 0n, 5000000000n);

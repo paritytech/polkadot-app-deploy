@@ -2355,6 +2355,73 @@ export class DotNS {
     return { status: "ok", txHash: txRes.kind === TX_KIND_HASH ? txRes.hash : undefined, feeWei };
   }
 
+  /** Reassign an existing subname (e.g. `app.foo.dot`) to `toH160`.
+   *
+   *  Subnames are NOT ERC-721 tokens, so they cannot go through
+   *  transferName/transferFrom — the registrar has no token for them. Instead
+   *  the *parent-domain* owner reassigns a subname via the registry's
+   *  setSubnodeOwner (the same call deploy uses to create it). Authorisation is
+   *  on parent ownership, not on the subname's current owner, so the connected
+   *  signer must own `${parentLabel}.dot`. Idempotent: a no-op when the
+   *  recipient already owns it. */
+  async transferSubname(
+    sublabel: string,
+    parentLabel: string,
+    toH160: string,
+    statusCallback: (status: string) => void = () => {},
+  ): Promise<{ status: "ok" | "skipped-already-owned"; txHash?: string }> {
+    this.ensureConnected();
+    const fullName = `${sublabel}.${parentLabel}.dot`;
+    const parentNode = namehash(`${parentLabel}.dot`);
+    const subnode = namehash(fullName);
+
+    // Only the parent owner may reassign a subname. Check parent ownership up
+    // front so the failure is actionable rather than a bare registry revert.
+    const parentOwner = (await withTimeout(
+      this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [parentNode]),
+      30000, "owner",
+    )) as string | null;
+    if (!parentOwner || parentOwner === zeroAddress) {
+      throw new Error(`Cannot transfer ${fullName}: parent ${parentLabel}.dot is not registered.`);
+    }
+    if (parentOwner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
+      throw new Error(
+        `Cannot transfer ${fullName}: it is a subname, which only the owner of the parent ` +
+        `${parentLabel}.dot can reassign (subnames are not transferable tokens). Parent is owned ` +
+        `by ${parentOwner}, but the signer is ${this.evmAddress}. Sign as the parent owner ` +
+        `(e.g. pass its --mnemonic).`,
+      );
+    }
+
+    const current = (await withTimeout(
+      this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [subnode]),
+      30000, "owner",
+    )) as string | null;
+    if (current && current.toLowerCase() === toH160.toLowerCase()) {
+      statusCallback("already owned by recipient");
+      return { status: "skipped-already-owned" };
+    }
+
+    // setSubnodeOwner overwrites the subnode owner. We deliberately do NOT batch
+    // setResolver (as registerSubdomain does for a fresh node): once ownership
+    // moves to a third party the signer is no longer the subnode owner, so a
+    // trailing setResolver would revert. The recipient sets the resolver/content
+    // on their next deploy.
+    const subnodeRecord = { parentNode, subLabel: sublabel, parentLabel, owner: toH160 };
+    const txRes = await this.contractTransaction(
+      this._contracts.DOTNS_REGISTRY, 0n, DOTNS_REGISTRY_ABI, "setSubnodeOwner",
+      [subnodeRecord], statusCallback,
+    );
+    const after = (await withTimeout(
+      this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [subnode]),
+      30000, "owner",
+    )) as string | null;
+    if (!after || after.toLowerCase() !== toH160.toLowerCase()) {
+      throw new Error(`Transfer of ${fullName} did not land: owner is ${after ?? "unset"}, expected ${toH160}.`);
+    }
+    return { status: "ok", txHash: txRes.kind === TX_KIND_HASH ? txRes.hash : undefined };
+  }
+
   async getUserPopStatus(ownerAddress: string | null = null): Promise<number> {
     if (this._userPopStatusOverrideForTest !== null) {
       const result = this._userPopStatusOverrideForTest;

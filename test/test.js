@@ -9276,6 +9276,175 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
 });
 
 // ---------------------------------------------------------------------------
+// nightly-report per-environment status header + failure signatures
+// (ported from bulletin-deploy issue #1055 / pad issue #102 — nightly
+// failure issues previously gave no way to tell which environment(s) were
+// red, or why, without opening the Actions run).
+//
+// This actually executes the "Render report body" step's bash script
+// against synthetic fixtures — not a regex check on the YAML text — so it
+// catches logic/portability bugs the way a real nightly run would surface
+// them. Requires bash + awk + python3 on PATH (present on macOS + Linux CI).
+// ---------------------------------------------------------------------------
+describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
+  const E2E_YAML_PATH = ".github/workflows/e2e.yml";
+  // jobBlock is the module-level helper defined near the top of this file.
+
+  // Extracts a step's `run: |` bash body by step name, dedents it to
+  // column 0, and neutralizes any literal `${{ … }}` GitHub Actions
+  // expressions (e.g. `${{ github.run_id }}`) that survive into the run
+  // body — those are substituted by Actions before the shell ever sees
+  // them, so raw `${{ }}` is invalid bash and must be replaced before we
+  // can execute the script standalone.
+  function stepRunScript(jobText, stepName) {
+    const stepRe = new RegExp(`^ {6}- name: ${stepName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "m");
+    const stepMatch = jobText.match(stepRe);
+    assert.ok(stepMatch, `step "${stepName}" not found`);
+    const afterStep = jobText.slice(stepMatch.index + stepMatch[0].length);
+    const runRe = /^( *)run: \|-?\s*$/m;
+    const runMatch = afterStep.match(runRe);
+    assert.ok(runMatch, `step "${stepName}" has no run: | block`);
+    const runIndent = runMatch[1].length;
+    const afterRun = afterStep.slice(runMatch.index + runMatch[0].length);
+    // The block literal's content is indented deeper than the `run:` key
+    // itself; it ends at the first non-blank line indented at or shallower
+    // than that key (the next step, or the next job-level key).
+    const bodyLines = [];
+    for (const line of afterRun.split("\n")) {
+      if (line.trim().length === 0) { bodyLines.push(""); continue; }
+      const indent = line.match(/^ */)[0].length;
+      if (indent <= runIndent) break;
+      bodyLines.push(line);
+    }
+    const indents = bodyLines.filter(l => l.trim().length > 0).map(l => l.match(/^ */)[0].length);
+    const minIndent = indents.length ? Math.min(...indents) : 0;
+    const dedented = bodyLines.map(l => (l.trim().length ? l.slice(minIndent) : "")).join("\n");
+    return dedented.replace(/\$\{\{[^}]*\}\}/g, "TEST_GH_EXPR");
+  }
+
+  // Fixtures live at the literal /tmp paths the real workflow step hardcodes
+  // (it isn't parametrized — that's the thing under test), so this suite
+  // owns cleanup before AND after to avoid leaking fixture state.
+  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md"];
+  function cleanFixtures() {
+    for (const p of FIXTURE_PATHS) fs.rmSync(p, { force: true });
+  }
+
+  test("renders a per-env status header, per-leg env labels, and failure signatures", () => {
+    cleanFixtures();
+    let summaryPath;
+    try {
+      const e2e = fs.readFileSync(E2E_YAML_PATH, "utf-8");
+      const report = jobBlock(e2e, "nightly-report");
+      const script = stepRunScript(report, "Render report body");
+
+      // preview: S-REPROVE red; paseo-next-v2: all green — the motivating
+      // shape for the discrimination logic: one red environment must not
+      // mask another green one in the report.
+      fs.writeFileSync("/tmp/s1-legs.tsv", "");
+      fs.writeFileSync("/tmp/s2-legs.tsv", "");
+      fs.writeFileSync("/tmp/all-nightly-legs.tsv", [
+        // 3rd column is env_tag — the classification the real Fetch step now
+        // computes once (env suffix, $SELECTED_ENV for env-fixed scenarios,
+        // or META), which the Render step consumes rather than re-deriving.
+        "Nightly S1 pool/js on parity-default (preview)\tsuccess\tpreview",
+        "Nightly S1 pool/js on parity-default (paseo-next-v2)\tsuccess\tpaseo-next-v2",
+        "Nightly S-REPROVE auto-reprove stale alias (preview)\tfailure\tpreview",
+        "Nightly S-REPROVE auto-reprove stale alias (paseo-next-v2)\tsuccess\tpaseo-next-v2",
+        "Nightly S-INC s-inc / js\tsuccess\tpaseo-next-v2",
+        "Nightly — telemetry assertions\tsuccess\tMETA",
+        "Nightly · Code-path coverage\tsuccess\tMETA",
+      ].join("\n") + "\n");
+      const failSig = '>> FAIL: S-REPROVE: expected "Refresh complete" in preflight output — reprove completed but success log missing. Got:';
+      fs.writeFileSync("/tmp/fail-signatures.tsv", `Nightly S-REPROVE auto-reprove stale alias (preview)\t${failSig}\n`);
+
+      summaryPath = path.join(os.tmpdir(), `pad-step-summary-${process.pid}.md`);
+      fs.writeFileSync(summaryPath, "");
+      const scriptPath = path.join(os.tmpdir(), `pad-render-report-${process.pid}.sh`);
+      fs.writeFileSync(scriptPath, script);
+
+      const env = {
+        ...process.env,
+        TAG: "e2e-nightly",
+        VERSION: "0.13.2",
+        RUN_URL: "https://github.com/paritytech/polkadot-app-deploy/actions/runs/1",
+        SELECTED_ENV: "paseo-next-v2",
+        HEALTHY_ENVS: '["preview","paseo-next-v2"]',
+        GITHUB_STEP_SUMMARY: summaryPath,
+      };
+      const res = spawnSync("bash", [scriptPath], { encoding: "utf-8", env });
+      assert.equal(res.status, 0, `render script exited ${res.status}\nstderr:\n${res.stderr}`);
+
+      const body = fs.readFileSync("/tmp/report-body.md", "utf-8");
+
+      // (a) per-environment status header.
+      assert.match(body, /Environment status:/, "report body must include a per-environment status header");
+      assert.match(body, /- preview: ❌ 1 scenario\(s\) red \(Nightly S-REPROVE auto-reprove stale alias\)/,
+        ">> FAIL: preview must be reported red with the failing scenario named");
+      assert.match(body, /- paseo-next-v2: ✅ all green/,
+        ">> FAIL: paseo-next-v2 must be reported all-green — it must NOT inherit preview's failure");
+
+      // (b) per-leg row labelled with its environment.
+      assert.match(body, /Nightly S-REPROVE auto-reprove stale alias \(preview\) \| ❌ FAIL/,
+        ">> FAIL: the failing-legs table must label the S-REPROVE row with its (preview) environment");
+
+      // (c) one-line failure signature per failing leg, in the body.
+      assert.match(body, /Failure signatures/, ">> FAIL: report body must include a Failure signatures section");
+      assert.ok(body.includes(failSig), ">> FAIL: report body must include the exact >> FAIL: one-line signature for the failing leg");
+    } finally {
+      cleanFixtures();
+      if (summaryPath) fs.rmSync(summaryPath, { force: true });
+    }
+  });
+
+  test("an all-green run reports every environment green with no failure-signatures section", () => {
+    cleanFixtures();
+    let summaryPath;
+    try {
+      const e2e = fs.readFileSync(E2E_YAML_PATH, "utf-8");
+      const report = jobBlock(e2e, "nightly-report");
+      const script = stepRunScript(report, "Render report body");
+
+      fs.writeFileSync("/tmp/s1-legs.tsv", "");
+      fs.writeFileSync("/tmp/s2-legs.tsv", "");
+      fs.writeFileSync("/tmp/all-nightly-legs.tsv", [
+        "Nightly S1 pool/js on parity-default (preview)\tsuccess\tpreview",
+        "Nightly S1 pool/js on parity-default (paseo-next-v2)\tsuccess\tpaseo-next-v2",
+        "Nightly S-INC s-inc / js\tsuccess\tpreview",
+      ].join("\n") + "\n");
+      // No /tmp/fail-signatures.tsv at all — mirrors a real green run, where
+      // the Fetch step's fail-signature loop never iterates.
+
+      summaryPath = path.join(os.tmpdir(), `pad-step-summary-green-${process.pid}.md`);
+      fs.writeFileSync(summaryPath, "");
+      const scriptPath = path.join(os.tmpdir(), `pad-render-report-green-${process.pid}.sh`);
+      fs.writeFileSync(scriptPath, script);
+
+      const env = {
+        ...process.env,
+        TAG: "e2e-nightly",
+        VERSION: "0.13.2",
+        RUN_URL: "https://github.com/paritytech/polkadot-app-deploy/actions/runs/1",
+        SELECTED_ENV: "preview",
+        HEALTHY_ENVS: '["preview","paseo-next-v2"]',
+        GITHUB_STEP_SUMMARY: summaryPath,
+      };
+      const res = spawnSync("bash", [scriptPath], { encoding: "utf-8", env });
+      assert.equal(res.status, 0, `render script exited ${res.status}\nstderr:\n${res.stderr}`);
+
+      const body = fs.readFileSync("/tmp/report-body.md", "utf-8");
+      assert.match(body, /- preview: ✅ all green/, ">> FAIL: all-green run must report preview green");
+      assert.match(body, /- paseo-next-v2: ✅ all green/, ">> FAIL: all-green run must report paseo-next-v2 green");
+      assert.doesNotMatch(body, /Failure signatures/, ">> FAIL: an all-green run must not render a Failure signatures section");
+      assert.doesNotMatch(body, /Failing legs by env/, ">> FAIL: an all-green run must not render a Failing legs by env table");
+    } finally {
+      cleanFixtures();
+      if (summaryPath) fs.rmSync(summaryPath, { force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // classifyDeployError
 // ---------------------------------------------------------------------------
 describe("classifyDeployError", () => {

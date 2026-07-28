@@ -2074,6 +2074,7 @@ jobs:
       - name: Fetch per-leg job results
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SELECTED_ENV: ${{ needs.select-env.outputs.selected_env }}
         # Same robustness fix as pr-report: use curl + pipefail so a
         # missing-gh-binary regression on the runner can't silently
         # produce empty TSVs and a headerless report.
@@ -2096,9 +2097,61 @@ jobs:
             /tmp/jobs.json > /tmp/s1-legs.tsv
           jq -r '.jobs[] | select(.name | startswith("Nightly S2 fresh ")) | "\(.name)\t\(.conclusion)"' \
             /tmp/jobs.json > /tmp/s2-legs.tsv
-          # Per-env breakdown: group any "Nightly …" jobs by the env suffix in parentheses.
-          jq -r '.jobs[] | select(.name | test("^Nightly ")) | "\(.name)\t\(.conclusion)"' \
-            /tmp/jobs.json > /tmp/all-nightly-legs.tsv
+          # Per-env breakdown (issue #1055): classify every "Nightly …" job
+          # ONCE, here, into a 3rd column — the env parsed from its "(<env>)"
+          # name suffix, $SELECTED_ENV for the env-fixed scenarios (S-INC,
+          # PR-coverage) that carry no suffix, or META for jobs that aren't
+          # scoped to a single env (telemetry/pool-dist/code-path/DotNS-drift/
+          # this report job itself). Computed once and reused downstream by
+          # the render step (env filter = exact match on this column) instead
+          # of re-deriving env/meta from the name string in multiple places.
+          jq -r '.jobs[] | select(.name | test("^Nightly ")) | "\(.name)\t\(.conclusion)"' /tmp/jobs.json |
+          awk -F'\t' -v selected="$SELECTED_ENV" '
+            BEGIN { OFS="\t" }
+            {
+              name = $1; conclusion = $2
+              meta = (index(name,"telemetry assertions")>0) || (index(name,"pool selection")>0) || \
+                     (index(name,"code-path")>0) || (index(name,"E2E Report")>0) || (index(name,"DotNS address drift")>0)
+              env_tag = "META"
+              if (!meta) {
+                env_tag = selected
+                n = length(name)
+                if (substr(name, n, 1) == ")") {
+                  for (i = n; i >= 1; i--) {
+                    if (substr(name, i, 1) == "(") {
+                      env_tag = substr(name, i + 1, n - i - 1)
+                      break
+                    }
+                  }
+                }
+              }
+              print name, conclusion, env_tag
+            }' > /tmp/all-nightly-legs.tsv
+
+          # One-line failure signature per failing leg (issue #1055): fetch each
+          # failing job's raw log and grab the last `>> FAIL: …` / `Deployment
+          # failed: …` line — the convention test/CLAUDE.md requires assertions
+          # to end with. Lets triage read the cause from the issue body alone,
+          # without opening the Actions run. Capped at 20 jobs: a broad outage
+          # can fail/cancel most of the matrix at once, and this loop is
+          # sequential — 20 raw-log downloads is enough for any real triage
+          # without risking the job's own 10-minute timeout budget.
+          : > /tmp/fail-signatures.tsv
+          jq -r '.jobs[] | select(.name | test("^Nightly ")) | select(.conclusion == "failure" or .conclusion == "cancelled") | "\(.id)\t\(.name)"' \
+            /tmp/jobs.json | head -n 20 |
+          while IFS=$'\t' read -r job_id job_name; do
+            SIG=$(curl -fsSL \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "${{ github.api_url }}/repos/${{ github.repository }}/actions/jobs/${job_id}/logs" 2>/dev/null \
+              | grep -aE '>> FAIL:|Deployment failed:' \
+              | tail -n 1 \
+              | tr -d '\r' \
+              | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z[[:space:]]*//' \
+              || true)
+            SIG="${SIG:-(no failure signature found in logs — open the run)}"
+            printf '%s\t%s\n' "$job_name" "$SIG" >> /tmp/fail-signatures.tsv
+          done
 
       - name: Render report body
         env:
@@ -2150,9 +2203,43 @@ jobs:
             echo ""
             echo "Tag: \`$TAG\` · Run: [${{ github.run_id }}]($RUN_URL)"
             echo ""
-            # Show which envs the nightly ran on
-            HEALTHY_LIST=$(echo "$HEALTHY_ENVS" | python3 -c "import json,sys; envs=json.load(sys.stdin); print(', '.join(envs))" 2>/dev/null || echo "$HEALTHY_ENVS")
+            # Show which envs the nightly ran on. ENV_LIST is the source list;
+            # HEALTHY_LIST just reformats it — one JSON parse, not two.
+            ENV_LIST=$(echo "$HEALTHY_ENVS" | python3 -c "import json,sys; print('\n'.join(json.load(sys.stdin)))" 2>/dev/null || echo "$SELECTED_ENV")
+            HEALTHY_LIST=$(printf '%s\n' "$ENV_LIST" | paste -sd ',' - | sed 's/,/, /g')
             echo "Environments: $HEALTHY_LIST | Fixed scenarios (S-INC, PR-coverage) on: $SELECTED_ENV"
+            echo ""
+            # Per-environment status header (issue #1055): /tmp/all-nightly-legs.tsv
+            # already carries a 3rd column classifying each row's env — either
+            # the "(<env>)" name suffix, $SELECTED_ENV for the env-fixed
+            # scenarios (S-INC, PR-coverage), or META for jobs that aren't
+            # scoped to a single env (telemetry, pool distribution, code-path,
+            # DotNS drift, this report job itself). That classification is
+            # computed once, upstream in the Fetch step; here we only filter
+            # and count — no re-parsing of job names, so it can't drift out of
+            # sync with the failing-legs table below (which reads the same
+            # column). META failures get their own line so a global failure
+            # there can never render as "all green".
+            join_semi() { paste -sd '|' - | sed 's/|/; /g'; }
+            echo "Environment status:"
+            while IFS= read -r env; do
+              [ -z "$env" ] && continue
+              MATCHING=$(awk -F'\t' -v env="$env" '$3==env' /tmp/all-nightly-legs.tsv)
+              TOTAL=$(printf '%s\n' "$MATCHING" | grep -c . || true)
+              FAILS=$(printf '%s\n' "$MATCHING" | awk -F'\t' '$2=="failure"||$2=="cancelled"{print $1}')
+              FAIL_COUNT=$(printf '%s\n' "$FAILS" | grep -c . || true)
+              if [ "$FAIL_COUNT" -gt 0 ]; then
+                NAMES=$(printf '%s\n' "$FAILS" | sed -E 's/ *\([^()]*\)$//' | sort -u | join_semi)
+                echo "- ${env}: ❌ ${FAIL_COUNT} scenario(s) red (${NAMES})"
+              else
+                echo "- ${env}: ✅ all green (${TOTAL} legs)"
+              fi
+            done <<< "$ENV_LIST"
+            META_FAILS=$(awk -F'\t' '$3=="META" && ($2=="failure"||$2=="cancelled"){print $1}' /tmp/all-nightly-legs.tsv)
+            if [ -n "$META_FAILS" ]; then
+              META_NAMES=$(printf '%s\n' "$META_FAILS" | sort -u | join_semi)
+              echo "- process-level (non-env): ❌ ${META_NAMES}"
+            fi
             echo ""
             echo "## Aggregate results"
             echo ""
@@ -2195,26 +2282,39 @@ jobs:
               echo "| $name | $(emoji "$conclusion") |"
             done < /tmp/s2-legs.tsv
             echo ""
-            # Per-env breakdown: extract env ids from job names (suffix in parentheses)
-            # and group failing/cancelled legs by env so readers can tell which env hit.
-            FAIL_LEGS=$(grep -E $'\tfailure$|\tcancelled$' /tmp/all-nightly-legs.tsv || true)
+            # Per-env breakdown: group failing/cancelled legs so readers can
+            # tell which env hit. Reads the same env_tag column the header
+            # above does, so a leg's env label can't disagree between the
+            # two sections.
+            FAIL_LEGS=$(awk -F'\t' '$2=="failure"||$2=="cancelled"' /tmp/all-nightly-legs.tsv || true)
             if [ -n "$FAIL_LEGS" ]; then
               echo "## Failing legs by env"
               echo ""
               echo "| Leg | Result |"
               echo "|-----|--------|"
-              while IFS=$'\t' read -r name conclusion; do
-                # Annotate legs without env suffix (S-INC, PR-coverage run on selected_env only)
-                case "$name" in
-                  *paseo-next-v2*|*preview*|*"telemetry assertions"*|*"pool selection"*|*"code-path"*|*"E2E Report"*)
-                    ;;  # already has env info or is a meta-job
-                  *)
-                    name="$name (on ${SELECTED_ENV})"
-                    ;;
-                esac
-                echo "| $name | $(emoji "$conclusion") |"
+              while IFS=$'\t' read -r name conclusion env_tag; do
+                # Annotate legs whose name doesn't already show an env (the
+                # env-fixed scenarios — S-INC, PR-coverage); META and
+                # already-tagged names are left as-is.
+                display_name="$name"
+                if [ "$env_tag" != "META" ] && [[ "$name" != *"($env_tag)" ]]; then
+                  display_name="$name (on ${env_tag})"
+                fi
+                echo "| $display_name | $(emoji "$conclusion") |"
               done <<< "$FAIL_LEGS"
               echo ""
+              # One-line failure signature per failing leg (issue #1055),
+              # looked up by the raw (un-annotated) job name so it matches
+              # what the Fetch step keyed /tmp/fail-signatures.tsv on.
+              if [ -f /tmp/fail-signatures.tsv ] && [ -s /tmp/fail-signatures.tsv ]; then
+                echo "### Failure signatures"
+                echo ""
+                while IFS=$'\t' read -r name conclusion env_tag; do
+                  SIG=$(awk -F'\t' -v n="$name" '$1==n{print $2; exit}' /tmp/fail-signatures.tsv)
+                  [ -n "$SIG" ] && echo "- **$name**: $SIG"
+                done <<< "$FAIL_LEGS"
+                echo ""
+              fi
             fi
             echo "**Sentry:** [E2E Health dashboard](https://paritytech.sentry.io/dashboard/1732713/?project=4511093597405264) · [raw traces](https://paritytech.sentry.io/explore/traces/?project=4511093597405264&query=deploy.tag%3A$TAG)"
           } > /tmp/report-body.md

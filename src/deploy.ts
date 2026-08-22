@@ -23,7 +23,7 @@ import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManif
 import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
 import { keccak256, toBytes } from "viem";
-import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI } from "./dotns.js";
+import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI, classifyRegistrability, formatUnregistrableReason } from "./dotns.js";
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep } from "./dotns.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -2719,6 +2719,33 @@ export function assertSubdomainOwnerMatchesSigner(
   }
 }
 
+/**
+ * An unregistered, non-registrable parent (a governance-reserved name) used
+ * to yield "parent game.dot is owned by no one, not by this signer" —
+ * awkward, and silent about the only route forward. When the parent is
+ * non-registrable per classifyRegistrability AND unowned, this additionally
+ * teaches the dotns-cli whitelisted-registration route, via the SAME
+ * formatUnregistrableReason preflight/register() use, so the texts cannot
+ * drift. Owned-by-another-account keeps the original message unchanged —
+ * that case is about ownership, not registrability, and must NOT suggest
+ * registering a name someone else already holds.
+ */
+export function formatSubdomainParentError(
+  fullName: string,
+  parentLabel: string,
+  parentOwner: string | null,
+  selfAddress: string,
+): string {
+  if (parentOwner !== null) {
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.dot is owned by ${parentOwner}, not by this signer.`;
+  }
+  const registrability = classifyRegistrability(parentLabel);
+  if (registrability.registrable) {
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.dot is owned by no one, not by this signer.`;
+  }
+  return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress })}`;
+}
+
 // Publish step. Subdomains are not supported by the Publisher contract (it only
 // indexes top-level `.dot` labels) so we skip rather than publish the parent.
 async function publish(
@@ -2943,8 +2970,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
   // Injected signer (options.signer) and mnemonic paths are also unchanged.
 
   // Validate the label up-front (parseDomainName runs the pure, chain-free
-  // validateDomainLabel) so an invalid one — e.g. a Reserved <=5-char base name —
-  // fails before we print a signer plan that can never matter.
+  // validateDomainLabel) so a syntactically-invalid one — bad charset, wrong
+  // length, or an edge hyphen — fails before we print a signer plan that can
+  // never matter. A Reserved/PopRules-shaped label (e.g. a <=5-char base name)
+  // is NOT rejected here: parseDomainName always succeeds for those now,
+  // since the signer might legitimately own the name (registerReserved
+  // bypasses PopRules on-chain). That decision moved to ownership-aware
+  // preflight — see classifyRegistrability/decideRegistrabilityOutcome in
+  // src/dotns.ts.
   const parsed: ParsedDomainName | null = domainName ? parseDomainName(domainName) : null;
 
   let sessionCleanup: (() => void) | undefined;
@@ -3174,7 +3207,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             const { owned: parentOwned, owner: parentOwner } = await preflight.checkOwnership(parsed.parentLabel!);
             if (!parentOwned) {
               throw new NonRetryableError(
-                `Cannot deploy ${parsed.fullName}: parent ${parsed.parentLabel}.dot is owned by ${parentOwner ?? "no one"}, not by this signer.`
+                formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "")
               );
             }
           }

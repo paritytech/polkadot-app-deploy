@@ -15,9 +15,9 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -202,67 +202,18 @@ describe("validateDomainLabel", () => {
     assert.throws(() => validateDomainLabel("my_domain"), /lowercase letters/);
   });
 
-  // #1189 FLIP: validateDomainLabel used to call sanitizeDomainLabel and
-  // silently deploy to a DIFFERENT label — mylabel123 -> mylabel23,
-  // myapplabel1234 -> myapplabel34, my-app900 -> my-app00 — registering,
-  // paying for, and writing contenthash to a name the operator never typed,
-  // with only a console.log as the sole signal. It now refuses and names
-  // compliant alternatives derived from the operator's own input instead of
-  // rewriting. This test protects the same property ("a non-compliant label
-  // never reaches the chain") via refusal instead of silent rewrite.
-  test("refuses labels with more than 2 trailing digits instead of silently rewriting them (#1189)", () => {
-    const cases = [
-      ["mylabel123", 3, "mylabel23.dot"],
-      ["myapplabel1234", 4, "myapplabel34.dot"],
-      ["my-app900", 3, "my-app00.dot"],
-    ];
-    for (const [input, expectedDigitCount, expectedAlternative] of cases) {
-      try {
-        const result = validateDomainLabel(input);
-        assert.fail(`>> FAIL: validateDomainLabel-refusal: "${input}" returned "${result}" instead of throwing — the #1189 silent-retarget bug has regressed.`);
-      } catch (e) {
-        assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-refusal: "${input}": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-        assert.match(e.message, new RegExp(`${expectedDigitCount} trailing digit`), `>> FAIL: validateDomainLabel-refusal: "${input}": message should name the trailing-digit count, got: ${e.message}`);
-        assert.ok(e.message.includes(expectedAlternative), `>> FAIL: validateDomainLabel-refusal: "${input}": message should offer "${expectedAlternative}" as a compliant alternative (what the old rewrite would have silently deployed to), got: ${e.message}`);
-      }
-    }
-  });
-
-  test("returns label unchanged when trailing digits <= 2", () => {
+  // #1185: validateDomainLabel never rewrites and never applies PopRules
+  // rules (trailing-digit count, hyphen-base, Reserved) — it always returns
+  // the label unchanged when the label is contract-syntax-valid, regardless
+  // of trailing-digit count. See the "validateDomainLabel is contract-level
+  // syntax only" describe below for the full #1185 boundary tests.
+  test("returns label unchanged (never rewrites, any trailing-digit count)", () => {
     assert.strictEqual(validateDomainLabel("my-domain"), "my-domain");
     assert.strictEqual(validateDomainLabel("testapp12"), "testapp12");
     assert.strictEqual(validateDomainLabel("abcdef"), "abcdef");
   });
 
-  // Regression guard: dotns-cli (paritytech/dotns-sdk) strips trailing digits
-  // only — not the trailing hyphen — when computing the base name. Inputs of
-  // the form `<word>-<digits>$` therefore yield a base name ending in `-`,
-  // and the on-chain `isBaseNameReserved(baseName)` reverts with
-  // PopError("Name must be lowercase ASCII DNS label"). Reject pre-upload.
-  test("rejects <word>-<digits> patterns that dotns-cli's base-name extractor breaks", () => {
-    // These are all trailing-2-digit cases, so the #1189 digit-count check
-    // passes them through unchanged (raw label === what the hyphen check
-    // sees, since there is no more sanitize rewrite) and the trailing-hyphen
-    // check fires next, as before. Trailing-1 cases (e.g. `foo-1`,
-    // `palacehub-app-88-pr-1`) now hit the digit-count refusal instead —
-    // covered in their own tests below (#1189 FLIP).
-    assert.throws(() => validateDomainLabel("palacehub-33"), /trailing hyphen/);
-    assert.throws(() => validateDomainLabel("palace-hub-app-88"), /trailing hyphen/);
-    assert.throws(() => validateDomainLabel("localdot-33-pr-78"), /trailing hyphen/);
-  });
-
-  test("error message suggests viable rename and identifies the broken base name", () => {
-    try {
-      validateDomainLabel("palacehub-33");
-      assert.fail("should have thrown");
-    } catch (e) {
-      assert.match(e.message, /palacehub-/, "should quote the broken base name");
-      assert.match(e.message, /palacehub33/, "should suggest dropping the hyphen");
-      assert.match(e.message, /palacehub-pr33/, "should suggest inserting a non-digit segment");
-    }
-  });
-
-  test("accepts hyphen-before-letters-then-digits patterns (the working shape)", () => {
+  test("accepts hyphen-before-letters-then-digits patterns", () => {
     assert.doesNotThrow(() => validateDomainLabel("palacehub-pr03"));
     assert.doesNotThrow(() => validateDomainLabel("palace-hub-pr04"));
     assert.doesNotThrow(() => validateDomainLabel("rc069pool00"));
@@ -270,172 +221,8 @@ describe("validateDomainLabel", () => {
     assert.doesNotThrow(() => validateDomainLabel("test-app00"));
   });
 
-  // #1189 FLIP: these inputs have >2 trailing digits, so the NEW digit-count
-  // refusal fires before the trailing-hyphen check ever runs (ordering
-  // requirement from #1189: digit-count check must come first). Previously
-  // sanitize ran first, stripped the trailing hyphen, and returned a
-  // different label ("my-app-1234" -> "my-app34"); now it's refused outright,
-  // with buildLabelAlternatives (which reuses stripTrailingDigits internally)
-  // deriving the same hyphen-safe candidates as suggestions instead.
-  test("refuses >2-trailing-digit hyphenated labels; alternatives are still hyphen-safe", () => {
-    for (const [input, expectedDigitCount, expectedAlternative] of [
-      ["my-app-1234", 4, "my-app34.dot"],
-      ["palacehub-9999", 4, "palacehub99.dot"],
-    ]) {
-      try {
-        validateDomainLabel(input);
-        assert.fail(`>> FAIL: validateDomainLabel-hyphen-refusal: "${input}" did not throw.`);
-      } catch (e) {
-        assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-hyphen-refusal: "${input}": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-        assert.match(e.message, new RegExp(`${expectedDigitCount} trailing digit`), `>> FAIL: validateDomainLabel-hyphen-refusal: "${input}": message should name the trailing-digit count, got: ${e.message}`);
-        assert.ok(e.message.includes(expectedAlternative), `>> FAIL: validateDomainLabel-hyphen-refusal: "${input}": alternative "${expectedAlternative}" should be offered and must not itself throw, got: ${e.message}`);
-        assert.doesNotThrow(() => validateDomainLabel(expectedAlternative.replace(/\.dot$/, "")), `>> FAIL: validateDomainLabel-hyphen-refusal: suggested alternative for "${input}" is not itself dotns-cli-safe`);
-      }
-    }
-  });
-
-  // Issue #573: Reserved-class preflight — client-side fail-fast
-  test("rejects 'foo' (baselength=3) with NonRetryableError quoting governance phrase", () => {
-    try {
-      validateDomainLabel("foo");
-      assert.fail("should have thrown");
-    } catch (e) {
-      assert.ok(e instanceof NonRetryableError, `expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-      assert.match(e.message, /governance|5 chars or fewer/i);
-    }
-  });
-
-  test("rejects 'abcde' (baselength=5, exactly at the limit) with NonRetryableError", () => {
-    assert.throws(
-      () => validateDomainLabel("abcde"),
-      (e) => e instanceof NonRetryableError && /governance|5 chars or fewer/i.test(e.message),
-    );
-  });
-
-  test("accepts 'abcdef' (baselength=6) — does NOT throw on Reserved grounds", () => {
+  test("accepts 'abcdef' (baselength=6) — does NOT throw on Reserved grounds (contract-level syntax only)", () => {
     assert.doesNotThrow(() => validateDomainLabel("abcdef"));
-  });
-
-  // #1189 FLIP: "foo123" has 3 trailing digits, so it's now refused by the
-  // digit-count check BEFORE classifyDotnsLabel ever runs — the rewrite it
-  // used to sanitize to ("foo23", still Reserved at base 3) never happens.
-  // Both would-be-Reserved candidates (foo23, foo) are correctly excluded by
-  // buildLabelAlternatives, leaving only the NoStatus-safe fallback.
-  test("refuses 'foo123' (3 trailing digits) — was silently sanitized to Reserved 'foo23', now refused pre-classification (#1189)", () => {
-    try {
-      validateDomainLabel("foo123");
-      assert.fail(">> FAIL: validateDomainLabel-refusal: \"foo123\" did not throw.");
-    } catch (e) {
-      assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-refusal: "foo123": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-      assert.match(e.message, /3 trailing digit/, `>> FAIL: validateDomainLabel-refusal: "foo123": message should name the trailing-digit count, got: ${e.message}`);
-      assert.ok(e.message.includes("fooxxxxxx00.dot"), `>> FAIL: validateDomainLabel-refusal: "foo123": only the NoStatus fallback should survive (foo23/foo are both Reserved at base 3), got: ${e.message}`);
-    }
-  });
-
-  // #1189 FLIP: "a12345" has 5 trailing digits, refused by the digit-count
-  // check directly (never reaches the old sanitize-to-"a45"-then-Reserved path).
-  test("refuses 'a12345' (5 trailing digits) with NonRetryableError naming the digit count (#1189)", () => {
-    try {
-      validateDomainLabel("a12345");
-      assert.fail(">> FAIL: validateDomainLabel-refusal: \"a12345\" did not throw.");
-    } catch (e) {
-      assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-refusal: "a12345": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-      assert.match(e.message, /5 trailing digit/, `>> FAIL: validateDomainLabel-refusal: "a12345": message should name the trailing-digit count, got: ${e.message}`);
-      assert.ok(e.message.includes("axxxxxxxx00.dot"), `>> FAIL: validateDomainLabel-refusal: "a12345": only the NoStatus fallback should survive (base "a" is 1 char, Reserved), got: ${e.message}`);
-    }
-  });
-
-  test("regression: trailing-hyphen edge case still throws plain Error (not NonRetryableError)", () => {
-    // "palacehub-33" survives sanitize (trailing=2) and hits the
-    // trailing-hyphen check on the sanitized form. (Pre-rc.2 this test used
-    // "foo-1" which now sanitizes to "foo" — Reserved baselength, different
-    // error path. Pick a trailing-2 input so the trailing-hyphen check is
-    // still the dominant rejection path.)
-    try {
-      validateDomainLabel("palacehub-33");
-      assert.fail("should have thrown");
-    } catch (e) {
-      assert.match(e.message, /trailing hyphen/i, "should be the trailing-hyphen error");
-      assert.ok(!(e instanceof NonRetryableError), "trailing-hyphen error must be a plain Error, not NonRetryableError");
-    }
-  });
-
-  // #1189 FLIP: these are all single-trailing-digit inputs (commit-hash short
-  // SHAs often end in exactly 1 digit — the original PR · s1-smoke case this
-  // test used to protect). Pre-#1189, sanitize silently normalized them
-  // (stripping the trailing digit + exposed dash) and validateDomainLabel
-  // returned a DIFFERENT label. Now the digit-count refusal fires directly on
-  // the raw 1-trailing-digit input — no rewrite happens at all. The property
-  // this test protects — "a non-compliant label never reaches the chain
-  // silently" — now holds via refusal instead of rewrite.
-  test("refuses <word>-<single-digit> inputs outright instead of silently normalizing them (#1189)", () => {
-    for (const [input, expectedAlternative] of [
-      ["palacehub-app-88-pr-1", "palacehub-app-88-pr01.dot"],
-      ["e2esmoke26652530002-83abbd6", "e2esmoke26652530002-83abbd06.dot"],
-      ["foo-1", "fooxxxxxx00.dot"],
-    ]) {
-      try {
-        const result = validateDomainLabel(input);
-        assert.fail(`>> FAIL: validateDomainLabel-single-digit-refusal: "${input}" returned "${result}" instead of throwing.`);
-      } catch (e) {
-        assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-single-digit-refusal: "${input}": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-        assert.match(e.message, /1 trailing digit/, `>> FAIL: validateDomainLabel-single-digit-refusal: "${input}": message should name the trailing-digit count, got: ${e.message}`);
-        assert.ok(e.message.includes(expectedAlternative), `>> FAIL: validateDomainLabel-single-digit-refusal: "${input}": message should offer "${expectedAlternative}" as a compliant alternative, got: ${e.message}`);
-      }
-    }
-  });
-
-  // Issue #1189, ordering requirement: the digit-count refusal must run
-  // BEFORE the #185 trailing-hyphen check, and both must test the RAW label.
-  // Reason: #185's own suggestions (drop-the-hyphen / insert-a-segment) are
-  // only compliant for inputs that already have 0 or 2 trailing digits. For
-  // "my-app-1" (1 trailing digit) those suggestions would be "my-app1" and
-  // "my-app-pr1" — both STILL 1-trailing-digit and refused on the very next
-  // attempt. Verifying the ordering means: (1) the thrown error is the
-  // digit-count message, not the hyphen message, and (2) the hyphen check's
-  // own suggestion pattern (dropHyphen/insertSegment) is NOT what gets
-  // offered — buildLabelAlternatives' suggestions are, and those ARE
-  // registrable on the first attempt.
-  test("orders the digit-count refusal BEFORE the #185 trailing-hyphen check (#1189)", () => {
-    try {
-      validateDomainLabel("my-app-1");
-      assert.fail(">> FAIL: validateDomainLabel-ordering: \"my-app-1\" did not throw.");
-    } catch (e) {
-      assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-ordering: expected the digit-count refusal (NonRetryableError), got ${e.constructor.name}: ${e.message}`);
-      assert.match(e.message, /1 trailing digit/, `>> FAIL: validateDomainLabel-ordering: expected the digit-count message to win over the #185 trailing-hyphen message, got: ${e.message}`);
-      assert.ok(!/trailing hyphen/i.test(e.message), `>> FAIL: validateDomainLabel-ordering: the #185 trailing-hyphen message should NOT fire first for "my-app-1", got: ${e.message}`);
-      // The #185-style suggestions ("my-app1", "my-app-pr1") both still have
-      // exactly 1 trailing digit — they must NOT be what's offered, since
-      // they'd be refused again on the next attempt.
-      assert.ok(!e.message.includes("my-app1.dot"), `>> FAIL: validateDomainLabel-ordering: "my-app1.dot" (the old #185 drop-hyphen suggestion) still has 1 trailing digit and would be refused again — must not be offered, got: ${e.message}`);
-      assert.ok(!e.message.includes("my-app-pr1.dot"), `>> FAIL: validateDomainLabel-ordering: "my-app-pr1.dot" (the old #185 insert-segment suggestion) still has 1 trailing digit and would be refused again — must not be offered, got: ${e.message}`);
-      // Every alternative actually offered must be immediately registrable.
-      const bulletMatches = [...e.message.matchAll(/- ([a-z0-9-]+)\.dot/g)].map((m) => m[1]);
-      assert.ok(bulletMatches.length > 0, `>> FAIL: validateDomainLabel-ordering: no alternatives found in message: ${e.message}`);
-      for (const alt of bulletMatches) {
-        assert.doesNotThrow(() => validateDomainLabel(alt), `>> FAIL: validateDomainLabel-ordering: offered alternative "${alt}" is not itself compliant on the next attempt.`);
-      }
-    }
-  });
-
-  // Issue #1189 invariant: every candidate buildLabelAlternatives returns must
-  // itself pass validateDomainLabel without throwing — otherwise we'd be
-  // suggesting a name that gets refused on the very next attempt.
-  test("buildLabelAlternatives invariant: every candidate it returns passes validateDomainLabel (#1189)", () => {
-    const inputs = [
-      "my-app-1", "mysite123", "dim2", "blog-2026", "my-app-1234",
-      "palacehub-9999", "e2esmoke26652530002-83abbd6", "a12345", "foo123",
-    ];
-    for (const input of inputs) {
-      const alternatives = buildLabelAlternatives(input);
-      assert.ok(alternatives.length > 0, `>> FAIL: buildLabelAlternatives-invariant: "${input}" produced zero alternatives — the NoStatus fallback should always survive.`);
-      for (const alt of alternatives) {
-        assert.doesNotThrow(
-          () => validateDomainLabel(alt.label),
-          `>> FAIL: buildLabelAlternatives-invariant: candidate "${alt.label}" (suggested for "${input}") does not itself pass validateDomainLabel.`,
-        );
-      }
-    }
   });
 
   test("rejects labels longer than 63 chars", () => {
@@ -448,6 +235,208 @@ describe("validateDomainLabel", () => {
     // 63 'a's: base 63, 0 trailing digits → NoStatus class, shape-valid at the 63-octet max
     const exactly63 = "a".repeat(63);
     assert.doesNotThrow(() => validateDomainLabel(exactly63));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3a-i. validateDomainLabel is contract-level syntax only (#1185)
+//
+// Task 3 of the #1185 plan: validateDomainLabel shrinks to what the DotNS
+// contract itself enforces (charset, length 3-63, no edge hyphens). Every
+// PopRules-derived rule (trailing-digit count, hyphen-base, Reserved
+// baselength) moved to classifyRegistrability, consumed by ownership-aware
+// preflight — see the describe block below for where those properties now
+// live.
+// ---------------------------------------------------------------------------
+describe("validateDomainLabel is contract-level syntax only (#1185)", () => {
+  test("accepts labels DotNS would refuse to register but the contract accepts", () => {
+    // dim2 exists on-chain: registerReserved bypasses PopRules entirely, so a
+    // 1-trailing-digit name is a legitimate deploy target for its owner.
+    for (const l of ["dim2", "game", "my-app-1", "mysite123", "palacehub-33"]) {
+      assert.doesNotThrow(() => validateDomainLabel(l),
+        `>> FAIL: ${l}: validateDomainLabel must no longer apply PopRules rules — they moved to preflight`);
+      assert.strictEqual(validateDomainLabel(l), l,
+        `>> FAIL: ${l}: validateDomainLabel must return the label unchanged (no rewriting, ever)`);
+    }
+  });
+
+  test("still refuses what the contract itself refuses", () => {
+    for (const [l, re] of [["ab", /3-63 chars/], ["UPPER", /lowercase/], ["-lead", /hyphen/], ["trail-", /hyphen/], ["has_underscore", /lowercase/]]) {
+      assert.throws(() => validateDomainLabel(l), re,
+        `>> FAIL: ${l}: a contract-level syntax rule was dropped`);
+    }
+  });
+
+  test("parseDomainName no longer rewrites or refuses on PopRules grounds", () => {
+    assert.strictEqual(parseDomainName("dim2.dot").fullName, "dim2.dot",
+      ">> FAIL: dim2.dot must survive parse intact — this is the #1185 case");
+    assert.strictEqual(parseDomainName("app.game.dot").fullName, "app.game.dot",
+      ">> FAIL: subdomain of a reserved parent must survive parse; parent ownership is checked later");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3a-ii. PopRules-derived rules, relocated (#1185)
+//
+// Every test below used to assert that validateDomainLabel THREW for these
+// inputs (#1189-era / #573-era behavior). Post-#1185 that refusal moved to
+// classifyRegistrability + formatUnregistrableReason, consumed by
+// ownership-aware preflight instead of parse-time validation. Each test here
+// is a relocation, not a deletion — the property protected ("a non-
+// registrable label is refused, with actionable alternatives, before it
+// silently reaches the chain") still holds, just enforced later in the
+// pipeline so an owner of the name is never blocked from deploying to it.
+// ---------------------------------------------------------------------------
+describe("PopRules-derived rules relocated from validateDomainLabel to classifyRegistrability (#1185)", () => {
+  test("trailing-digit-count violations: validateDomainLabel accepts unchanged; classifyRegistrability flags trailing-digits with the same operator-derived alternatives", () => {
+    const cases = [
+      ["mylabel123", 3, "mylabel23.dot"],
+      ["myapplabel1234", 4, "myapplabel34.dot"],
+      ["my-app900", 3, "my-app00.dot"],
+      ["foo123", 3, "fooxxxxxx00.dot"],
+      ["a12345", 5, "axxxxxxxx00.dot"],
+      ["palacehub-app-88-pr-1", 1, "palacehub-app-88-pr01.dot"],
+      ["e2esmoke26652530002-83abbd6", 1, "e2esmoke26652530002-83abbd06.dot"],
+      ["foo-1", 1, "fooxxxxxx00.dot"],
+      // >2-trailing-digit AND hyphen-preceding-digits: trailing-digits rule
+      // must still win over hyphen-base (precedence requirement, #1189/#1185).
+      ["my-app-1234", 4, "my-app34.dot"],
+      ["palacehub-9999", 4, "palacehub99.dot"],
+    ];
+    for (const [input, expectedDigitCount, expectedAlternative] of cases) {
+      assert.strictEqual(validateDomainLabel(input), input,
+        `>> FAIL: relocated-trailing-digits: "${input}": validateDomainLabel must accept this unchanged post-#1185 (PopRules rules moved to preflight)`);
+      const r = classifyRegistrability(input);
+      assert.strictEqual(r.registrable, false, `>> FAIL: relocated-trailing-digits: "${input}": classifyRegistrability should flag it`);
+      assert.strictEqual(r.rule, "trailing-digits",
+        `>> FAIL: relocated-trailing-digits: "${input}": expected rule trailing-digits (must win over hyphen-base/reserved-base), got ${r.rule}`);
+      assert.match(r.message, new RegExp(`${expectedDigitCount} trailing digit`),
+        `>> FAIL: relocated-trailing-digits: "${input}": message should name the trailing-digit count, got: ${r.message}`);
+      const msg = formatUnregistrableReason({ label: input, registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+      assert.ok(msg.includes(expectedAlternative),
+        `>> FAIL: relocated-trailing-digits: "${input}": message should still offer "${expectedAlternative}" as a compliant alternative, got: ${msg}`);
+      assert.doesNotThrow(() => validateDomainLabel(expectedAlternative.replace(/\.dot$/, "")),
+        `>> FAIL: relocated-trailing-digits: suggested alternative for "${input}" is not itself syntax-valid`);
+    }
+  });
+
+  test("hyphen-base violations (dotns-cli's digit-only base-name extraction trap): validateDomainLabel accepts unchanged; classifyRegistrability flags hyphen-base", () => {
+    for (const input of ["palacehub-33", "palace-hub-app-88", "localdot-33-pr-78"]) {
+      assert.strictEqual(validateDomainLabel(input), input,
+        `>> FAIL: relocated-hyphen-base: "${input}": validateDomainLabel must accept this unchanged post-#1185`);
+      const r = classifyRegistrability(input);
+      assert.strictEqual(r.registrable, false, `>> FAIL: relocated-hyphen-base: "${input}": classifyRegistrability should flag it`);
+      assert.strictEqual(r.rule, "hyphen-base", `>> FAIL: relocated-hyphen-base: "${input}": expected rule hyphen-base, got ${r.rule}`);
+    }
+  });
+
+  test("hyphen-base message identifies the broken base name and offers only re-registrable alternatives", () => {
+    const r = classifyRegistrability("palacehub-33");
+    const msg = formatUnregistrableReason({ label: "palacehub-33", registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+    assert.match(msg, /palacehub-/, "should quote the broken base name");
+    const bulletMatches = [...msg.matchAll(/- ([a-z0-9-]+)\.dot/g)].map((m) => m[1]);
+    assert.ok(bulletMatches.length > 0, `>> FAIL: hyphen-base message has no alternatives: ${msg}`);
+    for (const alt of bulletMatches) {
+      assert.doesNotThrow(() => validateDomainLabel(alt), `>> FAIL: offered alternative "${alt}" is not itself syntax-valid`);
+      assert.strictEqual(classifyRegistrability(alt).registrable, true, `>> FAIL: offered alternative "${alt}" is not itself registrable`);
+    }
+  });
+
+  test("reserved-base (baselength<=5) violations: validateDomainLabel accepts unchanged; classifyRegistrability flags reserved-base quoting the governance phrase", () => {
+    for (const input of ["foo", "abcde", "game"]) {
+      assert.strictEqual(validateDomainLabel(input), input,
+        `>> FAIL: relocated-reserved-base: "${input}": validateDomainLabel must accept this unchanged post-#1185`);
+      const r = classifyRegistrability(input);
+      assert.strictEqual(r.registrable, false, `>> FAIL: relocated-reserved-base: "${input}": classifyRegistrability should flag it`);
+      assert.strictEqual(r.rule, "reserved-base", `>> FAIL: relocated-reserved-base: "${input}": expected rule reserved-base, got ${r.rule}`);
+      assert.match(r.message, /governance|5 chars or fewer/i, `>> FAIL: relocated-reserved-base: "${input}": message should quote the governance phrase, got: ${r.message}`);
+    }
+  });
+
+  // Ordering requirement (originally #1189, still true post-#1185): the
+  // trailing-digits rule must win over hyphen-base, because hyphen-base's
+  // own remediation only makes sense for inputs whose digit count is already
+  // compliant. Verify with the ordering test's original motivating input.
+  test("orders the trailing-digits rule BEFORE the hyphen-base rule", () => {
+    const r = classifyRegistrability("my-app-1");
+    assert.strictEqual(r.rule, "trailing-digits",
+      `>> FAIL: ordering: expected trailing-digits to win over hyphen-base for "my-app-1", got ${r.rule}`);
+    const msg = formatUnregistrableReason({ label: "my-app-1", registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+    // The old hyphen-base-style suggestions ("my-app1", "my-app-pr1") both
+    // still have exactly 1 trailing digit — they must NOT be offered, since
+    // they'd be refused again on the next attempt.
+    assert.ok(!msg.includes("my-app1.dot"), `>> FAIL: ordering: "my-app1.dot" still has 1 trailing digit and would be refused again — must not be offered, got: ${msg}`);
+    assert.ok(!msg.includes("my-app-pr1.dot"), `>> FAIL: ordering: "my-app-pr1.dot" still has 1 trailing digit and would be refused again — must not be offered, got: ${msg}`);
+    const bulletMatches = [...msg.matchAll(/- ([a-z0-9-]+)\.dot/g)].map((m) => m[1]);
+    assert.ok(bulletMatches.length > 0, `>> FAIL: ordering: no alternatives found in message: ${msg}`);
+    for (const alt of bulletMatches) {
+      assert.strictEqual(classifyRegistrability(alt).registrable, true, `>> FAIL: ordering: offered alternative "${alt}" is not itself registrable on the next attempt.`);
+    }
+  });
+
+  // Invariant (originally #1189, still true post-#1185): every candidate
+  // buildLabelAlternatives returns must itself be registrable — otherwise
+  // we'd be suggesting a name that gets refused on the very next attempt.
+  test("buildLabelAlternatives invariant: every candidate it returns is itself registrable", () => {
+    const inputs = [
+      "my-app-1", "mysite123", "dim2", "blog-2026", "my-app-1234",
+      "palacehub-9999", "e2esmoke26652530002-83abbd6", "a12345", "foo123",
+    ];
+    for (const input of inputs) {
+      const alternatives = buildLabelAlternatives(input);
+      assert.ok(alternatives.length > 0, `>> FAIL: buildLabelAlternatives-invariant: "${input}" produced zero alternatives — the NoStatus fallback should always survive.`);
+      for (const alt of alternatives) {
+        assert.doesNotThrow(
+          () => validateDomainLabel(alt.label),
+          `>> FAIL: buildLabelAlternatives-invariant: candidate "${alt.label}" (suggested for "${input}") does not itself pass validateDomainLabel.`,
+        );
+        assert.strictEqual(classifyRegistrability(alt.label).registrable, true,
+          `>> FAIL: buildLabelAlternatives-invariant: candidate "${alt.label}" (suggested for "${input}") is not itself registrable.`);
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3a-iii. exampleNoStatusLabel (#1185 hardening, deferred from #1189)
+//
+// Pre-#1185 this called validateDomainLabel(label, { checkReserved: false }),
+// which COULD throw post-#1189 (the digit-count refusal was gated on
+// skipSanitize, not checkReserved) — unreachable only because both call
+// sites sat downstream of a validateDomainLabel that already threw. #1185
+// deletes the options param entirely, so exampleNoStatusLabel no longer calls
+// validateDomainLabel at all; it strips/cleans the input directly.
+// ---------------------------------------------------------------------------
+// exampleNoStatusLabel is module-private in src/dotns.ts (not exported), and
+// its only reachable production call sites post-#1185 are
+// formatPopShortfallReason's PoP-shortfall path (preflight's Full/Lite gate)
+// and register()'s rejectIneligible — both reached only for a label that
+// classifyRegistrability already accepted (registrable:true), i.e. 0-or-2
+// trailing digits, baseLength 6-8. Labels like "dim2"/"mysite123"/"---1" are
+// UNREACHABLE by construction: anything classifyRegistrability rejects now
+// aborts at the registrability gate before ever reaching a PoP-shortfall
+// message. The real reachable-input coverage lives in the "testnet NoStatus
+// signer on Full-required label" test above, which asserts the exact
+// production output (through _preflightInternal, not a reimplementation).
+//
+// The "never throws" property this describe used to assert directly is
+// still true, but by a one-line argument rather than exercising more code:
+// post-#1185 exampleNoStatusLabel(label) = noStatusFallbackBase(stripTrailingDigits(label)
+// .replace(charset)) — validateDomainLabel is no longer in the call chain at
+// all (the #1189-era hazard this hardening was about), and neither
+// stripTrailingDigits nor a charset-cleaning regex.replace can throw for any
+// string input. There is no remaining code path that can throw here.
+describe("exampleNoStatusLabel (#1185)", () => {
+  test("cannot throw: its only two calls (stripTrailingDigits, a regex .replace) are total functions over any string", () => {
+    // Not a reimplementation-and-test-the-copy — this asserts the actual
+    // exported building blocks exampleNoStatusLabel is composed of (both
+    // already exercised as production code by real callers) never throw,
+    // which is the necessary and sufficient condition for the whole
+    // function not to throw.
+    for (const label of ["dim2", "mysite123", "game", "blog-2026", "---1", ""]) {
+      assert.doesNotThrow(() => stripTrailingDigits(label).replace(/[^a-z0-9-]/g, "x"),
+        `>> FAIL: exampleNoStatusLabel building blocks must be total functions; "${label}" threw`);
+    }
   });
 });
 
@@ -654,6 +643,141 @@ describe("countTrailingDigits", () => {
 
   test("returns 0 for names ending in non-digit after digits", () => {
     assert.strictEqual(countTrailingDigits("app-88-pr"), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4b-i. classifyRegistrability (#1185) — one predicate for every PopRules
+// rule. Reserved/trailing-digits/hyphen-base are registration-time
+// authorization properties, not label-syntax properties — validateDomainLabel
+// no longer applies them (see Task 3 below); this is their new home, consumed
+// by ownership-aware preflight instead of parse-time validation.
+// ---------------------------------------------------------------------------
+describe("classifyRegistrability (#1185)", () => {
+  test("accepts labels that satisfy every PopRules rule", () => {
+    for (const l of ["mysitedemo00", "palacehub00", "test-app00", "testapp12"]) {
+      const r = classifyRegistrability(l);
+      assert.strictEqual(r.registrable, true,
+        `>> FAIL: classifyRegistrability: registrable label rejected: ${l} classified as ${JSON.stringify(r)}`);
+    }
+  });
+
+  test("flags 1 or 3+ trailing digits before any other rule", () => {
+    for (const l of ["mysite123", "my-app-1", "dim2"]) {
+      const r = classifyRegistrability(l);
+      assert.strictEqual(r.registrable, false, `>> FAIL: classifyRegistrability: ${l}: expected non-registrable`);
+      assert.strictEqual(r.rule, "trailing-digits",
+        `>> FAIL: classifyRegistrability: ${l}: expected rule trailing-digits, got ${r.rule} (precedence bug: trailing-digits must win over hyphen-base and reserved-base)`);
+    }
+  });
+
+  test("flags a hyphen-terminated base only when digits are compliant", () => {
+    const r = classifyRegistrability("palacehub-33");
+    assert.strictEqual(r.rule, "hyphen-base",
+      `>> FAIL: classifyRegistrability: palacehub-33: expected hyphen-base, got ${r.rule}`);
+  });
+
+  test("flags a short base", () => {
+    const r = classifyRegistrability("game");
+    assert.strictEqual(r.rule, "reserved-base",
+      `>> FAIL: classifyRegistrability: game: expected reserved-base, got ${r.rule}`);
+    assert.match(r.message, /base name is 4 chars/i,
+      `>> FAIL: classifyRegistrability: game: message must state the base length (isExpectedError in telemetry.ts keys on "base name is \\d+ chars"); got: ${r.message}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4b-ii. formatUnregistrableReason (#1185) — the three-way operator message
+// for a label DotNS naming rules forbid registering. Style matches
+// formatPopShortfallReason: lead-in sentence, blank line, "  - " bullets.
+// ---------------------------------------------------------------------------
+describe("formatUnregistrableReason (#1185)", () => {
+  const R = {
+    registrable: false, rule: "reserved-base",
+    message: "Base name is 4 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules).",
+  };
+
+  test("unregistered: names the dotns-cli route", () => {
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa" });
+    assert.match(m, /not registered/i, `>> FAIL: formatUnregistrableReason: unregistered message must say so; got: ${m}`);
+    assert.match(m, /dotns register domain -n game --governance/,
+      `>> FAIL: formatUnregistrableReason: must give the exact dotns-cli command; got: ${m}`);
+    assert.doesNotMatch(m, /--bootstrap/,
+      `>> FAIL: formatUnregistrableReason: --bootstrap is one-time ops and must never appear in recovery advice; got: ${m}`);
+  });
+
+  test("owned by another account: tells the operator to deploy with that account", () => {
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: "0xbbb", selfAddress: "0xaaa" });
+    assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatUnregistrableReason: must name the owner; got: ${m}`);
+    assert.match(m, /--mnemonic/, `>> FAIL: formatUnregistrableReason: must offer the owning-signer route; got: ${m}`);
+    assert.doesNotMatch(m, /dotns register domain/,
+      `>> FAIL: formatUnregistrableReason: an already-owned name must NOT suggest registering it; got: ${m}`);
+  });
+
+  test("keeps the phrasing telemetry classifies as a user error", () => {
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa" });
+    assert.strictEqual(isExpectedError(m), true,
+      `>> FAIL: formatUnregistrableReason: message would be classified as a non-user error and would raise a bug-report prompt; got: ${m}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4b-iii. decideRegistrabilityOutcome (#1185) — decides Reserved by
+// ownership, not by label syntax. The owner of a governance-reserved name
+// must be allowed to deploy to it (registerReserved bypasses PopRules
+// entirely, so ownership legitimately overrides the syntax rule).
+// ---------------------------------------------------------------------------
+describe("decideRegistrabilityOutcome (#1185)", () => {
+  const nr = { registrable: false, rule: "reserved-base", message: "Base name is 4 chars; …" };
+
+  test("proceeds when the signer owns the name", () => {
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xaaa", selfAddress: "0xaaa" });
+    assert.strictEqual(d.canProceed, true,
+      ">> FAIL: decideRegistrabilityOutcome: the owner of a reserved name must be allowed to update its content");
+    assert.strictEqual(d.plannedAction, "already-owned-by-us",
+      `>> FAIL: decideRegistrabilityOutcome: expected already-owned-by-us so the deploy skips register and goes to setContenthash; got ${d.plannedAction}`);
+  });
+
+  test("aborts when unregistered", () => {
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: null, selfAddress: "0xaaa" });
+    assert.strictEqual(d.canProceed, false,
+      ">> FAIL: decideRegistrabilityOutcome: bulletin-deploy cannot register a reserved name; must abort");
+    assert.match(d.reason, /dotns register domain/,
+      `>> FAIL: decideRegistrabilityOutcome: abort reason must teach the dotns-cli route; got: ${d.reason}`);
+  });
+
+  test("aborts when owned by another account", () => {
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xbbb", selfAddress: "0xaaa" });
+    assert.strictEqual(d.canProceed, false,
+      ">> FAIL: decideRegistrabilityOutcome: must not attempt to write content to someone else's name");
+    assert.match(d.reason, /0xbbb/, `>> FAIL: decideRegistrabilityOutcome: abort reason must name the owner; got: ${d.reason}`);
+  });
+
+  test("does not short-circuit a registrable label", () => {
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa" });
+    assert.strictEqual(d.canProceed, true,
+      ">> FAIL: decideRegistrabilityOutcome: a registrable label must fall through to the normal register path");
+    assert.notStrictEqual(d.plannedAction, "abort",
+      ">> FAIL: decideRegistrabilityOutcome: a registrable label must never be aborted by this decision function");
+  });
+
+  // Ownership and registrability must be reported as DISTINCT outcomes.
+  // A terser `registrable || existingOwner === selfAddress` collapse passes
+  // both assertions above while returning "already-owned-by-us" for a name
+  // nobody owns — and `plannedAction` is load-bearing outside this function
+  // (src/deploy.ts reads "already-owned-by-us" to skip registration; the
+  // phone-signature planner branches on "register"). This is the assertion
+  // that discriminates the two.
+  test("a registrable, UNOWNED label plans register — never already-owned-by-us", () => {
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa" });
+    assert.strictEqual(d.plannedAction, "register",
+      `>> FAIL: decideRegistrabilityOutcome: a registrable label nobody owns must plan "register"; got "${d.plannedAction}" — reporting already-owned-by-us here would tell a caller to skip registering a name that does not exist`);
+  });
+
+  test("ownership wins over registrability when the signer owns a registrable label", () => {
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: "0xaaa", selfAddress: "0xaaa" });
+    assert.strictEqual(d.plannedAction, "already-owned-by-us",
+      `>> FAIL: decideRegistrabilityOutcome: a registrable label the signer already owns must plan already-owned-by-us (skip register, go to setContenthash); got "${d.plannedAction}"`);
   });
 });
 
@@ -1377,6 +1501,29 @@ describe("classifyErrorKind", () => {
     );
   });
 
+  // naming.governance_reserved (#1185): a name DotNS naming rules forbid
+  // registering, decided by ownership in preflight. "cannot register it" is
+  // the distinctive phrase — present in both the unregistered and the
+  // owned-by-another-account formatUnregistrableReason variants.
+  test("naming.governance_reserved: classifies a governance-reserved refusal as a user error with its own kind", () => {
+    const msg = "game.dot is not registered, and bulletin-deploy cannot register it: Base name is 4 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules).";
+    assert.strictEqual(classifyDeployError(msg), "user",
+      `>> FAIL: naming.governance_reserved: would raise a bug-report prompt for an operator naming mistake; got ${classifyDeployError(msg)}`);
+    assert.strictEqual(classifyErrorKind(msg), "naming.governance_reserved",
+      `>> FAIL: naming.governance_reserved: expected naming.governance_reserved; got ${classifyErrorKind(msg)}`);
+  });
+  test("naming.governance_reserved: also classifies the owned-by-another-account variant", () => {
+    const msg = "game.dot is owned by 0xbbb, and bulletin-deploy cannot register it for a different account: Base name is 4 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules).";
+    assert.strictEqual(classifyErrorKind(msg), "naming.governance_reserved",
+      `>> FAIL: naming.governance_reserved: owned-by-another variant should classify the same way (uniform 'cannot register it' phrase); got ${classifyErrorKind(msg)}`);
+  });
+  test("naming.governance_reserved: message without 'cannot register it' does not match", () => {
+    assert.strictEqual(
+      classifyErrorKind("Base name is 4 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules)."),
+      "unknown",
+    );
+  });
+
   // naming.subdomain_orphan
   test("naming.subdomain_orphan: verbatim parent-owned message", () => {
     assert.strictEqual(
@@ -1930,6 +2077,21 @@ describe("isExpectedError", () => {
   test("classifies short-base-name errors as expected", () => {
     assert.ok(isExpectedError("Base name is 4 chars; DotNS reserves base names of 5 chars or fewer"));
     assert.ok(isExpectedError("base name is 3 chars; DotNS reserves"));
+  });
+
+  // #1185: formatUnregistrableReason's distinctive phrase must classify as a
+  // user error for ALL THREE classifyRegistrability rules, not only
+  // reserved-base (which happens to already match via "base name is N
+  // chars"). The trailing-digits variant does NOT carry any other existing
+  // isExpectedError pattern, so without this it would fall through to
+  // 'unknown' and raise a bug-report prompt for a plain naming mistake.
+  test("classifies governance-reserved refusals (any rule) as expected (#1185)", () => {
+    assert.ok(isExpectedError(
+      "mylabel123.dot is not registered, and bulletin-deploy cannot register it: Name has 3 trailing digits; DotNS allows exactly 0 or 2 trailing digits. Use a base name with no trailing digits or a 2-digit suffix.",
+    ), ">> FAIL: isExpectedError: trailing-digits governance-reserved message must classify as a user error");
+    assert.ok(isExpectedError(
+      "game.dot is owned by 0xbbb, and bulletin-deploy cannot register it for a different account: Base name is 4 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules).",
+    ), ">> FAIL: isExpectedError: owned-by-another governance-reserved message must classify as a user error");
   });
 
   test("classifies NameNotAvailable contract revert as expected", () => {
@@ -4152,6 +4314,40 @@ describe("DotNS.register contract path", () => {
     assert.ok(caught, "should throw after second failure");
     assert.match(caught.message, /bare-revert/);
   });
+
+  // Task 5 of the #1185 plan: register() must not attempt a doomed
+  // registration now that validateDomainLabel no longer refuses
+  // non-registrable labels itself. A library caller can invoke deploy()
+  // without preflight, so register() needs its own guard — using the SAME
+  // formatUnregistrableReason preflight uses, so the two texts cannot drift.
+  test("#1185: register() refuses a non-registrable label via classifyRegistrability, before any chain call", async () => {
+    const d = makeDotnsForRegister();
+    const calls = [];
+    d.classifyName = async (label) => { calls.push(`classify:${label}`); return { requiredStatus: ProofOfPersonhoodStatus.NoStatus, message: "Available to all" }; };
+    d.ensureNotRegistered = async (label) => { calls.push(`ensure:${label}`); };
+    d.generateCommitment = async () => { calls.push("generateCommitment"); throw new Error("generateCommitment should not be called"); };
+
+    let caught;
+    try { await d.register("game"); } catch (e) { caught = e; }
+    assert.ok(caught instanceof NonRetryableError,
+      `>> FAIL: register-guard: expected NonRetryableError, got ${caught?.constructor?.name}: ${caught?.message}`);
+    assert.match(caught.message, /dotns register domain -n game --governance/,
+      `>> FAIL: register-guard: message must give the exact dotns-cli command; got: ${caught.message}`);
+    assert.deepStrictEqual(calls, [], ">> FAIL: register-guard: must refuse before any chain call (classifyName/ensureNotRegistered never called)");
+  });
+
+  // #1185 unifies all three classifyRegistrability rules (trailing-digits,
+  // hyphen-base, reserved-base) onto the SAME NonRetryableError + shared
+  // message, closing a pre-existing inconsistency where hyphen-base alone
+  // threw a plain Error from validateDomainLabel. Verify uniformity directly
+  // against register()'s guard for a hyphen-base input.
+  test("#1185: register() refuses a hyphen-base label with the same NonRetryableError class as trailing-digits/reserved-base", async () => {
+    const d = makeDotnsForRegister();
+    let caught;
+    try { await d.register("palacehub-33"); } catch (e) { caught = e; }
+    assert.ok(caught instanceof NonRetryableError,
+      `>> FAIL: register-guard-hyphen-uniformity: hyphen-base must throw NonRetryableError just like the other two rules (no more plain-Error carve-out); got ${caught?.constructor?.name}: ${caught?.message}`);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4398,20 +4594,44 @@ describe("DotNS.preflight", () => {
     return d;
   }
 
-  test("baseLength <= 5 → Reserved, aborts with no chain reads", async () => {
-    // Since #573 validateDomainLabel throws NonRetryableError for Reserved labels
-    // before preflight reaches any chain call. Property protected: zero chain reads.
+  // #1185 FLIP (was #573): Reserved used to be a terminal, ownership-blind
+  // rejection — validateDomainLabel threw before preflight ever read the
+  // chain, so a governance-reserved name could never be deployed to, even by
+  // its rightful owner (registerReserved bypasses PopRules entirely, so an
+  // owner can genuinely hold a Reserved-shaped name on-chain). #1185 moves
+  // this decision to ownership-aware preflight: the chain reads now DO
+  // happen (that's the point — you can't know if you own it without asking),
+  // and the outcome depends on who owns it.
+  test("baseLength <= 5 → Reserved AND unregistered → aborts, teaching the dotns-cli whitelisted route (#1185, was #573)", async () => {
     let chainReadCount = 0;
-    const d = stubDotns({});
-    d.getUserPopStatus = async () => { chainReadCount++; return ProofOfPersonhoodStatus.NoStatus; };
-    d.contractCall = async (...a) => { chainReadCount++; };
-    d.contractCallNullable = async (...a) => { chainReadCount++; };
-    d.checkOwnership = async () => { chainReadCount++; };
-    await assert.rejects(
-      () => d.preflight("rc4i00"),
-      (e) => e instanceof NonRetryableError && /governance|5 chars or fewer/i.test(e.message),
-    );
-    assert.strictEqual(chainReadCount, 0, "Reserved labels must short-circuit with zero chain reads");
+    const d = stubDotns({ checkOwnership: { owned: false, owner: null } });
+    const realCheckOwnership = d.checkOwnership;
+    d.checkOwnership = async (...a) => { chainReadCount++; return realCheckOwnership(...a); };
+    const r = await d.preflight("rc4i00");
+    assert.strictEqual(r.canProceed, false,
+      ">> FAIL: baseLength<=5-unregistered: an unregistered Reserved name must abort — bulletin-deploy cannot register it.");
+    assert.strictEqual(r.plannedAction, "abort");
+    assert.match(r.reason, /dotns register domain -n rc4i00 --governance/,
+      `>> FAIL: baseLength<=5-unregistered: reason must teach the dotns-cli whitelisted-registration route; got: ${r.reason}`);
+    assert.ok(chainReadCount > 0,
+      ">> FAIL: baseLength<=5-unregistered: preflight must read ownership before deciding (#1185) — a zero-chain-read short-circuit would mean the owner-proceeds path can never work.");
+  });
+
+  // This is the single most important new test for #1185: the owner of a
+  // governance-reserved name must be allowed to deploy to it. Without this,
+  // dim2.dot (a real on-chain name registered via registerReserved) would be
+  // permanently undeployable by its own owner.
+  test("baseLength <= 5 → Reserved BUT owned by this signer → canProceed:true, plannedAction:already-owned-by-us (#1185 core fix)", async () => {
+    const myAddr = "0xabcd000000000000000000000000000000000001";
+    const d = stubDotns({
+      evmAddress: myAddr,
+      checkOwnership: { owned: true, owner: myAddr },
+    });
+    const r = await d.preflight("rc4i00");
+    assert.strictEqual(r.canProceed, true,
+      ">> FAIL: baseLength<=5-owned: the owner of a Reserved-shaped name must be allowed to deploy to it — this is the whole point of #1185.");
+    assert.strictEqual(r.plannedAction, "already-owned-by-us",
+      `>> FAIL: baseLength<=5-owned: expected already-owned-by-us so the deploy skips register and goes straight to setContenthash; got ${r.plannedAction}`);
   });
 
   // PopRules.priceWithCheck applies no personhood check on the NoStatus branch,
@@ -4485,6 +4705,12 @@ describe("DotNS.preflight", () => {
     assert.ok(r.reason?.includes("requires ProofOfPersonhoodFull"), `reason should mention required status; got: ${r.reason}`);
     assert.ok(r.reason?.includes("NoStatus-compatible label"), `reason should suggest NoStatus names; got: ${r.reason}`);
     assert.ok(r.reason?.includes("github.com/paritytech/dotns"), `reason should include whitelist URL; got: ${r.reason}`);
+    // #1185 (exampleNoStatusLabel hardening): this exercises exampleNoStatusLabel
+    // through the REAL production path (_preflightInternal -> formatPopShortfallReason
+    // -> exampleNoStatusLabel("e2efull")) rather than a reimplementation. Its output
+    // must appear verbatim in the reason — "e2efull" (0 trailing digits, base 7) pads
+    // to "e2efullxx00.dot" via the shared noStatusFallbackBase convention.
+    assert.ok(r.reason?.includes("e2efullxx00.dot"), `>> FAIL: exampleNoStatusLabel real-path: reason should include the exact NoStatus-safe suggestion; got: ${r.reason}`);
   });
 
   test("preflight aborts instead of planning self-attestation when signer lacks required PoP", async () => {
@@ -4606,61 +4832,82 @@ describe("DotNS.preflight", () => {
     assert.strictEqual(r.plannedAction, "register");
   });
 
-  // Regression guards for issue #118, flipped in #1189.
+  // #1185 code review finding: the isBaseNameReserved non-fatal wrapper must
+  // NOT swallow every error uniformly — only a revert/empty-data response
+  // (the dry-run call completed) should default to "not reserved". A
+  // genuine RPC/connection failure (the read never completed) must still
+  // propagate, or preflight would fail-open under network noise.
+  test("isBaseNameReserved revert/empty-data defaults to not-reserved (non-fatal)", async () => {
+    const d = stubDotns({ userStatus: Lite });
+    d.contractCall = async (_contract, _abi, fn) => {
+      if (fn === "isBaseNameReserved") throw new Error("Contract reverted (flags=1) with data: 0x");
+      if (fn === "startingPrice") return 10n * 10n ** 18n;
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const r = await d.preflight("mainnet-long-label00");
+    assert.strictEqual(r.canProceed, true,
+      `>> FAIL: isBaseNameReserved-non-fatal: a revert on this advisory read must not block a registrable label; got reason: ${r.reason}`);
+    assert.strictEqual(r.isBaseNameReserved, false,
+      ">> FAIL: isBaseNameReserved-non-fatal: a revert must default to isBaseNameReserved:false");
+  });
+
+  test("isBaseNameReserved genuine RPC/connection failure propagates (fails preflight, does not silently default)", async () => {
+    const d = stubDotns({ userStatus: Lite });
+    d.contractCall = async (_contract, _abi, fn) => {
+      if (fn === "isBaseNameReserved") throw new Error("isBaseNameReserved timed out after 30000ms");
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    await assert.rejects(
+      () => d.preflight("mainnet-long-label00"),
+      /isBaseNameReserved timed out after 30000ms/,
+      ">> FAIL: isBaseNameReserved-propagates: a genuine RPC timeout must propagate, not be silently treated as 'not reserved'",
+    );
+  });
+
+  // Regression guards for issue #118 (flipped in #1189, relocated again in #1185).
   //
   // 1. Pre-#1189, classification ran on the *sanitized* label because
   //    validateDomainLabel rewrote the input before classifying it — the raw
   //    "e2e-177655616508" looked long and shapely, while the silently-rewritten
-  //    "e2e08" had a 3-char base and was Reserved. Post-#1189 there is no more
-  //    rewrite: validateDomainLabel refuses the RAW input directly (12 trailing
-  //    digits is not 0-or-2), so the doomed deploy is caught even earlier —
-  //    before classifyDotnsLabel's base-length check ever runs.
-  test("preflight refuses a bad-digit-count raw label outright, before classifyDotnsLabel ever runs (regression #118, flipped in #1189)", async () => {
+  //    "e2e08" had a 3-char base and was Reserved. #1189 fixed this by
+  //    THROWING on the raw input. #1185 keeps that "no silent rewrite" fix but
+  //    moves the enforcement from a throw at parse/validate time to an
+  //    ownership-aware abort in preflight (a NonRetryableError is no longer
+  //    how this is surfaced at all — preflight resolves with canProceed:false).
+  test("preflight aborts on a bad-digit-count raw label (unregistered), never silently rewriting it (regression #118, relocated in #1185)", async () => {
     const d = stubDotns({});
-    await assert.rejects(
-      () => d.preflight("e2e-177655616508"),
-      (e) => {
-        if (!(e instanceof NonRetryableError)) return false;
-        assert.match(e.message, /12 trailing digit/, `>> FAIL: preflight-1189-regression118: message should name the trailing-digit count, got: ${e.message}`);
-        assert.ok(e.message.includes("e2e-177655616508.dot"), `>> FAIL: preflight-1189-regression118: message should quote the operator's raw input (nothing is silently rewritten anymore), got: ${e.message}`);
-        return true;
-      },
-    );
+    const r = await d.preflight("e2e-177655616508");
+    assert.strictEqual(r.canProceed, false,
+      `>> FAIL: preflight-regression118: expected abort; got canProceed=${r.canProceed}`);
+    assert.match(r.reason, /12 trailing digit/, `>> FAIL: preflight-regression118: reason should name the trailing-digit count, got: ${r.reason}`);
+    assert.ok(r.reason.includes("e2e-177655616508.dot"), `>> FAIL: preflight-regression118: reason should quote the operator's raw input (nothing is silently rewritten anymore), got: ${r.reason}`);
   });
 
   // 2. Pre-#1189, the message had to surface a "sanitize trail" (raw input +
   //    silently-rewritten form) so the user wasn't confused by a label they
-  //    never typed. Post-#1189 there is nothing to reconcile — the message
-  //    talks about exactly the label the operator typed, which is strictly
-  //    more transparent than the old rewrite-then-explain flow.
-  test("Reserved/digit-count rejection reasons refer only to the operator's own input — no more silent-rewrite trail to reconcile (regression #118, flipped in #1189)", async () => {
+  //    never typed. Post-#1189/#1185 there is nothing to reconcile — the
+  //    message talks about exactly the label the operator typed.
+  test("Reserved/digit-count abort reasons refer only to the operator's own input — no silent-rewrite trail to reconcile (regression #118, relocated in #1185)", async () => {
     const d = stubDotns({});
-    await assert.rejects(
-      () => d.preflight("e2e-177655616508"),
-      (e) => {
-        if (!(e instanceof NonRetryableError)) return false;
-        assert.ok(e.message.includes("e2e-177655616508.dot"), `>> FAIL: preflight-1189-transparency: message should name the operator's own input, got: ${e.message}`);
-        assert.match(e.message, /Use a name you can register instead/, `>> FAIL: preflight-1189-transparency: message should offer alternatives, got: ${e.message}`);
-        return true;
-      },
-    );
+    const r = await d.preflight("e2e-177655616508");
+    assert.strictEqual(r.canProceed, false);
+    assert.ok(r.reason.includes("e2e-177655616508.dot"), `>> FAIL: preflight-transparency: reason should name the operator's own input, got: ${r.reason}`);
+    assert.match(r.reason, /use a name you can register/i, `>> FAIL: preflight-transparency: reason should offer alternatives, got: ${r.reason}`);
   });
 
-  test("Reserved rejection reason includes actionable, input-derived remediation (flipped in #1189)", async () => {
+  test("Reserved abort reason includes actionable, input-derived remediation AND the dotns-cli whitelisted route (relocated in #1185, was #1189)", async () => {
     // #1189: the classifyDotnsLabel message dropped the internal
     // 'rc<N>pool'/'rc<N>dir' jargon in favour of input-derived alternatives
-    // from buildLabelAlternatives.
+    // from buildLabelAlternatives. #1185: the message ALSO now teaches the
+    // dotns-cli whitelisted-registration route, since bulletin-deploy itself
+    // cannot register a governance-reserved name.
     const d = stubDotns({});
-    await assert.rejects(
-      () => d.preflight("rc4i00"),
-      (e) => {
-        if (!(e instanceof NonRetryableError)) return false;
-        assert.match(e.message, /base name/i, `>> FAIL: preflight-remediation: message should state the base-name constraint, got: ${e.message}`);
-        assert.ok(e.message.includes("rc4ixxxxx00.dot"), `>> FAIL: preflight-remediation: message should offer the NoStatus-safe alternative derived from the input, got: ${e.message}`);
-        assert.ok(!/rc<N>pool|rc<N>dir|role prefix/i.test(e.message), `>> FAIL: preflight-remediation: internal E2E naming jargon must not leak into the message, got: ${e.message}`);
-        return true;
-      },
-    );
+    const r = await d.preflight("rc4i00");
+    assert.strictEqual(r.canProceed, false);
+    assert.match(r.reason, /base name/i, `>> FAIL: preflight-remediation: reason should state the base-name constraint, got: ${r.reason}`);
+    assert.ok(r.reason.includes("rc4ixxxxx00.dot"), `>> FAIL: preflight-remediation: reason should offer the NoStatus-safe alternative derived from the input, got: ${r.reason}`);
+    assert.match(r.reason, /dotns register domain -n rc4i00 --governance/, `>> FAIL: preflight-remediation: reason should teach the dotns-cli whitelisted route, got: ${r.reason}`);
+    assert.ok(!/rc<N>pool|rc<N>dir|role prefix/i.test(r.reason), `>> FAIL: preflight-remediation: internal E2E naming jargon must not leak into the message, got: ${r.reason}`);
   });
 
   // -----------------------------------------------------------------
@@ -5029,6 +5276,39 @@ describe("assertSubdomainOwnerMatchesSigner (issue #562)", () => {
         "dotlake",
       )
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatSubdomainParentError — subdomain parent ownership message (#1185)
+//
+// Task 7 of the #1185 plan. Today an unregistered reserved parent yields
+// "parent game.dot is owned by no one, not by this signer" — awkward, and
+// silent about the only route forward. When the parent is non-registrable
+// per classifyRegistrability AND unowned, the message must additionally
+// teach the dotns-cli whitelisted-registration route.
+// ---------------------------------------------------------------------------
+describe("formatSubdomainParentError (#1185)", () => {
+  test("unregistered, non-registrable parent: names it and teaches the dotns-cli route", () => {
+    const m = formatSubdomainParentError("app.game.dot", "game", null, "0xaaa");
+    assert.match(m, /parent game\.dot is not registered/,
+      `>> FAIL: formatSubdomainParentError: must say the parent is not registered; got: ${m}`);
+    assert.match(m, /dotns register domain -n game --governance/,
+      `>> FAIL: formatSubdomainParentError: must give the exact dotns-cli command; got: ${m}`);
+  });
+
+  test("owned by another account: still names the owner, does NOT suggest registering", () => {
+    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa");
+    assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must name the owner; got: ${m}`);
+    assert.doesNotMatch(m, /dotns register domain/,
+      `>> FAIL: formatSubdomainParentError: an already-owned parent must NOT suggest registering it; got: ${m}`);
+  });
+
+  test("unregistered, registrable parent: unchanged pre-#1185 message (no dotns-cli line)", () => {
+    const m = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa");
+    assert.match(m, /parent mysitedemo00\.dot is owned by no one, not by this signer/,
+      `>> FAIL: formatSubdomainParentError: a registrable, unregistered parent must keep the original message; got: ${m}`);
+    assert.doesNotMatch(m, /dotns register domain/, `>> FAIL: formatSubdomainParentError: must not add unnecessary registration advice; got: ${m}`);
   });
 });
 
@@ -8150,53 +8430,60 @@ describe("parseDomainName", () => {
     assert.throws(() => parseDomainName("SUB.parent.dot"), /lowercase letters/);
   });
 
-  // #1189 FLIP: parseDomainName used to propagate sanitizeDomainLabel's
-  // rewrite, so a >2-trailing-digit top-level label silently resolved to a
-  // DIFFERENT registered name than what the operator typed. It now refuses
-  // instead of rewriting — the property "downstream checkOwnership/register
-  // never operate on a name the operator didn't type" now holds by refusal.
-  test("refuses top-level labels with >2 trailing digits instead of silently rewriting them (#1189)", () => {
-    try {
-      const result = parseDomainName("tick3t-tb-ui-improvements-v400.dot");
-      assert.fail(`>> FAIL: parseDomainName-refusal: "tick3t-tb-ui-improvements-v400.dot" returned ${JSON.stringify(result)} instead of throwing.`);
-    } catch (e) {
-      assert.ok(e instanceof NonRetryableError, `>> FAIL: parseDomainName-refusal: expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-      assert.match(e.message, /3 trailing digit/, `>> FAIL: parseDomainName-refusal: message should name the trailing-digit count, got: ${e.message}`);
-    }
+  // #1185 FLIP (was #1189): parseDomainName used to REFUSE (throw
+  // NonRetryableError) for a >2-trailing-digit top-level label — #1189's fix
+  // for the earlier silent-rewrite bug (sanitizeDomainLabel used to
+  // propagate through parseDomainName and resolve to a DIFFERENT registered
+  // name than what the operator typed). #1185 relocates that refusal one
+  // more step: parseDomainName now ALWAYS succeeds (never rewrites, never
+  // refuses on PopRules grounds) and classifyRegistrability/preflight decide
+  // registrability with ownership context. The silent-rewrite property this
+  // test protects — "the label parseDomainName returns is exactly the label
+  // the operator typed, never a different one" — still holds; it's just
+  // "doesNotThrow + identity" now, with the separate non-registrable-ness
+  // caught by classifyRegistrability.
+  test("top-level labels with >2 trailing digits: parseDomainName returns them unchanged; classifyRegistrability still flags them (#1185, was #1189)", () => {
+    const input = "tick3t-tb-ui-improvements-v400.dot";
+    const result = parseDomainName(input);
+    assert.strictEqual(result.fullName, input, `>> FAIL: parseDomainName-relocated: "${input}" must survive parse intact (no rewrite, no refusal) — the property moved to preflight.`);
+    const r = classifyRegistrability(result.label);
+    assert.strictEqual(r.registrable, false, `>> FAIL: parseDomainName-relocated: "${input}": classifyRegistrability should still flag it`);
+    assert.strictEqual(r.rule, "trailing-digits", `>> FAIL: parseDomainName-relocated: "${input}": expected rule trailing-digits, got ${r.rule}`);
   });
 
-  // #1189 FLIP: the parent label (a registered name) used to be silently
-  // rewritten the same way; the sublabel (a subnode leaf, no digit limit) is
-  // correctly unaffected either way.
-  test("refuses subdomain parent labels with >2 trailing digits instead of silently rewriting them (#1189)", () => {
-    try {
-      const result = parseDomainName("my-sub00.parent-app999.dot");
-      assert.fail(`>> FAIL: parseDomainName-refusal: "my-sub00.parent-app999.dot" returned ${JSON.stringify(result)} instead of throwing.`);
-    } catch (e) {
-      assert.ok(e instanceof NonRetryableError, `>> FAIL: parseDomainName-refusal: expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-      assert.match(e.message, /parent-app999\.dot/, `>> FAIL: parseDomainName-refusal: message should name the offending parent label, got: ${e.message}`);
-      assert.match(e.message, /3 trailing digit/, `>> FAIL: parseDomainName-refusal: message should name the trailing-digit count, got: ${e.message}`);
-    }
+  // #1185 FLIP (was #1189): the parent label (a registered name) used to be
+  // refused the same way the top-level case was; the sublabel (a subnode
+  // leaf, no digit limit) is correctly unaffected either way, both before
+  // and after #1185.
+  test("subdomain parent labels with >2 trailing digits: parseDomainName returns them unchanged; classifyRegistrability still flags the parent (#1185, was #1189)", () => {
+    const input = "my-sub00.parent-app999.dot";
+    const result = parseDomainName(input);
+    assert.strictEqual(result.fullName, input, `>> FAIL: parseDomainName-relocated: "${input}" must survive parse intact.`);
+    const r = classifyRegistrability(result.parentLabel);
+    assert.strictEqual(r.registrable, false, `>> FAIL: parseDomainName-relocated: parent "${result.parentLabel}": classifyRegistrability should flag it`);
+    assert.strictEqual(r.rule, "trailing-digits", `>> FAIL: parseDomainName-relocated: parent "${result.parentLabel}": expected rule trailing-digits, got ${r.rule}`);
   });
 
-  // Issue #1189's own repro, asserted directly at the entry point: these two
-  // labels used to silently deploy to a DIFFERENT domain than what was typed
+  // Issue #1189's own repro, relocated for #1185: these two labels used to
+  // silently deploy to a DIFFERENT domain than what was typed
   // (my-app-1.dot -> my-app.dot; mysite123.dot -> mysite23.dot), with only a
-  // console.log as the sole signal. They must now throw, and must NOT return
-  // the old rewritten names.
-  test("#1189 repro: parseDomainName throws for the exact silent-retarget inputs and never returns the old rewritten names", () => {
+  // console.log as the sole signal. #1189 fixed that by throwing; #1185 keeps
+  // the "never returns a different name" guarantee but via identity instead
+  // of a throw — parseDomainName now always returns the label verbatim, and
+  // classifyRegistrability (not parseDomainName) is the thing that would
+  // have refused the old rewrite targets.
+  test("#1185 (was #1189 repro): parseDomainName returns the exact input for the former silent-retarget cases, never the old rewritten names", () => {
     for (const [input, oldRewrittenFullName] of [
       ["my-app-1.dot", "my-app.dot"],
       ["mysite123.dot", "mysite23.dot"],
     ]) {
-      try {
-        const result = parseDomainName(input);
-        assert.fail(`>> FAIL: parseDomainName-1189-repro: "${input}" returned ${JSON.stringify(result)} instead of throwing — the #1189 silent-retarget bug has regressed.`);
-      } catch (e) {
-        assert.ok(e instanceof NonRetryableError, `>> FAIL: parseDomainName-1189-repro: "${input}": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-        assert.notStrictEqual(e.fullName, oldRewrittenFullName, `>> FAIL: parseDomainName-1189-repro: "${input}" must not resolve to the old silently-rewritten name "${oldRewrittenFullName}".`);
-        assert.ok(!e.message.includes(`Deploys to ${oldRewrittenFullName}`), `>> FAIL: parseDomainName-1189-repro: "${input}" error message must not imply the old rewritten target, got: ${e.message}`);
-      }
+      const result = parseDomainName(input);
+      assert.strictEqual(result.fullName, input,
+        `>> FAIL: parseDomainName-1185-repro: "${input}" must round-trip to itself exactly.`);
+      assert.notStrictEqual(result.fullName, oldRewrittenFullName,
+        `>> FAIL: parseDomainName-1185-repro: "${input}" must not resolve to the old silently-rewritten name "${oldRewrittenFullName}".`);
+      assert.strictEqual(classifyRegistrability(result.label).registrable, false,
+        `>> FAIL: parseDomainName-1185-repro: "${input}": classifyRegistrability should flag this label as non-registrable`);
     }
   });
 
@@ -8212,26 +8499,27 @@ describe("parseDomainName", () => {
     assert.strictEqual(r.sublabel, "env99999", ">> FAIL: 5-digit sublabel must be preserved");
   });
 
-  // #1189 FLIP: the parent is still fully validated (not exempt the way the
-  // sublabel is) — it's a registered name. Pre-#1189 that meant "still
-  // sanitised" (staging999 -> staging99, silently). Now it means "still
-  // refused": the sublabel's digit-limit exemption does NOT bleed onto the
-  // parent, demonstrated by the parent's bad digit count (3) throwing even
-  // though the sibling sublabel test ("app", 0 digits) throws for neither.
-  test("parent is still fully validated (refused, not exempt) when sublabel skip is active (no bleed) (#656, flipped in #1189)", () => {
-    try {
-      const r = parseDomainName("app.staging999.dot");
-      assert.fail(`>> FAIL: parseDomainName-no-bleed: "app.staging999.dot" returned ${JSON.stringify(r)} instead of throwing — the sublabel's digit-limit exemption must not bleed onto the parent.`);
-    } catch (e) {
-      assert.ok(e instanceof NonRetryableError, `>> FAIL: parseDomainName-no-bleed: expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
-      assert.match(e.message, /staging999\.dot/, `>> FAIL: parseDomainName-no-bleed: message should name the offending PARENT label (not the exempt sublabel), got: ${e.message}`);
-      assert.match(e.message, /3 trailing digit/, `>> FAIL: parseDomainName-no-bleed: message should name the trailing-digit count, got: ${e.message}`);
-    }
-    // Sanity: a compliant parent alongside the same sublabel shape does NOT throw.
-    assert.doesNotThrow(
-      () => parseDomainName("app.staging00.dot"),
-      ">> FAIL: parseDomainName-no-bleed: a compliant parent (0/2 trailing digits) must not be refused.",
-    );
+  // #1185 FLIP (was #656, flipped in #1189): the parent is still a
+  // registered name — classifyRegistrability applies to it the same way it
+  // would to a top-level label; the sublabel's digit-limit exemption (no
+  // PopRules constraint at all — subnode leaves never had one) does NOT
+  // bleed onto the parent. Pre-#1189: silently sanitised. #1189: refused at
+  // parse time. #1185: parse always succeeds; classifyRegistrability still
+  // flags the parent specifically (not the sibling sublabel, which is never
+  // subject to any PopRules rule).
+  test("parent is still classified independently (no bleed) when sublabel skip is active (#656, relocated in #1185)", () => {
+    const r = parseDomainName("app.staging999.dot");
+    assert.strictEqual(r.fullName, "app.staging999.dot",
+      ">> FAIL: parseDomainName-no-bleed: parse must succeed unchanged post-#1185.");
+    const parentRegistrability = classifyRegistrability(r.parentLabel);
+    assert.strictEqual(parentRegistrability.registrable, false,
+      ">> FAIL: parseDomainName-no-bleed: classifyRegistrability must flag the PARENT (not exempt like the sublabel).");
+    assert.strictEqual(parentRegistrability.rule, "trailing-digits",
+      `>> FAIL: parseDomainName-no-bleed: expected rule trailing-digits for the parent, got ${parentRegistrability.rule}`);
+    // Sanity: a compliant parent alongside the same sublabel shape is registrable.
+    const compliant = parseDomainName("app.staging00.dot");
+    assert.strictEqual(classifyRegistrability(compliant.parentLabel).registrable, true,
+      ">> FAIL: parseDomainName-no-bleed: a compliant parent (0/2 trailing digits) must be registrable.");
   });
 
   test("sublabel with hyphen+digits is NOT rejected (#656)", () => {

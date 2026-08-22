@@ -6,7 +6,7 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish } from "../dist/deploy.js";
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish, resolveEffectiveMnemonic } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
@@ -77,6 +77,17 @@ if (flags.publish && flags.unpublish) {
   process.exit(1);
 }
 
+// The mnemonic actually used to sign — --mnemonic flag > MNEMONIC env var >
+// DOTNS_MNEMONIC env var. Used everywhere deploy/publish/unpublish need a
+// signer identity (existence guards below intentionally keep checking
+// flags.mnemonic / process.env.MNEMONIC directly — only the VALUE forwarded
+// to options.mnemonic changes here).
+const effectiveMnemonic = resolveEffectiveMnemonic({
+  flagMnemonic: flags.mnemonic,
+  envMnemonic: process.env.MNEMONIC,
+  envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
+});
+
 // --environment-file: propagate to the env var so all internal loadEnvironments()
 // call sites (deploy.ts, manifest/publish.ts, personhood) honor the override.
 if (flags.environmentFile) {
@@ -118,7 +129,7 @@ if (flags.unpublish) {
   }
   try {
     const result = await unpublish(domain, {
-      mnemonic: flags.mnemonic,
+      mnemonic: effectiveMnemonic,
       derivationPath: flags.derivationPath,
       rpc: flags.rpc,
       env: flags.env,
@@ -445,7 +456,7 @@ try {
     rpc: effectiveRpc,
     repo: process.env.GITHUB_REPOSITORY,
     branch: process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME,
-    signerMode: flags.mnemonic ? "direct" : "pool",
+    signerMode: effectiveMnemonic ? "direct" : "pool",
     deployTag,
     cliFlags: buildCliFlagsSummary(flags),
     ci,
@@ -473,7 +484,7 @@ try {
   }
 
   const result = await deploy(buildDir, domain, {
-    mnemonic: flags.mnemonic,
+    mnemonic: effectiveMnemonic,
     derivationPath: flags.derivationPath,
     suri: flags.suri,
     rpc: flags.rpc,
@@ -556,7 +567,7 @@ try {
           buildDirCid: { absPath: buildDirAbs, cid: result.cid },
           env: flags.env,
           rpc: flags.rpc,
-          mnemonic: flags.mnemonic,
+          mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,
         });
       } catch (err) {

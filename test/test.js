@@ -19943,7 +19943,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -20205,6 +20205,43 @@ describe("chooseSignerInput Layer-3 isolation (#19)", () => {
     const choice = chooseSignerInput({ mnemonic: "bottom drive obey lake curtain smoke basket hold race lonely fit walk", suri: undefined, hasInjectedSigner: false, hasSession: false });
     assert.strictEqual(choice, "mnemonic",
       ">> FAIL: chooseSignerInput Layer-3: mnemonic must always choose mnemonic path");
+  });
+});
+
+describe("resolveEffectiveMnemonic env/flag precedence (#1107)", () => {
+  const MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+  const FLAG_MNEMONIC = "vessel ladder alter error federal sibling chat ability sun glass valve picture";
+  const DOTNS_MNEMONIC = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+  test("MNEMONIC env var present, no --mnemonic flag → returns the env mnemonic, not undefined", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: MNEMONIC, envDotnsMnemonic: undefined });
+    assert.strictEqual(resolved, MNEMONIC,
+      ">> FAIL: resolveEffectiveMnemonic: MNEMONIC env var must reach options.mnemonic when no --mnemonic flag is given (#1107 — previously returned undefined, so a persisted session silently won instead)");
+  });
+
+  test("DOTNS_MNEMONIC env var present, no flag and no MNEMONIC → returns the DOTNS_MNEMONIC fallback", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: undefined, envDotnsMnemonic: DOTNS_MNEMONIC });
+    assert.strictEqual(resolved, DOTNS_MNEMONIC,
+      ">> FAIL: resolveEffectiveMnemonic: DOTNS_MNEMONIC env var must be honored as a fallback when MNEMONIC is unset");
+  });
+
+  test("--mnemonic flag present → flag wins over both env vars", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: FLAG_MNEMONIC, envMnemonic: MNEMONIC, envDotnsMnemonic: DOTNS_MNEMONIC });
+    assert.strictEqual(resolved, FLAG_MNEMONIC,
+      ">> FAIL: resolveEffectiveMnemonic: an explicit --mnemonic flag must take precedence over MNEMONIC/DOTNS_MNEMONIC env vars");
+  });
+
+  test("neither flag nor env vars set → returns undefined (pool/session path unaffected)", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: undefined, envDotnsMnemonic: undefined });
+    assert.strictEqual(resolved, undefined,
+      ">> FAIL: resolveEffectiveMnemonic: with no flag and no env vars the result must stay undefined so pool/session selection is untouched");
+  });
+
+  test("env-resolved mnemonic + persisted session → chooseSignerInput still picks 'mnemonic', not 'resolve' (#1107 end-to-end)", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: MNEMONIC, envDotnsMnemonic: undefined });
+    const choice = chooseSignerInput({ mnemonic: resolved, suri: undefined, hasInjectedSigner: false, hasSession: true });
+    assert.strictEqual(choice, "mnemonic",
+      ">> FAIL: resolveEffectiveMnemonic + chooseSignerInput: an env-only MNEMONIC must still win over a persisted session (#1107 — the bin previously forwarded undefined here, so hasSession made this 'resolve' and the deploy silently used the signed-in session instead)");
   });
 });
 

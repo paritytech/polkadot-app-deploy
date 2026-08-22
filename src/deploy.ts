@@ -465,6 +465,24 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
   return { client, unsafeApi, signer, ss58 };
 }
 
+/**
+ * Resolve the mnemonic the CLI should act with, in precedence order:
+ * `--mnemonic` flag > `MNEMONIC` env var > `DOTNS_MNEMONIC` env var.
+ *
+ * Exists so the bin's flag/env resolution is unit-testable and so the two
+ * env vars are forwarded consistently: previously the bin only forwarded
+ * `flags.mnemonic` into `options.mnemonic`, so an env-only mnemonic never
+ * reached `chooseSignerInput` and a persisted session silently won instead —
+ * even though `chooseSignerInput` already prefers mnemonic first.
+ */
+export function resolveEffectiveMnemonic(opts: {
+  flagMnemonic: string | undefined;
+  envMnemonic: string | undefined;
+  envDotnsMnemonic: string | undefined;
+}): string | undefined {
+  return opts.flagMnemonic ?? opts.envMnemonic ?? opts.envDotnsMnemonic;
+}
+
 /** storageSigner > signer > mnemonic > pool precedence for storage routing. Exported for unit testing. */
 export function __selectStorageProviderModeForTest(
   options: Pick<DeployOptions, "storageSigner" | "storageSignerAddress" | "signer" | "signerAddress" | "mnemonic">,
@@ -2860,6 +2878,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
     hasInjectedSigner: !!(options.signer && options.signerAddress),
     hasSession,
   });
+  // An explicit mnemonic (from --mnemonic OR the MNEMONIC/DOTNS_MNEMONIC env
+  // vars) always wins over a persisted login session — chooseSignerInput
+  // already encodes that precedence. Surface it so the override is visible
+  // instead of silent: without this, a signed-in user setting MNEMONIC for a
+  // one-off deploy would see no indication their session was bypassed.
+  if (signerChoice === "mnemonic" && hasSession) {
+    console.error("Using the provided mnemonic; the persisted login session will be ignored for this deploy.");
+  }
   // userSession is set when the resolve path finds a session — used below for
   // slot-key allocation which is available to any caller, not just the resolve path.
   // Typed as any to avoid importing UserSession from @parity/product-sdk-terminal here.

@@ -44,7 +44,11 @@ if (process.env.DOTNS_ENV && !process.env.PAD_ENV) {
   console.warn("DOTNS_ENV is deprecated; use PAD_ENV. Will be removed in a future release.");
 }
 const LABEL = process.env.LABEL ?? (PAD_ENV === "paseo-next-v2" ? "e2epoolns01" : "e2epool");
-const OWNED_LABEL = process.env.OWNED_LABEL ?? (PAD_ENV === "paseo-next-v2" ? "e2eownedns02" : "e2eowned");
+// e2eownedns03, not e2eownedns02: verified live 2026-08-22 via checkOwnership
+// that e2eownedns02.paseo was squatted by a third party (0x237a2b18…) after
+// the Asset Hub re-genesis — e2eownedns03.paseo is the one actually owned by
+// Bob (0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01). See test/e2e.test.js's S3 block.
+const OWNED_LABEL = process.env.OWNED_LABEL ?? (PAD_ENV === "paseo-next-v2" ? "e2eownedns03" : "e2eowned");
 const DEPLOY_TAG = process.env.DEPLOY_TAG ?? "e2e-local-s7";
 const RPC = process.env.BULLETIN_RPC ?? "wss://paseo-bulletin-rpc.polkadot.io";
 const MNEMONIC = process.env.MNEMONIC ?? process.env.DOTNS_MNEMONIC;

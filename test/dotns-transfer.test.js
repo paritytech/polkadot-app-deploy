@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability } from "../dist/dotns.js";
+import { namehash } from "viem";
 
 test("weiToNative: zero stays zero", () => {
   assert.equal(weiToNative(0n, 100000000n), 0n);
@@ -60,25 +61,35 @@ test("transferName: transfers when worker owns it", async () => {
   assert.equal(r.feeWei, 10n * 10n ** 18n);
 });
 
-// transferSubname touches only contractCallNullable("owner", node) — three
-// times: parent owner, current subname owner, post-tx re-read — plus
-// contractTransaction(setSubnodeOwner). The node arg is ignored here; we drive
-// results by call order.
-function stubSubname({ parentOwner, evmAddress, currentSubOwner, afterOwner, txHash = "0xsub" }) {
+// transferSubname touches contractCallNullable("owner", [node]) three times —
+// parent owner, current subname owner, post-tx re-read — plus
+// contractTransaction(setSubnodeOwner). Every call's node/args is captured
+// (d.__nullableCalls / d.__txCall) so tests can assert the ACTUAL node
+// derivation, not just call order — the #paseo-tld follow-up fixed a real bug
+// where this method hardcoded `.dot` in all three node computations, and the
+// original version of this stub was blind to it by construction (it never
+// looked at the `node` argument at all).
+function stubSubname({ parentOwner, evmAddress, currentSubOwner, afterOwner, txHash = "0xsub", tld = "dot" }) {
   const d = Object.create(DotNS.prototype);
   d.connected = true;
   d.evmAddress = evmAddress;
   d._contracts = { DOTNS_REGISTRY: "0xRegistry" };
+  d._tld = tld;
   d.ensureConnected = () => {};
   let ownerCalls = 0;
-  d.contractCallNullable = async (_addr, _abi, fn) => {
+  d.__nullableCalls = [];
+  d.contractCallNullable = async (_addr, _abi, fn, args) => {
     if (fn !== "owner") throw new Error("unexpected call " + fn);
+    d.__nullableCalls.push({ fn, node: args?.[0] });
     ownerCalls += 1;
     if (ownerCalls === 1) return parentOwner;
     if (ownerCalls === 2) return currentSubOwner;
     return afterOwner;
   };
-  d.contractTransaction = async () => ({ kind: "hash", hash: txHash });
+  d.contractTransaction = async (...args) => {
+    d.__txCall = args;
+    return { kind: "hash", hash: txHash };
+  };
   return d;
 }
 
@@ -108,6 +119,51 @@ test("transferSubname: reassigns via setSubnodeOwner when the signer owns the pa
 test("transferSubname: throws when the reassignment does not land", async () => {
   const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xOLD", afterOwner: "0xOLD" });
   await assert.rejects(() => d.transferSubname("app", "foo", "0xRECIP"), /did not land/i);
+});
+
+// #paseo-tld follow-up: transferSubname was added (twin-only, PR #151) AFTER
+// the per-env DotNS TLD port landed upstream, so it hardcoded `.dot` in three
+// places (fullName, parentNode, subnode) — exactly the derivation-site bug
+// class fixed elsewhere in src/dotns.ts (see computeDomainTokenId's doc
+// comment). The tests above never caught it: stubSubname ignored the `node`
+// argument entirely and drove results purely by call ORDER, so a wrong node
+// value could never fail them. This test asserts the ACTUAL node values
+// against an INDEPENDENTLY computed namehash, under a NON-default TLD, so a
+// hardcoded ".dot" reintroduction fails immediately instead of silently
+// passing.
+test("transferSubname: node derivation — parentNode/subnode/setSubnodeOwner all use this._tld, not a hardcoded .dot", async () => {
+  const d = stubSubname({
+    parentOwner: "0xOWNER",
+    evmAddress: "0xOWNER",
+    currentSubOwner: "0xOLD",
+    afterOwner: "0xRECIP",
+    tld: "paseo",
+  });
+  const r = await d.transferSubname("app", "foo", "0xRECIP");
+  assert.equal(r.status, "ok");
+
+  // Independently computed — NOT derived from any dotns.ts helper — so this
+  // can't agree with a wrong implementation by construction.
+  const expectedParentNode = namehash("foo.paseo");
+  const expectedSubnode = namehash("app.foo.paseo");
+  const wrongDotParentNode = namehash("foo.dot");
+  const wrongDotSubnode = namehash("app.foo.dot");
+
+  assert.equal(d.__nullableCalls.length, 3,
+    ">> FAIL: transferSubname node derivation: expected exactly 3 owner() reads (parent, current sub, post-tx)");
+  assert.equal(d.__nullableCalls[0].node, expectedParentNode,
+    `>> FAIL: transferSubname parent-owner check must query namehash("foo.paseo"), not namehash("foo.dot") (${wrongDotParentNode}); got ${d.__nullableCalls[0].node}`);
+  assert.equal(d.__nullableCalls[1].node, expectedSubnode,
+    `>> FAIL: transferSubname current-subname-owner check must query namehash("app.foo.paseo"), not namehash("app.foo.dot") (${wrongDotSubnode}); got ${d.__nullableCalls[1].node}`);
+  assert.equal(d.__nullableCalls[2].node, expectedSubnode,
+    `>> FAIL: transferSubname post-tx re-read must query namehash("app.foo.paseo"); got ${d.__nullableCalls[2].node}`);
+
+  // contractTransaction(contractAddress, value, abi, functionName, args, statusCallback)
+  assert.ok(d.__txCall, ">> FAIL: transferSubname must call contractTransaction");
+  assert.equal(d.__txCall[3], "setSubnodeOwner");
+  const [subnodeRecord] = d.__txCall[4];
+  assert.equal(subnodeRecord.parentNode, expectedParentNode,
+    ">> FAIL: transferSubname's setSubnodeOwner call must pass the paseo-tld parentNode, not a hardcoded .dot one");
 });
 
 test("feeFloorFor: adds the transfer fee to the register floor", () => {

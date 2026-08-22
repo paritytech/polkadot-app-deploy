@@ -2957,15 +2957,21 @@ export class DotNS {
     return { status: "ok", txHash: txRes.kind === TX_KIND_HASH ? txRes.hash : undefined, feeWei };
   }
 
-  /** Reassign an existing subname (e.g. `app.foo.dot`) to `toH160`.
+  /** Reassign an existing subname (e.g. `app.foo.<tld>`) to `toH160`.
    *
    *  Subnames are NOT ERC-721 tokens, so they cannot go through
    *  transferName/transferFrom — the registrar has no token for them. Instead
    *  the *parent-domain* owner reassigns a subname via the registry's
    *  setSubnodeOwner (the same call deploy uses to create it). Authorisation is
    *  on parent ownership, not on the subname's current owner, so the connected
-   *  signer must own `${parentLabel}.dot`. Idempotent: a no-op when the
-   *  recipient already owns it. */
+   *  signer must own `${parentLabel}.${this._tld}`. Idempotent: a no-op when
+   *  the recipient already owns it.
+   *
+   *  #paseo-tld follow-up: this method was added (PR #151) AFTER bulletin's
+   *  #1240 per-env-TLD port ran, so it hardcoded `.dot` in three places —
+   *  exactly the derivation-site bug class #1240/#1244 fixed elsewhere in this
+   *  file (see computeDomainTokenId's doc comment). Fixed here the same way:
+   *  derive every node from `this._tld`, resolved by connect(), not a literal. */
   async transferSubname(
     sublabel: string,
     parentLabel: string,
@@ -2973,8 +2979,8 @@ export class DotNS {
     statusCallback: (status: string) => void = () => {},
   ): Promise<{ status: "ok" | "skipped-already-owned"; txHash?: string }> {
     this.ensureConnected();
-    const fullName = `${sublabel}.${parentLabel}.dot`;
-    const parentNode = namehash(`${parentLabel}.dot`);
+    const fullName = `${sublabel}.${parentLabel}.${this._tld}`;
+    const parentNode = namehash(`${parentLabel}.${this._tld}`);
     const subnode = namehash(fullName);
 
     // Only the parent owner may reassign a subname. Check parent ownership up
@@ -2984,12 +2990,12 @@ export class DotNS {
       30000, "owner",
     )) as string | null;
     if (!parentOwner || parentOwner === zeroAddress) {
-      throw new Error(`Cannot transfer ${fullName}: parent ${parentLabel}.dot is not registered.`);
+      throw new Error(`Cannot transfer ${fullName}: parent ${parentLabel}.${this._tld} is not registered.`);
     }
     if (parentOwner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
       throw new Error(
         `Cannot transfer ${fullName}: it is a subname, which only the owner of the parent ` +
-        `${parentLabel}.dot can reassign (subnames are not transferable tokens). Parent is owned ` +
+        `${parentLabel}.${this._tld} can reassign (subnames are not transferable tokens). Parent is owned ` +
         `by ${parentOwner}, but the signer is ${this.evmAddress}. Sign as the parent owner ` +
         `(e.g. pass its --mnemonic).`,
       );

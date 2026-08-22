@@ -117,3 +117,24 @@ test("guard: src/dotns.ts must not hardcode a namehash-of-a-TLD constant reachab
     `>> FAIL: guard hardcoded TLD node: ${JSON.stringify(offenders)} — a namehash-of-a-TLD constant (like the old DOT_NODE) must never be hardcoded; derive it from the active tld via namehash(tld) at call time instead`,
   );
 });
+
+// Broader guard (twin-specific, #paseo-tld sweep): no *node-derivation* call
+// site in src/dotns.ts may embed a literal ".dot" suffix inside a namehash()
+// template — every one of the nine sites #1240 converted, PLUS
+// DotNS.transferSubname (added by this twin's own PR #151, after the
+// upstream #1240 port ran, and fixed separately) must interpolate the
+// resolved tld instead. A regex for one syntax (namehash(`...dot`)) is
+// exactly the kind of narrow sweep that missed computeDomainTokenId
+// originally — this checks the namehash() call sites directly, independent
+// of that guard.
+test("guard: no namehash(...) call in src/dotns.ts embeds a literal .dot suffix", () => {
+  const srcPath = fileURLToPath(new URL("../src/dotns.ts", import.meta.url));
+  const src = readFileSync(srcPath, "utf8");
+  const badNamehashRe = /namehash\(`[^`]*\.dot`\)/g;
+  const offenders = [...src.matchAll(badNamehashRe)].map((m) => m[0]);
+  assert.deepEqual(
+    offenders,
+    [],
+    `>> FAIL: guard hardcoded .dot in namehash(): ${JSON.stringify(offenders)} — every namehash() call in a node-derivation path must interpolate the resolved tld (e.g. \${this._tld}), never a literal ".dot"`,
+  );
+});

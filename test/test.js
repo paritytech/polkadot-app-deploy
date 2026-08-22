@@ -13748,7 +13748,10 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     const s7Script = fs.readFileSync("scripts/e2e-sigint-scenario.mjs", "utf-8");
     assert.match(s7Script, /const envFlag = PAD_ENV \? \["--env", PAD_ENV\] : \[\]/, "S7 harness must forward PAD_ENV to both deploy invocations");
     assert.match(s7Script, /const LABEL = process\.env\.LABEL \?\? \(PAD_ENV === "paseo-next-v2" \? "e2epoolns01" : "e2epool"\)/, "S7 harness must default to the v2 NoStatus pool label");
-    assert.match(s7Script, /OWNED_LABEL[\s\S]{0,120}e2eownedns02/, "S7 harness must use the v2 Bob-owned fixture for the relaunch warning check");
+    // e2eownedns03, not e2eownedns02: the Asset Hub re-genesis emptied the
+    // .paseo namespace and a third party squatted e2eownedns02.paseo before
+    // this fixture was re-provisioned (verified live via checkOwnership).
+    assert.match(s7Script, /OWNED_LABEL[\s\S]{0,120}e2eownedns03/, "S7 harness must use the v2 Bob-owned fixture for the relaunch warning check");
     // #paseo-tld (#1248): args1/args2 must pass BARE labels — the CLI's
     // wrong-TLD guard rejects a hardcoded ".dot" suffix on a ".paseo" env, so
     // hardcoding either suffix here would break exactly one environment.

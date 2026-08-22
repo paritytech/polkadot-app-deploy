@@ -17,7 +17,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -16705,7 +16705,12 @@ describe("signAndSubmitExtrinsic silent-watcher branch wiring (#990)", () => {
     const src = fs.readFileSync("src/dotns.ts", "utf-8");
     const idx = src.indexOf("async signAndSubmitWithRetry(");
     assert.ok(idx >= 0, ">> FAIL: #990 wiring: could not locate signAndSubmitWithRetry in src/dotns.ts");
-    const body = src.slice(idx, idx + 2000);
+    // Window sized to cover the method's catch region (both calls live well
+    // before the next method decl). Widened from 2000→4000 for #1158: the
+    // nonce-contention branch now sits between the two calls — still BEFORE
+    // the general retry classification, which is the invariant this test
+    // guards; the old fixed window just no longer reached it.
+    const body = src.slice(idx, idx + 4000);
     const fastFailIdx = body.indexOf("classifyWatcherSilentFastFail(");
     const retryDecisionIdx = body.indexOf("classifyTxRetryDecision(");
     assert.ok(fastFailIdx >= 0, ">> FAIL: #990 wiring: signAndSubmitWithRetry must call classifyWatcherSilentFastFail");
@@ -19034,6 +19039,95 @@ describe("DotNS tx retry backoff (nonce burst)", () => {
   test("REVIVE_ADDRESS_ATTEMPTS is a small positive integer (>1 so a transient blip retries)", () => {
     assert.ok(Number.isInteger(REVIVE_ADDRESS_ATTEMPTS) && REVIVE_ADDRESS_ATTEMPTS >= 2 && REVIVE_ADDRESS_ATTEMPTS <= 5,
       `>> FAIL: revive-attempts: expected 2..5, got ${REVIVE_ADDRESS_ATTEMPTS}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1158: nonce-contention re-acquisition on the shared zero-config signer.
+// Concurrent deploys share ONE Asset Hub nonce space (the bare default key, no
+// derivation), so a sibling can steal the slot our tx was built against. The
+// old code re-used the STALE expectedNonce on every generic retry and thrashed
+// until an outer CI retry wrapper's timeout hid it. reacquireNonceOnContention
+// re-fetches the LIVE nonce, backs off with jitter, and bounds attempts so a
+// genuinely unlandable write fails fast with actionable guidance.
+describe("nonce contention re-acquisition (#1158)", () => {
+  test("nonceContentionBackoffMs: jittered, grows with attempt, capped ~2s, never negative", () => {
+    assert.equal(nonceContentionBackoffMs(1, () => 0.5), 250,
+      ">> FAIL: nonce-backoff: attempt 1 with zero jitter must be the 250ms base");
+    assert.ok(nonceContentionBackoffMs(3, () => 0.5) > nonceContentionBackoffMs(1, () => 0.5),
+      ">> FAIL: nonce-backoff: must grow with attempt");
+    assert.ok(nonceContentionBackoffMs(20, () => 1) <= 2000 + 250,
+      ">> FAIL: nonce-backoff: base must cap at ~2s (plus at most one base unit of jitter)");
+    assert.ok(nonceContentionBackoffMs(1, () => 0) >= 0,
+      ">> FAIL: nonce-backoff: full negative jitter must clamp to >= 0");
+  });
+
+  test("isNonceContentionAmbiguous: matches only the nonce-advance-fallback message", () => {
+    assert.equal(isNonceContentionAmbiguous(new Error("nonce-advance fallback: nonce moved past 22286 but expected on-chain effect not observable")), true,
+      ">> FAIL: nonce-ambiguous: must match the nonce-advance-fallback message");
+    assert.equal(isNonceContentionAmbiguous(new Error("websocket disconnected")), false,
+      ">> FAIL: nonce-ambiguous: must not match unrelated errors (they take the generic retry path)");
+    assert.equal(isNonceContentionAmbiguous("nonce-advance fallback: x"), true,
+      ">> FAIL: nonce-ambiguous: must accept string errors too");
+  });
+
+  test("reacquireNonceOnContention: re-fetches the live nonce and resolves when a later resubmit lands", async () => {
+    const liveNonces = [8300, 8301, 8302];
+    let fetched = 0, submits = 0;
+    const fetchNonce = async () => liveNonces[Math.min(fetched++, liveNonces.length - 1)];
+    const resubmit = async () => {
+      submits++;
+      if (submits < 3) throw new Error("nonce-advance fallback: sibling stole the slot");
+      return { kind: TX_KIND_BEST_BLOCK };
+    };
+    const res = await reacquireNonceOnContention(
+      resubmit,
+      { rpcs: ["wss://x"], senderSS58: "5DfhGyQ", expectedNonce: 8299 },
+      "setResolver",
+      { fetchNonce, sleep: async () => {}, backoffMs: () => 0, maxAttempts: 5 },
+    );
+    assert.equal(res.kind, TX_KIND_BEST_BLOCK,
+      ">> FAIL: nonce-reacquire: must return the successful resubmit's resolution");
+    assert.equal(submits, 3,
+      ">> FAIL: nonce-reacquire: must keep resubmitting (bounded) until one lands");
+    assert.ok(fetched >= 2,
+      ">> FAIL: nonce-reacquire: must re-fetch the LIVE nonce between attempts, not reuse the stale expectedNonce");
+  });
+
+  test("reacquireNonceOnContention: fails fast with actionable guidance after maxAttempts (no infinite loop)", async () => {
+    let submits = 0;
+    const resubmit = async () => { submits++; throw new Error("nonce-advance fallback: still contended"); };
+    await assert.rejects(
+      () => reacquireNonceOnContention(
+        resubmit,
+        { rpcs: ["wss://x"], senderSS58: "5DfhGyQ", expectedNonce: 1 },
+        "setResolver",
+        { fetchNonce: async () => 2, sleep: async () => {}, backoffMs: () => 0, maxAttempts: 3 },
+      ),
+      /under nonce contention; pass your own --mnemonic/,
+      ">> FAIL: nonce-reacquire: must fail fast with the shared-signer contention guidance after maxAttempts",
+    );
+    assert.equal(submits, 3,
+      ">> FAIL: nonce-reacquire: must stop at maxAttempts (bounded), not loop forever");
+  });
+
+  test("reacquireNonceOnContention: rethrows a non-contention error unchanged (never masks the real cause)", async () => {
+    const resubmit = async () => { throw new Error("websocket disconnected mid-submit"); };
+    await assert.rejects(
+      () => reacquireNonceOnContention(
+        resubmit,
+        { rpcs: ["wss://x"], senderSS58: "5DfhGyQ", expectedNonce: 1 },
+        "setResolver",
+        { fetchNonce: async () => 2, sleep: async () => {}, backoffMs: () => 0, maxAttempts: 3 },
+      ),
+      /websocket disconnected mid-submit/,
+      ">> FAIL: nonce-reacquire: a non-contention failure must propagate as-is, not be folded into the contention message",
+    );
+  });
+
+  test("DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS is a small positive bound", () => {
+    assert.ok(Number.isInteger(DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS) && DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS >= 2 && DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS <= 10,
+      `>> FAIL: nonce-max-attempts: expected a small bound 2..10, got ${DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS}`);
   });
 });
 

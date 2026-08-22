@@ -102,5 +102,6 @@
   "engines": {
     "node": ">=22"
   },
+  "packageManager": "npm@11.17.0",
   "license": "GPL-3.0-or-later"
 }

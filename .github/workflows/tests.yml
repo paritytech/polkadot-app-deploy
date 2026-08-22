@@ -56,3 +56,35 @@ jobs:
       - run: npm --version
       - run: npm ci
       - run: npm test
+
+      # Static-check the workflows themselves. `yaml.safe_load` only proves a
+      # file is well-formed YAML — it cannot see an invalid *expression*. That
+      # is exactly how bulletin's #938 shipped a job-level `if:` referencing the
+      # `matrix` context and made e2e.yml unrunnable: every run failed at setup
+      # with zero jobs, while a local YAML parse reported the file fine.
+      #
+      # Run as a `run:` step, NOT the docker action: `args:` on a docker action
+      # is not shell-parsed, so `-ignore 'pattern with spaces'` splits into
+      # separate argv entries and the ignores silently never apply.
+      #
+      # This repo has no self-hosted runners (see .github/actionlint.yaml), so
+      # the runner-label rule needs no exceptions here.
+      #
+      # The three ignores below are pre-existing findings, not expression bugs:
+      #   - shellcheck / "potentially untrusted" github.head_ref: carried over
+      #     from bulletin, same rationale (style note / already-safe usage).
+      #   - constant expression "false" in condition: this repo's public-
+      #     snapshot pattern for jobs that need Parity Sentry access we don't
+      #     have here (nightly-verify-telemetry, nightly-dotns-address-drift,
+      #     nightly-code-path-coverage, promote.yml) — the if:false is
+      #     deliberate and must stay off, not be "fixed" by removing the guard.
+      # All three are scoped by exact phrase so they cannot mask a real
+      # expression error like the matrix-context bug above.
+      - name: Lint workflows (actionlint)
+        run: |
+          set -euo pipefail
+          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint -color \
+            -ignore 'shellcheck reported issue in this script' \
+            -ignore 'is potentially untrusted' \
+            -ignore 'constant expression "false" in condition'

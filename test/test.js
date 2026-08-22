@@ -9574,8 +9574,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     assert.ok(job, "nightly-pr-coverage job must exist");
     assert.match(job, /^ {4}runs-on:\s*ubuntu-latest$/m,
       "nightly-pr-coverage runs on ubuntu-latest");
-    // 13 matrix legs covering 11 distinct scenario names (s1 and s-inc each appear twice).
-    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env"]) {
+    // 15 matrix legs covering 13 distinct scenario names (s1 and s-inc each appear twice).
+    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env", "s-transfer", "s-transfer-subname"]) {
       assert.match(job, new RegExp(`scenario:\\s*${sc.replace(/-/g, "-")}\\b`),
         `nightly-pr-coverage matrix must include scenario ${sc}`);
     }
@@ -9607,6 +9607,24 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       job,
       /scenario:\s*s-manifest-env,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*9\s*}/,
       "nightly-pr-coverage must wire scenario s-manifest-env to signer pool, merkle js, poolIndex 9",
+    );
+
+    // S-TRANSFER existed in test/e2e.test.js and scripts/e2e-pass.sh but had
+    // no CI job at all before this — the whole `transfer` recovery command
+    // path ran only locally on demand. First nightly wiring.
+    assert.match(
+      job,
+      /scenario:\s*s-transfer,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*10\s*}/,
+      "nightly-pr-coverage must wire scenario s-transfer to signer pool, merkle js, poolIndex 10",
+    );
+
+    // S-TRANSFER-SUBNAME (bulletin #150/#151): transfer's setSubnodeOwner
+    // subname path. No E2E coverage of this path existed anywhere before
+    // this leg.
+    assert.match(
+      job,
+      /scenario:\s*s-transfer-subname,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*11\s*}/,
+      "nightly-pr-coverage must wire scenario s-transfer-subname to signer pool, merkle js, poolIndex 11",
     );
 
     // Each new leg's poolIndex must be unique within the whole matrix (#863

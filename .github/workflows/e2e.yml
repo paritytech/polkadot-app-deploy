@@ -740,6 +740,17 @@ jobs:
           - { scenario: s-subdomain,              signer: pool,   merkle: js,   poolIndex: 7 }
           - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 8 }
           - { scenario: s-manifest-env,           signer: pool,   merkle: js,   poolIndex: 9 }
+          # S-TRANSFER: register-as-worker then hand over via the `transfer`
+          # command, plus idempotent re-run. Existed in test/e2e.test.js and
+          # scripts/e2e-pass.sh since its introduction but was never wired
+          # into any CI job — this is its first nightly coverage.
+          - { scenario: s-transfer,               signer: pool,   merkle: js,   poolIndex: 10 }
+          # S-TRANSFER-SUBNAME (bulletin #150/#151): `transfer`'s subname path
+          # via setSubnodeOwner — handover leg + a negative leg asserting the
+          # actionable parent-ownership error (not the old misleading
+          # "Invalid domain label"). No E2E coverage of this path existed
+          # anywhere before this leg.
+          - { scenario: s-transfer-subname,       signer: pool,   merkle: js,   poolIndex: 11 }
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6

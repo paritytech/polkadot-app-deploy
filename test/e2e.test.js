@@ -1661,7 +1661,11 @@ describe("e2e", { skip: !ENABLED }, () => {
         assertOnChainMatches(onChain, expected, { scenario: "S-MANIFEST-ENV", label });
 
         const iconCid = parseLineOrExplain(stdout, {
-          pattern: /Icon CID:\s+(bafy\S+)/,
+          // The icon is a single small file → a raw-codec CIDv1 ("bafk…"), NOT
+          // the dag-pb "bafy…" of a directory/root. Match any CIDv1 base32
+          // (baf…) so both codecs are accepted (the earlier bafy-only pattern
+          // false-failed S-MANIFEST-ENV on the real bafk icon CID).
+          pattern: /Icon CID:\s+(baf\S+)/,
           scenario: "S-MANIFEST-ENV",
           what: "manifest icon CID",
           hint: "publishManifest logs 'Icon CID: bafk...' right after uploading the icon (src/manifest/publish.ts). Missing means manifest publish either didn't run or failed before reaching the icon upload — check for a preceding 'Manifest publish failed' line.",

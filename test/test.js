@@ -15,9 +15,9 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -25,7 +25,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   sanitizeRepo, setDeploySentryTag, sampleMemory, initTelemetry,
   setDeployAttribute, __setDeployRootSpanForTest,
   flush, closeTelemetry, __setSentryForTest,
-  classifyErrorKind, sanitizeErrorMessage,
+  classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
 import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
@@ -1176,6 +1176,13 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(classifyErrorKind("Contract execution would revert during finalize-registration on DOTNS_REGISTRAR_CONTROLLER"), "contract-revert");
   });
 
+  test("contract-revert: papi 2.x typed ContractReverted dispatch-error shape (#1061)", () => {
+    assert.strictEqual(
+      classifyErrorKind('Transaction failed: {"type":"Module","value":{"type":"Revive","value":{"type":"ContractReverted"}}}'),
+      "contract-revert",
+    );
+  });
+
   test("chain-timeout: timed out waiting for block", () => {
     assert.strictEqual(classifyErrorKind("finalize-registration timed out after 90s waiting for block confirmation"), "chain-timeout");
   });
@@ -1268,6 +1275,12 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(
       classifyErrorKind("parent mysite.dot is owned by 0xabc"),
       "unknown",
+    );
+  });
+  test("naming.subdomain_orphan: 'owned by no one' variant (#1061)", () => {
+    assert.strictEqual(
+      classifyErrorKind("Cannot deploy sub.mysite.dot: parent mysite.dot is owned by no one, not by this signer."),
+      "naming.subdomain_orphan",
     );
   });
 
@@ -1409,11 +1422,13 @@ describe("classifyErrorKind", () => {
     );
   });
 
-  // naming.contract_unavailable
-  test("naming.contract_unavailable: Cannot decode zero data from ABI call", () => {
+  // dotns.abi_decode_empty (#1061 — split out from naming.contract_unavailable:
+  // this is the raw viem decode message, not one of contractCall's own
+  // actionable wrapper messages below, so it gets its own dedicated kind).
+  test("dotns.abi_decode_empty: Cannot decode zero data from ABI call", () => {
     assert.strictEqual(
       classifyErrorKind('Cannot decode zero data ("0x") with ABI parameters.\n\nVersion: viem@2.51.3'),
-      "naming.contract_unavailable",
+      "dotns.abi_decode_empty",
     );
   });
 
@@ -1705,13 +1720,22 @@ describe("withSpan error attribute propagation", () => {
 
   test("source: withDeploySpan catch also sets deploy.error_kind on the root span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    // withDeploySpan's catch sets deploy.status + deploy.error_category, which are unique
-    // to that block. Assert all four error-kind attributes appear in the same region.
+    // #1061: the catch now routes error recording through the single
+    // setDeployErrorOnSpan choke point instead of inlining each setAttribute —
+    // so the invariant (catch sets deploy.error_kind on the root span) is
+    // preserved *via the helper*. Verify BOTH the delegation and that the
+    // helper writes the attribute, so no path can record deploy.error without it.
     const deploySpanCatch = src.match(/setAttribute\("deploy\.status",\s*"error"\)[\s\S]*?throw error;/);
     assert.ok(deploySpanCatch, "withDeploySpan catch block must exist");
     assert.ok(
-      /setAttribute\("deploy\.error_kind",/.test(deploySpanCatch[0]),
-      "withDeploySpan catch must write deploy.error_kind to root span",
+      /setDeployErrorOnSpan\(/.test(deploySpanCatch[0]),
+      "withDeploySpan catch must route error recording through setDeployErrorOnSpan",
+    );
+    const helper = src.match(/function setDeployErrorOnSpan\([\s\S]*?\n}/);
+    assert.ok(helper, "setDeployErrorOnSpan helper must exist");
+    assert.ok(
+      /setAttribute\("deploy\.error_kind",/.test(helper[0]),
+      "setDeployErrorOnSpan must write deploy.error_kind to the span",
     );
   });
 
@@ -1720,8 +1744,14 @@ describe("withSpan error attribute propagation", () => {
     const deploySpanCatch = src.match(/setAttribute\("deploy\.status",\s*"error"\)[\s\S]*?throw error;/);
     assert.ok(deploySpanCatch, "withDeploySpan catch block must exist");
     assert.ok(
-      /setAttribute\("deploy\.error_message",/.test(deploySpanCatch[0]),
-      "withDeploySpan catch must write deploy.error_message to root span",
+      /setDeployErrorOnSpan\(/.test(deploySpanCatch[0]),
+      "withDeploySpan catch must route error recording through setDeployErrorOnSpan",
+    );
+    const helper = src.match(/function setDeployErrorOnSpan\([\s\S]*?\n}/);
+    assert.ok(helper, "setDeployErrorOnSpan helper must exist");
+    assert.ok(
+      /setAttribute\("deploy\.error_message",/.test(helper[0]),
+      "setDeployErrorOnSpan must write deploy.error_message to the span",
     );
   });
 
@@ -4944,6 +4974,22 @@ describe("DotNS.setTextRecord", () => {
     return d;
   }
 
+  // #1168: setTextRecord now does an extra contractCallNullable read (the
+  // skip-if-unchanged pre-check) before the write. Tests below that mocked
+  // contractCallNullable to always return the target value need their FIRST
+  // read to instead miss (return "", i.e. unset) so the pre-check doesn't skip
+  // the write before contractTransaction is ever invoked — everything after
+  // that first call defers to `next` (a value, or a function for call-site
+  // side effects/assertions on every invocation, including the pre-check's).
+  function stubAfterPrecheck(next) {
+    let served = false;
+    return async (...args) => {
+      const result = typeof next === "function" ? await next(...args) : next;
+      if (!served) { served = true; return ""; }
+      return result;
+    };
+  }
+
   test("writes via contract setText then verifies via contract text read", async () => {
     const domain = "myapp";
     const key = "name";
@@ -4958,21 +5004,23 @@ describe("DotNS.setTextRecord", () => {
     };
     // #1060: the post-hoc poll reads via contractCallNullable (not contractCall)
     // so an unset/not-yet-finalized text key doesn't throw on the first read.
-    d.contractCallNullable = async (_address, _abi, functionName, args) => {
+    d.contractCallNullable = stubAfterPrecheck((_address, _abi, functionName, args) => {
       calls.push({ type: "call", functionName, args });
       return value;
-    };
+    });
     const result = await d.setTextRecord(domain, key, value);
 
     assert.deepStrictEqual(result, { value, txHash });
-    assert.strictEqual(calls.length, 2);
-    assert.strictEqual(calls[0].type, "tx");
-    assert.strictEqual(calls[0].functionName, "setText");
-    assert.strictEqual(calls[0].args[1], key);
-    assert.strictEqual(calls[0].args[2], value);
-    assert.strictEqual(calls[1].type, "call");
-    assert.strictEqual(calls[1].functionName, "text");
+    assert.strictEqual(calls.length, 3, "expected #1168 pre-check read + tx + post-hoc verify read");
+    assert.strictEqual(calls[0].type, "call", "call 0 must be the #1168 skip-if-unchanged pre-check read");
+    assert.strictEqual(calls[0].functionName, "text");
+    assert.strictEqual(calls[1].type, "tx");
+    assert.strictEqual(calls[1].functionName, "setText");
     assert.strictEqual(calls[1].args[1], key);
+    assert.strictEqual(calls[1].args[2], value);
+    assert.strictEqual(calls[2].type, "call");
+    assert.strictEqual(calls[2].functionName, "text");
+    assert.strictEqual(calls[2].args[1], key);
   });
 
   test("polls finalized chain time until a stale text read catches up", async () => {
@@ -5017,14 +5065,20 @@ describe("DotNS.setTextRecord", () => {
   // #1060: exercises the exact null-tolerant path the fix introduced — an unset
   // text key reads back `null` from contractCallNullable, and the post-hoc poll
   // must coerce that to "" instead of throwing on it.
+  // #1168: target value here is "" itself, so a naive stub that always returns
+  // null would make the skip-if-unchanged pre-check see "" === "" and skip the
+  // write entirely — never reaching the post-hoc poll this test is meant to
+  // guard. The FIRST read ("old") is non-empty so the pre-check proceeds to the
+  // write; the poll's own first read (null) is what exercises the #1060 coercion.
   test("treats contract text null value as empty string for comparison", async () => {
     const domain = "myapp";
     const key = "name";
     const value = "";
 
+    const reads = ["old", null];
     const d = makeDotnsForTextRecord();
     d.contractTransaction = async () => ({ kind: "hash", hash: "0xghi789" });
-    d.contractCallNullable = async () => null;
+    d.contractCallNullable = async () => reads.shift() ?? null;
     const result = await d.setTextRecord(domain, key, value);
     assert.strictEqual(result.value, "");
   });
@@ -5038,7 +5092,10 @@ describe("DotNS.setTextRecord", () => {
     const domain = "myapp";
     const key = "name";
     const value = "My App";
-    const reads = [null, value];
+    // "" first serves the #1168 skip-if-unchanged pre-check (forces it to see a
+    // mismatch and proceed to the write); the original null->value sequence
+    // then exercises the post-hoc poll's null-tolerance as before.
+    const reads = ["", null, value];
     const d = makeDotnsForTextRecord();
     d.clientWrapper = {
       client: { query: { Timestamp: { Now: { getValue: async () => 1_000_000 } } } },
@@ -5065,7 +5122,7 @@ describe("DotNS.setTextRecord", () => {
       capturedOpts.push(opts);
       return { kind: "hash", hash: "0xverify123" };
     };
-    d.contractCallNullable = async () => value;
+    d.contractCallNullable = stubAfterPrecheck(value);
 
     await d.setTextRecord(domain, key, value);
 
@@ -5087,11 +5144,11 @@ describe("DotNS.setTextRecord", () => {
     };
     // Stub contractCallNullable for both the verifyEffect closure and the
     // post-hoc poll to use — both read the same text(node, key) now (#1060).
-    d.contractCallNullable = async (_addr, _abi, fn, args) => {
+    d.contractCallNullable = stubAfterPrecheck((_addr, _abi, fn, args) => {
       assert.strictEqual(fn, "text", "verifyEffect must read the 'text' function");
       assert.strictEqual(args[1], key, "verifyEffect must pass the correct key");
       return value;
-    };
+    });
 
     await d.setTextRecord(domain, key, value);
 
@@ -5137,14 +5194,18 @@ describe("DotNS.setTextRecord", () => {
     d.rpc = null;
     d.clientWrapper = makeWrapper();
 
-    // contractCallNullable serves BOTH the post-hoc poll inside setTextRecord()
-    // (#1060: it now reads via contractCallNullable, not contractCall) and the
-    // verifyEffect closure invoked manually below — same stub, different phase.
-    // Start it returning the expected value so the post-hoc poll inside
-    // setTextRecord() below succeeds immediately instead of hanging; flip it to
-    // "stale-value" right before exercising verifyEffect in isolation.
+    // contractCallNullable serves the #1168 skip-if-unchanged pre-check, the
+    // post-hoc poll inside setTextRecord() (#1060: it now reads via
+    // contractCallNullable, not contractCall), and the verifyEffect closure
+    // invoked manually below — same stub, different phases. Its first call
+    // (the pre-check) sees "" (unset) so it proceeds to the write instead of
+    // skipping before contractTransaction is ever invoked; every call after
+    // that returns onChainStub, which starts at the expected value so the
+    // post-hoc poll inside setTextRecord() below succeeds immediately instead
+    // of hanging, then is flipped to "stale-value" right before exercising
+    // verifyEffect in isolation.
     let onChainStub = value;
-    d.contractCallNullable = async () => onChainStub;
+    d.contractCallNullable = stubAfterPrecheck(() => onChainStub);
 
     // Capture verifyEffect by stubbing contractTransaction
     let capturedVerifyEffect = null;
@@ -5181,7 +5242,7 @@ describe("DotNS.setTextRecord", () => {
       capturedVerifyEffect = opts?.verifyEffect ?? null;
       return { kind: "hash", hash: "0xverifyteardown" };
     };
-    d.contractCallNullable = async () => value;
+    d.contractCallNullable = stubAfterPrecheck(value);
 
     await d.setTextRecord(domain, key, value);
 
@@ -5192,6 +5253,40 @@ describe("DotNS.setTextRecord", () => {
     assert.ok(capturedVerifyEffect !== null, "verifyEffect should have been captured");
     const result = await capturedVerifyEffect();
     assert.strictEqual(result, false, "verifyEffect must return false when session is torn down");
+  });
+
+  // #1168: behavioral coverage for the skip-if-unchanged pre-check itself — the
+  // shouldSkipTextWrite unit tests below only cover the pure decision function;
+  // this drives setTextRecord end-to-end through the seam the tests above
+  // proved works (stubbed contractTransaction/contractCallNullable), so a
+  // regression in the WIRING (e.g. the pre-check silently dropped, or its
+  // condition inverted) fails here even though the pure function is unchanged.
+  test("skips the tx when the on-chain value already matches (#1168)", async () => {
+    const domain = "myapp";
+    const key = "name";
+    const value = "My App";
+
+    const root = { attrs: new Map(), setAttribute(k, v) { this.attrs.set(k, v); } };
+    __setDeployRootSpanForTest(root);
+    try {
+      const d = makeDotnsForTextRecord();
+      let txCalled = false;
+      d.contractTransaction = async () => { txCalled = true; return { kind: "hash", hash: "0xnope" }; };
+      d.contractCallNullable = async () => value; // already equals target on every read
+
+      const result = await d.setTextRecord(domain, key, value);
+
+      assert.strictEqual(txCalled, false,
+        ">> FAIL: setTextRecord skip-path: contractTransaction must not run when the on-chain value is unchanged");
+      assert.strictEqual(result.txHash, TX_KIND_SKIPPED,
+        ">> FAIL: setTextRecord skip-path: result.txHash must be the TX_KIND_SKIPPED sentinel, not a real tx hash");
+      assert.strictEqual(result.value, value,
+        ">> FAIL: setTextRecord skip-path: result.value must still echo the target value on skip");
+      assert.strictEqual(root.attrs.get("deploy.dotns.text_unchanged"), "true",
+        ">> FAIL: setTextRecord skip-path: must set deploy.dotns.text_unchanged=true on the root deploy span");
+    } finally {
+      __setDeployRootSpanForTest(null);
+    }
   });
 });
 
@@ -7715,6 +7810,82 @@ describe("DotNS external signer path (#158)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #1094: manifest publish uploaded the icon/executables to the DEFAULT
+// Bulletin RPC, ignoring --env/--rpc. deploy() itself resolves its Bulletin
+// endpoint via this exact override precedence before setting the
+// module-level BULLETIN_ENDPOINTS that storeFile/storeDirectory fall back to
+// (getProvider(), no client of their own). resolveBulletinEndpoints/
+// setBulletinEndpoints are extracted so manifest/publish.ts can reuse the
+// SAME mechanism instead of inventing a second one — see
+// test/product-manifest.test.js for the publishManifest-level regression
+// test that exercises the actual wiring.
+// ---------------------------------------------------------------------------
+describe("resolveBulletinEndpoints (#1094)", () => {
+  test("no rpc override, no BULLETIN_RPC env var: env's bulletin list passes through unchanged", () => {
+    const saved = process.env.BULLETIN_RPC;
+    delete process.env.BULLETIN_RPC;
+    try {
+      const envBulletin = ["wss://paseo-bulletin-next-rpc.polkadot.io", "wss://backup.example"];
+      const r = resolveBulletinEndpoints(envBulletin);
+      assert.deepStrictEqual(r, envBulletin,
+        ">> FAIL: resolveBulletinEndpoints no-override: env's bulletin list must pass through unchanged");
+    } finally {
+      if (saved === undefined) delete process.env.BULLETIN_RPC; else process.env.BULLETIN_RPC = saved;
+    }
+  });
+
+  test("explicit rpcOverride wins, placed first, envBulletin de-duplicated", () => {
+    const saved = process.env.BULLETIN_RPC;
+    delete process.env.BULLETIN_RPC;
+    try {
+      const envBulletin = ["wss://paseo-bulletin-next-rpc.polkadot.io", "wss://override.example"];
+      const r = resolveBulletinEndpoints(envBulletin, "wss://override.example");
+      assert.deepStrictEqual(r, ["wss://override.example", "wss://paseo-bulletin-next-rpc.polkadot.io"],
+        ">> FAIL: resolveBulletinEndpoints rpcOverride: override must be primary (index 0) with envBulletin de-duplicated behind it");
+    } finally {
+      if (saved === undefined) delete process.env.BULLETIN_RPC; else process.env.BULLETIN_RPC = saved;
+    }
+  });
+
+  test("BULLETIN_RPC env var is honoured when rpcOverride is not passed", () => {
+    const saved = process.env.BULLETIN_RPC;
+    process.env.BULLETIN_RPC = "wss://from-env-var.example";
+    try {
+      const r = resolveBulletinEndpoints(["wss://paseo-bulletin-next-rpc.polkadot.io"]);
+      assert.deepStrictEqual(r, ["wss://from-env-var.example", "wss://paseo-bulletin-next-rpc.polkadot.io"],
+        ">> FAIL: resolveBulletinEndpoints BULLETIN_RPC fallback: env var override must apply when no explicit rpcOverride is passed");
+    } finally {
+      if (saved === undefined) delete process.env.BULLETIN_RPC; else process.env.BULLETIN_RPC = saved;
+    }
+  });
+
+  test("explicit rpcOverride wins over BULLETIN_RPC env var", () => {
+    const saved = process.env.BULLETIN_RPC;
+    process.env.BULLETIN_RPC = "wss://from-env-var.example";
+    try {
+      const r = resolveBulletinEndpoints(["wss://env.example"], "wss://explicit.example");
+      assert.deepStrictEqual(r, ["wss://explicit.example", "wss://env.example"],
+        ">> FAIL: resolveBulletinEndpoints precedence: explicit rpcOverride must win over BULLETIN_RPC env var");
+    } finally {
+      if (saved === undefined) delete process.env.BULLETIN_RPC; else process.env.BULLETIN_RPC = saved;
+    }
+  });
+});
+
+describe("setBulletinEndpoints (#1094)", () => {
+  test("updates the exported BULLETIN_ENDPOINTS binding read by getProvider()/storeFile/storeDirectory", () => {
+    const before = BULLETIN_ENDPOINTS;
+    try {
+      setBulletinEndpoints(["wss://paseo-bulletin-next-rpc.polkadot.io"]);
+      assert.deepStrictEqual(BULLETIN_ENDPOINTS, ["wss://paseo-bulletin-next-rpc.polkadot.io"],
+        ">> FAIL: setBulletinEndpoints: exported BULLETIN_ENDPOINTS must reflect the setter's argument (live ESM binding) — this is the only way manifest/publish.ts (a different module) can update deploy.ts's module-level state");
+    } finally {
+      setBulletinEndpoints(before);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setDeploySentryTag — propagates deploy.tag to error events for dashboard
 // filtering on the Errors dataset (not just Spans).
 // ---------------------------------------------------------------------------
@@ -8943,14 +9114,50 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     assert.ok(job, "nightly-pr-coverage job must exist");
     assert.match(job, /^ {4}runs-on:\s*ubuntu-latest$/m,
       "nightly-pr-coverage runs on ubuntu-latest");
-    // 10 matrix legs covering 8 distinct scenario names (s1 and s-inc each appear twice).
-    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation"]) {
+    // 13 matrix legs covering 11 distinct scenario names (s1 and s-inc each appear twice).
+    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env"]) {
       assert.match(job, new RegExp(`scenario:\\s*${sc.replace(/-/g, "-")}\\b`),
         `nightly-pr-coverage matrix must include scenario ${sc}`);
     }
     // Schedule trigger must still fire it.
     assert.match(job, /github\.event_name == 'schedule'/,
       "nightly-pr-coverage must trigger on schedule");
+  });
+
+  test(".github/workflows/e2e.yml: nightly-pr-coverage wires #1163 (--no-manifest) and #1094 (manifest --env) legs with isolated pool indices", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const job = jobBlock(e2e, "nightly-pr-coverage");
+    assert.ok(job, "nightly-pr-coverage job must exist");
+
+    // #1163: content-only deploy (product config present + --no-manifest).
+    // signer/merkle/poolIndex live in the matrix include entry; the actual
+    // --no-manifest flag is chosen inside test/e2e.test.js from E2E_SCENARIO
+    // (this job's command is scenario-agnostic), so the flag itself is
+    // asserted where it's built (test/e2e.test.js's S-CONTENT-ONLY block),
+    // not here.
+    assert.match(
+      job,
+      /scenario:\s*s-content-only,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*8\s*}/,
+      "nightly-pr-coverage must wire scenario s-content-only to signer pool, merkle js, poolIndex 8",
+    );
+
+    // #1094: manifest publish on a non-default env (PAD_ENV is always set
+    // from select-env in this job).
+    assert.match(
+      job,
+      /scenario:\s*s-manifest-env,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*9\s*}/,
+      "nightly-pr-coverage must wire scenario s-manifest-env to signer pool, merkle js, poolIndex 9",
+    );
+
+    // Each new leg's poolIndex must be unique within the whole matrix (#863
+    // per-leg nonce isolation) — a collision would reintroduce Alice
+    // Asset-Hub nonce contention between legs.
+    const poolIndices = [...job.matchAll(/poolIndex:\s*(\d+)/g)].map((m) => Number(m[1]));
+    const uniqueIndices = new Set(poolIndices);
+    assert.equal(
+      uniqueIndices.size, poolIndices.length,
+      `nightly-pr-coverage poolIndex values must all be unique, got [${poolIndices.join(", ")}]`,
+    );
   });
 
   test(".github/workflows/e2e.yml: nightly-report depends on nightly-pr-coverage", () => {
@@ -12644,6 +12851,57 @@ describe("setDeployAttribute → root span (regression guard)", () => {
       body.includes("deployRootSpan"),
       "captureWarning must reference deployRootSpan for deploy.sad"
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setDeployError — shared choke point for deploy.error + classification (#1061)
+// ---------------------------------------------------------------------------
+describe("setDeployError → root span choke point (#1061)", () => {
+  // Helper: build a simple spy span (same pattern as the setDeployAttribute
+  // regression-guard block above).
+  function makeSpan() {
+    const attrs = new Map();
+    return { setAttribute: (k, v) => attrs.set(k, v), attrs };
+  }
+
+  test("setDeployError populates deploy.error + classification on the root span", () => {
+    const root = makeSpan();
+    __setDeployRootSpanForTest(root);
+    try {
+      const msg = 'Transaction failed: {"type":"Module","value":{"type":"Revive","value":{"type":"ContractReverted"}}}';
+      setDeployError(msg);
+      assert.strictEqual(root.attrs.get("deploy.error"), msg.slice(0, 500),
+        "setDeployError must set deploy.error to the (length-capped) raw message");
+      assert.strictEqual(root.attrs.get("deploy.error_kind"), "contract-revert",
+        "setDeployError must classify the ContractReverted shape as contract-revert");
+      assert.strictEqual(root.attrs.get("deploy.error_message"), sanitizeErrorMessage(msg),
+        "setDeployError must set deploy.error_message to the sanitized message");
+      assert.ok(root.attrs.has("deploy.error_pattern_signature"),
+        "setDeployError must also set deploy.error_pattern_signature");
+    } finally {
+      __setDeployRootSpanForTest(null);
+    }
+  });
+
+  test("setDeployError classifies the subdomain-orphan message and populates all three attributes", () => {
+    const root = makeSpan();
+    __setDeployRootSpanForTest(root);
+    try {
+      const msg = "Cannot deploy sub.mysite.dot: parent mysite.dot is owned by no one, not by this signer.";
+      setDeployError(msg);
+      assert.strictEqual(root.attrs.get("deploy.error_kind"), "naming.subdomain_orphan",
+        "setDeployError must classify the 'owned by no one' subdomain-orphan message");
+      assert.strictEqual(root.attrs.get("deploy.error"), msg.slice(0, 500));
+      assert.strictEqual(root.attrs.get("deploy.error_message"), sanitizeErrorMessage(msg));
+    } finally {
+      __setDeployRootSpanForTest(null);
+    }
+  });
+
+  test("setDeployError is a no-op when deployRootSpan is null (outside a deploy)", () => {
+    __setDeployRootSpanForTest(null);
+    assert.doesNotThrow(() => setDeployError("some error outside a deploy span"));
   });
 });
 
@@ -16508,6 +16766,41 @@ describe("35. Block + tx hash capture for Bulletin uploads (#537)", () => {
   });
 });
 
+describe("setTextRecord skip-if-unchanged pre-check (#1168)", () => {
+  test("shouldSkipTextWrite: current equals target -> skip (true)", () => {
+    assert.strictEqual(shouldSkipTextWrite("hello world", "hello world"), true,
+      ">> FAIL: shouldSkipTextWrite equal-values: expected skip decision true when on-chain value already matches target");
+  });
+
+  test("shouldSkipTextWrite: current differs from target -> proceed (false)", () => {
+    assert.strictEqual(shouldSkipTextWrite("old value", "new value"), false,
+      ">> FAIL: shouldSkipTextWrite differing-values: expected skip decision false so the write proceeds when values differ");
+  });
+
+  test("shouldSkipTextWrite: unset key (current === \"\") with a non-empty target -> proceed (false)", () => {
+    assert.strictEqual(shouldSkipTextWrite("", "first write"), false,
+      ">> FAIL: shouldSkipTextWrite unset-key: expected skip decision false so an unset text[key] (getTextRecord's \"\" sentinel) still gets written");
+  });
+
+  test("setTextRecord source wires the pre-check: reads getTextRecord, compares via shouldSkipTextWrite, and returns TX_KIND_SKIPPED on match", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    const setTextIdx = src.indexOf("async setTextRecord(");
+    assert.ok(setTextIdx !== -1, ">> FAIL: setTextRecord wiring: could not locate setTextRecord in src/dotns.ts");
+    const setTextRecordsIdx = src.indexOf("async setTextRecords(");
+    const body = src.slice(setTextIdx, setTextRecordsIdx !== -1 ? setTextRecordsIdx : setTextIdx + 4000);
+    assert.ok(/await this\.getTextRecord\(domainName,\s*key\)/.test(body),
+      ">> FAIL: setTextRecord wiring: pre-check must read the current value via this.getTextRecord(domainName, key)");
+    assert.ok(/shouldSkipTextWrite\(current,\s*value\)/.test(body),
+      ">> FAIL: setTextRecord wiring: pre-check must decide via shouldSkipTextWrite(current, value)");
+    assert.ok(/setDeployAttribute\("deploy\.dotns\.text_unchanged",\s*"true"\)/.test(body),
+      ">> FAIL: setTextRecord wiring: must set deploy.dotns.text_unchanged=true on skip");
+    assert.ok(/setDeployAttribute\("deploy\.dotns\.text_unchanged",\s*"false"\)/.test(body),
+      ">> FAIL: setTextRecord wiring: must set deploy.dotns.text_unchanged=false when proceeding to write");
+    assert.ok(/txHash:\s*TX_KIND_SKIPPED/.test(body),
+      ">> FAIL: setTextRecord wiring: skip-path return must use the TX_KIND_SKIPPED sentinel for txHash");
+  });
+});
+
 describe("35b. DotNS tx/block hash attribute emission — source guards (#537)", () => {
   // DotNS calls are EVM contract transactions; end-to-end mocking would require
   // a full EVM RPC stub. We use source-regex assertions to guard the shape of
@@ -16705,7 +16998,12 @@ describe("signAndSubmitExtrinsic silent-watcher branch wiring (#990)", () => {
     const src = fs.readFileSync("src/dotns.ts", "utf-8");
     const idx = src.indexOf("async signAndSubmitWithRetry(");
     assert.ok(idx >= 0, ">> FAIL: #990 wiring: could not locate signAndSubmitWithRetry in src/dotns.ts");
-    const body = src.slice(idx, idx + 2000);
+    // Window sized to cover the method's catch region (both calls live well
+    // before the next method decl). Widened from 2000→4000 for #1158: the
+    // nonce-contention branch now sits between the two calls — still BEFORE
+    // the general retry classification, which is the invariant this test
+    // guards; the old fixed window just no longer reached it.
+    const body = src.slice(idx, idx + 4000);
     const fastFailIdx = body.indexOf("classifyWatcherSilentFastFail(");
     const retryDecisionIdx = body.indexOf("classifyTxRetryDecision(");
     assert.ok(fastFailIdx >= 0, ">> FAIL: #990 wiring: signAndSubmitWithRetry must call classifyWatcherSilentFastFail");
@@ -19038,6 +19336,95 @@ describe("DotNS tx retry backoff (nonce burst)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #1158: nonce-contention re-acquisition on the shared zero-config signer.
+// Concurrent deploys share ONE Asset Hub nonce space (the bare default key, no
+// derivation), so a sibling can steal the slot our tx was built against. The
+// old code re-used the STALE expectedNonce on every generic retry and thrashed
+// until an outer CI retry wrapper's timeout hid it. reacquireNonceOnContention
+// re-fetches the LIVE nonce, backs off with jitter, and bounds attempts so a
+// genuinely unlandable write fails fast with actionable guidance.
+describe("nonce contention re-acquisition (#1158)", () => {
+  test("nonceContentionBackoffMs: jittered, grows with attempt, capped ~2s, never negative", () => {
+    assert.equal(nonceContentionBackoffMs(1, () => 0.5), 250,
+      ">> FAIL: nonce-backoff: attempt 1 with zero jitter must be the 250ms base");
+    assert.ok(nonceContentionBackoffMs(3, () => 0.5) > nonceContentionBackoffMs(1, () => 0.5),
+      ">> FAIL: nonce-backoff: must grow with attempt");
+    assert.ok(nonceContentionBackoffMs(20, () => 1) <= 2000 + 250,
+      ">> FAIL: nonce-backoff: base must cap at ~2s (plus at most one base unit of jitter)");
+    assert.ok(nonceContentionBackoffMs(1, () => 0) >= 0,
+      ">> FAIL: nonce-backoff: full negative jitter must clamp to >= 0");
+  });
+
+  test("isNonceContentionAmbiguous: matches only the nonce-advance-fallback message", () => {
+    assert.equal(isNonceContentionAmbiguous(new Error("nonce-advance fallback: nonce moved past 22286 but expected on-chain effect not observable")), true,
+      ">> FAIL: nonce-ambiguous: must match the nonce-advance-fallback message");
+    assert.equal(isNonceContentionAmbiguous(new Error("websocket disconnected")), false,
+      ">> FAIL: nonce-ambiguous: must not match unrelated errors (they take the generic retry path)");
+    assert.equal(isNonceContentionAmbiguous("nonce-advance fallback: x"), true,
+      ">> FAIL: nonce-ambiguous: must accept string errors too");
+  });
+
+  test("reacquireNonceOnContention: re-fetches the live nonce and resolves when a later resubmit lands", async () => {
+    const liveNonces = [8300, 8301, 8302];
+    let fetched = 0, submits = 0;
+    const fetchNonce = async () => liveNonces[Math.min(fetched++, liveNonces.length - 1)];
+    const resubmit = async () => {
+      submits++;
+      if (submits < 3) throw new Error("nonce-advance fallback: sibling stole the slot");
+      return { kind: TX_KIND_BEST_BLOCK };
+    };
+    const res = await reacquireNonceOnContention(
+      resubmit,
+      { rpcs: ["wss://x"], senderSS58: "5DfhGyQ", expectedNonce: 8299 },
+      "setResolver",
+      { fetchNonce, sleep: async () => {}, backoffMs: () => 0, maxAttempts: 5 },
+    );
+    assert.equal(res.kind, TX_KIND_BEST_BLOCK,
+      ">> FAIL: nonce-reacquire: must return the successful resubmit's resolution");
+    assert.equal(submits, 3,
+      ">> FAIL: nonce-reacquire: must keep resubmitting (bounded) until one lands");
+    assert.ok(fetched >= 2,
+      ">> FAIL: nonce-reacquire: must re-fetch the LIVE nonce between attempts, not reuse the stale expectedNonce");
+  });
+
+  test("reacquireNonceOnContention: fails fast with actionable guidance after maxAttempts (no infinite loop)", async () => {
+    let submits = 0;
+    const resubmit = async () => { submits++; throw new Error("nonce-advance fallback: still contended"); };
+    await assert.rejects(
+      () => reacquireNonceOnContention(
+        resubmit,
+        { rpcs: ["wss://x"], senderSS58: "5DfhGyQ", expectedNonce: 1 },
+        "setResolver",
+        { fetchNonce: async () => 2, sleep: async () => {}, backoffMs: () => 0, maxAttempts: 3 },
+      ),
+      /under nonce contention; pass your own --mnemonic/,
+      ">> FAIL: nonce-reacquire: must fail fast with the shared-signer contention guidance after maxAttempts",
+    );
+    assert.equal(submits, 3,
+      ">> FAIL: nonce-reacquire: must stop at maxAttempts (bounded), not loop forever");
+  });
+
+  test("reacquireNonceOnContention: rethrows a non-contention error unchanged (never masks the real cause)", async () => {
+    const resubmit = async () => { throw new Error("websocket disconnected mid-submit"); };
+    await assert.rejects(
+      () => reacquireNonceOnContention(
+        resubmit,
+        { rpcs: ["wss://x"], senderSS58: "5DfhGyQ", expectedNonce: 1 },
+        "setResolver",
+        { fetchNonce: async () => 2, sleep: async () => {}, backoffMs: () => 0, maxAttempts: 3 },
+      ),
+      /websocket disconnected mid-submit/,
+      ">> FAIL: nonce-reacquire: a non-contention failure must propagate as-is, not be folded into the contention message",
+    );
+  });
+
+  test("DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS is a small positive bound", () => {
+    assert.ok(Number.isInteger(DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS) && DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS >= 2 && DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS <= 10,
+      `>> FAIL: nonce-max-attempts: expected a small bound 2..10, got ${DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // setContenthash read-back client refresh (#1131-follow-up): the final
 // read-back retry used to re-read this.getContenthash(domainName) up to
 // CONTENTHASH_VERIFY_ATTEMPTS times on the SAME this.client. paseo-next-v2's
@@ -19943,7 +20330,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -20205,6 +20592,111 @@ describe("chooseSignerInput Layer-3 isolation (#19)", () => {
     const choice = chooseSignerInput({ mnemonic: "bottom drive obey lake curtain smoke basket hold race lonely fit walk", suri: undefined, hasInjectedSigner: false, hasSession: false });
     assert.strictEqual(choice, "mnemonic",
       ">> FAIL: chooseSignerInput Layer-3: mnemonic must always choose mnemonic path");
+  });
+});
+
+describe("resolveEffectiveMnemonic env/flag precedence (#1107)", () => {
+  const MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+  const FLAG_MNEMONIC = "vessel ladder alter error federal sibling chat ability sun glass valve picture";
+  const DOTNS_MNEMONIC = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+  test("MNEMONIC env var present, no --mnemonic flag → returns the env mnemonic, not undefined", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: MNEMONIC, envDotnsMnemonic: undefined });
+    assert.strictEqual(resolved, MNEMONIC,
+      ">> FAIL: resolveEffectiveMnemonic: MNEMONIC env var must reach options.mnemonic when no --mnemonic flag is given (#1107 — previously returned undefined, so a persisted session silently won instead)");
+  });
+
+  test("DOTNS_MNEMONIC env var present, no flag and no MNEMONIC → returns the DOTNS_MNEMONIC fallback", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: undefined, envDotnsMnemonic: DOTNS_MNEMONIC });
+    assert.strictEqual(resolved, DOTNS_MNEMONIC,
+      ">> FAIL: resolveEffectiveMnemonic: DOTNS_MNEMONIC env var must be honored as a fallback when MNEMONIC is unset");
+  });
+
+  test("--mnemonic flag present → flag wins over both env vars", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: FLAG_MNEMONIC, envMnemonic: MNEMONIC, envDotnsMnemonic: DOTNS_MNEMONIC });
+    assert.strictEqual(resolved, FLAG_MNEMONIC,
+      ">> FAIL: resolveEffectiveMnemonic: an explicit --mnemonic flag must take precedence over MNEMONIC/DOTNS_MNEMONIC env vars");
+  });
+
+  test("neither flag nor env vars set → returns undefined (pool/session path unaffected)", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: undefined, envDotnsMnemonic: undefined });
+    assert.strictEqual(resolved, undefined,
+      ">> FAIL: resolveEffectiveMnemonic: with no flag and no env vars the result must stay undefined so pool/session selection is untouched");
+  });
+
+  test("env-resolved mnemonic + persisted session → chooseSignerInput still picks 'mnemonic', not 'resolve' (#1107 end-to-end)", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: MNEMONIC, envDotnsMnemonic: undefined });
+    const choice = chooseSignerInput({ mnemonic: resolved, suri: undefined, hasInjectedSigner: false, hasSession: true });
+    assert.strictEqual(choice, "mnemonic",
+      ">> FAIL: resolveEffectiveMnemonic + chooseSignerInput: an env-only MNEMONIC must still win over a persisted session (#1107 — the bin previously forwarded undefined here, so hasSession made this 'resolve' and the deploy silently used the signed-in session instead)");
+  });
+});
+
+describe("resolveEnvId env/flag precedence (#1165)", () => {
+  const FLAG_ENV = "preview";
+  const VAR_ENV = "summit";
+
+  test("--env flag present, no PAD_ENV → returns the flag value", () => {
+    const resolved = resolveEnvId({ flagEnv: FLAG_ENV, envVar: undefined });
+    assert.strictEqual(resolved, FLAG_ENV,
+      ">> FAIL: resolveEnvId: an explicit --env flag with no env var set must resolve to the flag value");
+  });
+
+  test("--env flag present AND PAD_ENV set → flag wins", () => {
+    const resolved = resolveEnvId({ flagEnv: FLAG_ENV, envVar: VAR_ENV });
+    assert.strictEqual(resolved, FLAG_ENV,
+      ">> FAIL: resolveEnvId: --env flag must take precedence over PAD_ENV when both are set");
+  });
+
+  test("only PAD_ENV set, no --env flag → returns the env var value", () => {
+    const resolved = resolveEnvId({ flagEnv: undefined, envVar: VAR_ENV });
+    assert.strictEqual(resolved, VAR_ENV,
+      ">> FAIL: resolveEnvId: PAD_ENV must be honored as the session default when no --env flag is given");
+  });
+
+  test("neither --env flag nor PAD_ENV set → returns undefined (caller applies DEFAULT_ENV_ID)", () => {
+    const resolved = resolveEnvId({ flagEnv: undefined, envVar: undefined });
+    assert.strictEqual(resolved, undefined,
+      ">> FAIL: resolveEnvId: with no flag and no env var the result must stay undefined so callers fall through to DEFAULT_ENV_ID (paseo-next-v2) themselves");
+  });
+});
+
+describe("shouldPublishManifest / validateNoManifestFlags — --no-manifest / --content-only (#1163)", () => {
+  test("config present + noManifest → false (skip manifest publish even though a config was discovered)", () => {
+    const result = shouldPublishManifest({ configFound: true, noManifest: true });
+    assert.strictEqual(result, false,
+      ">> FAIL: shouldPublishManifest: --no-manifest must skip manifest publishing even when a polkadot-app-deploy.config.* is discoverable (#1163 — content-only deploy is the whole point of the flag)");
+  });
+
+  test("config present + !noManifest → true (default behavior unchanged: publish when a config is found)", () => {
+    const result = shouldPublishManifest({ configFound: true, noManifest: false });
+    assert.strictEqual(result, true,
+      ">> FAIL: shouldPublishManifest: with no --no-manifest flag, a discovered config must still trigger manifest publishing — default behavior must stay unchanged");
+  });
+
+  test("no config found → false regardless of noManifest (nothing to publish either way)", () => {
+    assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: false }), false,
+      ">> FAIL: shouldPublishManifest: with no config discovered, manifest publishing must stay skipped (legacy contenthash-only path)");
+    assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: true }), false,
+      ">> FAIL: shouldPublishManifest: with no config discovered AND --no-manifest set, manifest publishing must stay skipped");
+  });
+
+  test("--no-manifest + --publish → rejected as a contradiction", () => {
+    const err = validateNoManifestFlags({ noManifest: true, publish: true });
+    assert.match(err, /--no-manifest.*--publish are mutually exclusive/,
+      ">> FAIL: validateNoManifestFlags: --no-manifest + --publish must be rejected — Publisher listing (--publish) depends on the manifest records --no-manifest skips");
+  });
+
+  test("--no-manifest without --publish → not rejected", () => {
+    const err = validateNoManifestFlags({ noManifest: true, publish: false });
+    assert.strictEqual(err, null,
+      ">> FAIL: validateNoManifestFlags: --no-manifest alone (no --publish) must be accepted — it's the normal content-only use case");
+  });
+
+  test("--publish without --no-manifest → not rejected", () => {
+    const err = validateNoManifestFlags({ noManifest: false, publish: true });
+    assert.strictEqual(err, null,
+      ">> FAIL: validateNoManifestFlags: --publish alone (no --no-manifest) must be accepted — unaffected by #1163");
   });
 });
 

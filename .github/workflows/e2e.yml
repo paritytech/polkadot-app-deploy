@@ -738,6 +738,8 @@ jobs:
           - { scenario: s-inc-portability,        signer: pool,   merkle: js,   poolIndex: 5 }
           - { scenario: s-inc-asset-rotation,     signer: pool,   merkle: js,   poolIndex: 6 }
           - { scenario: s-subdomain,              signer: pool,   merkle: js,   poolIndex: 7 }
+          - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 8 }
+          - { scenario: s-manifest-env,           signer: pool,   merkle: js,   poolIndex: 9 }
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6

@@ -97,6 +97,24 @@ export type TxResolution =
   | { kind: typeof TX_KIND_HASH; hash: string; block?: { hash: string; number: number } }
   | { kind: typeof TX_KIND_NONCE_ADVANCED; rpc: string }
   | { kind: typeof TX_KIND_BEST_BLOCK };
+
+// Sentinel txHash placed in setTextRecord's return when the skip-if-unchanged
+// pre-check finds the on-chain value already matches — no tx was submitted,
+// so there is no real hash to report. Not part of TxResolution (that union
+// describes contractTransaction's tx-submission outcomes; this is a
+// no-op-write outcome that never reaches contractTransaction).
+export const TX_KIND_SKIPPED = "skipped" as const;
+
+/**
+ * Pure skip-decision for `setTextRecord`'s already-set pre-check: true when
+ * the on-chain value already equals the target, meaning the write can be
+ * skipped entirely. Mirrors setContenthash's inline `current === expected`
+ * check, extracted here so the decision is unit-testable without a live chain.
+ */
+export function shouldSkipTextWrite(current: string, target: string): boolean {
+  return current === target;
+}
+
 export interface PriceValidationResult { priceWei: bigint; requiredStatus: number; userStatus: number; message: string; }
 export interface ParsedDomainName {
   isSubdomain: boolean;
@@ -564,6 +582,102 @@ export async function verifyNonceAdvanced(
     }
   }
   return { advanced: false };
+}
+
+// Jittered backoff between nonce-contention re-submits (#1158). Shorter base/cap
+// than dotnsRetryBackoffMs: a re-acquisition attempt is a cheap nonce-refetch-
+// and-resubmit cycle, not a full watch, so concurrent siblings need to de-sync
+// quickly rather than wait out a long ceiling. Same injectable-rand shape as
+// dotnsRetryBackoffMs so tests stay deterministic.
+const NONCE_CONTENTION_BACKOFF_BASE_MS = 250;
+const NONCE_CONTENTION_BACKOFF_MAX_MS = 2_000;
+export function nonceContentionBackoffMs(attempt: number, rand: () => number = Math.random): number {
+  const base = Math.min(NONCE_CONTENTION_BACKOFF_BASE_MS * 2 ** (attempt - 1), NONCE_CONTENTION_BACKOFF_MAX_MS);
+  const jitter = (rand() * 2 - 1) * NONCE_CONTENTION_BACKOFF_BASE_MS; // ± one base unit
+  return Math.max(0, Math.round(base + jitter));
+}
+
+// Bounded attempts for the nonce-contention re-acquisition loop below — separate
+// from DOTNS_TX_MAX_ATTEMPTS (which governs the general, expensive full-watch
+// retry loop in signAndSubmitWithRetry). Kept small so a genuinely unlandable
+// write fails fast instead of thrashing until an outer CI retry wrapper's
+// timeout hides it (#1158 repro: ~12min until a 15-min CI timeout).
+export const DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS: number = 5;
+
+// True only for the specific ambiguous nonce-advance-fallback message thrown by
+// signAndSubmitExtrinsic's poll loop (nonce moved past expectedNonce AND
+// verifyEffectWithGrace's re-polls found no observable effect — i.e. a sibling
+// consumed the nonce slot and our own tx did not land). Checked BEFORE
+// classifyTxRetryDecision in signAndSubmitWithRetry's catch — same pattern as
+// classifyWatcherSilentFastFail above — so this specific case gets its own
+// bounded re-acquisition loop instead of the generic attempt/backoff path.
+export function isNonceContentionAmbiguous(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.startsWith("nonce-advance fallback:");
+}
+
+/**
+ * #1158: bounded nonce re-acquisition for the ambiguous nonce-advance-fallback
+ * case on the zero-config write path, where concurrent deploys share ONE Asset
+ * Hub nonce space (the bare default signer, no derivation). When a sibling
+ * deploy's tx consumes the nonce slot our own tx was built against,
+ * `resubmit()` rejects with the ambiguous message (nonce advanced, but our
+ * effect isn't observable) instead of resolving. The old code fell through to
+ * signAndSubmitWithRetry's general retry loop, which reused the SAME stale
+ * nonceFallback.expectedNonce on every attempt — so the very next attempt's
+ * first poll tick saw "nonce already > (still-stale) N" and rejected again
+ * near-instantly, before its own freshly-submitted tx had any chance to land.
+ * That thrashing is the real #1158 repro.
+ *
+ * Fix: re-fetch the LIVE account nonce (never the stale expectedNonce a prior
+ * attempt was built against) so the next resubmit has a real chance to land,
+ * wait a short jittered backoff so concurrent siblings de-sync rather than
+ * lock-stepping onto the same slot again, and bound the whole thing to
+ * `maxAttempts` so a genuinely unlandable write fails FAST with a clear,
+ * actionable terminal error.
+ *
+ * `resubmit` is a full rebuild+sign+watch cycle — its own outcome already
+ * encodes the nonce-advance detection + verifyEffectWithGrace re-polls, so
+ * this function only decides whether/how to retry it; it never re-implements
+ * that detection. A resubmit failure that is NOT the ambiguous case (e.g. a
+ * websocket blip) is rethrown as-is — folding a genuinely different failure
+ * into the contention loop's own message would mask the real cause.
+ */
+export async function reacquireNonceOnContention(
+  resubmit: () => Promise<TxResolution>,
+  nonceFallback: { rpcs: string[]; senderSS58: string; expectedNonce: number },
+  label: string,
+  opts: {
+    fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>;
+    sleep?: (ms: number) => Promise<void>;
+    backoffMs?: (attempt: number) => number;
+    maxAttempts?: number;
+  } = {},
+): Promise<TxResolution> {
+  const fetchNonceFn = opts.fetchNonce ?? fetchNonce;
+  const sleepFn = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const backoffFn = opts.backoffMs ?? nonceContentionBackoffMs;
+  const maxAttempts = opts.maxAttempts ?? DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Raw number (not String(...)) — sum()/avg() only work on numeric-emitting
+    // Sentry attributes, not stringified ones.
+    setDeployAttribute("deploy.dotns.nonce_contention_retries", attempt);
+    const ms = backoffFn(attempt);
+    console.log(`   ${label}: nonce contention (attempt ${attempt}/${maxAttempts}) — re-acquiring nonce and resubmitting in ${ms}ms…`);
+    await sleepFn(ms);
+    try {
+      nonceFallback.expectedNonce = await fetchNonceFn(nonceFallback.rpcs, nonceFallback.senderSS58);
+    } catch { /* keep the previous baseline; the next resubmit's own poll re-checks it anyway */ }
+    try {
+      return await resubmit();
+    } catch (e: any) {
+      if (!isNonceContentionAmbiguous(e)) throw e;
+      // else: sibling stole the newly-acquired slot too — loop again, bounded by maxAttempts
+    }
+  }
+  throw new NonRetryableError(
+    `DotNS write could not acquire a nonce slot after ${maxAttempts} attempts — the shared signer (${nonceFallback.senderSS58}) is under nonce contention; pass your own --mnemonic for an isolated nonce space.`,
+  );
 }
 
 export const ProofOfPersonhoodStatus = {
@@ -1316,7 +1430,7 @@ export class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void>; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
@@ -1344,6 +1458,24 @@ export class ReviveClientWrapper {
         if (fastFail) {
           filter.flush();
           throw fastFail;
+        }
+
+        // #1158: the ambiguous nonce-advance-fallback case gets its own bounded
+        // re-acquisition loop (see reacquireNonceOnContention) instead of the
+        // generic attempt/backoff path below — checked before
+        // classifyTxRetryDecision so it pre-empts the general retry entirely.
+        if (opts.nonceFallback && isNonceContentionAmbiguous(e)) {
+          try {
+            return await reacquireNonceOnContention(
+              () => this.signAndSubmitExtrinsic(buildExtrinsic(), signer, filter.callback, opts),
+              opts.nonceFallback,
+              label,
+              { fetchNonce: opts.fetchNonce, sleep: opts.sleep, backoffMs: opts.nonceContentionBackoffMs },
+            );
+          } catch (contentionErr: any) {
+            filter.flush();
+            throw contentionErr;
+          }
         }
 
         const decision = classifyTxRetryDecision(e);
@@ -2817,6 +2949,21 @@ export class DotNS {
       this.ensureConnected();
       console.log(`   Setting text[${key}]: ${value}`);
       const node = namehash(`${domainName}.dot`);
+
+      // Pre-check: skip the tx if already set to the same value (mirrors
+      // setContenthash's pre-check above). Reuses getTextRecord, which
+      // already returns "" for an unset key.
+      try {
+        const current = await this.getTextRecord(domainName, key);
+        if (shouldSkipTextWrite(current, value)) {
+          console.log(`   text[${key}] already set — skipping tx`);
+          setDeployAttribute("deploy.dotns.text_unchanged", "true");
+          return { value, txHash: TX_KIND_SKIPPED };
+        }
+      } catch (_) {
+        // Read failure — proceed with the normal set path.
+      }
+      setDeployAttribute("deploy.dotns.text_unchanged", "false");
 
       // verifyEffect: mirrors setContenthash — used by submitTransaction's
       // nonce-advance fallback path so a nonce consumed by a concurrent writer

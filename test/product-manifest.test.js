@@ -16,8 +16,11 @@ import {
   loadProductConfig,
   preflightProductConfig,
   checkProductConfigFilesExist,
+  publishManifest,
+  formatConfigLoadError,
 } from "../dist/index.js";
 import { NonRetryableError } from "../dist/errors.js";
+import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -456,6 +459,196 @@ describe("loadProductConfig — auto-discovery", () => {
     await assert.rejects(
       () => loadProductConfig({ cwd: dir }),
       err => err.message.includes("domain"),
+    );
+  });
+
+  test("#1103: a config that throws '<VAR> is required' surfaces a friendly NonRetryableError with an env-var hint, preserving the original message", async (t) => {
+    const dir = await tmpDir(t, "product-config-throws-required-");
+    const configPath = path.join(dir, "polkadot-app-deploy.config.ts");
+    await fs.writeFile(
+      configPath,
+      `if (!process.env.APP_DOTNS_DOMAIN) throw new Error("APP_DOTNS_DOMAIN is required");\nexport default ${JSON.stringify(VALID_CONFIG, null, 2)};\n`,
+    );
+    await assert.rejects(
+      () => loadProductConfig({ cwd: dir }),
+      err => {
+        assert.equal(err.name, "NonRetryableError", `>> FAIL: config-throws-required: expected NonRetryableError, got ${err.name}`);
+        assert.match(err.message, /threw while loading: APP_DOTNS_DOMAIN is required/, `>> FAIL: config-throws-required: friendly wrapper missing or original message not preserved (got "${err.message}")`);
+        assert.match(err.message, /Hint: set the APP_DOTNS_DOMAIN environment variable\./, `>> FAIL: config-throws-required: expected env-var hint (got "${err.message}")`);
+        return true;
+      },
+    );
+  });
+
+  test("#1103: a config that throws a non-'required' shape surfaces the friendly wrapper with no false hint", async (t) => {
+    const dir = await tmpDir(t, "product-config-throws-other-");
+    const configPath = path.join(dir, "polkadot-app-deploy.config.ts");
+    await fs.writeFile(
+      configPath,
+      `throw new Error("Cannot read properties of undefined (reading 'foo')");\nexport default ${JSON.stringify(VALID_CONFIG, null, 2)};\n`,
+    );
+    await assert.rejects(
+      () => loadProductConfig({ cwd: dir }),
+      err => {
+        assert.equal(err.name, "NonRetryableError", `>> FAIL: config-throws-other: expected NonRetryableError, got ${err.name}`);
+        assert.match(err.message, /threw while loading: Cannot read properties of undefined \(reading 'foo'\)/, `>> FAIL: config-throws-other: friendly wrapper missing or original message not preserved (got "${err.message}")`);
+        assert.ok(!/Hint:/.test(err.message), `>> FAIL: config-throws-other: unexpected env-var hint on a non-required-shape message (got "${err.message}")`);
+        return true;
+      },
+    );
+  });
+});
+
+describe("formatConfigLoadError — pure helper", () => {
+  test("'<VAR> is required' shape produces the friendly wrapper + hint, preserving the original message", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.ts",
+      new Error("APP_DOTNS_DOMAIN is required"),
+    );
+    assert.match(message, /^Your polkadot-app-deploy\.config\.ts threw while loading: APP_DOTNS_DOMAIN is required\. Check its required env vars \/ inputs\./, `>> FAIL: formatConfigLoadError required-shape: unexpected message shape (got "${message}")`);
+    assert.match(message, /Hint: set the APP_DOTNS_DOMAIN environment variable\.$/, `>> FAIL: formatConfigLoadError required-shape: missing hint (got "${message}")`);
+  });
+
+  test("'missing env var X' shape also produces a hint", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.js",
+      new Error("missing env var API_KEY"),
+    );
+    assert.match(message, /Hint: set the API_KEY environment variable\.$/, `>> FAIL: formatConfigLoadError missing-env-var shape: expected API_KEY hint (got "${message}")`);
+  });
+
+  test("a non-'required' shape produces the wrapper with no hint", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.mjs",
+      new Error("Cannot read properties of undefined (reading 'foo')"),
+    );
+    assert.equal(
+      message,
+      "Your polkadot-app-deploy.config.mjs threw while loading: Cannot read properties of undefined (reading 'foo'). Check its required env vars / inputs.",
+      `>> FAIL: formatConfigLoadError non-required-shape: unexpected message (got "${message}")`,
+    );
+  });
+
+  test("a thrown non-Error value is stringified, not [object Object]", () => {
+    const message = formatConfigLoadError("/proj/polkadot-app-deploy.config.ts", "plain string throw");
+    assert.match(message, /threw while loading: plain string throw\./, `>> FAIL: formatConfigLoadError non-Error throw: expected stringified value (got "${message}")`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1094: manifest publish uploaded the icon/executables to the DEFAULT
+// Bulletin RPC, ignoring the deploy's --env/--rpc — storeFile/storeDirectory
+// are called with no client of their own, so they fall back to whatever
+// getProvider() reads off the module-level BULLETIN_ENDPOINTS. Asserting
+// BULLETIN_ENDPOINTS directly after publishManifest is not a hollow proxy:
+// storeFile/storeDirectory connect to exactly BULLETIN_ENDPOINTS[0] (verified
+// live against the real chain while fixing this issue — pre-fix connected to
+// DEFAULT_BULLETIN_RPC despite env:"paseo-next-v2"; post-fix connected to
+// paseo-next-v2's own wss://paseo-bulletin-next-rpc.polkadot.io).
+//
+// Each test seeds BULLETIN_ENDPOINTS at the module-default seed first — this
+// is the state any *standalone* publishManifest() call starts from (a fresh
+// process, or any library caller that didn't run deploy() first in-process;
+// see the module's own JSDoc: "on top of an already-completed legacy
+// deploy"). A broken icon path makes publishManifest throw immediately after
+// resolving+setting the endpoint (readFileOrThrow), before any real
+// network/chain call — keeps this a fast, deterministic unit test.
+//
+// "devnet" is used as the non-default env below (this twin's assets/
+// environments.json only defines paseo-next-v2 and devnet — bulletin's
+// equivalent test used a "paseo-review" env that has no counterpart here).
+describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
+  test("resolves the given env's Bulletin endpoint before storeFile/storeDirectory run, not the module default", async (t) => {
+    const before = BULLETIN_ENDPOINTS;
+    t.after(() => setBulletinEndpoints(before));
+    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
+
+    const dir = await tmpDir(t, "product-manifest-rpc-");
+    const loaded = {
+      config: {
+        ...VALID_CONFIG,
+        domain: "manifestrpctest.dot",
+        icon: { path: "./missing-icon.png", format: "png" },
+        executables: [],
+      },
+      sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
+    };
+
+    await assert.rejects(
+      () => publishManifest({ loaded, domain: "manifestrpctest.dot", env: "devnet" }),
+      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      ">> FAIL: publishManifest #1094 setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
+    );
+
+    // devnet's Bulletin endpoint(s) (assets/environments.json), distinct
+    // from BOTH the module-default seed AND paseo-next-v2's own endpoint —
+    // this assertion cannot pass by accident.
+    assert.deepStrictEqual(
+      BULLETIN_ENDPOINTS,
+      ["wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
+      ">> FAIL: publishManifest #1094: BULLETIN_ENDPOINTS must be set to the resolved env's ('devnet') Bulletin endpoint before storeFile/storeDirectory run — it was left at DEFAULT_BULLETIN_RPC, which is exactly what storeFile/storeDirectory would connect to (getProvider() has no client of its own)",
+    );
+  });
+
+  test("an --rpc override wins even against a non-default env, with the env endpoint kept as fail-over backup", async (t) => {
+    const before = BULLETIN_ENDPOINTS;
+    t.after(() => setBulletinEndpoints(before));
+    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
+
+    const dir = await tmpDir(t, "product-manifest-rpc-override-");
+    const loaded = {
+      config: {
+        ...VALID_CONFIG,
+        domain: "manifestrpctest.dot",
+        icon: { path: "./missing-icon.png", format: "png" },
+        executables: [],
+      },
+      sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
+    };
+
+    await assert.rejects(
+      () => publishManifest({ loaded, domain: "manifestrpctest.dot", env: "devnet", rpc: "wss://custom-override.example" }),
+      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      ">> FAIL: publishManifest #1094 rpc-override setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
+    );
+
+    assert.deepStrictEqual(
+      BULLETIN_ENDPOINTS,
+      ["wss://custom-override.example", "wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
+      ">> FAIL: publishManifest #1094 rpc-override: an explicit --rpc must win over the resolved env's own endpoint, with the env endpoint kept behind it as a fail-over backup",
+    );
+  });
+
+  test("default env (no --env/--rpc passed) resolves to the SAME endpoint deploy() itself would use — non-regression", async (t) => {
+    const before = BULLETIN_ENDPOINTS;
+    t.after(() => setBulletinEndpoints(before));
+    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
+
+    const dir = await tmpDir(t, "product-manifest-rpc-default-");
+    const loaded = {
+      config: {
+        ...VALID_CONFIG,
+        domain: "manifestrpctest.dot",
+        icon: { path: "./missing-icon.png", format: "png" },
+        executables: [],
+      },
+      sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
+    };
+
+    await assert.rejects(
+      () => publishManifest({ loaded, domain: "manifestrpctest.dot" }),
+      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      ">> FAIL: publishManifest #1094 default-env setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
+    );
+
+    // paseo-next-v2 is both DEFAULT_ENV_ID (environments.ts) and the CLI's
+    // implicit default when --env is omitted — must resolve to its OWN
+    // endpoint (wss://paseo-bulletin-next-rpc.polkadot.io), NOT the
+    // DEFAULT_BULLETIN_RPC seed constant (a different URL — see #1094).
+    assert.deepStrictEqual(
+      BULLETIN_ENDPOINTS,
+      ["wss://paseo-bulletin-next-rpc.polkadot.io"],
+      ">> FAIL: publishManifest #1094 default-env: omitting --env must still resolve to paseo-next-v2's OWN Bulletin endpoint, not the unrelated DEFAULT_BULLETIN_RPC seed constant",
     );
   });
 });

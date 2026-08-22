@@ -100,6 +100,38 @@ export const DEFAULT_POOL_SIZE = 10;
 // backups here once the Bulletin team publishes them (no code change needed).
 export let BULLETIN_ENDPOINTS: string[] = [DEFAULT_BULLETIN_RPC];
 let POOL_SIZE = DEFAULT_POOL_SIZE;
+
+/**
+ * Bulletin RPC override precedence, shared by every caller that resolves an
+ * env's Bulletin endpoint(s): an explicit `rpcOverride` (CLI `--rpc`) wins,
+ * falling back to the `BULLETIN_RPC` env var, else the env-resolved
+ * candidate list is used unchanged. The override is placed first (primary)
+ * with the rest of the env's candidates kept as fail-over backups, minus any
+ * duplicate of the override itself.
+ *
+ * Extracted from `deploy()`'s own resolution so `manifest/publish.ts` can
+ * compute the exact same endpoint `deploy()` would for a given env/--rpc,
+ * instead of inventing a second resolution mechanism.
+ */
+export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: string): string[] {
+  const userRpc = rpcOverride ?? process.env.BULLETIN_RPC;
+  return userRpc ? [userRpc, ...envBulletin.filter(e => e !== userRpc)] : envBulletin;
+}
+
+/**
+ * Set the module-level Bulletin endpoint list that `getProvider()` (and
+ * therefore `storeFile`/`storeDirectory` when called without an explicit
+ * client) connects to. `deploy()` sets this from the resolved env/--rpc at
+ * the top of every run. Exported so callers outside this module — namely
+ * `manifest/publish.ts`'s `publishManifest`, which can run without a
+ * preceding in-process `deploy()` call — can point their own storage
+ * uploads at the same env instead of silently defaulting to
+ * `DEFAULT_BULLETIN_RPC`. ESM named imports are read-only bindings, so a
+ * setter is the only way for another module to update this `let`.
+ */
+export function setBulletinEndpoints(endpoints: string[]): void {
+  BULLETIN_ENDPOINTS = endpoints;
+}
 // Module-level flag: flipped by getWsProvider's onStatusChanged if papi
 // connects to a non-primary endpoint. Flushed into the deploy span at the end
 // of deploy() so the attribute always lands even if the callback fires late
@@ -463,6 +495,75 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
   setDeployAttribute("deploy.signer.mode", "external");
   setDeployAttribute("deploy.signer.address", truncateAddress(ss58) as string);
   return { client, unsafeApi, signer, ss58 };
+}
+
+/**
+ * Resolve the mnemonic the CLI should act with, in precedence order:
+ * `--mnemonic` flag > `MNEMONIC` env var > `DOTNS_MNEMONIC` env var.
+ *
+ * Exists so the bin's flag/env resolution is unit-testable and so the two
+ * env vars are forwarded consistently: previously the bin only forwarded
+ * `flags.mnemonic` into `options.mnemonic`, so an env-only mnemonic never
+ * reached `chooseSignerInput` and a persisted session silently won instead —
+ * even though `chooseSignerInput` already prefers mnemonic first.
+ */
+export function resolveEffectiveMnemonic(opts: {
+  flagMnemonic: string | undefined;
+  envMnemonic: string | undefined;
+  envDotnsMnemonic: string | undefined;
+}): string | undefined {
+  return opts.flagMnemonic ?? opts.envMnemonic ?? opts.envDotnsMnemonic;
+}
+
+/**
+ * Resolve the environment id the CLI should target, in precedence order:
+ * `--env` flag > `PAD_ENV` env var. Returns `undefined` when neither is
+ * set — callers (deploy(), the bin's other flag sites) already fall back to
+ * `DEFAULT_ENV_ID` themselves, so this helper doesn't bake that default in;
+ * it only resolves the flag/env-var precedence (mirrors
+ * `resolveEffectiveMnemonic`'s pattern so the bin's session default is
+ * unit-testable).
+ */
+export function resolveEnvId(opts: {
+  flagEnv: string | undefined;
+  envVar: string | undefined;
+}): string | undefined {
+  return opts.flagEnv ?? opts.envVar;
+}
+
+/**
+ * Decide whether the deploy should publish product-config manifest records
+ * (subname registration + resolver + contenthash + text records), independent
+ * of whether `tryLoadProductConfig` found a config on disk. Exists so the
+ * bin's `--no-manifest` / `--content-only` short-circuit is unit-testable:
+ * with the flag set, manifest publishing is skipped even when a
+ * `polkadot-app-deploy.config.*` is discoverable, producing the same
+ * content-only deploy as when no config exists at all.
+ */
+export function shouldPublishManifest(opts: {
+  configFound: boolean;
+  noManifest: boolean;
+}): boolean {
+  return opts.configFound && !opts.noManifest;
+}
+
+/**
+ * Reject the contradictory `--no-manifest`/`--content-only` + `--publish`
+ * combination up front. `--publish` lists the domain in the on-chain
+ * Publisher registry, which reads the manifest's text records (Browse relies
+ * on them) — skipping manifest publishing while also asking to list the
+ * domain would silently publish a domain with no manifest data. Returns an
+ * error message string to print + exit on, or `null` when the combination is
+ * fine. Exported for unit testing.
+ */
+export function validateNoManifestFlags(opts: {
+  noManifest: boolean;
+  publish: boolean;
+}): string | null {
+  if (opts.noManifest && opts.publish) {
+    return "Error: --no-manifest (--content-only) and --publish are mutually exclusive — --publish requires the manifest records that --no-manifest skips.";
+  }
+  return null;
 }
 
 /** storageSigner > signer > mnemonic > pool precedence for storage routing. Exported for unit testing. */
@@ -2833,10 +2934,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   if (options.contracts && Object.keys(options.contracts).length > 0) {
     envContracts = { ...envContracts, ...options.contracts };
   }
-  const userRpc = options.rpc ?? process.env.BULLETIN_RPC;
-  BULLETIN_ENDPOINTS = userRpc
-    ? [userRpc, ...envBulletin.filter(e => e !== userRpc)]
-    : envBulletin;
+  BULLETIN_ENDPOINTS = resolveBulletinEndpoints(envBulletin, options.rpc);
   _deployRpcFailedOver = false;
   POOL_SIZE = options.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
 
@@ -2860,6 +2958,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
     hasInjectedSigner: !!(options.signer && options.signerAddress),
     hasSession,
   });
+  // An explicit mnemonic (from --mnemonic OR the MNEMONIC/DOTNS_MNEMONIC env
+  // vars) always wins over a persisted login session — chooseSignerInput
+  // already encodes that precedence. Surface it so the override is visible
+  // instead of silent: without this, a signed-in user setting MNEMONIC for a
+  // one-off deploy would see no indication their session was bypassed.
+  if (signerChoice === "mnemonic" && hasSession) {
+    console.error("Using the provided mnemonic; the persisted login session will be ignored for this deploy.");
+  }
   // userSession is set when the resolve path finds a session — used below for
   // slot-key allocation which is available to any caller, not just the resolve path.
   // Typed as any to avoid importing UserSession from @parity/product-sdk-terminal here.

@@ -18,11 +18,20 @@ import {
   storeDirectory,
   storeFile,
   resolveDotnsConnectOptions,
+  resolveBulletinEndpoints,
+  setBulletinEndpoints,
   type DeployOptions,
 } from "../deploy.js";
 import { DotNS } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
-import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig } from "../environments.js";
+import {
+  loadEnvironments,
+  resolveEndpoints,
+  getPopSelfServeConfig,
+  DEFAULT_ENV_ID,
+  type ResolvedEndpoints,
+  type PopSelfServeConfig,
+} from "../environments.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
 import type { LoadedProductConfig } from "./config-load.js";
 import type {
@@ -46,9 +55,13 @@ export interface PublishManifestOptions {
    * this CID instead of re-uploading the same bytes.
    */
   buildDirCid?: { absPath: string; cid: string };
-  /** Env id (e.g. "paseo-next-v2"). Drives RPC + contract resolution. */
+  /**
+   * Env id (e.g. "paseo-next-v2"). Drives DotNS RPC + contract resolution
+   * AND the Bulletin endpoint the icon/executable uploads target — both use
+   * the same resolved env, matching the legacy deploy.
+   */
   env?: string;
-  /** Optional bulletin RPC override. */
+  /** Optional bulletin RPC override — same precedence as the legacy deploy's `--rpc`. */
   rpc?: string;
   /** Required: signer mnemonic. */
   mnemonic?: string;
@@ -89,6 +102,22 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
 
   const configDir = path.dirname(sourcePath);
 
+  // Resolve the env's Bulletin endpoint(s) up front — same env/--rpc
+  // precedence deploy() uses (resolveBulletinEndpoints is the exact function
+  // deploy() itself calls) — and point the module-level storage endpoint at
+  // it BEFORE any storeFile/storeDirectory call below. Without this,
+  // storeFile/storeDirectory connect with no client of their own, falling
+  // back to getProvider()'s module-default endpoint (DEFAULT_BULLETIN_RPC)
+  // regardless of opts.env/opts.rpc, while the DotNS text-record writes
+  // further down correctly use the resolved env — so the manifest content
+  // could land on the wrong Bulletin chain. Resolve once here and reuse the
+  // result in connectDotNS below (no second load).
+  const envId = opts.env ?? DEFAULT_ENV_ID;
+  const { doc } = await loadEnvironments();
+  const resolved = resolveEndpoints(doc, envId);
+  const popSelfServe = getPopSelfServeConfig(doc, envId);
+  setBulletinEndpoints(resolveBulletinEndpoints(resolved.bulletin, opts.rpc));
+
   const iconAbs = path.resolve(configDir, config.icon.path);
   const iconBytes = await readFileOrThrow(iconAbs, "icon");
   console.log(`\nManifest publish — ${config.domain}`);
@@ -111,7 +140,7 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
     executableCids[exec.kind] = storageCid;
   }
 
-  const dotns = await connectDotNS(opts);
+  const dotns = await connectDotNS(opts, resolved, popSelfServe, envId);
 
   try {
     // DotNS helpers append `.dot` internally, so pass the bare label.
@@ -168,12 +197,12 @@ async function readFileOrThrow(p: string, label: string): Promise<Uint8Array> {
   }
 }
 
-async function connectDotNS(opts: PublishManifestOptions): Promise<DotNS> {
-  const envId = opts.env ?? "paseo-next-v2";
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, envId);
-  const popSelfServe = getPopSelfServeConfig(doc, envId);
-
+async function connectDotNS(
+  opts: PublishManifestOptions,
+  resolved: ResolvedEndpoints,
+  popSelfServe: PopSelfServeConfig | null,
+  envId: string,
+): Promise<DotNS> {
   const deployOptsShim: Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress"> = {
     mnemonic: opts.mnemonic,
     derivationPath: opts.derivationPath,

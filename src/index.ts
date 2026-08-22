@@ -73,7 +73,7 @@ export {
   pessimisticSizePreflight,
 } from "./manifest/byte-budget.js";
 export type { BudgetCheck, PessimisticSizeReport } from "./manifest/byte-budget.js";
-export { loadProductConfig, tryLoadProductConfig } from "./manifest/config-load.js";
+export { loadProductConfig, tryLoadProductConfig, formatConfigLoadError } from "./manifest/config-load.js";
 export type { LoadProductConfigOptions, LoadedProductConfig } from "./manifest/config-load.js";
 export { preflightProductConfig, checkProductConfigFilesExist } from "./manifest/product-preflight.js";
 export { publishManifest } from "./manifest/publish.js";

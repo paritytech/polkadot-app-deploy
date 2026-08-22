@@ -13501,7 +13501,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.strictEqual(env.webGateway, "paseo.li",
       `>> FAIL: paseo-next-v2-web-gateway: paseo-next-v2 must set webGateway to "paseo.li"; got ${JSON.stringify(env.webGateway)}. Without it browserUrlFor falls back to dot.li, so the post-deploy link points at the wrong gateway host.`);
   });
-  });
 
   test.skip("paseo-next-v2 fixture bootstrap repairs funder-owned labels", () => { // skipped in public snapshot: tool not shipped
     const helper = fs.readFileSync("tools/register-test-fixture.mjs", "utf-8");

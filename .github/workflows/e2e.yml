@@ -828,7 +828,7 @@ jobs:
     uses: ./.github/workflows/deploy.yml
     with:
       artifact-name: e2e-fixture-nightly
-      dotns-domain: e2epoolns01.dot
+      dotns-domain: e2epoolns01
       skip-cache: true
       js-merkle: ${{ matrix.merkle == 'js' }}
       direct-signer: false
@@ -872,7 +872,7 @@ jobs:
     uses: ./.github/workflows/deploy.yml
     with:
       artifact-name: e2e-fixture-nightly
-      dotns-domain: e2edirectdp01.dot
+      dotns-domain: e2edirectdp01
       derivation-path: //e2e-direct
       skip-cache: true
       js-merkle: ${{ matrix.merkle == 'js' }}
@@ -923,7 +923,7 @@ jobs:
       artifact-name: e2e-fixture-nightly
       # Ends in the signer name plus 00 so the final label has base length
       # >= 9 and exactly two trailing digits, classifying as NoStatus on both envs.
-      dotns-domain: e2enightly${{ github.run_id }}${{ matrix.signer }}00.dot
+      dotns-domain: e2enightly${{ github.run_id }}${{ matrix.signer }}00
       derivation-path: //e2e-fresh-${{ matrix.signer }}
       skip-cache: true
       js-merkle: true
@@ -968,7 +968,7 @@ jobs:
       MNEMONIC: ${{ secrets.DOTNS_MNEMONIC || 'bottom drive obey lake curtain smoke basket hold race lonely fit walk' }}
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       PAD_ENV: ${{ matrix.env }}
-      S3_LABEL: e2eownedns02.dot
+      S3_LABEL: e2eownedns03
     steps:
       - uses: actions/setup-node@v6
         with:
@@ -1112,7 +1112,7 @@ jobs:
           DOTNS_COMMITMENT_BUFFER: "0"
           # x00 forces NoStatus classification on paseo-next-v2 without
           # depending on POP_RULES self-attestation.
-          LABEL: "e2es5${{ github.run_id }}a${{ github.run_attempt }}x00.dot"
+          LABEL: "e2es5${{ github.run_id }}a${{ github.run_attempt }}x00"
         with:
           timeout_minutes: 15
           max_attempts: 2
@@ -1230,7 +1230,7 @@ jobs:
         run: |
           set +e
           set -o pipefail
-          "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build e2epoolns01.dot 2>&1 | tee /tmp/s6.log
+          "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build e2epoolns01 2>&1 | tee /tmp/s6.log
           EXIT=${PIPESTATUS[0]}
           set -e
           echo "---"
@@ -1691,7 +1691,7 @@ jobs:
           PAD_ENV: ${{ matrix.env }}
           # x00 forces NoStatus classification on both e2eEligible envs without
           # depending on POP_RULES self-attestation.
-          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00.dot
+          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00
         with:
           timeout_minutes: 40
           max_attempts: 2
@@ -1728,7 +1728,7 @@ jobs:
           const BIN = path.join(__dirname, "node_modules", ".bin", "polkadot-app-deploy");
 
           const PAD_ENV = process.env.PAD_ENV ?? process.env.DOTNS_ENV ?? "paseo-next-v2";
-          const LABEL = process.env.LABEL || "e2escar00default.dot";
+          const LABEL = process.env.LABEL || "e2escar00default";
           const MNEMONIC = process.env.MNEMONIC || "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
           const DEPLOY_TAG = process.env.DEPLOY_TAG || undefined;
           const SENTRY_DSN = process.env.SENTRY_DSN || undefined;
@@ -1801,7 +1801,7 @@ jobs:
           PAD_ENV: ${{ matrix.env }}
           # x00 forces NoStatus classification on both e2eEligible envs without
           # depending on POP_RULES self-attestation.
-          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00.dot
+          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00
         with:
           timeout_minutes: 38
           max_attempts: 2

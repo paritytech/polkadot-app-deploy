@@ -173,6 +173,42 @@ describe("resolveEndpoints — pricing overrides", () => {
   });
 });
 
+describe("resolveEndpoints — tld (per-environment DotNS TLD)", () => {
+  test("returns env.tld when the env sets it", () => {
+    const doc = {
+      ...FIXTURE_DOC,
+      environments: [
+        { id: "paseo-next", name: "Paseo Next", network: "testnet", description: "", tld: "paseo" },
+        { id: "paseo-review", name: "Paseo Review", network: "testnet", description: "" },
+      ],
+    };
+    const r1 = resolveEndpoints(doc, "paseo-next");
+    assert.equal(r1.tld, "paseo",
+      ">> FAIL: resolveEndpoints tld: env.tld must surface verbatim when set");
+
+    const r2 = resolveEndpoints(doc, "paseo-review");
+    assert.equal(r2.tld, undefined,
+      ">> FAIL: resolveEndpoints tld: an env with no `tld` key must resolve to undefined here (mirrors webGateway's pattern) — the \"dot\" default is applied by the consumer (DotNS/DEFAULT_TLD), not by resolveEndpoints itself");
+  });
+
+  test("an env with no tld key resolves to undefined, not a hardcoded default", () => {
+    const r = resolveEndpoints(FIXTURE_DOC, "paseo-next");
+    assert.equal(r.tld, undefined,
+      ">> FAIL: resolveEndpoints tld: FIXTURE_DOC's paseo-next declares no `tld` — resolveEndpoints must not silently substitute \"dot\" here (that default belongs to the consumer, e.g. DotNS._tld / DEFAULT_TLD in src/dotns.ts)");
+  });
+
+  test("real bundled environments.json: paseo-next-v2 resolves tld \"paseo\", devnet resolves tld undefined (community-operated, falls back to code default)", async () => {
+    const { doc } = await loadEnvironments();
+    const paseoNextV2 = resolveEndpoints(doc, "paseo-next-v2");
+    assert.equal(paseoNextV2.tld, "paseo",
+      `>> FAIL: resolveEndpoints tld: paseo-next-v2 must resolve tld "paseo" (post-redeploy DotNS TLD); got ${JSON.stringify(paseoNextV2.tld)}`);
+
+    const devnet = resolveEndpoints(doc, "devnet");
+    assert.equal(devnet.tld, undefined,
+      `>> FAIL: resolveEndpoints tld: devnet is community-operated (we don't control its deployment) and must declare no tld, falling back to the code default; got ${JSON.stringify(devnet.tld)}`);
+  });
+});
+
 describe("resolveEndpoints — mainnet guard", () => {
   test("polkadot has no bulletin endpoint → throws NonRetryableError pointing at environments.json", () => {
     try {

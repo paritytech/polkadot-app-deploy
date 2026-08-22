@@ -44,7 +44,11 @@ if (process.env.DOTNS_ENV && !process.env.PAD_ENV) {
   console.warn("DOTNS_ENV is deprecated; use PAD_ENV. Will be removed in a future release.");
 }
 const LABEL = process.env.LABEL ?? (PAD_ENV === "paseo-next-v2" ? "e2epoolns01" : "e2epool");
-const OWNED_LABEL = process.env.OWNED_LABEL ?? (PAD_ENV === "paseo-next-v2" ? "e2eownedns02" : "e2eowned");
+// e2eownedns03, not e2eownedns02: verified live 2026-08-22 via checkOwnership
+// that e2eownedns02.paseo was squatted by a third party (0x237a2b18…) after
+// the Asset Hub re-genesis — e2eownedns03.paseo is the one actually owned by
+// Bob (0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01). See test/e2e.test.js's S3 block.
+const OWNED_LABEL = process.env.OWNED_LABEL ?? (PAD_ENV === "paseo-next-v2" ? "e2eownedns03" : "e2eowned");
 const DEPLOY_TAG = process.env.DEPLOY_TAG ?? "e2e-local-s7";
 const RPC = process.env.BULLETIN_RPC ?? "wss://paseo-bulletin-rpc.polkadot.io";
 const MNEMONIC = process.env.MNEMONIC ?? process.env.DOTNS_MNEMONIC;
@@ -93,7 +97,11 @@ function ok(msg) {
 console.log("─── S7 Run 1: spawn bulletin-deploy and SIGINT mid-chunk-upload ───");
 
 const envFlag = PAD_ENV ? ["--env", PAD_ENV] : [];
-const args1 = [FIXTURE_DIR, `${LABEL}.dot`, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
+// Bare label: the DotNS TLD is per-environment (".paseo" on paseo-next-v2,
+// ".dot" elsewhere), and the CLI appends the env's resolved TLD itself.
+// Hardcoding ".dot" here made the CLI's wrong-TLD guard reject every
+// paseo-next-v2 run before the scenario could even start.
+const args1 = [FIXTURE_DIR, LABEL, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
 const env1 = PAD_ENV ? { ...process.env } : { ...process.env, BULLETIN_RPC: RPC };
 if (MNEMONIC) env1.MNEMONIC = MNEMONIC;
 
@@ -183,7 +191,7 @@ console.log("─── S7 Run 2: relaunch should warn about the SIGINT'd previou
 // Bob's domain returns exit 78 fast — perfect for capturing
 // the relaunch warning that bin/bulletin-deploy:93 prints BEFORE the deploy
 // proceeds. We don't care about the deploy outcome; we care about stderr.
-const args2 = [FIXTURE_DIR, `${OWNED_LABEL}.dot`, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
+const args2 = [FIXTURE_DIR, OWNED_LABEL, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
 const child2 = spawn(PAD_BIN, args2, { env: env1, stdio: ["ignore", "pipe", "pipe"] });
 
 let stderr2 = "";

@@ -22,6 +22,9 @@ import {
 import { registerOrEnsureResolver } from "../dist/manifest/publish.js";
 import { NonRetryableError } from "../dist/errors.js";
 import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
+import { KNOWN_TLDS as DOTNS_KNOWN_TLDS } from "../dist/dotns.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -225,6 +228,37 @@ describe("validateProductConfig", () => {
     const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp" });
     assert.equal(result.ok, false);
     assert.ok(result.errors.some(e => e.includes("domain")));
+  });
+
+  // #paseo-tld: DotNS's TLD is per-environment (paseo-next-v2: "paseo") —
+  // a config domain ending in .paseo must validate, not be rejected as if
+  // ".dot" were the only legal suffix.
+  test("accepts a domain with .paseo suffix (paseo-next-v2)", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp.paseo" });
+    assert.equal(result.ok, true,
+      `>> FAIL: validateProductConfig .paseo: expected ok:true, got errors: ${JSON.stringify(result.ok ? [] : result.errors)}`);
+  });
+
+  test("still rejects a domain ending in an unknown TLD", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp.example" });
+    assert.equal(result.ok, false,
+      ">> FAIL: validateProductConfig unknown TLD: 'demoapp.example' must still be rejected — only KNOWN_TLDS suffixes are valid");
+  });
+
+  // Keeps src/manifest/schema.ts's hand-copied KNOWN_TLDS list (documented as
+  // "kept in sync with dotns.ts's KNOWN_TLDS by hand") from silently drifting
+  // — schema.ts deliberately doesn't import dotns.ts (stays free of the
+  // polkadot-api dep), so nothing else would catch a divergence.
+  test("schema.ts's KNOWN_TLDS list stays in sync with dotns.ts's KNOWN_TLDS", () => {
+    const schemaSrc = readFileSync(fileURLToPath(new URL("../src/manifest/schema.ts", import.meta.url)), "utf8");
+    const m = schemaSrc.match(/const KNOWN_TLDS = \[([^\]]+)\] as const;/);
+    assert.ok(m, ">> FAIL: could not find schema.ts's KNOWN_TLDS declaration to compare");
+    const schemaTlds = m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean);
+    assert.deepEqual(
+      schemaTlds.sort(),
+      [...DOTNS_KNOWN_TLDS].sort(),
+      `>> FAIL: KNOWN_TLDS drift: src/manifest/schema.ts has ${JSON.stringify(schemaTlds)} but src/dotns.ts has ${JSON.stringify(DOTNS_KNOWN_TLDS)} — a config domain valid on-chain could now fail schema validation, or vice versa`,
+    );
   });
 
   test("rejects empty executables array", () => {

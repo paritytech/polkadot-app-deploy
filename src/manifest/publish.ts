@@ -22,7 +22,7 @@ import {
   setBulletinEndpoints,
   type DeployOptions,
 } from "../deploy.js";
-import { DotNS, type OwnershipResult } from "../dotns.js";
+import { DotNS, DEFAULT_TLD, stripTldSuffix, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
 import {
   loadEnvironments,
@@ -143,8 +143,9 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   const dotns = await connectDotNS(opts, resolved, popSelfServe, envId);
 
   try {
-    // DotNS helpers append `.dot` internally, so pass the bare label.
-    const baseLabel = stripDotSuffix(config.domain);
+    // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
+    // DotNS._tld / connectDotNS above), so pass the bare label.
+    const baseLabel = stripDotSuffix(config.domain, resolved.tld ?? DEFAULT_TLD);
 
     await dotns.ensureContentResolver(baseLabel);
 
@@ -246,6 +247,7 @@ async function connectDotNS(
     envId,
     popSelfServe,
     resolved.registerStorageDeposit,
+    resolved.tld,
   );
 
   const dotns = new DotNS();
@@ -284,6 +286,9 @@ function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
   } as WorkerManifest;
 }
 
-function stripDotSuffix(domain: string): string {
-  return domain.replace(/\.dot$/i, "");
+// tld is a required param: this function's single caller (below) always
+// passes a resolved value (`resolved.tld ?? DEFAULT_TLD`), so a default here
+// was dead code.
+function stripDotSuffix(domain: string, tld: string): string {
+  return stripTldSuffix(domain, tld);
 }

@@ -13473,24 +13473,33 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
     const env = envDoc.environments.find((entry) => entry.id === "paseo-next-v2");
     assert.ok(env, "assets/environments.json must define paseo-next-v2");
+    // DotNS was redeployed on paseo-next-v2 on 2026-08-12. Addresses come from the
+    // canonical registry (paritytech/dotns DEPLOYMENTS.md); DotNS deploys through a
+    // CREATE3 factory, so every network shares these addresses and only the TLD differs.
+    // A stale entry here does not fail the build — it fails at deploy time with
+    // "No contract deployed at 0x… (POP_RULES)", so this pin is the early-warning.
     assert.deepStrictEqual(env.contracts, {
-      DOTNS_PROTOCOL_REGISTRY: "0x8F28419f4E32Bb0aA02e156A0543Ff253f126D7D",
-      DOTNS_REGISTRAR: "0xf7Ad3F44F316C73E4a2b46b1ed48d376bCc9E639",
-      DOTNS_REGISTRAR_CONTROLLER: "0x674b705268DAE369F0a7BE9cbaCDb928b8BA38C2",
-      DOTNS_REGISTRY: "0xa1b2b939E82b2ecE55Bd8a0E283818BfC1CA6CDc",
-      DOTNS_POP_CONTROLLER: "0x1c858C31497a7715C0D56A11208feB6b74FaB2aB",
-      ROOT_GATEWAY_DISPATCHER: "0xd3F059FA65dA566B294b5d755a06054d4bE7ce7C",
-      DOTNS_RESOLVER: "0xA8988eA083174ea94Ed1D686f0F073a10f65598D",
-      DOTNS_CONTENT_RESOLVER: "0x8A26480b0B5Df3d4D9b95adc24a5Ecb33A5b8F64",
-      DOTNS_REVERSE_RESOLVER: "0x259B9D8199c29d2EF132264ad05f8F74F3115A2E",
-      DOTNS_POP_RESOLVER: "0xC9D511Eb80fD8B745DC5Be59aCF5d700271bC01e",
-      DOTNS_NAME_ESCROW: "0x2Cb9899d91Ee575E8917958723F5E941b1BcC6A1",
-      POP_RULES: "0x4909bFb3f4Fd86244abD6430fDfA0Ce5C91aD0c4",
-      STORE_FACTORY: "0x692047C1477a017F287488E1c85F96Ca28C23fD8",
-      LABEL_STORE_BEACON: "0x86ff9CE56C86bC3DfcaA7E316FB0Dd816e9fA2df",
-      USER_STORE_BEACON: "0x6a7a938f72D39f949ee484a78c4C500514E2cb69",
-      PUBLISHER: "0xa616254fd98724c7a3d295c98ca393a486096b68",
-    });
+      DOTNS_PROTOCOL_REGISTRY: "0xD19e3D0C97CF501125a04A97405e3e6592fa846E",
+      DOTNS_REGISTRAR: "0x4f06E818Ba3d987704fd91cf3d868E4b019106Ab",
+      DOTNS_REGISTRAR_CONTROLLER: "0xBdaA01bD1bA67d709F2b1fF286Da0d854977EA30",
+      DOTNS_REGISTRY: "0xf34054fd76BbF85f216cf9908226D5f0A72E50CA",
+      DOTNS_POP_CONTROLLER: "0xCC932348606cc1f3318cADeC5A5Cd2CA447f8a4b",
+      ROOT_GATEWAY_DISPATCHER: "0xa889CCA3Fb4B07b98a11cc54C10f13dDA20bc3db",
+      DOTNS_RESOLVER: "0xbd1165E549DF96F083c0A16f61590927bC187009",
+      DOTNS_CONTENT_RESOLVER: "0x7F74D7CD50f5a834270E2ad395a01b01891AB37d",
+      DOTNS_REVERSE_RESOLVER: "0xee3883d7eB60Ee9BCD7F3bcD8f2f05302A9Cc035",
+      DOTNS_POP_RESOLVER: "0xDaC984884EcA8Fc44011f1D6C49B27828390A72B",
+      DOTNS_NAME_ESCROW: "0x4881Afb78e7C908cAe818168B926229D93376520",
+      POP_RULES: "0x747B456bE03aec0b42bd85C51513730FBD45DA31",
+      STORE_FACTORY: "0x709A027F446a9e2a4BB9cb9a9c754435b19e32B7",
+      LABEL_STORE_BEACON: "0xb57Ebc2e7085616d4906D1fE49af1cE13f7dffeF",
+      USER_STORE_BEACON: "0xb7C995601679840d36F37E86DB2d7dF30797eC5C",
+      MULTICALL3: "0xB4468000abD87D3c56cbFBd153161223D7b109e5",
+    }, ">> FAIL: paseo-next-v2-contracts: assets/environments.json contract addresses drifted from the canonical DotNS deployment. Re-check paritytech/dotns DEPLOYMENTS.md — a stale address surfaces as \"No contract deployed at 0x… \" in preflight, not as a build error.");
+    assert.strictEqual(env.tld, "paseo",
+      `>> FAIL: paseo-next-v2-tld: paseo-next-v2 must set tld to "paseo"; got ${JSON.stringify(env.tld)}. The redeployed DotNS on this network roots names under .paseo, not .dot — a wrong or missing tld makes every registration target a non-existent TLD root.`);
+    assert.strictEqual(env.webGateway, "paseo.li",
+      `>> FAIL: paseo-next-v2-web-gateway: paseo-next-v2 must set webGateway to "paseo.li"; got ${JSON.stringify(env.webGateway)}. Without it browserUrlFor falls back to dot.li, so the post-deploy link points at the wrong gateway host.`);
   });
 
   test.skip("paseo-next-v2 fixture bootstrap repairs funder-owned labels", () => { // skipped in public snapshot: tool not shipped
@@ -13617,11 +13626,15 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     // pickDirectLabel(). Verify: one fresh-label pick + two buildArgs calls.
     assert.match(e2e, /describe\("S8[\s\S]{0,300}const label = pickFreshRunLabel\("s8smoke"\)/,
       "S8 must pick a fresh per-run label once at describe scope");
-    const s8Args = e2e.match(/const args = buildArgs\(fixtureDir, `\$\{label\}\.dot`\);/g) ?? [];
+    // #paseo-tld: the suffix is now the env's resolved tld (bare "dot" was
+    // hardcoded pre-#1240; the CLI's wrong-TLD guard would reject that on a
+    // .paseo env), so this regex accepts any `.${tld}`-shaped interpolation
+    // instead of a literal ".dot".
+    const s8Args = e2e.match(/const args = buildArgs\(fixtureDir, `\$\{label\}\.\$\{tld\}`\);/g) ?? [];
     assert.equal(
       s8Args.length,
       2,
-      "both S8 deploys must use buildArgs() with the shared label binding so --env paseo-next-v2 is passed in PR CI",
+      "both S8 deploys must use buildArgs() with the shared label binding, suffixed with the resolved env tld (not a hardcoded .dot), so --env paseo-next-v2 is passed in PR CI",
     );
   });
 
@@ -13688,9 +13701,9 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assertNoStatusLabel("e2enightly25829471478pool00");
     assertNoStatusLabel("e2enightly25829471478direct00");
 
-    assert.match(workflowJobBlock(workflow, "nightly-s1-pool"), /dotns-domain:\s*e2epoolns01\.dot/, "nightly S1 pool must use a NoStatus label");
-    assert.match(workflowJobBlock(workflow, "nightly-s1-direct"), /dotns-domain:\s*e2edirectdp01\.dot/, "nightly S1 direct must use a NoStatus label owned by the direct derivation");
-    assert.match(workflowJobBlock(workflow, "nightly-s2-fresh"), /dotns-domain:\s*e2enightly\$\{\{ github\.run_id \}\}\$\{\{ matrix\.signer \}\}00\.dot/, "nightly S2 fresh labels must classify as NoStatus");
+    assert.match(workflowJobBlock(workflow, "nightly-s1-pool"), /dotns-domain:\s*e2epoolns01$/m, "nightly S1 pool must use a NoStatus label");
+    assert.match(workflowJobBlock(workflow, "nightly-s1-direct"), /dotns-domain:\s*e2edirectdp01$/m, "nightly S1 direct must use a NoStatus label owned by the direct derivation");
+    assert.match(workflowJobBlock(workflow, "nightly-s2-fresh"), /dotns-domain:\s*e2enightly\$\{\{ github\.run_id \}\}\$\{\{ matrix\.signer \}\}00$/m, "nightly S2 fresh labels must classify as NoStatus");
   });
 
   test("release/nightly inline E2E jobs read PAD_ENV from matrix.env (fan-out)", () => {
@@ -13709,7 +13722,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     }
 
     const s3 = workflowJobBlock(workflow, "nightly-s3");
-    assert.match(s3, /S3_LABEL:\s*e2eownedns02\.dot/, "nightly S3 must use the v2 Bob-owned fixture label");
+    assert.match(s3, /S3_LABEL:\s*e2eownedns03$/m, "nightly S3 must use the Bob-owned fixture label (ns03 — ns02 was squatted after the re-genesis)");
     assert.match(s3, /--env "\$PAD_ENV" build "\$S3_LABEL"/, "nightly S3 must pass --env to bulletin-deploy");
 
     for (const label of [
@@ -13720,10 +13733,11 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       assertNoStatusLabel(label);
     }
 
-    assert.match(workflowJobBlock(workflow, "nightly-s5"), /LABEL:\s*"e2es5\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00\.dot"/, "nightly S5 must use a dynamic NoStatus label");
-    assert.match(workflowJobBlock(workflow, "nightly-s6"), /build e2epoolns01\.dot/, "nightly S6 must deploy the v2 NoStatus pool label");
+    assert.match(workflowJobBlock(workflow, "nightly-s5"), /LABEL:\s*"e2es5\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00"/, "nightly S5 must use a dynamic NoStatus label");
+    assert.match(workflowJobBlock(workflow, "nightly-s6"), /build e2epoolns01\b(?!\.)/, "nightly S6 must deploy the NoStatus pool label as a BARE label — a \".dot\" suffix is rejected on a .paseo environment");
     assert.match(workflowJobBlock(workflow, "nightly-s7"), /LABEL:\s*e2epoolns01/, "nightly S7 must use the v2 NoStatus pool label");
-    assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00\.dot/, "nightly S-CAR must use a dynamic NoStatus label");
+    assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00$/m, "nightly S-CAR must use a dynamic NoStatus label");
+
     const sExt = workflowJobBlock(workflow, "nightly-s-ext-signer");
     assert.match(sExt, /setContenthash\("e2epoolns01", expected\)/, "nightly S-ext-signer must write the v2 NoStatus pool label");
     assert.match(sExt, /import \{ DotNS, loadEnvironments, resolveEndpoints \} from "@parity\/polkadot-app-deploy"/, "npm-installed S-ext must use the package's environment helpers");
@@ -13735,7 +13749,35 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     const s7Script = fs.readFileSync("scripts/e2e-sigint-scenario.mjs", "utf-8");
     assert.match(s7Script, /const envFlag = PAD_ENV \? \["--env", PAD_ENV\] : \[\]/, "S7 harness must forward PAD_ENV to both deploy invocations");
     assert.match(s7Script, /const LABEL = process\.env\.LABEL \?\? \(PAD_ENV === "paseo-next-v2" \? "e2epoolns01" : "e2epool"\)/, "S7 harness must default to the v2 NoStatus pool label");
-    assert.match(s7Script, /OWNED_LABEL[\s\S]{0,120}e2eownedns02/, "S7 harness must use the v2 Bob-owned fixture for the relaunch warning check");
+    // e2eownedns03, not e2eownedns02: the Asset Hub re-genesis emptied the
+    // .paseo namespace and a third party squatted e2eownedns02.paseo before
+    // this fixture was re-provisioned (verified live via checkOwnership).
+    assert.match(s7Script, /OWNED_LABEL[\s\S]{0,120}e2eownedns03/, "S7 harness must use the v2 Bob-owned fixture for the relaunch warning check");
+    // #paseo-tld (#1248): args1/args2 must pass BARE labels — the CLI's
+    // wrong-TLD guard rejects a hardcoded ".dot" suffix on a ".paseo" env, so
+    // hardcoding either suffix here would break exactly one environment.
+    assert.match(s7Script, /const args1 = \[FIXTURE_DIR, LABEL, "--js-merkle"/, "S7 harness must pass a bare LABEL (no hardcoded TLD) so the CLI resolves the env's own suffix");
+    assert.match(s7Script, /const args2 = \[FIXTURE_DIR, OWNED_LABEL, "--js-merkle"/, "S7 harness must pass a bare OWNED_LABEL (no hardcoded TLD) so the CLI resolves the env's own suffix");
+  });
+
+  // Class-level guard. Six separate assertions in this file pinned ".dot"-suffixed
+  // e2e.yml labels, and they surfaced one failure at a time as each was fixed —
+  // so pin the INVARIANT instead of relying on finding every call site by grep.
+  // parseDomainName refuses a ".dot" name on a ".paseo" environment (it tells you
+  // to pass the bare label), and the nightly matrix includes paseo-next-v2, so a
+  // suffixed label value in e2e.yml is a hard CI failure, not a style question.
+  test("e2e.yml passes BARE domain labels — a hardcoded TLD suffix breaks every non-.dot environment", () => {
+    const workflow = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const offenders = workflow.split("\n")
+      .map((line, i) => ({ line, n: i + 1 }))
+      .filter(({ line }) => !line.trim().startsWith("#"))
+      .filter(({ line }) => /(?:LABEL|dotns-domain|S3_LABEL)\s*:\s*"?[^"\n]*\.dot\b/.test(line)
+                         || /\bbuild\s+\S*\.dot\b/.test(line))
+      .map(({ line, n }) => `    line ${n}: ${line.trim()}`);
+    assert.deepStrictEqual(
+      offenders, [],
+      `>> FAIL: e2e-yml-bare-labels: ${offenders.length} label value(s) in .github/workflows/e2e.yml still carry a ".dot" suffix. The env TLD is appended by the CLI, and parseDomainName REJECTS a ".dot" name on a ".paseo" environment — every one of these fails the nightly against paseo-next-v2. Pass the bare label instead:\n${offenders.join("\\n")}`,
+    );
   });
 
   test("workflow has a select-env job that drives test-pr", () => {
@@ -16740,9 +16782,11 @@ describe("deploy.ts: persistent cache write replaces buildDir sidecar", () => {
 describe("deploy.ts: PoP wording uses 'requires' + 'Your PoP'", () => {
   test("DotNS line uses 'requires' verb (not 'classifies as')", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // #paseo-tld: the suffix is now the resolved env tld (envTld), not a
+    // hardcoded ".dot" — match either form.
     assert.ok(
-      /DotNS:.*\.dot\s+requires/.test(src),
-      "deploy.ts: DotNS line must say '<domain>.dot requires <tier>' (verb: 'requires', not 'classifies as')"
+      /DotNS:.*\.\S+\s+requires/.test(src),
+      "deploy.ts: DotNS line must say '<domain>.<tld> requires <tier>' (verb: 'requires', not 'classifies as')"
     );
   });
 

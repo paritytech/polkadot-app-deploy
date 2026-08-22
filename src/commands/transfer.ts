@@ -8,6 +8,7 @@
 import { DotNS, DEFAULT_MNEMONIC, DEFAULT_TLD, parseDomainName } from "../dotns.js";
 import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig } from "../environments.js";
 import { CLI_NAME } from "../cli-name.js";
+import { zeroAddress } from "viem";
 
 export interface TransferRecipientContext {
   sessionH160?: string;
@@ -20,7 +21,15 @@ export async function resolveTransferRecipient(
   to: string | undefined,
   ctx: TransferRecipientContext,
 ): Promise<string> {
-  if (to && to.startsWith("0x") && to.length === 42) return to;
+  if (to && to.startsWith("0x") && to.length === 42) {
+    // Reject the burn sentinel before any chain call — DotNS.transferName/
+    // transferSubname guard it too (defense in depth), but catching it here
+    // means a typo'd --to never even opens a connection.
+    if (to.toLowerCase() === zeroAddress) {
+      throw new Error(`--to must not be the zero address (${zeroAddress}): this would permanently burn the name.`);
+    }
+    return to;
+  }
   if (to) throw new Error(`--to must be a 0x H160 address (got "${to}").`);
   if (ctx.sessionH160) return ctx.sessionH160;
   throw new Error("No recipient: pass --to <0xH160> or sign in first (no session found).");

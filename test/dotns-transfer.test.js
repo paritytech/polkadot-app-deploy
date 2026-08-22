@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability } from "../dist/dotns.js";
-import { namehash } from "viem";
+import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient } from "../dist/dotns.js";
+import { namehash, zeroAddress } from "viem";
 
 test("weiToNative: zero stays zero", () => {
   assert.equal(weiToNative(0n, 100000000n), 0n);
@@ -59,6 +59,52 @@ test("transferName: transfers when worker owns it", async () => {
   assert.equal(r.status, "ok");
   assert.equal(r.txHash, "0xabc");
   assert.equal(r.feeWei, 10n * 10n ** 18n);
+});
+
+// --- zero-address burn guard -------------------------------------------
+// transferFrom/setSubnodeOwner both accept the zero address as a recipient
+// without reverting — it is a valid ERC-721/registry-owner value, just one
+// nobody can ever recover a name from. Neither transferName nor
+// transferSubname had a guard against it, so `--to 0x000...000` (a plausible
+// typo for an empty --to, or a copy/paste slip) would silently and
+// irreversibly burn the name. assertNotZeroRecipient is the single guard both
+// paths call before touching the chain at all.
+
+test("assertNotZeroRecipient: throws for the zero address", () => {
+  assert.throws(
+    () => assertNotZeroRecipient(zeroAddress, "giftbox.dot"),
+    /zero address/i,
+    ">> FAIL: assertNotZeroRecipient exact-case: expected a 'zero address' error for the literal zero address, got none or a different error",
+  );
+});
+
+test("assertNotZeroRecipient: throws case-insensitively", () => {
+  const upper = "0x" + "0".repeat(40).toUpperCase();
+  assert.throws(
+    () => assertNotZeroRecipient(upper, "giftbox.dot"),
+    /zero address/i,
+    ">> FAIL: assertNotZeroRecipient case-insensitive: an all-uppercase-hex zero address must still be caught (address comparisons are case-insensitive throughout this file)",
+  );
+});
+
+test("assertNotZeroRecipient: does not throw for a real address", () => {
+  assert.doesNotThrow(
+    () => assertNotZeroRecipient("0x" + "ab".repeat(20), "giftbox.dot"),
+    ">> FAIL: assertNotZeroRecipient false-positive: a real (non-zero) address must never be rejected by the burn guard",
+  );
+});
+
+test("transferName: refuses to transfer to the zero address before any chain call", async () => {
+  const d = stubDotns({ owner: "0xWORKER", evmAddress: "0xWORKER" });
+  // If the guard fires AFTER a chain read (or not at all), this stub throws
+  // "unexpected call" instead of the expected burn-guard error — proving the
+  // guard runs first.
+  d.contractCall = async (_a, _abi, fn) => { throw new Error("unexpected call " + fn + " — burn guard did not fire before the chain read"); };
+  await assert.rejects(
+    () => d.transferName("giftbox", zeroAddress),
+    /zero address/i,
+    ">> FAIL: transferName burn guard: expected transferName to refuse --to the zero address before any ownerOf/transferFloor call",
+  );
 });
 
 // transferSubname touches contractCallNullable("owner", [node]) three times —
@@ -119,6 +165,16 @@ test("transferSubname: reassigns via setSubnodeOwner when the signer owns the pa
 test("transferSubname: throws when the reassignment does not land", async () => {
   const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xOLD", afterOwner: "0xOLD" });
   await assert.rejects(() => d.transferSubname("app", "foo", "0xRECIP"), /did not land/i);
+});
+
+test("transferSubname: refuses to transfer to the zero address before any chain call", async () => {
+  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER" });
+  d.contractCallNullable = async (_a, _b, fn) => { throw new Error("unexpected call " + fn + " — burn guard did not fire before the chain read"); };
+  await assert.rejects(
+    () => d.transferSubname("app", "foo", zeroAddress),
+    /zero address/i,
+    ">> FAIL: transferSubname burn guard: expected transferSubname to refuse --to the zero address before any owner() read",
+  );
 });
 
 // #paseo-tld follow-up: transferSubname was added (twin-only, PR #151) AFTER

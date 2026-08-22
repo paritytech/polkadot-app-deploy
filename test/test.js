@@ -13749,6 +13749,11 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.match(s7Script, /const envFlag = PAD_ENV \? \["--env", PAD_ENV\] : \[\]/, "S7 harness must forward PAD_ENV to both deploy invocations");
     assert.match(s7Script, /const LABEL = process\.env\.LABEL \?\? \(PAD_ENV === "paseo-next-v2" \? "e2epoolns01" : "e2epool"\)/, "S7 harness must default to the v2 NoStatus pool label");
     assert.match(s7Script, /OWNED_LABEL[\s\S]{0,120}e2eownedns02/, "S7 harness must use the v2 Bob-owned fixture for the relaunch warning check");
+    // #paseo-tld (#1248): args1/args2 must pass BARE labels — the CLI's
+    // wrong-TLD guard rejects a hardcoded ".dot" suffix on a ".paseo" env, so
+    // hardcoding either suffix here would break exactly one environment.
+    assert.match(s7Script, /const args1 = \[FIXTURE_DIR, LABEL, "--js-merkle"/, "S7 harness must pass a bare LABEL (no hardcoded TLD) so the CLI resolves the env's own suffix");
+    assert.match(s7Script, /const args2 = \[FIXTURE_DIR, OWNED_LABEL, "--js-merkle"/, "S7 harness must pass a bare OWNED_LABEL (no hardcoded TLD) so the CLI resolves the env's own suffix");
   });
 
   test("workflow has a select-env job that drives test-pr", () => {

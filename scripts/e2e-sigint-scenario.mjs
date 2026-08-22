@@ -93,7 +93,11 @@ function ok(msg) {
 console.log("─── S7 Run 1: spawn bulletin-deploy and SIGINT mid-chunk-upload ───");
 
 const envFlag = PAD_ENV ? ["--env", PAD_ENV] : [];
-const args1 = [FIXTURE_DIR, `${LABEL}.dot`, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
+// Bare label: the DotNS TLD is per-environment (".paseo" on paseo-next-v2,
+// ".dot" elsewhere), and the CLI appends the env's resolved TLD itself.
+// Hardcoding ".dot" here made the CLI's wrong-TLD guard reject every
+// paseo-next-v2 run before the scenario could even start.
+const args1 = [FIXTURE_DIR, LABEL, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
 const env1 = PAD_ENV ? { ...process.env } : { ...process.env, BULLETIN_RPC: RPC };
 if (MNEMONIC) env1.MNEMONIC = MNEMONIC;
 
@@ -183,7 +187,7 @@ console.log("─── S7 Run 2: relaunch should warn about the SIGINT'd previou
 // Bob's domain returns exit 78 fast — perfect for capturing
 // the relaunch warning that bin/bulletin-deploy:93 prints BEFORE the deploy
 // proceeds. We don't care about the deploy outcome; we care about stderr.
-const args2 = [FIXTURE_DIR, `${OWNED_LABEL}.dot`, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
+const args2 = [FIXTURE_DIR, OWNED_LABEL, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
 const child2 = spawn(PAD_BIN, args2, { env: env1, stdio: ["ignore", "pipe", "pipe"] });
 
 let stderr2 = "";

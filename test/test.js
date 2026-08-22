@@ -13473,24 +13473,34 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
     const env = envDoc.environments.find((entry) => entry.id === "paseo-next-v2");
     assert.ok(env, "assets/environments.json must define paseo-next-v2");
+    // DotNS was redeployed on paseo-next-v2 on 2026-08-12. Addresses come from the
+    // canonical registry (paritytech/dotns DEPLOYMENTS.md); DotNS deploys through a
+    // CREATE3 factory, so every network shares these addresses and only the TLD differs.
+    // A stale entry here does not fail the build — it fails at deploy time with
+    // "No contract deployed at 0x… (POP_RULES)", so this pin is the early-warning.
     assert.deepStrictEqual(env.contracts, {
-      DOTNS_PROTOCOL_REGISTRY: "0x8F28419f4E32Bb0aA02e156A0543Ff253f126D7D",
-      DOTNS_REGISTRAR: "0xf7Ad3F44F316C73E4a2b46b1ed48d376bCc9E639",
-      DOTNS_REGISTRAR_CONTROLLER: "0x674b705268DAE369F0a7BE9cbaCDb928b8BA38C2",
-      DOTNS_REGISTRY: "0xa1b2b939E82b2ecE55Bd8a0E283818BfC1CA6CDc",
-      DOTNS_POP_CONTROLLER: "0x1c858C31497a7715C0D56A11208feB6b74FaB2aB",
-      ROOT_GATEWAY_DISPATCHER: "0xd3F059FA65dA566B294b5d755a06054d4bE7ce7C",
-      DOTNS_RESOLVER: "0xA8988eA083174ea94Ed1D686f0F073a10f65598D",
-      DOTNS_CONTENT_RESOLVER: "0x8A26480b0B5Df3d4D9b95adc24a5Ecb33A5b8F64",
-      DOTNS_REVERSE_RESOLVER: "0x259B9D8199c29d2EF132264ad05f8F74F3115A2E",
-      DOTNS_POP_RESOLVER: "0xC9D511Eb80fD8B745DC5Be59aCF5d700271bC01e",
-      DOTNS_NAME_ESCROW: "0x2Cb9899d91Ee575E8917958723F5E941b1BcC6A1",
-      POP_RULES: "0x4909bFb3f4Fd86244abD6430fDfA0Ce5C91aD0c4",
-      STORE_FACTORY: "0x692047C1477a017F287488E1c85F96Ca28C23fD8",
-      LABEL_STORE_BEACON: "0x86ff9CE56C86bC3DfcaA7E316FB0Dd816e9fA2df",
-      USER_STORE_BEACON: "0x6a7a938f72D39f949ee484a78c4C500514E2cb69",
-      PUBLISHER: "0xa616254fd98724c7a3d295c98ca393a486096b68",
-    });
+      DOTNS_PROTOCOL_REGISTRY: "0xD19e3D0C97CF501125a04A97405e3e6592fa846E",
+      DOTNS_REGISTRAR: "0x4f06E818Ba3d987704fd91cf3d868E4b019106Ab",
+      DOTNS_REGISTRAR_CONTROLLER: "0xBdaA01bD1bA67d709F2b1fF286Da0d854977EA30",
+      DOTNS_REGISTRY: "0xf34054fd76BbF85f216cf9908226D5f0A72E50CA",
+      DOTNS_POP_CONTROLLER: "0xCC932348606cc1f3318cADeC5A5Cd2CA447f8a4b",
+      ROOT_GATEWAY_DISPATCHER: "0xa889CCA3Fb4B07b98a11cc54C10f13dDA20bc3db",
+      DOTNS_RESOLVER: "0xbd1165E549DF96F083c0A16f61590927bC187009",
+      DOTNS_CONTENT_RESOLVER: "0x7F74D7CD50f5a834270E2ad395a01b01891AB37d",
+      DOTNS_REVERSE_RESOLVER: "0xee3883d7eB60Ee9BCD7F3bcD8f2f05302A9Cc035",
+      DOTNS_POP_RESOLVER: "0xDaC984884EcA8Fc44011f1D6C49B27828390A72B",
+      DOTNS_NAME_ESCROW: "0x4881Afb78e7C908cAe818168B926229D93376520",
+      POP_RULES: "0x747B456bE03aec0b42bd85C51513730FBD45DA31",
+      STORE_FACTORY: "0x709A027F446a9e2a4BB9cb9a9c754435b19e32B7",
+      LABEL_STORE_BEACON: "0xb57Ebc2e7085616d4906D1fE49af1cE13f7dffeF",
+      USER_STORE_BEACON: "0xb7C995601679840d36F37E86DB2d7dF30797eC5C",
+      MULTICALL3: "0xB4468000abD87D3c56cbFBd153161223D7b109e5",
+    }, ">> FAIL: paseo-next-v2-contracts: assets/environments.json contract addresses drifted from the canonical DotNS deployment. Re-check paritytech/dotns DEPLOYMENTS.md — a stale address surfaces as \"No contract deployed at 0x… \" in preflight, not as a build error.");
+    assert.strictEqual(env.tld, "paseo",
+      `>> FAIL: paseo-next-v2-tld: paseo-next-v2 must set tld to "paseo"; got ${JSON.stringify(env.tld)}. The redeployed DotNS on this network roots names under .paseo, not .dot — a wrong or missing tld makes every registration target a non-existent TLD root.`);
+    assert.strictEqual(env.webGateway, "paseo.li",
+      `>> FAIL: paseo-next-v2-web-gateway: paseo-next-v2 must set webGateway to "paseo.li"; got ${JSON.stringify(env.webGateway)}. Without it browserUrlFor falls back to dot.li, so the post-deploy link points at the wrong gateway host.`);
+  });
   });
 
   test.skip("paseo-next-v2 fixture bootstrap repairs funder-owned labels", () => { // skipped in public snapshot: tool not shipped

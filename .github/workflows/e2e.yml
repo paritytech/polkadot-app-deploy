@@ -259,6 +259,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - id: select
         env:
           PRIMARY_ENV: ${{ inputs.primary-env || 'paseo-next-v2' }}
@@ -349,6 +352,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - run: npm ci
       - name: Restore Kubo from cache
         if: matrix.merkle == 'kubo'
@@ -541,6 +547,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - run: npm ci
       - name: Resolve test-version and deploy-tag from trigger
         id: version
@@ -735,6 +744,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Restore Kubo from cache
         if: matrix.merkle == 'kubo'
         uses: actions/cache@v5
@@ -959,6 +971,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1054,6 +1069,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1168,6 +1186,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1256,6 +1277,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1332,6 +1356,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
         run: |
@@ -1399,6 +1426,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
         run: |
@@ -1457,6 +1487,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
         run: |
@@ -1516,6 +1549,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
         run: |
@@ -1578,6 +1614,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         run: |
           SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
@@ -1624,6 +1663,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
 
       # ---- source-build path (schedule / dispatch without version) ----------
       - name: Checkout polkadot-app-deploy source
@@ -1806,6 +1848,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - name: Checkout polkadot-app-deploy source
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: actions/checkout@v6
@@ -1864,6 +1909,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
 
       # ---- source-build path (schedule / dispatch without version) ----------
       - name: Checkout polkadot-app-deploy source
@@ -2445,6 +2493,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       - run: npm ci
       - name: Assert every extrinsic encodes against the live chain
         run: E2E=1 node --test test/e2e-chain-calls.test.js
@@ -2470,6 +2521,9 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - run: npm install -g npm@11.17.0
       # paritytech/dotns is a private repo — GITHUB_TOKEN can't read it. With the
       # DOTNS_REPO_READ_TOKEN PAT this is the real drift check; without it the
       # tool soft-skips (exit 0) on the fetch failure rather than false-failing.

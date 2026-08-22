@@ -288,18 +288,38 @@ export function isConnectionError(error: any): boolean {
 
 /**
  * True for benign teardown noise that must NOT fail a deploy/command. Covers:
- *  - connection errors (recoverable via the storage reconnect path), and
+ *  - connection errors (recoverable via the storage reconnect path) — this already
+ *    includes papi's raw "Not connected" via isConnectionError above;
  *  - "DestroyedError: Client destroyed" — orphaned pending-response promises the
  *    SSO/papi client rejects while a session adapter is torn down AFTER the work
- *    is done (e.g. the owner-signs update path destroying its re-acquired session).
+ *    is done (e.g. the owner-signs update path destroying its re-acquired session);
+ *  - the `@novasamatech/sdk-statement` `getStatements` TDZ crash: `const unsubscribe`
+ *    is initialised from `api.subscribeStatement(...)`, and both the next/error
+ *    callbacks close over it. If that observable settles SYNCHRONOUSLY (a poll
+ *    firing after the WS client was already destroyed — hit on Ctrl+C/teardown
+ *    during an active pairing poll), the callback runs before the binding is
+ *    initialised, throwing `ReferenceError: Cannot access 'unsubscribe' before
+ *    initialization`, which rxjs rethrows as an uncaughtException.
+ *    `patches/@novasamatech+sdk-statement+0.6.0.patch` is the PRIMARY fix (it also
+ *    closes a subscription leak this guard cannot undo) — this only prevents an
+ *    unpatched consumer (e.g. npm blocking install scripts) from crashing outright.
+ *    Deliberately narrow: matches only this exact binding name, so an unrelated
+ *    ReferenceError still crashes the process.
  * The CLI's crash handlers use this so a successful deploy isn't marked killed
  * (exit 2) by late teardown noise. Checks name+message so DestroyedError matches
  * even when its message differs.
  */
 export function isBenignTeardownError(error: any): boolean {
   if (isConnectionError(error)) return true;
-  const s = error instanceof Error ? `${error.name ?? ""} ${error.message ?? ""}` : String(error);
-  return /DestroyedError|Client destroyed/.test(s);
+  const isErr = error instanceof Error;
+  const s = isErr ? `${error.name ?? ""} ${error.message ?? ""}` : String(error);
+  // Case-insensitive on purpose: login.ts's own regex was /client destroyed|destroyederror/i, so
+  // matching case-sensitively here would silently shrink its swallow set on delegation.
+  if (/DestroyedError|Client destroyed|Not connected/i.test(s)) return true;
+  // `instanceof Error` + exact name, so a plain object claiming to be a ReferenceError doesn't
+  // qualify; the binding name is pinned so an unrelated TDZ error still crashes.
+  return isErr && error.name === "ReferenceError"
+    && /cannot access 'unsubscribe' before initialization/i.test(error.message ?? "");
 }
 
 // Multihash codes accepted by createCID + toHashingEnum. Exported so callers

@@ -26,6 +26,7 @@ import { loadEnvironments } from "../environments.js";
 import { ss58Encode } from "@parity/product-sdk-address";
 import { waitForBulletinAuthorization } from "../storage-signer.js";
 import { startSpinner } from "../spinner.js";
+import { isBenignTeardownError } from "../deploy.js";
 
 /**
  * How long we wait for the mobile wallet to respond to the allocation request.
@@ -183,10 +184,11 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
     // on destroy() doesn't catch it because it's thrown in a Subscription finalizer, not the
     // destroy promise's rejection. We narrow-swallow it only while actively tearing down so that
     // real errors (before teardown or after) still surface and crash the process.
+    // Delegates to the shared `isBenignTeardownError` (src/deploy.ts) instead of carrying its own
+    // regex — that predicate covers "Not connected"/"Client destroyed"/DestroyedError.
     let tearingDown = false;
     const teardownFilter = (e: unknown): void => {
-        const msg = String((e as { message?: string })?.message ?? e);
-        if (tearingDown && /not connected|client destroyed|destroyederror/i.test(msg)) return;
+        if (tearingDown && isBenignTeardownError(e)) return;
         console.error(e);
         process.exit(1);
     };

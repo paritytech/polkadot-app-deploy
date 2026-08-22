@@ -516,6 +516,22 @@ export function resolveEffectiveMnemonic(opts: {
 }
 
 /**
+ * Resolve the environment id the CLI should target, in precedence order:
+ * `--env` flag > `PAD_ENV` env var. Returns `undefined` when neither is
+ * set — callers (deploy(), the bin's other flag sites) already fall back to
+ * `DEFAULT_ENV_ID` themselves, so this helper doesn't bake that default in;
+ * it only resolves the flag/env-var precedence (mirrors
+ * `resolveEffectiveMnemonic`'s pattern so the bin's session default is
+ * unit-testable).
+ */
+export function resolveEnvId(opts: {
+  flagEnv: string | undefined;
+  envVar: string | undefined;
+}): string | undefined {
+  return opts.flagEnv ?? opts.envVar;
+}
+
+/**
  * Decide whether the deploy should publish product-config manifest records
  * (subname registration + resolver + contenthash + text records), independent
  * of whether `tryLoadProductConfig` found a config on disk. Exists so the

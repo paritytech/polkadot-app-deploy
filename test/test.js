@@ -20194,7 +20194,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -20493,6 +20493,35 @@ describe("resolveEffectiveMnemonic env/flag precedence (#1107)", () => {
     const choice = chooseSignerInput({ mnemonic: resolved, suri: undefined, hasInjectedSigner: false, hasSession: true });
     assert.strictEqual(choice, "mnemonic",
       ">> FAIL: resolveEffectiveMnemonic + chooseSignerInput: an env-only MNEMONIC must still win over a persisted session (#1107 — the bin previously forwarded undefined here, so hasSession made this 'resolve' and the deploy silently used the signed-in session instead)");
+  });
+});
+
+describe("resolveEnvId env/flag precedence (#1165)", () => {
+  const FLAG_ENV = "preview";
+  const VAR_ENV = "summit";
+
+  test("--env flag present, no PAD_ENV → returns the flag value", () => {
+    const resolved = resolveEnvId({ flagEnv: FLAG_ENV, envVar: undefined });
+    assert.strictEqual(resolved, FLAG_ENV,
+      ">> FAIL: resolveEnvId: an explicit --env flag with no env var set must resolve to the flag value");
+  });
+
+  test("--env flag present AND PAD_ENV set → flag wins", () => {
+    const resolved = resolveEnvId({ flagEnv: FLAG_ENV, envVar: VAR_ENV });
+    assert.strictEqual(resolved, FLAG_ENV,
+      ">> FAIL: resolveEnvId: --env flag must take precedence over PAD_ENV when both are set");
+  });
+
+  test("only PAD_ENV set, no --env flag → returns the env var value", () => {
+    const resolved = resolveEnvId({ flagEnv: undefined, envVar: VAR_ENV });
+    assert.strictEqual(resolved, VAR_ENV,
+      ">> FAIL: resolveEnvId: PAD_ENV must be honored as the session default when no --env flag is given");
+  });
+
+  test("neither --env flag nor PAD_ENV set → returns undefined (caller applies DEFAULT_ENV_ID)", () => {
+    const resolved = resolveEnvId({ flagEnv: undefined, envVar: undefined });
+    assert.strictEqual(resolved, undefined,
+      ">> FAIL: resolveEnvId: with no flag and no env var the result must stay undefined so callers fall through to DEFAULT_ENV_ID (paseo-next-v2) themselves");
   });
 });
 

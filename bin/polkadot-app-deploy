@@ -6,7 +6,7 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish, resolveEffectiveMnemonic, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
@@ -99,6 +99,12 @@ const effectiveMnemonic = resolveEffectiveMnemonic({
   envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
 });
 
+// The env id actually targeted this session — --env flag > PAD_ENV env var.
+// `undefined` here still means "let deploy()/the DEFAULT_ENV_ID fallback
+// below decide" — this only resolves the flag/env-var precedence so a
+// session default doesn't require repeating --env on every invocation.
+const effectiveEnvId = resolveEnvId({ flagEnv: flags.env, envVar: process.env.PAD_ENV });
+
 // --environment-file: propagate to the env var so all internal loadEnvironments()
 // call sites (deploy.ts, manifest/publish.ts, personhood) honor the override.
 if (flags.environmentFile) {
@@ -143,7 +149,7 @@ if (flags.unpublish) {
       mnemonic: effectiveMnemonic,
       derivationPath: flags.derivationPath,
       rpc: flags.rpc,
-      env: flags.env,
+      env: effectiveEnvId,
     });
     console.log(`Domain: ${result.domainName}`);
     console.log(`Status: ${result.status}`);
@@ -169,7 +175,7 @@ function installSsoTeardownGuards() {
 {
   const sub = positional[0];
   if (sub === "login" || sub === "logout" || sub === "whoami") {
-    const envId = flags.env ?? DEFAULT_ENV_ID;
+    const envId = effectiveEnvId ?? DEFAULT_ENV_ID;
     installSsoTeardownGuards();
     try {
       const capSub = sub.charAt(0).toUpperCase() + sub.slice(1);
@@ -188,7 +194,7 @@ function installSsoTeardownGuards() {
 // (or --to). Stand-alone handover + recovery for a deploy whose transfer step
 // failed. Uses the SSO stack to resolve the session recipient.
 if (positional[0] === "transfer") {
-  const envId = flags.env ?? DEFAULT_ENV_ID;
+  const envId = effectiveEnvId ?? DEFAULT_ENV_ID;
   installSsoTeardownGuards();
   try {
     const { runTransfer } = await import("../dist/commands/transfer.js");
@@ -261,6 +267,9 @@ Options:
   --env <id>               Target environment from environments.json (default: paseo-next-v2).
                            Drives both the bulletin RPC and the asset-hub RPC used
                            by DotNS. See --list-environments for valid ids.
+                           Precedence: --env > PAD_ENV env var > paseo-next-v2.
+                           Set PAD_ENV to pick a session default without
+                           repeating --env on every invocation.
   --environment-file <path>
                            Path to a JSON file deep-merged over the bundled
                            environments.json. Override only the fields you need
@@ -510,7 +519,7 @@ try {
     derivationPath: flags.derivationPath,
     suri: flags.suri,
     rpc: flags.rpc,
-    env: flags.env,
+    env: effectiveEnvId,
     poolSize: flags.poolSize,
     password: flags.password,
     contracts: flags.contracts,
@@ -593,7 +602,7 @@ try {
           loaded,
           domain,
           buildDirCid: { absPath: buildDirAbs, cid: result.cid },
-          env: flags.env,
+          env: effectiveEnvId,
           rpc: flags.rpc,
           mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,

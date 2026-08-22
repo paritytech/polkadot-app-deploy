@@ -17,6 +17,7 @@ import {
   preflightProductConfig,
   checkProductConfigFilesExist,
   publishManifest,
+  formatConfigLoadError,
 } from "../dist/index.js";
 import { NonRetryableError } from "../dist/errors.js";
 import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
@@ -459,6 +460,78 @@ describe("loadProductConfig — auto-discovery", () => {
       () => loadProductConfig({ cwd: dir }),
       err => err.message.includes("domain"),
     );
+  });
+
+  test("#1103: a config that throws '<VAR> is required' surfaces a friendly NonRetryableError with an env-var hint, preserving the original message", async (t) => {
+    const dir = await tmpDir(t, "product-config-throws-required-");
+    const configPath = path.join(dir, "polkadot-app-deploy.config.ts");
+    await fs.writeFile(
+      configPath,
+      `if (!process.env.APP_DOTNS_DOMAIN) throw new Error("APP_DOTNS_DOMAIN is required");\nexport default ${JSON.stringify(VALID_CONFIG, null, 2)};\n`,
+    );
+    await assert.rejects(
+      () => loadProductConfig({ cwd: dir }),
+      err => {
+        assert.equal(err.name, "NonRetryableError", `>> FAIL: config-throws-required: expected NonRetryableError, got ${err.name}`);
+        assert.match(err.message, /threw while loading: APP_DOTNS_DOMAIN is required/, `>> FAIL: config-throws-required: friendly wrapper missing or original message not preserved (got "${err.message}")`);
+        assert.match(err.message, /Hint: set the APP_DOTNS_DOMAIN environment variable\./, `>> FAIL: config-throws-required: expected env-var hint (got "${err.message}")`);
+        return true;
+      },
+    );
+  });
+
+  test("#1103: a config that throws a non-'required' shape surfaces the friendly wrapper with no false hint", async (t) => {
+    const dir = await tmpDir(t, "product-config-throws-other-");
+    const configPath = path.join(dir, "polkadot-app-deploy.config.ts");
+    await fs.writeFile(
+      configPath,
+      `throw new Error("Cannot read properties of undefined (reading 'foo')");\nexport default ${JSON.stringify(VALID_CONFIG, null, 2)};\n`,
+    );
+    await assert.rejects(
+      () => loadProductConfig({ cwd: dir }),
+      err => {
+        assert.equal(err.name, "NonRetryableError", `>> FAIL: config-throws-other: expected NonRetryableError, got ${err.name}`);
+        assert.match(err.message, /threw while loading: Cannot read properties of undefined \(reading 'foo'\)/, `>> FAIL: config-throws-other: friendly wrapper missing or original message not preserved (got "${err.message}")`);
+        assert.ok(!/Hint:/.test(err.message), `>> FAIL: config-throws-other: unexpected env-var hint on a non-required-shape message (got "${err.message}")`);
+        return true;
+      },
+    );
+  });
+});
+
+describe("formatConfigLoadError — pure helper", () => {
+  test("'<VAR> is required' shape produces the friendly wrapper + hint, preserving the original message", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.ts",
+      new Error("APP_DOTNS_DOMAIN is required"),
+    );
+    assert.match(message, /^Your polkadot-app-deploy\.config\.ts threw while loading: APP_DOTNS_DOMAIN is required\. Check its required env vars \/ inputs\./, `>> FAIL: formatConfigLoadError required-shape: unexpected message shape (got "${message}")`);
+    assert.match(message, /Hint: set the APP_DOTNS_DOMAIN environment variable\.$/, `>> FAIL: formatConfigLoadError required-shape: missing hint (got "${message}")`);
+  });
+
+  test("'missing env var X' shape also produces a hint", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.js",
+      new Error("missing env var API_KEY"),
+    );
+    assert.match(message, /Hint: set the API_KEY environment variable\.$/, `>> FAIL: formatConfigLoadError missing-env-var shape: expected API_KEY hint (got "${message}")`);
+  });
+
+  test("a non-'required' shape produces the wrapper with no hint", () => {
+    const message = formatConfigLoadError(
+      "/proj/polkadot-app-deploy.config.mjs",
+      new Error("Cannot read properties of undefined (reading 'foo')"),
+    );
+    assert.equal(
+      message,
+      "Your polkadot-app-deploy.config.mjs threw while loading: Cannot read properties of undefined (reading 'foo'). Check its required env vars / inputs.",
+      `>> FAIL: formatConfigLoadError non-required-shape: unexpected message (got "${message}")`,
+    );
+  });
+
+  test("a thrown non-Error value is stringified, not [object Object]", () => {
+    const message = formatConfigLoadError("/proj/polkadot-app-deploy.config.ts", "plain string throw");
+    assert.match(message, /threw while loading: plain string throw\./, `>> FAIL: formatConfigLoadError non-Error throw: expected stringified value (got "${message}")`);
   });
 });
 

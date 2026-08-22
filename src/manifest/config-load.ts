@@ -116,14 +116,50 @@ async function fileExists(p: string): Promise<boolean> {
  *
  * jiti is dynamic-imported so the non-product-manifest CLI paths don't pay
  * its load cost.
+ *
+ * A throw here means the consumer's own config file threw while its
+ * top-level code ran (e.g. `if (!process.env.X) throw new Error("X is
+ * required")`) — distinct from a schema-validation failure on an object
+ * that loaded successfully. Wrap it so the raw stack trace never reaches
+ * the user; see `formatConfigLoadError`.
  */
 async function importConfig(sourcePath: string): Promise<unknown> {
-  if (sourcePath.endsWith(".ts")) {
-    const { createJiti } = await import("jiti");
-    const jiti = createJiti(import.meta.url, { interopDefault: false });
-    return jiti.import(sourcePath);
+  try {
+    if (sourcePath.endsWith(".ts")) {
+      const { createJiti } = await import("jiti");
+      const jiti = createJiti(import.meta.url, { interopDefault: false });
+      return await jiti.import(sourcePath);
+    }
+    return await import(pathToFileURL(sourcePath).href);
+  } catch (err) {
+    if (err instanceof NonRetryableError) throw err;
+    throw new NonRetryableError(formatConfigLoadError(sourcePath, err));
   }
-  return import(pathToFileURL(sourcePath).href);
+}
+
+/**
+ * Build the user-facing message for a config module that threw while being
+ * evaluated. Preserves the original thrown message and, when it matches a
+ * "<VAR> is required" / "missing env var VAR" shape, appends a hint naming
+ * the specific environment variable — that shape covers the overwhelming
+ * majority of consumer config throws (a required `process.env.X` guard).
+ */
+export function formatConfigLoadError(sourcePath: string, err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const filename = path.basename(sourcePath);
+  const base = `Your ${filename} threw while loading: ${message}. Check its required env vars / inputs.`;
+  const envVar = extractMissingEnvVar(message);
+  return envVar ? `${base}\nHint: set the ${envVar} environment variable.` : base;
+}
+
+function extractMissingEnvVar(message: string): string | null {
+  const required = message.match(/\b([A-Za-z_][A-Za-z0-9_]*)\s+is required\b/);
+  if (required) return required[1];
+  const missing = message.match(
+    /missing env(?:ironment)? var(?:iable)?s?[:\s]+([A-Za-z_][A-Za-z0-9_]*)/i,
+  );
+  if (missing) return missing[1];
+  return null;
 }
 
 function pickDefault(mod: unknown): unknown {

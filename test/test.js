@@ -17,7 +17,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -202,10 +202,30 @@ describe("validateDomainLabel", () => {
     assert.throws(() => validateDomainLabel("my_domain"), /lowercase letters/);
   });
 
-  test("sanitizes labels with more than 2 trailing digits", () => {
-    assert.strictEqual(validateDomainLabel("mylabel123"), "mylabel23");
-    assert.strictEqual(validateDomainLabel("myapplabel1234"), "myapplabel34");
-    assert.strictEqual(validateDomainLabel("my-app900"), "my-app00");
+  // #1189 FLIP: validateDomainLabel used to call sanitizeDomainLabel and
+  // silently deploy to a DIFFERENT label — mylabel123 -> mylabel23,
+  // myapplabel1234 -> myapplabel34, my-app900 -> my-app00 — registering,
+  // paying for, and writing contenthash to a name the operator never typed,
+  // with only a console.log as the sole signal. It now refuses and names
+  // compliant alternatives derived from the operator's own input instead of
+  // rewriting. This test protects the same property ("a non-compliant label
+  // never reaches the chain") via refusal instead of silent rewrite.
+  test("refuses labels with more than 2 trailing digits instead of silently rewriting them (#1189)", () => {
+    const cases = [
+      ["mylabel123", 3, "mylabel23.dot"],
+      ["myapplabel1234", 4, "myapplabel34.dot"],
+      ["my-app900", 3, "my-app00.dot"],
+    ];
+    for (const [input, expectedDigitCount, expectedAlternative] of cases) {
+      try {
+        const result = validateDomainLabel(input);
+        assert.fail(`>> FAIL: validateDomainLabel-refusal: "${input}" returned "${result}" instead of throwing — the #1189 silent-retarget bug has regressed.`);
+      } catch (e) {
+        assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-refusal: "${input}": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+        assert.match(e.message, new RegExp(`${expectedDigitCount} trailing digit`), `>> FAIL: validateDomainLabel-refusal: "${input}": message should name the trailing-digit count, got: ${e.message}`);
+        assert.ok(e.message.includes(expectedAlternative), `>> FAIL: validateDomainLabel-refusal: "${input}": message should offer "${expectedAlternative}" as a compliant alternative (what the old rewrite would have silently deployed to), got: ${e.message}`);
+      }
+    }
   });
 
   test("returns label unchanged when trailing digits <= 2", () => {
@@ -220,11 +240,12 @@ describe("validateDomainLabel", () => {
   // and the on-chain `isBaseNameReserved(baseName)` reverts with
   // PopError("Name must be lowercase ASCII DNS label"). Reject pre-upload.
   test("rejects <word>-<digits> patterns that dotns-cli's base-name extractor breaks", () => {
-    // Trailing-2 cases survive sanitize unchanged and hit the trailing-hyphen
-    // check on the sanitized form. Trailing-1 cases are now normalized by
-    // sanitize (strip 1 digit + exposed dash) into safe forms — `foo-1` →
-    // `foo` (then Reserved), `palacehub-app-88-pr-1` → `palacehub-app-88-pr`
-    // (then accepted). Those are covered in their own tests below.
+    // These are all trailing-2-digit cases, so the #1189 digit-count check
+    // passes them through unchanged (raw label === what the hyphen check
+    // sees, since there is no more sanitize rewrite) and the trailing-hyphen
+    // check fires next, as before. Trailing-1 cases (e.g. `foo-1`,
+    // `palacehub-app-88-pr-1`) now hit the digit-count refusal instead —
+    // covered in their own tests below (#1189 FLIP).
     assert.throws(() => validateDomainLabel("palacehub-33"), /trailing hyphen/);
     assert.throws(() => validateDomainLabel("palace-hub-app-88"), /trailing hyphen/);
     assert.throws(() => validateDomainLabel("localdot-33-pr-78"), /trailing hyphen/);
@@ -249,12 +270,28 @@ describe("validateDomainLabel", () => {
     assert.doesNotThrow(() => validateDomainLabel("test-app00"));
   });
 
-  test("sanitization of >2 trailing digits drops the trailing hyphen so result is dotns-cli-safe", () => {
-    // sanitize uses our hyphen-stripping stripTrailingDigits, so the trailing
-    // hyphen is removed before the last 2 digits are reattached. This must
-    // not regress — the new validator runs post-sanitize.
-    assert.strictEqual(validateDomainLabel("my-app-1234"), "my-app34");
-    assert.strictEqual(validateDomainLabel("palacehub-9999"), "palacehub99");
+  // #1189 FLIP: these inputs have >2 trailing digits, so the NEW digit-count
+  // refusal fires before the trailing-hyphen check ever runs (ordering
+  // requirement from #1189: digit-count check must come first). Previously
+  // sanitize ran first, stripped the trailing hyphen, and returned a
+  // different label ("my-app-1234" -> "my-app34"); now it's refused outright,
+  // with buildLabelAlternatives (which reuses stripTrailingDigits internally)
+  // deriving the same hyphen-safe candidates as suggestions instead.
+  test("refuses >2-trailing-digit hyphenated labels; alternatives are still hyphen-safe", () => {
+    for (const [input, expectedDigitCount, expectedAlternative] of [
+      ["my-app-1234", 4, "my-app34.dot"],
+      ["palacehub-9999", 4, "palacehub99.dot"],
+    ]) {
+      try {
+        validateDomainLabel(input);
+        assert.fail(`>> FAIL: validateDomainLabel-hyphen-refusal: "${input}" did not throw.`);
+      } catch (e) {
+        assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-hyphen-refusal: "${input}": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+        assert.match(e.message, new RegExp(`${expectedDigitCount} trailing digit`), `>> FAIL: validateDomainLabel-hyphen-refusal: "${input}": message should name the trailing-digit count, got: ${e.message}`);
+        assert.ok(e.message.includes(expectedAlternative), `>> FAIL: validateDomainLabel-hyphen-refusal: "${input}": alternative "${expectedAlternative}" should be offered and must not itself throw, got: ${e.message}`);
+        assert.doesNotThrow(() => validateDomainLabel(expectedAlternative.replace(/\.dot$/, "")), `>> FAIL: validateDomainLabel-hyphen-refusal: suggested alternative for "${input}" is not itself dotns-cli-safe`);
+      }
+    }
   });
 
   // Issue #573: Reserved-class preflight — client-side fail-fast
@@ -279,20 +316,33 @@ describe("validateDomainLabel", () => {
     assert.doesNotThrow(() => validateDomainLabel("abcdef"));
   });
 
-  test("rejects 'foo123' — sanitizes to 'foo23' (baselength=3, still Reserved)", () => {
-    // sanitizeDomainLabel("foo123") = "foo23"; base 3 → Reserved
-    assert.throws(
-      () => validateDomainLabel("foo123"),
-      (e) => e instanceof NonRetryableError && /governance|5 chars or fewer/i.test(e.message),
-    );
+  // #1189 FLIP: "foo123" has 3 trailing digits, so it's now refused by the
+  // digit-count check BEFORE classifyDotnsLabel ever runs — the rewrite it
+  // used to sanitize to ("foo23", still Reserved at base 3) never happens.
+  // Both would-be-Reserved candidates (foo23, foo) are correctly excluded by
+  // buildLabelAlternatives, leaving only the NoStatus-safe fallback.
+  test("refuses 'foo123' (3 trailing digits) — was silently sanitized to Reserved 'foo23', now refused pre-classification (#1189)", () => {
+    try {
+      validateDomainLabel("foo123");
+      assert.fail(">> FAIL: validateDomainLabel-refusal: \"foo123\" did not throw.");
+    } catch (e) {
+      assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-refusal: "foo123": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+      assert.match(e.message, /3 trailing digit/, `>> FAIL: validateDomainLabel-refusal: "foo123": message should name the trailing-digit count, got: ${e.message}`);
+      assert.ok(e.message.includes("fooxxxxxx00.dot"), `>> FAIL: validateDomainLabel-refusal: "foo123": only the NoStatus fallback should survive (foo23/foo are both Reserved at base 3), got: ${e.message}`);
+    }
   });
 
-  test("rejects 'a12345' (baselength=1 after sanitize to 'a45') with NonRetryableError", () => {
-    // sanitizeDomainLabel("a12345") = "a45"; base 1 → Reserved
-    assert.throws(
-      () => validateDomainLabel("a12345"),
-      (e) => e instanceof NonRetryableError,
-    );
+  // #1189 FLIP: "a12345" has 5 trailing digits, refused by the digit-count
+  // check directly (never reaches the old sanitize-to-"a45"-then-Reserved path).
+  test("refuses 'a12345' (5 trailing digits) with NonRetryableError naming the digit count (#1189)", () => {
+    try {
+      validateDomainLabel("a12345");
+      assert.fail(">> FAIL: validateDomainLabel-refusal: \"a12345\" did not throw.");
+    } catch (e) {
+      assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-refusal: "a12345": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+      assert.match(e.message, /5 trailing digit/, `>> FAIL: validateDomainLabel-refusal: "a12345": message should name the trailing-digit count, got: ${e.message}`);
+      assert.ok(e.message.includes("axxxxxxxx00.dot"), `>> FAIL: validateDomainLabel-refusal: "a12345": only the NoStatus fallback should survive (base "a" is 1 char, Reserved), got: ${e.message}`);
+    }
   });
 
   test("regression: trailing-hyphen edge case still throws plain Error (not NonRetryableError)", () => {
@@ -310,19 +360,82 @@ describe("validateDomainLabel", () => {
     }
   });
 
-  test("sanitize normalizes <word>-<single-digit> into safe forms", () => {
-    // Behavior introduced by the rc.2 sanitizer to fix PR · s1-smoke labels
-    // (commit-hash short SHAs often end in 1 digit). The sanitizer strips
-    // the trailing digit + exposed dash, and validateDomainLabel then sees a
-    // 0-trailing-digit label. Long-base inputs are accepted; short-base
-    // inputs hit the Reserved check instead of the trailing-hyphen check.
-    assert.strictEqual(validateDomainLabel("palacehub-app-88-pr-1"), "palacehub-app-88-pr");
-    assert.strictEqual(validateDomainLabel("e2esmoke26652530002-83abbd6"), "e2esmoke26652530002-83abbd");
-    assert.throws(
-      () => validateDomainLabel("foo-1"),
-      (e) => e instanceof NonRetryableError && /governance|5 chars or fewer/i.test(e.message),
-      "foo-1 sanitizes to 'foo' which trips Reserved baselength, not the trailing-hyphen check",
-    );
+  // #1189 FLIP: these are all single-trailing-digit inputs (commit-hash short
+  // SHAs often end in exactly 1 digit — the original PR · s1-smoke case this
+  // test used to protect). Pre-#1189, sanitize silently normalized them
+  // (stripping the trailing digit + exposed dash) and validateDomainLabel
+  // returned a DIFFERENT label. Now the digit-count refusal fires directly on
+  // the raw 1-trailing-digit input — no rewrite happens at all. The property
+  // this test protects — "a non-compliant label never reaches the chain
+  // silently" — now holds via refusal instead of rewrite.
+  test("refuses <word>-<single-digit> inputs outright instead of silently normalizing them (#1189)", () => {
+    for (const [input, expectedAlternative] of [
+      ["palacehub-app-88-pr-1", "palacehub-app-88-pr01.dot"],
+      ["e2esmoke26652530002-83abbd6", "e2esmoke26652530002-83abbd06.dot"],
+      ["foo-1", "fooxxxxxx00.dot"],
+    ]) {
+      try {
+        const result = validateDomainLabel(input);
+        assert.fail(`>> FAIL: validateDomainLabel-single-digit-refusal: "${input}" returned "${result}" instead of throwing.`);
+      } catch (e) {
+        assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-single-digit-refusal: "${input}": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+        assert.match(e.message, /1 trailing digit/, `>> FAIL: validateDomainLabel-single-digit-refusal: "${input}": message should name the trailing-digit count, got: ${e.message}`);
+        assert.ok(e.message.includes(expectedAlternative), `>> FAIL: validateDomainLabel-single-digit-refusal: "${input}": message should offer "${expectedAlternative}" as a compliant alternative, got: ${e.message}`);
+      }
+    }
+  });
+
+  // Issue #1189, ordering requirement: the digit-count refusal must run
+  // BEFORE the #185 trailing-hyphen check, and both must test the RAW label.
+  // Reason: #185's own suggestions (drop-the-hyphen / insert-a-segment) are
+  // only compliant for inputs that already have 0 or 2 trailing digits. For
+  // "my-app-1" (1 trailing digit) those suggestions would be "my-app1" and
+  // "my-app-pr1" — both STILL 1-trailing-digit and refused on the very next
+  // attempt. Verifying the ordering means: (1) the thrown error is the
+  // digit-count message, not the hyphen message, and (2) the hyphen check's
+  // own suggestion pattern (dropHyphen/insertSegment) is NOT what gets
+  // offered — buildLabelAlternatives' suggestions are, and those ARE
+  // registrable on the first attempt.
+  test("orders the digit-count refusal BEFORE the #185 trailing-hyphen check (#1189)", () => {
+    try {
+      validateDomainLabel("my-app-1");
+      assert.fail(">> FAIL: validateDomainLabel-ordering: \"my-app-1\" did not throw.");
+    } catch (e) {
+      assert.ok(e instanceof NonRetryableError, `>> FAIL: validateDomainLabel-ordering: expected the digit-count refusal (NonRetryableError), got ${e.constructor.name}: ${e.message}`);
+      assert.match(e.message, /1 trailing digit/, `>> FAIL: validateDomainLabel-ordering: expected the digit-count message to win over the #185 trailing-hyphen message, got: ${e.message}`);
+      assert.ok(!/trailing hyphen/i.test(e.message), `>> FAIL: validateDomainLabel-ordering: the #185 trailing-hyphen message should NOT fire first for "my-app-1", got: ${e.message}`);
+      // The #185-style suggestions ("my-app1", "my-app-pr1") both still have
+      // exactly 1 trailing digit — they must NOT be what's offered, since
+      // they'd be refused again on the next attempt.
+      assert.ok(!e.message.includes("my-app1.dot"), `>> FAIL: validateDomainLabel-ordering: "my-app1.dot" (the old #185 drop-hyphen suggestion) still has 1 trailing digit and would be refused again — must not be offered, got: ${e.message}`);
+      assert.ok(!e.message.includes("my-app-pr1.dot"), `>> FAIL: validateDomainLabel-ordering: "my-app-pr1.dot" (the old #185 insert-segment suggestion) still has 1 trailing digit and would be refused again — must not be offered, got: ${e.message}`);
+      // Every alternative actually offered must be immediately registrable.
+      const bulletMatches = [...e.message.matchAll(/- ([a-z0-9-]+)\.dot/g)].map((m) => m[1]);
+      assert.ok(bulletMatches.length > 0, `>> FAIL: validateDomainLabel-ordering: no alternatives found in message: ${e.message}`);
+      for (const alt of bulletMatches) {
+        assert.doesNotThrow(() => validateDomainLabel(alt), `>> FAIL: validateDomainLabel-ordering: offered alternative "${alt}" is not itself compliant on the next attempt.`);
+      }
+    }
+  });
+
+  // Issue #1189 invariant: every candidate buildLabelAlternatives returns must
+  // itself pass validateDomainLabel without throwing — otherwise we'd be
+  // suggesting a name that gets refused on the very next attempt.
+  test("buildLabelAlternatives invariant: every candidate it returns passes validateDomainLabel (#1189)", () => {
+    const inputs = [
+      "my-app-1", "mysite123", "dim2", "blog-2026", "my-app-1234",
+      "palacehub-9999", "e2esmoke26652530002-83abbd6", "a12345", "foo123",
+    ];
+    for (const input of inputs) {
+      const alternatives = buildLabelAlternatives(input);
+      assert.ok(alternatives.length > 0, `>> FAIL: buildLabelAlternatives-invariant: "${input}" produced zero alternatives — the NoStatus fallback should always survive.`);
+      for (const alt of alternatives) {
+        assert.doesNotThrow(
+          () => validateDomainLabel(alt.label),
+          `>> FAIL: buildLabelAlternatives-invariant: candidate "${alt.label}" (suggested for "${input}") does not itself pass validateDomainLabel.`,
+        );
+      }
+    }
   });
 
   test("rejects labels longer than 63 chars", () => {
@@ -3143,7 +3256,7 @@ describe("DotNS initial state", () => {
     d.getUserPopStatus = async () => 0; // NoStatus
 
     await assert.rejects(
-      () => d.getPriceAndValidate("abcdefg1234"),
+      () => d.getPriceAndValidate("abcdefg00"),
       (err) => {
         assert.match(err.message, /priceWithCheck returned unexpected shape/);
         assert.match(err.message, /expected object with \.price/);
@@ -3167,7 +3280,7 @@ describe("DotNS initial state", () => {
     d.getUserPopStatus = async () => 0; // NoStatus
 
     await assert.rejects(
-      () => d.getPriceAndValidate("abcdefg1234"),
+      () => d.getPriceAndValidate("abcdefg00"),
       /priceWithCheck returned unexpected shape/,
     );
   });
@@ -3187,7 +3300,7 @@ describe("DotNS initial state", () => {
     d.getUserPopStatus = async () => 0; // NoStatus
 
     await assert.rejects(
-      () => d.getPriceAndValidate("abcdefg1234"),
+      () => d.getPriceAndValidate("abcdefg00"),
       /priceWithCheck returned unexpected shape/,
     );
   });
@@ -4126,12 +4239,21 @@ describe("classifyDotnsLabel", () => {
   // verbatim to the user via preflight.reason and register()'s thrown error,
   // so it must explain the actual constraint and how to fix it, not just
   // quote the contract's internal label ("Reserved for Governance").
-  test("short-base message names the base length and a concrete remediation (regression #118)", () => {
+  //
+  // #1189 FLIP: the trailing sentence used to point at our internal E2E
+  // naming jargon ('rc<N>pool' / 'rc<N>dir' / 'nightly-<role>'), meaningless
+  // to an external consumer. It's now replaced with input-derived,
+  // tier-labelled alternatives from buildLabelAlternatives (same helper the
+  // digit-count refusal message uses) — the factual first half (base length +
+  // governance reservation) is unchanged.
+  test("short-base message names the base length and offers a concrete, input-derived remediation (regression #118, flipped in #1189)", () => {
     const r = classifyDotnsLabel("rc4i00"); // base 4, trailing 2 → Reserved
     assert.strictEqual(r.status, ProofOfPersonhoodStatus.Reserved);
     assert.match(r.message, /base name/i);
-    assert.match(r.message, /6/); // "6+ chars" / ">= 6" / "at least 6"
-    assert.match(r.message, /rc<N>pool|rc<N>dir|role prefix/i);
+    assert.match(r.message, /4 chars/i); // states the actual base length it computed
+    assert.match(r.message, /Use a name you can register instead/);
+    assert.ok(r.message.includes("rc4ixxxxx00.dot"), `>> FAIL: classifyDotnsLabel-message: "rc4i00" message should offer the NoStatus-safe alternative derived from its own input, got: ${r.message}`);
+    assert.ok(!/rc<N>pool|rc<N>dir|nightly-<role>/i.test(r.message), `>> FAIL: classifyDotnsLabel-message: internal E2E naming jargon must not leak into the consumer-facing message, got: ${r.message}`);
   });
 
   test("too-many-trailing-digits message names the 2-digit cap (regression #118)", () => {
@@ -4484,60 +4606,58 @@ describe("DotNS.preflight", () => {
     assert.strictEqual(r.plannedAction, "register");
   });
 
-  // Regression guards for issue #118.
+  // Regression guards for issue #118, flipped in #1189.
   //
-  // 1. classification must run on the *sanitized* label, not the raw input.
-  //    The user's input is what they typed; the registrar will see the
-  //    sanitized form. If we classified the input, "e2e-177655616508" looks
-  //    long and shapely; the sanitized "e2e08" has a 3-char base and is
-  //    Reserved. Classifying the input would let a doomed deploy through
-  //    preflight and only fail deep inside register().
-  test("classification runs on sanitized label, not raw input (regression #118)", async () => {
-    // Since #573: validateDomainLabel throws NonRetryableError for Reserved labels
-    // before preflight builds a result object. The throw message must reflect the
-    // *sanitized* form (e2e08, base 3 → Reserved), not the raw 18-digit input.
+  // 1. Pre-#1189, classification ran on the *sanitized* label because
+  //    validateDomainLabel rewrote the input before classifying it — the raw
+  //    "e2e-177655616508" looked long and shapely, while the silently-rewritten
+  //    "e2e08" had a 3-char base and was Reserved. Post-#1189 there is no more
+  //    rewrite: validateDomainLabel refuses the RAW input directly (12 trailing
+  //    digits is not 0-or-2), so the doomed deploy is caught even earlier —
+  //    before classifyDotnsLabel's base-length check ever runs.
+  test("preflight refuses a bad-digit-count raw label outright, before classifyDotnsLabel ever runs (regression #118, flipped in #1189)", async () => {
     const d = stubDotns({});
     await assert.rejects(
       () => d.preflight("e2e-177655616508"),
       (e) => {
         if (!(e instanceof NonRetryableError)) return false;
-        // Message must contain "e2e08" (the sanitized form classified as Reserved)
-        if (!e.message.includes("e2e08")) return false;
+        assert.match(e.message, /12 trailing digit/, `>> FAIL: preflight-1189-regression118: message should name the trailing-digit count, got: ${e.message}`);
+        assert.ok(e.message.includes("e2e-177655616508.dot"), `>> FAIL: preflight-1189-regression118: message should quote the operator's raw input (nothing is silently rewritten anymore), got: ${e.message}`);
         return true;
       },
     );
   });
 
-  // 2. When preflight rejects a sanitized form, the reason must make the
-  //    sanitize trail visible AND cite the actual constraint, otherwise
-  //    the user sees "Reserved for Governance" with no clue that their
-  //    label was transformed before classification.
-  test("Reserved rejection surfaces the sanitize trail when input differs from sanitized (regression #118)", async () => {
-    // Since #573: validateDomainLabel throws NonRetryableError with the sanitize
-    // trail included — both raw input and sanitized form must appear in the message.
+  // 2. Pre-#1189, the message had to surface a "sanitize trail" (raw input +
+  //    silently-rewritten form) so the user wasn't confused by a label they
+  //    never typed. Post-#1189 there is nothing to reconcile — the message
+  //    talks about exactly the label the operator typed, which is strictly
+  //    more transparent than the old rewrite-then-explain flow.
+  test("Reserved/digit-count rejection reasons refer only to the operator's own input — no more silent-rewrite trail to reconcile (regression #118, flipped in #1189)", async () => {
     const d = stubDotns({});
     await assert.rejects(
       () => d.preflight("e2e-177655616508"),
       (e) => {
         if (!(e instanceof NonRetryableError)) return false;
-        assert.ok(e.message.includes("e2e-177655616508"), `message should include raw input; got: ${e.message}`);
-        assert.ok(e.message.includes("e2e08"), `message should include sanitized form; got: ${e.message}`);
-        assert.match(e.message, /base name/i);
+        assert.ok(e.message.includes("e2e-177655616508.dot"), `>> FAIL: preflight-1189-transparency: message should name the operator's own input, got: ${e.message}`);
+        assert.match(e.message, /Use a name you can register instead/, `>> FAIL: preflight-1189-transparency: message should offer alternatives, got: ${e.message}`);
         return true;
       },
     );
   });
 
-  test("Reserved rejection reason includes actionable remediation", async () => {
-    // Since #573: throws NonRetryableError with the classifyDotnsLabel message,
-    // which includes the 6-char minimum and role-prefix suggestions verbatim.
+  test("Reserved rejection reason includes actionable, input-derived remediation (flipped in #1189)", async () => {
+    // #1189: the classifyDotnsLabel message dropped the internal
+    // 'rc<N>pool'/'rc<N>dir' jargon in favour of input-derived alternatives
+    // from buildLabelAlternatives.
     const d = stubDotns({});
     await assert.rejects(
       () => d.preflight("rc4i00"),
       (e) => {
         if (!(e instanceof NonRetryableError)) return false;
-        assert.match(e.message, /6/, `message should cite the 6-char minimum; got: ${e.message}`);
-        assert.match(e.message, /rc<N>pool|rc<N>dir|role prefix/i);
+        assert.match(e.message, /base name/i, `>> FAIL: preflight-remediation: message should state the base-name constraint, got: ${e.message}`);
+        assert.ok(e.message.includes("rc4ixxxxx00.dot"), `>> FAIL: preflight-remediation: message should offer the NoStatus-safe alternative derived from the input, got: ${e.message}`);
+        assert.ok(!/rc<N>pool|rc<N>dir|role prefix/i.test(e.message), `>> FAIL: preflight-remediation: internal E2E naming jargon must not leak into the message, got: ${e.message}`);
         return true;
       },
     );
@@ -8030,18 +8150,54 @@ describe("parseDomainName", () => {
     assert.throws(() => parseDomainName("SUB.parent.dot"), /lowercase letters/);
   });
 
-  test("returns the sanitized label when input has >2 trailing digits", () => {
-    const result = parseDomainName("tick3t-tb-ui-improvements-v400.dot");
-    assert.strictEqual(result.label, "tick3t-tb-ui-improvements-v00",
-      "parseDomainName must propagate the sanitized label so downstream checkOwnership/register use the same name as preflight");
-    assert.strictEqual(result.fullName, "tick3t-tb-ui-improvements-v00.dot");
+  // #1189 FLIP: parseDomainName used to propagate sanitizeDomainLabel's
+  // rewrite, so a >2-trailing-digit top-level label silently resolved to a
+  // DIFFERENT registered name than what the operator typed. It now refuses
+  // instead of rewriting — the property "downstream checkOwnership/register
+  // never operate on a name the operator didn't type" now holds by refusal.
+  test("refuses top-level labels with >2 trailing digits instead of silently rewriting them (#1189)", () => {
+    try {
+      const result = parseDomainName("tick3t-tb-ui-improvements-v400.dot");
+      assert.fail(`>> FAIL: parseDomainName-refusal: "tick3t-tb-ui-improvements-v400.dot" returned ${JSON.stringify(result)} instead of throwing.`);
+    } catch (e) {
+      assert.ok(e instanceof NonRetryableError, `>> FAIL: parseDomainName-refusal: expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+      assert.match(e.message, /3 trailing digit/, `>> FAIL: parseDomainName-refusal: message should name the trailing-digit count, got: ${e.message}`);
+    }
   });
 
-  test("sanitized label flows through for subdomains with >2 trailing digits", () => {
-    const result = parseDomainName("my-sub00.parent-app999.dot");
-    assert.strictEqual(result.sublabel, "my-sub00");
-    assert.strictEqual(result.parentLabel, "parent-app99");
-    assert.strictEqual(result.fullName, "my-sub00.parent-app99.dot");
+  // #1189 FLIP: the parent label (a registered name) used to be silently
+  // rewritten the same way; the sublabel (a subnode leaf, no digit limit) is
+  // correctly unaffected either way.
+  test("refuses subdomain parent labels with >2 trailing digits instead of silently rewriting them (#1189)", () => {
+    try {
+      const result = parseDomainName("my-sub00.parent-app999.dot");
+      assert.fail(`>> FAIL: parseDomainName-refusal: "my-sub00.parent-app999.dot" returned ${JSON.stringify(result)} instead of throwing.`);
+    } catch (e) {
+      assert.ok(e instanceof NonRetryableError, `>> FAIL: parseDomainName-refusal: expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+      assert.match(e.message, /parent-app999\.dot/, `>> FAIL: parseDomainName-refusal: message should name the offending parent label, got: ${e.message}`);
+      assert.match(e.message, /3 trailing digit/, `>> FAIL: parseDomainName-refusal: message should name the trailing-digit count, got: ${e.message}`);
+    }
+  });
+
+  // Issue #1189's own repro, asserted directly at the entry point: these two
+  // labels used to silently deploy to a DIFFERENT domain than what was typed
+  // (my-app-1.dot -> my-app.dot; mysite123.dot -> mysite23.dot), with only a
+  // console.log as the sole signal. They must now throw, and must NOT return
+  // the old rewritten names.
+  test("#1189 repro: parseDomainName throws for the exact silent-retarget inputs and never returns the old rewritten names", () => {
+    for (const [input, oldRewrittenFullName] of [
+      ["my-app-1.dot", "my-app.dot"],
+      ["mysite123.dot", "mysite23.dot"],
+    ]) {
+      try {
+        const result = parseDomainName(input);
+        assert.fail(`>> FAIL: parseDomainName-1189-repro: "${input}" returned ${JSON.stringify(result)} instead of throwing — the #1189 silent-retarget bug has regressed.`);
+      } catch (e) {
+        assert.ok(e instanceof NonRetryableError, `>> FAIL: parseDomainName-1189-repro: "${input}": expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+        assert.notStrictEqual(e.fullName, oldRewrittenFullName, `>> FAIL: parseDomainName-1189-repro: "${input}" must not resolve to the old silently-rewritten name "${oldRewrittenFullName}".`);
+        assert.ok(!e.message.includes(`Deploys to ${oldRewrittenFullName}`), `>> FAIL: parseDomainName-1189-repro: "${input}" error message must not imply the old rewritten target, got: ${e.message}`);
+      }
+    }
   });
 
   test("sublabel with 3 trailing digits is NOT sanitised (#656)", () => {
@@ -8056,10 +8212,26 @@ describe("parseDomainName", () => {
     assert.strictEqual(r.sublabel, "env99999", ">> FAIL: 5-digit sublabel must be preserved");
   });
 
-  test("parent IS still sanitised when sublabel skip is active (no bleed) (#656)", () => {
-    const r = parseDomainName("app.staging999.dot");
-    assert.strictEqual(r.sublabel, "app");
-    assert.strictEqual(r.parentLabel, "staging99", ">> FAIL: parent must still be sanitised — it's a registered name");
+  // #1189 FLIP: the parent is still fully validated (not exempt the way the
+  // sublabel is) — it's a registered name. Pre-#1189 that meant "still
+  // sanitised" (staging999 -> staging99, silently). Now it means "still
+  // refused": the sublabel's digit-limit exemption does NOT bleed onto the
+  // parent, demonstrated by the parent's bad digit count (3) throwing even
+  // though the sibling sublabel test ("app", 0 digits) throws for neither.
+  test("parent is still fully validated (refused, not exempt) when sublabel skip is active (no bleed) (#656, flipped in #1189)", () => {
+    try {
+      const r = parseDomainName("app.staging999.dot");
+      assert.fail(`>> FAIL: parseDomainName-no-bleed: "app.staging999.dot" returned ${JSON.stringify(r)} instead of throwing — the sublabel's digit-limit exemption must not bleed onto the parent.`);
+    } catch (e) {
+      assert.ok(e instanceof NonRetryableError, `>> FAIL: parseDomainName-no-bleed: expected NonRetryableError, got ${e.constructor.name}: ${e.message}`);
+      assert.match(e.message, /staging999\.dot/, `>> FAIL: parseDomainName-no-bleed: message should name the offending PARENT label (not the exempt sublabel), got: ${e.message}`);
+      assert.match(e.message, /3 trailing digit/, `>> FAIL: parseDomainName-no-bleed: message should name the trailing-digit count, got: ${e.message}`);
+    }
+    // Sanity: a compliant parent alongside the same sublabel shape does NOT throw.
+    assert.doesNotThrow(
+      () => parseDomainName("app.staging00.dot"),
+      ">> FAIL: parseDomainName-no-bleed: a compliant parent (0/2 trailing digits) must not be refused.",
+    );
   });
 
   test("sublabel with hyphen+digits is NOT rejected (#656)", () => {

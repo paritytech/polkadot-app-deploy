@@ -991,6 +991,13 @@ export function computeDomainTokenId(label: string): bigint {
 export function countTrailingDigits(label: string): number { let count = 0; for (let i = label.length - 1; i >= 0; i--) { const code = label.charCodeAt(i); if (code >= 48 && code <= 57) count++; else break; } return count; }
 export function stripTrailingDigits(label: string): string { return label.replace(/\d+$/, "").replace(/-$/, ""); }
 
+// NOTE (issue #1189): this REWRITES the label — it does not validate. Only
+// validateDomainLabel is the registration gate, and it no longer calls this
+// function (it refuses non-compliant labels instead, see below). Kept exported
+// for its existing callers: public API via src/index.ts, and E2E label
+// generators that construct already-compliant names. Do not wire this back
+// into anything that decides what gets registered/paid for/written on-chain —
+// that reintroduces the exact silent-retarget bug #1189 fixed.
 export function sanitizeDomainLabel(label: string): string {
   const trailingDigitCount = countTrailingDigits(label);
   // PopRules accepts exactly 0 or 2 trailing digits; everything else reverts.
@@ -1026,48 +1033,150 @@ export function sanitizeDomainLabel(label: string): string {
   return stripped;
 }
 
+// Pure, non-recursive status classifier — the numeric-only half of
+// classifyDotnsLabel. Split out so buildLabelAlternatives can filter candidate
+// labels (including candidates that turn out Reserved) WITHOUT calling
+// classifyDotnsLabel itself, which (for the baselength<=5 branch) builds its
+// message via buildLabelAlternatives. Calling classifyDotnsLabel from inside
+// buildLabelAlternatives would recurse (candidate "dim02" classifies as
+// Reserved → builds alternatives for "dim02" → candidate "dim02" again → ...).
+// Mirrors PopRules._classifyValidatedName exactly. classifyDotnsLabel below
+// calls this for its status/baseLength/trailingDigits rather than
+// re-deriving them, so the branch logic has one source of truth.
+function classifyLabelStatus(label: string): { status: number; trailingDigits: number; baseLength: number } {
+  const trailingDigits = countTrailingDigits(label);
+  const baseLength = label.length - trailingDigits;
+  if (trailingDigits === 1 || trailingDigits > 2 || baseLength <= 5) {
+    return { status: ProofOfPersonhoodStatus.Reserved, trailingDigits, baseLength };
+  }
+  if (baseLength <= 8) {
+    return { status: trailingDigits === 2 ? ProofOfPersonhoodStatus.ProofOfPersonhoodLite : ProofOfPersonhoodStatus.ProofOfPersonhoodFull, trailingDigits, baseLength };
+  }
+  return { status: ProofOfPersonhoodStatus.NoStatus, trailingDigits, baseLength };
+}
+
+function tierDescriptionFor(status: number): string {
+  if (status === ProofOfPersonhoodStatus.NoStatus) return "open to any account";
+  if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodLite) return "requires Personhood Lite";
+  if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodFull) return "requires Personhood Full";
+  return "unavailable";
+}
+
+// Shared NoStatus-anchoring convention (issue #1189): pad the charset-cleaned
+// base to 9 chars with 'x' then append "00" — 9+ chars with exactly 2
+// trailing digits is always NoStatus, so this is always registrable
+// regardless of how short or reserved-adjacent the original base was.
+// exampleNoStatusLabel (below) and buildLabelAlternatives both call this —
+// one convention, not two.
+function noStatusFallbackBase(base: string): string {
+  return `${base.padEnd(9, "x").slice(0, 9)}00`;
+}
+
+export interface DomainLabelAlternative {
+  label: string;
+  baseLength: number;
+  status: number;
+  tierDescription: string;
+}
+
+// Pure helper (issue #1189): given ANY label — typically one refused by
+// validateDomainLabel or classifyDotnsLabel — derive up to 3 compliant
+// alternatives from the operator's OWN input, each labelled with the
+// Personhood tier it needs. Never returns a candidate that is itself Reserved
+// or otherwise invalid; the NoStatus fallback (c) always survives because it's
+// engineered to be 9+ chars with exactly 2 trailing digits.
+export function buildLabelAlternatives(label: string): DomainLabelAlternative[] {
+  const trailingRun = label.slice(label.length - countTrailingDigits(label));
+  const base = stripTrailingDigits(label);
+  // Preserve the operator's own digits: last 2 of the original run if it's
+  // long enough, else the single digit zero-padded ("1" -> "01").
+  const twoDigitSuffix = trailingRun.length >= 2 ? trailingRun.slice(-2) : trailingRun.padStart(2, "0");
+  const noStatusBase = noStatusFallbackBase(base.replace(/[^a-z0-9-]/g, "x"));
+
+  const candidateLabels = [
+    `${base}${twoDigitSuffix}`, // (a) 2 trailing digits
+    base,                        // (b) 0 trailing digits
+    noStatusBase,                 // (c) NoStatus-safe fallback
+  ];
+
+  const seen = new Set<string>();
+  const alternatives: DomainLabelAlternative[] = [];
+  for (const candidate of candidateLabels) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    if (!/^[a-z0-9-]{3,63}$/.test(candidate)) continue;
+    if (candidate.startsWith("-") || candidate.endsWith("-")) continue;
+    if (/-\d+$/.test(candidate)) continue;
+    const { status, baseLength } = classifyLabelStatus(candidate);
+    if (status === ProofOfPersonhoodStatus.Reserved) continue;
+    alternatives.push({ label: candidate, baseLength, status, tierDescription: tierDescriptionFor(status) });
+  }
+  return alternatives;
+}
+
+function formatAlternativesList(alternatives: DomainLabelAlternative[]): string {
+  return alternatives.map((a) => `  - ${a.label}.dot — base ${a.baseLength}, ${a.tierDescription}`).join("\n");
+}
+
 export function validateDomainLabel(label: string, opts: { checkReserved?: boolean; skipSanitize?: boolean } = {}): string {
   if (!/^[a-z0-9-]{3,63}$/.test(label)) throw new Error("Invalid domain label: must be 3-63 chars and contain only lowercase letters, digits, and hyphens");
   if (label.startsWith("-") || label.endsWith("-")) throw new Error("Invalid domain label: cannot start or end with hyphen");
-  const sanitized = opts.skipSanitize ? label : sanitizeDomainLabel(label);
-  // dotns-cli (paritytech/dotns-sdk packages/cli/src/utils/validation.ts)
-  // computes the registry's "base name" by stripping trailing digits only.
-  // When the label matches `<word>-<digits>$`, that base name ends in `-` and
-  // the on-chain `isBaseNameReserved(baseName)` reverts with
-  // `PopError("Name must be lowercase ASCII DNS label")` — after the consumer's
-  // Bulletin upload is already done. Reject pre-upload instead.
-  // This is a registered-name-only rule: subdomain sublabels have no such
-  // constraint (setSubnodeOwner only requires isSingleLabel()). Skip when
-  // opts.skipSanitize is set.
-  if (!opts.skipSanitize && /-\d+$/.test(sanitized)) {
-    const baseWithHyphen = sanitized.replace(/\d+$/, "");
-    const dropHyphen = sanitized.replace(/-(\d+)$/, "$1");
-    const insertSegment = sanitized.replace(/-(\d+)$/, "-pr$1");
-    throw new Error(
-      `Invalid domain label: "${sanitized}" — dotns base-name extraction leaves a trailing hyphen ("${baseWithHyphen}"), which the registry rejects with PopError("Name must be lowercase ASCII DNS label"). Drop the hyphen before the digits (e.g. "${dropHyphen}") or add a non-digit segment between (e.g. "${insertSegment}").`,
-    );
+
+  // This is a registered-name-only rule set: subdomain sublabels have no
+  // digit-count or trailing-hyphen constraint (setSubnodeOwner only requires
+  // isSingleLabel()). Skip both checks when opts.skipSanitize is set (the
+  // parseDomainName sublabel path).
+  if (!opts.skipSanitize) {
+    // Issue #1189: labels whose trailing-digit count is not 0 or 2 are
+    // REFUSED, never rewritten. The prior behaviour called sanitizeDomainLabel
+    // here and returned a DIFFERENT label — registering/paying/writing
+    // contenthash to a name the operator never typed. sanitizeDomainLabel
+    // itself is unchanged and still exported (public API + E2E generators
+    // call it directly); validateDomainLabel simply stops calling it.
+    const trailingDigitCount = countTrailingDigits(label);
+    if (trailingDigitCount !== 0 && trailingDigitCount !== 2) {
+      const digitWord = trailingDigitCount === 1 ? "digit" : "digits";
+      const alternatives = buildLabelAlternatives(label);
+      throw new NonRetryableError(
+        `${label}.dot cannot be registered under DotNS naming rules: ${trailingDigitCount} trailing ${digitWord}, and DotNS allows exactly 0 or 2.\n\n` +
+        `Use a name you can register instead:\n${formatAlternativesList(alternatives)}`,
+      );
+    }
+
+    // dotns-cli (paritytech/dotns-sdk packages/cli/src/utils/validation.ts)
+    // computes the registry's "base name" by stripping trailing digits only.
+    // When the label matches `<word>-<digits>$`, that base name ends in `-` and
+    // the on-chain `isBaseNameReserved(baseName)` reverts with
+    // `PopError("Name must be lowercase ASCII DNS label")` — after the consumer's
+    // Bulletin upload is already done. Reject pre-upload instead.
+    // Ordering (#1189): this runs AFTER the digit-count refusal above and
+    // BEFORE the Reserved check below, and both now test the RAW label — the
+    // trailing-digit count is already known-good (0 or 2) by this point, so
+    // this check's own drop-the-hyphen / insert-a-segment suggestions are
+    // always compliant on the next attempt.
+    if (/-\d+$/.test(label)) {
+      const baseWithHyphen = label.replace(/\d+$/, "");
+      const dropHyphen = label.replace(/-(\d+)$/, "$1");
+      const insertSegment = label.replace(/-(\d+)$/, "-pr$1");
+      throw new Error(
+        `Invalid domain label: "${label}" — dotns base-name extraction leaves a trailing hyphen ("${baseWithHyphen}"), which the registry rejects with PopError("Name must be lowercase ASCII DNS label"). Drop the hyphen before the digits (e.g. "${dropHyphen}") or add a non-digit segment between (e.g. "${insertSegment}").`,
+      );
+    }
   }
+
   // Fast client-side Reserved-class preflight (issue #573).
   // classifyDotnsLabel mirrors PopRules._classifyValidatedName — pure, no chain call.
   // Reserved labels (baselength ≤ 5) always revert on-chain; reject immediately.
-  // Called on sanitized so excess-trailing-digit stripping has already run.
   // Opt-out via { checkReserved: false } for sublabel contexts (parseDomainName,
   // exampleNoStatusLabel) where the Reserved rule does not apply — subdomains are
   // user-defined strings, not DotNS-registered names.
   if (opts.checkReserved !== false) {
-    const classification = classifyDotnsLabel(sanitized);
+    const classification = classifyDotnsLabel(label);
     if (classification.status === ProofOfPersonhoodStatus.Reserved) {
-      // When sanitization changed the label, surface the trail so the user sees
-      // both the original input and the form that was actually classified.
-      const sanitizeTrail = label !== sanitized
-        ? `Input "${label}" was sanitized to "${sanitized}" (excess trailing digits trimmed). `
-        : "";
-      throw new NonRetryableError(
-        `${sanitizeTrail}Invalid domain label "${sanitized}": ${classification.message}`,
-      );
+      throw new NonRetryableError(`Invalid domain label "${label}": ${classification.message}`);
     }
   }
-  return sanitized;
+  return label;
 }
 
 // Pure helper exposed for tests. The DotNS RegistrarController checks
@@ -1107,28 +1216,35 @@ export function isCommitmentTimingBarerevert(msg: string): boolean {
 //   PopLite required: userStatus in { PopLite, PopFull }
 //   NoStatus required: any user tier may register
 export function classifyDotnsLabel(label: string): { status: number; message: string } {
-  const totalLength = label.length;
-  const trailingDigits = countTrailingDigits(label);
-  // PopRules requires exactly 0 or 2 trailing digits; 1 or 3+ revert on-chain.
-  if (trailingDigits === 1 || trailingDigits > 2) {
+  // Status/baseLength/trailingDigits all come from the single shared
+  // classifier — this function only turns that decision into a message.
+  const { status, trailingDigits, baseLength } = classifyLabelStatus(label);
+  if (status === ProofOfPersonhoodStatus.Reserved) {
+    // PopRules requires exactly 0 or 2 trailing digits; 1 or 3+ revert on-chain.
+    if (trailingDigits === 1 || trailingDigits > 2) {
+      return {
+        status,
+        message: `Name has ${trailingDigits} trailing digit${trailingDigits === 1 ? "" : "s"}; DotNS allows exactly 0 or 2 trailing digits. Use a base name with no trailing digits or a 2-digit suffix.`,
+      };
+    }
+    // baseLength <= 5. Issue #1189: the trailing sentence used to point at our
+    // internal E2E naming jargon ('rc<N>pool' / 'rc<N>dir' / 'nightly-<role>'),
+    // which means nothing to an external consumer. Replaced with alternatives
+    // derived from the operator's own input, same as validateDomainLabel's
+    // digit-count refusal message.
+    const alternatives = buildLabelAlternatives(label);
+    const suggestion = alternatives.length > 0
+      ? `\n\nUse a name you can register instead:\n${formatAlternativesList(alternatives)}`
+      : "";
     return {
-      status: ProofOfPersonhoodStatus.Reserved,
-      message: `Name has ${trailingDigits} trailing digit${trailingDigits === 1 ? "" : "s"}; DotNS allows exactly 0 or 2 trailing digits. Use a base name with no trailing digits or a 2-digit suffix.`,
+      status,
+      message: `Base name is ${baseLength} char${baseLength === 1 ? "" : "s"}; DotNS reserves base names of 5 chars or fewer for governance (PopRules).${suggestion}`,
     };
   }
-  const baselength = totalLength - trailingDigits;
-  if (baselength <= 5) {
-    return {
-      status: ProofOfPersonhoodStatus.Reserved,
-      message: `Base name is ${baselength} char${baselength === 1 ? "" : "s"}; DotNS reserves base names of 5 chars or fewer for governance (PopRules). Use a base name of 6+ chars — role prefixes like 'rc<N>pool' / 'rc<N>dir' / 'nightly-<role>' work well.`,
-    };
-  }
-  if (baselength >= 6 && baselength <= 8) {
-    if (trailingDigits === 2) return { status: ProofOfPersonhoodStatus.ProofOfPersonhoodLite, message: "Requires Light personhood verification" };
-    return { status: ProofOfPersonhoodStatus.ProofOfPersonhoodFull, message: "Requires Full personhood verification" };
-  }
-  // baselength >= 9: open to any caller (0 or 2 trailing digits already enforced above).
-  return { status: ProofOfPersonhoodStatus.NoStatus, message: "Available to all" };
+  if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodLite) return { status, message: "Requires Light personhood verification" };
+  if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodFull) return { status, message: "Requires Full personhood verification" };
+  // NoStatus: baseLength >= 9, open to any caller (0 or 2 trailing digits already enforced above).
+  return { status, message: "Available to all" };
 }
 
 // Pure helper — returns whether a user with `userStatus` is allowed to
@@ -1151,8 +1267,10 @@ export function canRegister(requiredStatus: number, userStatus: number): boolean
 function exampleNoStatusLabel(label: string): string {
   // Called when we already know the label is Reserved — bypass checkReserved so
   // we can construct a suggestion from the bad input rather than throwing again.
+  // Shares its padding convention with buildLabelAlternatives' NoStatus
+  // fallback via noStatusFallbackBase (issue #1189) — one convention, not two.
   const base = stripTrailingDigits(validateDomainLabel(label, { checkReserved: false })).replace(/[^a-z0-9-]/g, "x");
-  return `${base.padEnd(9, "x").slice(0, 9)}00.dot`;
+  return `${noStatusFallbackBase(base)}.dot`;
 }
 
 export function parseDomainName(input: string): ParsedDomainName {
@@ -1164,9 +1282,9 @@ export function parseDomainName(input: string): ParsedDomainName {
   }
   if (parts.length === 2) {
     // Sublabel is a user-defined subdomain leaf, not a DotNS-registered name —
-    // skip the Reserved check AND the digit sanitiser (setSubnodeOwner only
-    // requires isSingleLabel(); no digit limit on subnode leaves). Parent IS
-    // the registered name; apply full validation including sanitiser.
+    // skip the Reserved check AND the digit-count/trailing-hyphen checks
+    // (setSubnodeOwner only requires isSingleLabel(); no digit limit on
+    // subnode leaves). Parent IS the registered name; apply full validation.
     const sanitizedSub = validateDomainLabel(parts[0], { checkReserved: false, skipSanitize: true });
     const sanitizedParent = validateDomainLabel(parts[1]);
     const fullLabel = `${sanitizedSub}.${sanitizedParent}`;

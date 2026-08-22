@@ -22,8 +22,6 @@ import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./ma
 import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
 import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
-import { mirrorToGitHubPages, MirrorSkipped, pollMirrorFreshness } from "./gh-pages-mirror.js";
-import type { MirrorResult } from "./gh-pages-mirror.js";
 import { keccak256, toBytes } from "viem";
 import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI } from "./dotns.js";
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep } from "./dotns.js";
@@ -1524,12 +1522,10 @@ export async function merkleize(directoryPath: string, outputCarPath: string): P
 }
 
 // Pure, synchronous. Mirrors the root-CID compute inside storeChunkedContent
-// so callers (notably the gh-pages mirror) can predict the deploy's final
-// storage CID from the CAR bytes alone — no chain round-trip required. This
-// lets the mirror push fire in parallel with the Bulletin upload: by the
-// time Bulletin + DotNS complete the mirror has long since landed and
-// Pages has built/propagated, eliminating the "deploy then hit a stale CDN"
-// window that plagues sequential publication.
+// so callers can predict the deploy's final storage CID from the CAR bytes
+// alone — no chain round-trip required. This lets onCarReady-driven side
+// effects fire in parallel with the (slow) Bulletin upload instead of
+// waiting for it to finish.
 export function computeStorageCid(chunks: Uint8Array[]): string {
   const hashCode = 0x12;
   const chunkInfo = chunks.map(c => ({
@@ -1549,10 +1545,10 @@ export interface StoreDirectoryOptions {
   /**
    * Fires exactly once, right after the CAR has been merkleized + encrypted
    * and the final storage CID is known, but BEFORE the chunk upload to
-   * Bulletin starts. Use to kick off parallel side-effects (e.g. the
-   * gh-pages mirror) that can run concurrently with the slow upload. The
-   * returned promise is awaited at the end of the deploy; errors are passed
-   * through to the caller so they can decide fatal / non-fatal policy.
+   * Bulletin starts. Use to kick off parallel side-effects that can run
+   * concurrently with the slow upload. The returned promise is awaited at
+   * the end of the deploy; errors are passed through to the caller so they
+   * can decide fatal / non-fatal policy.
    */
   onCarReady?: (carBytes: Uint8Array, storageCid: string) => Promise<void> | void;
   /**
@@ -1577,8 +1573,6 @@ export interface StoreDirectoryOptions {
   reproducibleSource?: string;
   /**
    * DotNS domain label being deployed (without the `.dot` suffix, e.g. `"myapp"`).
-   * When provided, `fetchPreviousManifest` also tries the GitHub Pages mirror
-   * before falling through to the IPFS gateway.
    */
   domain?: string;
   /**
@@ -1649,8 +1643,8 @@ export async function storeDirectory(directoryPath: string, providerOrOptions: E
   }
   const carChunks = chunk(carContent, CHUNK_SIZE);
   // Predicted storage CID, available without any chain round-trip. Lets the
-  // onCarReady callback fire a parallel mirror push with the final CID in
-  // the manifest. Verified against Bulletin's own rootCid computation below.
+  // onCarReady callback act on the final CID before the chain upload lands.
+  // Verified against Bulletin's own rootCid computation below.
   const predictedStorageCid = computeStorageCid(carChunks);
   if (opts.onCarReady) await opts.onCarReady(carContent, predictedStorageCid);
   // Enrich the threshold-triggered memory report with deploy shape. No-op
@@ -2114,7 +2108,7 @@ export async function storeDirectoryV2(
     }
   }
   // computeStorageCid is the predicted root CID; published via onCarReady so
-  // the gh-pages mirror can fire concurrently with the Phase B upload.
+  // callers can react before the Phase B upload completes.
   const predictedStorageCid = computeStorageCid(carChunksB);
   if (opts.onCarReady) await opts.onCarReady(phaseB.carBytes, predictedStorageCid);
 
@@ -2467,14 +2461,6 @@ export interface DeployOptions {
   tag?: string;
   /** Custom telemetry attributes, merged into the deploy span. Overrides auto-detected values. */
   attributes?: Record<string, string>;
-  /**
-   * Opt-in: after a successful deploy, push the CAR to the current repo's
-   * `gh-pages` branch under `bulletin/<domain>.dot.car` so hosts can fetch it
-   * via `https://<owner>.github.io/<repo>/bulletin/<domain>.dot.car` as a
-   * fast-path cache. Non-fatal on failure. See docs/… for the discoverability
-   * caveat.
-   */
-  ghPagesMirror?: boolean;
   /** Skip the 500 MiB abort guard and allow oversized deploys. */
   allowLargeDeploy?: boolean;
   /**
@@ -3033,13 +3019,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
     let cid: string | undefined;
     let ipfsCid: string | undefined;
-    // Parallel mirror push: fires from storeDirectory's onCarReady the moment
-    // the CAR is ready, runs concurrently with the (typically slow) Bulletin
-    // upload + DotNS. By the time we reach the final-checks section below,
-    // Pages has usually long since built and propagated the CDN, so the
-    // "freshness" poll at the end completes almost immediately for small
-    // apps and well within timeout for larger ones.
-    let mirrorPromise: Promise<MirrorResult | MirrorSkipped | Error | null> = Promise.resolve(null);
     console.log("\n" + "=".repeat(60));
     console.log(`DEPLOYING TO TESTNET                    v${VERSION}`);
     console.log("=".repeat(60));
@@ -3245,18 +3224,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
               carChunks = chunk(carContent, CHUNK_SIZE);
             }
           }
-          const predictedStorageCid = computeStorageCid(carChunks);
-          if (options.ghPagesMirror) {
-            mirrorPromise = mirrorToGitHubPages({
-              domain: name,
-              carBytes: carContent,
-              cid: predictedStorageCid,
-              toolVersion: VERSION,
-              bulletinRpc: BULLETIN_ENDPOINTS[0],
-              encrypted: Boolean(options.password),
-              repoPath: process.env.PAD_GH_PAGES_REPO || undefined,
-            }).catch((err: unknown) => (err instanceof Error ? err : new Error(String(err))));
-          }
           cid = (await storeChunkedContent(carChunks, providerWithReconnect)).storageCid;
         } else if (process.env.IPFS_CID) {
           setDeployAttribute("deploy.content_type", "ipfsCid");
@@ -3292,7 +3259,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             if (previousContenthashCid) console.log(`   Incremental: previous contenthash ${previousContenthashCid}`);
             else console.log(`   Incremental: first deploy (no previous contenthash)`);
             // Destructure so carBytes (the third field on the return) isn't
-            // pinned through DotNS + mirror wait. Route through storeDirectoryV2
+            // pinned through the DotNS phase below. Route through storeDirectoryV2
             // for the incremental-upload-v2 flow when not encrypted; encrypted
             // deploys fall through to the legacy path inside storeDirectoryV2.
             if (options.password) setDeployAttribute("deploy.encrypted", "true");
@@ -3307,24 +3274,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
               domain: name,
               gateway: envIpfs,
               dumpCar: options.dumpCar,
-              onCarReady: (carBytes, predictedCid) => {
-                // Kick off the gh-pages mirror the instant the CAR is ready
-                // so it overlaps with the Bulletin chunk upload. The Bulletin
-                // upload is minutes; the mirror push + Pages build is ~1–2 min.
-                // Running them in parallel means the final-checks URL probe
-                // at the end of the deploy usually passes immediately.
-                if (options.ghPagesMirror) {
-                  mirrorPromise = mirrorToGitHubPages({
-                    domain: name,
-                    carBytes,
-                    cid: predictedCid,
-                    toolVersion: VERSION,
-                    bulletinRpc: BULLETIN_ENDPOINTS[0],
-                    encrypted: Boolean(options.password),
-                    repoPath: process.env.PAD_GH_PAGES_REPO || undefined,
-                  }).catch((err: unknown) => (err instanceof Error ? err : new Error(String(err))));
-                }
-              },
             });
             cid = sCid;
             ipfsCid = iCid;
@@ -3531,51 +3480,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
           console.log(`   P2P retrieval: ⚠ not yet retrievable (${probe.errorVariant}, ${probe.durationMs}ms)`);
         }
       });
-
-      // Final checks: join the mirror push (which has been running in
-      // parallel since onCarReady fired mid-storage) and verify Pages is
-      // actually serving this deploy's bytes. Non-fatal: on-chain state is
-      // authoritative, and a late-blooming Pages build would catch up soon
-      // after the CLI exits — but surfacing the wait here means a user who
-      // immediately opens dot.li / Desktop after the CLI returns sees fresh
-      // content instead of racing against CDN propagation.
-      if (options.ghPagesMirror) {
-        console.log("\n" + "=".repeat(60));
-        console.log("Final checks");
-        console.log("=".repeat(60));
-        await withSpan("deploy.gh-pages-mirror", "4. gh-pages-mirror", { "deploy.domain": name }, async () => {
-          const mirror = await mirrorPromise;
-          if (mirror === null) {
-            console.log("   GitHub Pages mirror: skipped (only directory deploys produce a CAR suitable for mirroring).");
-            return;
-          }
-          if (mirror instanceof MirrorSkipped) {
-            console.log(`   GitHub Pages mirror: skipped — ${mirror.message}`);
-            return;
-          }
-          if (mirror instanceof Error) {
-            console.log(`   GitHub Pages mirror: failed (non-fatal) — ${mirror.message}`);
-            captureWarning("gh-pages mirror failed", { error: mirror.message.slice(0, 200) });
-            return;
-          }
-          console.log(`   Mirror: ${mirror.url}`);
-          console.log(`   Manifest: https://${mirror.owner}.github.io/${mirror.repo}/${mirror.manifestPath}`);
-          setDeployAttribute("deploy.gh_pages_url", mirror.url);
-          process.stdout.write("   Verifying Pages serves this deploy's CAR... ");
-          const freshness = await pollMirrorFreshness(mirror.url, cid as string, { timeoutMs: 3 * 60 * 1000, intervalMs: 10_000 });
-          if (freshness.verified) {
-            console.log(`ok (${freshness.attempts} attempt${freshness.attempts === 1 ? "" : "s"}, ${(freshness.durationMs / 1000).toFixed(0)}s).`);
-            setDeployAttribute("deploy.gh_pages_freshness_verified", "true");
-          } else {
-            // Non-fatal: courtesy poll only. Pages CDN propagation can run past our 3-min budget,
-            // especially on self-hosted runners. Record the outcome as a span attribute (both
-            // values, per ratio-attribute convention) without flipping deploy.sad.
-            console.log(`timed out.`);
-            console.log(`   GitHub Pages last served cid=${freshness.lastCid ?? "n/a"} (expected ${cid}); it should catch up shortly. Non-fatal.`);
-            setDeployAttribute("deploy.gh_pages_freshness_verified", "false");
-          }
-        });
-      }
 
       console.log("\n" + "=".repeat(60));
       console.log("DEPLOYMENT COMPLETE!");

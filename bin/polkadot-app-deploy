@@ -56,7 +56,6 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === "--input-car") { flags.inputCar = args[++i]; }
   else if (args[i] === "--tag") { flags.tag = args[++i]; }
   else if (args[i] === "--config") { flags.config = args[++i]; }
-  else if (args[i] === "--gh-pages-mirror") { flags.ghPagesMirror = true; }
   else if (args[i] === "--allow-large-deploy") { flags.allowLargeDeploy = true; }
   else if (args[i] === "--reproducible") { flags.reproducibleSource = "commit"; }
   else if (args[i].startsWith("--reproducible=")) { flags.reproducibleSource = args[i].slice("--reproducible=".length); }
@@ -277,8 +276,6 @@ Options:
                       <build-dir> looking for polkadot-app-deploy.config.{ts,js,mjs}). When a
                       config is found, deploy ALSO writes the manifest + executable text
                       records on <domain> and its app/widget/worker subnames.
-  --gh-pages-mirror   After deploy, push the CAR to the current repo's gh-pages branch
-                      at bulletin/<domain>.dot.car (opt-in; also set GH_PAGES_MIRROR=1)
   --publish           After deploy, list <domain> in the on-chain Publisher
                       registry (Publisher.publish). Only takes effect on envs
                       with a deployed Publisher (currently: paseo-next-v2).
@@ -487,7 +484,6 @@ try {
     jsMerkle: flags.jsMerkle,
     inputCar: flags.inputCar,
     tag: flags.tag,
-    ghPagesMirror: flags.ghPagesMirror,
     allowLargeDeploy: flags.allowLargeDeploy,
     reproducibleSource: flags.reproducibleSource,
     dumpCar: flags.dumpCar,

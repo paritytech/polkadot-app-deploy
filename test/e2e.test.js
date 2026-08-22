@@ -283,8 +283,7 @@ function buildArgs(fixtureDir, label) {
   // load-bearing for coverage (s1 happy-path, s-inc incremental). Running it
   // unconditionally on every @HEAD scenario added ~70 extra Asset Hub txs per
   // run on Alice's shared nonce stream, evicting sibling jobs from the mempool
-  // and blowing through the 3-attempt × 180s retry budget — observed as the
-  // S9/S6/S4 chain-progress failures on v0.7.28-rc.1 ([run 26410360929]).
+  // and blowing through the 3-attempt × 180s retry budget.
   const MANIFEST_SCENARIOS = new Set(["s1", "s-inc"]);
   if (MANIFEST_SCENARIOS.has(SCENARIO)) {
     const { configPath } = buildManifestSidecar({ buildDir: fixtureDir, label });
@@ -481,112 +480,6 @@ describe("e2e", { skip: !ENABLED }, () => {
         t2.stdout, /already owned by/i,
         ">> FAIL: S-TRANSFER: second transfer should be a no-op (already-owned), not a re-transfer",
       );
-    });
-  });
-
-  describe("S4 — gh-pages mirror serves the deployed CAR", { skip: SCENARIO !== "s4" }, () => {
-    // GitHub Pages builds usually land within ~1-2 minutes of the push, but
-    // first-time branch creation can take longer and a busy queue bumps it
-    // further. 5 minutes is enough in practice without parking the test
-    // indefinitely on a broken Pages build.
-    const PAGES_WAIT_MS = 5 * 60 * 1000;
-    const PAGES_POLL_INTERVAL_MS = 10_000;
-
-    function parseMirrorUrl(stdout) {
-      return parseLineOrExplain(stdout, {
-        pattern: /Mirror:\s+(https:\/\/\S+\.car)\b/,
-        scenario: "S4",
-        what: "gh-pages mirror URL",
-        hint: "S4 expects '--gh-pages-mirror' to print a 'Mirror: https://...car' line. Missing means the mirror step didn't execute (check the gh-pages push log).",
-      })[1];
-    }
-
-    async function pollUntil200(url, timeoutMs) {
-      const deadline = Date.now() + timeoutMs;
-      let lastStatus = 0;
-      while (Date.now() < deadline) {
-        const res = await fetch(url, { redirect: "follow" });
-        if (res.status === 200) return res;
-        lastStatus = res.status;
-        await new Promise((r) => setTimeout(r, PAGES_POLL_INTERVAL_MS));
-      }
-      throw new Error(`${url} never served 200 within ${timeoutMs}ms (last status ${lastStatus})`);
-    }
-
-    // Pages is CDN-backed; a fresh commit can return 200 for several seconds
-    // while the edge still serves stale bytes. Poll the manifest (which the
-    // CLI writes atomically alongside the CAR) until its `cid` field matches
-    // this deploy's CID — at that point the edge has picked up our commit
-    // and a subsequent CAR fetch is guaranteed fresh. Cache-busting via a
-    // query string is used for the CAR fetch too as a second line of defence.
-    async function pollUntilManifestCidMatches(url, expectedCid, timeoutMs) {
-      const deadline = Date.now() + timeoutMs;
-      let lastCid = null;
-      let lastStatus = 0;
-      while (Date.now() < deadline) {
-        const res = await fetch(url, { redirect: "follow", cache: "no-store" });
-        if (res.status === 200) {
-          const m = await res.json();
-          if (m.cid === expectedCid) return m;
-          lastCid = m.cid;
-        } else {
-          lastStatus = res.status;
-        }
-        await new Promise((r) => setTimeout(r, PAGES_POLL_INTERVAL_MS));
-      }
-      throw new Error(`${url} manifest CID never reached ${expectedCid} within ${timeoutMs}ms (last seen cid=${lastCid ?? "n/a"}, last status=${lastStatus})`);
-    }
-
-    test(`deploy ${SIGNER}/${MERKLE} with --gh-pages-mirror and fetch via Pages`, { timeout: DEPLOY_TIMEOUT_MS + PAGES_WAIT_MS + 60_000 }, async () => {
-      const label = pickStableLabel();
-      const { fixtureDir } = await mutateFixture(RUN_TAG);
-      // Reference copy of the exact bytes the CLI sends to Bulletin. We
-      // can't HTTP-GET from Bulletin directly (content lives in the
-      // TransactionStorage pallet split into chunks; there's no gateway
-      // that ships with Paseo), so we ask the CLI to save the pre-upload
-      // CAR via PAD_DUMP_CAR and compare that file against the
-      // mirror download. Dump is post-encryption, so the bytes match
-      // exactly what Bulletin receives AND what the mirror publishes —
-      // same bytes, same content-hash, same object.
-      const dumpPath = path.join(os.tmpdir(), `e2e-s4-car-${Date.now()}.bin`);
-      try {
-        const { code, stdout, stderr } = await runBulletinDeploy({
-          args: [...buildArgs(fixtureDir, `${label}.dot`), "--gh-pages-mirror"],
-          env: { ...rpcEnv(), PAD_DUMP_CAR: dumpPath },
-          timeoutMs: DEPLOY_TIMEOUT_MS,
-        });
-        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S4" });
-
-        assert.ok(fs.existsSync(dumpPath), `CLI should have dumped the pre-upload CAR to ${dumpPath}`);
-        const bulletinBytes = new Uint8Array(fs.readFileSync(dumpPath));
-
-        // Mirror URL comes from the CLI output; trusting the CLI's own claim
-        // means a mis-wired Mirror: log line (wrong owner/repo) would fail
-        // the subsequent fetch rather than silently passing.
-        const mirrorUrl = parseMirrorUrl(stdout);
-        const manifestUrl = mirrorUrl.replace(/\.car$/, ".json");
-        const deployedCid = parseDeployedCid(stdout, "S4");
-
-        // Wait for Pages to serve THIS deploy's manifest (CID-matched), then
-        // fetch the CAR with a cache-busting query string. Without this,
-        // the CDN can return 200 while still serving a prior deploy's CAR
-        // for seconds-to-minutes, surfacing as a spurious byte mismatch.
-        const manifest = await pollUntilManifestCidMatches(manifestUrl, deployedCid, PAGES_WAIT_MS);
-        assert.strictEqual(manifest.domain, `${label}.dot`);
-        assert.strictEqual(manifest.encrypted, false);
-
-        const carResp = await fetch(`${mirrorUrl}?v=${deployedCid}`, { redirect: "follow", cache: "no-store" });
-        assert.strictEqual(carResp.status, 200, `CAR URL must serve 200 once manifest is fresh`);
-        const pagesBytes = new Uint8Array(await carResp.arrayBuffer());
-
-        assert.strictEqual(pagesBytes.length, bulletinBytes.length,
-          `Pages CAR is ${pagesBytes.length} bytes; Bulletin CAR is ${bulletinBytes.length} bytes`);
-        assert.ok(Buffer.from(pagesBytes).equals(Buffer.from(bulletinBytes)),
-          `Pages and Bulletin CAR bytes differ (same length ${pagesBytes.length} but content mismatch)`);
-      } finally {
-        fs.rmSync(fixtureDir, { recursive: true, force: true });
-        fs.rmSync(dumpPath, { force: true });
-      }
     });
   });
 

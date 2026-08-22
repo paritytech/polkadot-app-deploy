@@ -64,10 +64,6 @@ on:
         description: 'Free-form label attached to the deploy span as deploy.tag (e.g. "e2e-ci-pr", "load-test"). Lets Sentry dashboards filter test/benchmark traffic out of real-user views. Empty = no tag.'
         type: string
         default: ''
-      gh-pages-mirror:
-        description: 'Opt-in: after deploy, push the CAR to the caller repo''s gh-pages branch as a fast-path HTTP cache (see --gh-pages-mirror). Requires contents:write on the calling workflow.'
-        type: boolean
-        default: false
       gateway:
         description: 'Gateway host used to construct browser URLs in the deployment summary and PR comment (e.g. "dot.li", "paseo.li"). Does not affect the deploy itself — only the URL displayed.'
         type: string
@@ -191,21 +187,6 @@ jobs:
           ref: ${{ inputs.polkadot-app-deploy-ref }}
           path: polkadot-app-deploy-src
 
-      # Checkout the caller's repo so the gh-pages mirror has a real git context
-      # (origin + push credentials). The deploy CLI runs in the workspace root,
-      # which is NOT a git repo (the artifact lands in build/; the source clone,
-      # when present, lives in polkadot-app-deploy-src/). Without this checkout
-      # `git worktree add … HEAD` fails and gh-pages is never created.
-      # The path (.gh-pages-mirror-ctx) is a sibling of build/ so it does not
-      # clobber the downloaded artifact. PAD_GH_PAGES_REPO is exported in the
-      # Deploying step so the CLI child process inherits it.
-      - name: Checkout repo for gh-pages mirror context
-        if: inputs.gh-pages-mirror == true
-        uses: actions/checkout@v6
-        with:
-          path: .gh-pages-mirror-ctx
-          fetch-depth: 1
-
       - name: Install polkadot-app-deploy
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
@@ -282,7 +263,6 @@ jobs:
             export NODE_OPTIONS='--max-old-space-size=8192'
             export SENTRY_DSN='${{ secrets.sentry-dsn }}'
             export GITHUB_REPOSITORY='${{ github.repository }}'
-            if [ "${{ inputs.gh-pages-mirror }}" = "true" ]; then export PAD_GH_PAGES_REPO="$(pwd)/.gh-pages-mirror-ctx"; fi
             # Build argv as a bash array rather than a space-joined string. With a
             # string + `polkadot-app-deploy $FLAGS`, shell word-splits on whitespace and
             # single quotes inside the value become literal argv characters — that's
@@ -291,7 +271,6 @@ jobs:
             FLAGS=()
             if [ -n "${{ inputs.tag }}" ]; then FLAGS+=(--tag "${{ inputs.tag }}"); fi
             if [ "${{ inputs.js-merkle }}" = "true" ]; then FLAGS+=(--js-merkle); fi
-            if [ "${{ inputs.gh-pages-mirror }}" = "true" ]; then FLAGS+=(--gh-pages-mirror); fi
             if [ "${{ inputs.direct-signer }}" = "true" ]; then FLAGS+=(--mnemonic "${{ secrets.mnemonic }}"); fi
             if [ -n "${{ inputs.derivation-path }}" ]; then FLAGS+=(--derivation-path "${{ inputs.derivation-path }}"); fi
             if [ -n "${{ inputs.rpc }}" ]; then FLAGS+=(--rpc "${{ inputs.rpc }}"); fi

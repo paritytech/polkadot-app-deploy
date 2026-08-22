@@ -9,12 +9,11 @@
 # Modes:
 #   smoke   — 1 scenario: S1 pool/js. Fastest sanity check (~5 min).
 #   pr      — 4 scenarios matching the per-PR CI matrix: S1 pool/js,
-#             S1 direct/kubo, S3 pool/js, S4 pool/js (~20 min).
-#   nightly — 12 scenarios covering the nightly matrix minus the runner
+#             S1 direct/kubo, S3 pool/js, S8 direct/js (~20 min).
+#   nightly — 11 scenarios covering the nightly matrix minus the runner
 #             dimension: S1 full signer×merkle cube (4), S2 fresh per signer
-#             with unique labels (2), S3 (1), S4 gh-pages mirror (1),
-#             S5 commit-reveal race (1), S6 RPC failover (1), S-INC
-#             incremental upload v2 per backend (2).
+#             with unique labels (2), S3 (1), S5 commit-reveal race (1),
+#             S6 RPC failover (1), S-INC incremental upload v2 per backend (2).
 #             ~45–60 min.
 #
 # --quiet (or E2E_QUIET=1): suppresses live node:test output, bulletin-deploy
@@ -109,7 +108,6 @@ case "$MODE" in
     run s1 pool   js
     run s1 direct kubo
     run s3 pool   js
-    run s4 pool   js
     # S8: WS fault injection. dropAtMs=40s accounts for the manifest fetch
     # latency (~30s) that precedes chunk upload in incremental mode.
     GITHUB_RUN_ID=$(date +%s) GITHUB_SHA=$(openssl rand -hex 4) \
@@ -127,7 +125,6 @@ case "$MODE" in
         run s2 "$signer" js
     done
     run s3 pool js
-    run s4 pool js
     # S5 needs a per-run unique label (its register() retry path can only
     # exercise on a fresh, unowned label). Match the per-shard env override
     # used by S2 so RUN_TAG produces a unique e2e-s5<…> domain each run.

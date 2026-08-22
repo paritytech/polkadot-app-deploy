@@ -97,6 +97,24 @@ export type TxResolution =
   | { kind: typeof TX_KIND_HASH; hash: string; block?: { hash: string; number: number } }
   | { kind: typeof TX_KIND_NONCE_ADVANCED; rpc: string }
   | { kind: typeof TX_KIND_BEST_BLOCK };
+
+// Sentinel txHash placed in setTextRecord's return when the skip-if-unchanged
+// pre-check finds the on-chain value already matches — no tx was submitted,
+// so there is no real hash to report. Not part of TxResolution (that union
+// describes contractTransaction's tx-submission outcomes; this is a
+// no-op-write outcome that never reaches contractTransaction).
+export const TX_KIND_SKIPPED = "skipped" as const;
+
+/**
+ * Pure skip-decision for `setTextRecord`'s already-set pre-check: true when
+ * the on-chain value already equals the target, meaning the write can be
+ * skipped entirely. Mirrors setContenthash's inline `current === expected`
+ * check, extracted here so the decision is unit-testable without a live chain.
+ */
+export function shouldSkipTextWrite(current: string, target: string): boolean {
+  return current === target;
+}
+
 export interface PriceValidationResult { priceWei: bigint; requiredStatus: number; userStatus: number; message: string; }
 export interface ParsedDomainName {
   isSubdomain: boolean;
@@ -2931,6 +2949,21 @@ export class DotNS {
       this.ensureConnected();
       console.log(`   Setting text[${key}]: ${value}`);
       const node = namehash(`${domainName}.dot`);
+
+      // Pre-check: skip the tx if already set to the same value (mirrors
+      // setContenthash's pre-check above). Reuses getTextRecord, which
+      // already returns "" for an unset key.
+      try {
+        const current = await this.getTextRecord(domainName, key);
+        if (shouldSkipTextWrite(current, value)) {
+          console.log(`   text[${key}] already set — skipping tx`);
+          setDeployAttribute("deploy.dotns.text_unchanged", "true");
+          return { value, txHash: TX_KIND_SKIPPED };
+        }
+      } catch (_) {
+        // Read failure — proceed with the normal set path.
+      }
+      setDeployAttribute("deploy.dotns.text_unchanged", "false");
 
       // verifyEffect: mirrors setContenthash — used by submitTransaction's
       // nonce-advance fallback path so a nonce consumed by a concurrent writer

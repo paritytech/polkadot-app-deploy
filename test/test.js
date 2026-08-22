@@ -17,7 +17,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -4974,6 +4974,22 @@ describe("DotNS.setTextRecord", () => {
     return d;
   }
 
+  // #1168: setTextRecord now does an extra contractCallNullable read (the
+  // skip-if-unchanged pre-check) before the write. Tests below that mocked
+  // contractCallNullable to always return the target value need their FIRST
+  // read to instead miss (return "", i.e. unset) so the pre-check doesn't skip
+  // the write before contractTransaction is ever invoked — everything after
+  // that first call defers to `next` (a value, or a function for call-site
+  // side effects/assertions on every invocation, including the pre-check's).
+  function stubAfterPrecheck(next) {
+    let served = false;
+    return async (...args) => {
+      const result = typeof next === "function" ? await next(...args) : next;
+      if (!served) { served = true; return ""; }
+      return result;
+    };
+  }
+
   test("writes via contract setText then verifies via contract text read", async () => {
     const domain = "myapp";
     const key = "name";
@@ -4988,21 +5004,23 @@ describe("DotNS.setTextRecord", () => {
     };
     // #1060: the post-hoc poll reads via contractCallNullable (not contractCall)
     // so an unset/not-yet-finalized text key doesn't throw on the first read.
-    d.contractCallNullable = async (_address, _abi, functionName, args) => {
+    d.contractCallNullable = stubAfterPrecheck((_address, _abi, functionName, args) => {
       calls.push({ type: "call", functionName, args });
       return value;
-    };
+    });
     const result = await d.setTextRecord(domain, key, value);
 
     assert.deepStrictEqual(result, { value, txHash });
-    assert.strictEqual(calls.length, 2);
-    assert.strictEqual(calls[0].type, "tx");
-    assert.strictEqual(calls[0].functionName, "setText");
-    assert.strictEqual(calls[0].args[1], key);
-    assert.strictEqual(calls[0].args[2], value);
-    assert.strictEqual(calls[1].type, "call");
-    assert.strictEqual(calls[1].functionName, "text");
+    assert.strictEqual(calls.length, 3, "expected #1168 pre-check read + tx + post-hoc verify read");
+    assert.strictEqual(calls[0].type, "call", "call 0 must be the #1168 skip-if-unchanged pre-check read");
+    assert.strictEqual(calls[0].functionName, "text");
+    assert.strictEqual(calls[1].type, "tx");
+    assert.strictEqual(calls[1].functionName, "setText");
     assert.strictEqual(calls[1].args[1], key);
+    assert.strictEqual(calls[1].args[2], value);
+    assert.strictEqual(calls[2].type, "call");
+    assert.strictEqual(calls[2].functionName, "text");
+    assert.strictEqual(calls[2].args[1], key);
   });
 
   test("polls finalized chain time until a stale text read catches up", async () => {
@@ -5047,14 +5065,20 @@ describe("DotNS.setTextRecord", () => {
   // #1060: exercises the exact null-tolerant path the fix introduced — an unset
   // text key reads back `null` from contractCallNullable, and the post-hoc poll
   // must coerce that to "" instead of throwing on it.
+  // #1168: target value here is "" itself, so a naive stub that always returns
+  // null would make the skip-if-unchanged pre-check see "" === "" and skip the
+  // write entirely — never reaching the post-hoc poll this test is meant to
+  // guard. The FIRST read ("old") is non-empty so the pre-check proceeds to the
+  // write; the poll's own first read (null) is what exercises the #1060 coercion.
   test("treats contract text null value as empty string for comparison", async () => {
     const domain = "myapp";
     const key = "name";
     const value = "";
 
+    const reads = ["old", null];
     const d = makeDotnsForTextRecord();
     d.contractTransaction = async () => ({ kind: "hash", hash: "0xghi789" });
-    d.contractCallNullable = async () => null;
+    d.contractCallNullable = async () => reads.shift() ?? null;
     const result = await d.setTextRecord(domain, key, value);
     assert.strictEqual(result.value, "");
   });
@@ -5068,7 +5092,10 @@ describe("DotNS.setTextRecord", () => {
     const domain = "myapp";
     const key = "name";
     const value = "My App";
-    const reads = [null, value];
+    // "" first serves the #1168 skip-if-unchanged pre-check (forces it to see a
+    // mismatch and proceed to the write); the original null->value sequence
+    // then exercises the post-hoc poll's null-tolerance as before.
+    const reads = ["", null, value];
     const d = makeDotnsForTextRecord();
     d.clientWrapper = {
       client: { query: { Timestamp: { Now: { getValue: async () => 1_000_000 } } } },
@@ -5095,7 +5122,7 @@ describe("DotNS.setTextRecord", () => {
       capturedOpts.push(opts);
       return { kind: "hash", hash: "0xverify123" };
     };
-    d.contractCallNullable = async () => value;
+    d.contractCallNullable = stubAfterPrecheck(value);
 
     await d.setTextRecord(domain, key, value);
 
@@ -5117,11 +5144,11 @@ describe("DotNS.setTextRecord", () => {
     };
     // Stub contractCallNullable for both the verifyEffect closure and the
     // post-hoc poll to use — both read the same text(node, key) now (#1060).
-    d.contractCallNullable = async (_addr, _abi, fn, args) => {
+    d.contractCallNullable = stubAfterPrecheck((_addr, _abi, fn, args) => {
       assert.strictEqual(fn, "text", "verifyEffect must read the 'text' function");
       assert.strictEqual(args[1], key, "verifyEffect must pass the correct key");
       return value;
-    };
+    });
 
     await d.setTextRecord(domain, key, value);
 
@@ -5167,14 +5194,18 @@ describe("DotNS.setTextRecord", () => {
     d.rpc = null;
     d.clientWrapper = makeWrapper();
 
-    // contractCallNullable serves BOTH the post-hoc poll inside setTextRecord()
-    // (#1060: it now reads via contractCallNullable, not contractCall) and the
-    // verifyEffect closure invoked manually below — same stub, different phase.
-    // Start it returning the expected value so the post-hoc poll inside
-    // setTextRecord() below succeeds immediately instead of hanging; flip it to
-    // "stale-value" right before exercising verifyEffect in isolation.
+    // contractCallNullable serves the #1168 skip-if-unchanged pre-check, the
+    // post-hoc poll inside setTextRecord() (#1060: it now reads via
+    // contractCallNullable, not contractCall), and the verifyEffect closure
+    // invoked manually below — same stub, different phases. Its first call
+    // (the pre-check) sees "" (unset) so it proceeds to the write instead of
+    // skipping before contractTransaction is ever invoked; every call after
+    // that returns onChainStub, which starts at the expected value so the
+    // post-hoc poll inside setTextRecord() below succeeds immediately instead
+    // of hanging, then is flipped to "stale-value" right before exercising
+    // verifyEffect in isolation.
     let onChainStub = value;
-    d.contractCallNullable = async () => onChainStub;
+    d.contractCallNullable = stubAfterPrecheck(() => onChainStub);
 
     // Capture verifyEffect by stubbing contractTransaction
     let capturedVerifyEffect = null;
@@ -5211,7 +5242,7 @@ describe("DotNS.setTextRecord", () => {
       capturedVerifyEffect = opts?.verifyEffect ?? null;
       return { kind: "hash", hash: "0xverifyteardown" };
     };
-    d.contractCallNullable = async () => value;
+    d.contractCallNullable = stubAfterPrecheck(value);
 
     await d.setTextRecord(domain, key, value);
 
@@ -5222,6 +5253,40 @@ describe("DotNS.setTextRecord", () => {
     assert.ok(capturedVerifyEffect !== null, "verifyEffect should have been captured");
     const result = await capturedVerifyEffect();
     assert.strictEqual(result, false, "verifyEffect must return false when session is torn down");
+  });
+
+  // #1168: behavioral coverage for the skip-if-unchanged pre-check itself — the
+  // shouldSkipTextWrite unit tests below only cover the pure decision function;
+  // this drives setTextRecord end-to-end through the seam the tests above
+  // proved works (stubbed contractTransaction/contractCallNullable), so a
+  // regression in the WIRING (e.g. the pre-check silently dropped, or its
+  // condition inverted) fails here even though the pure function is unchanged.
+  test("skips the tx when the on-chain value already matches (#1168)", async () => {
+    const domain = "myapp";
+    const key = "name";
+    const value = "My App";
+
+    const root = { attrs: new Map(), setAttribute(k, v) { this.attrs.set(k, v); } };
+    __setDeployRootSpanForTest(root);
+    try {
+      const d = makeDotnsForTextRecord();
+      let txCalled = false;
+      d.contractTransaction = async () => { txCalled = true; return { kind: "hash", hash: "0xnope" }; };
+      d.contractCallNullable = async () => value; // already equals target on every read
+
+      const result = await d.setTextRecord(domain, key, value);
+
+      assert.strictEqual(txCalled, false,
+        ">> FAIL: setTextRecord skip-path: contractTransaction must not run when the on-chain value is unchanged");
+      assert.strictEqual(result.txHash, TX_KIND_SKIPPED,
+        ">> FAIL: setTextRecord skip-path: result.txHash must be the TX_KIND_SKIPPED sentinel, not a real tx hash");
+      assert.strictEqual(result.value, value,
+        ">> FAIL: setTextRecord skip-path: result.value must still echo the target value on skip");
+      assert.strictEqual(root.attrs.get("deploy.dotns.text_unchanged"), "true",
+        ">> FAIL: setTextRecord skip-path: must set deploy.dotns.text_unchanged=true on the root deploy span");
+    } finally {
+      __setDeployRootSpanForTest(null);
+    }
   });
 });
 
@@ -16662,6 +16727,41 @@ describe("35. Block + tx hash capture for Bulletin uploads (#537)", () => {
     } finally {
       __setDeployRootSpanForTest(null);
     }
+  });
+});
+
+describe("setTextRecord skip-if-unchanged pre-check (#1168)", () => {
+  test("shouldSkipTextWrite: current equals target -> skip (true)", () => {
+    assert.strictEqual(shouldSkipTextWrite("hello world", "hello world"), true,
+      ">> FAIL: shouldSkipTextWrite equal-values: expected skip decision true when on-chain value already matches target");
+  });
+
+  test("shouldSkipTextWrite: current differs from target -> proceed (false)", () => {
+    assert.strictEqual(shouldSkipTextWrite("old value", "new value"), false,
+      ">> FAIL: shouldSkipTextWrite differing-values: expected skip decision false so the write proceeds when values differ");
+  });
+
+  test("shouldSkipTextWrite: unset key (current === \"\") with a non-empty target -> proceed (false)", () => {
+    assert.strictEqual(shouldSkipTextWrite("", "first write"), false,
+      ">> FAIL: shouldSkipTextWrite unset-key: expected skip decision false so an unset text[key] (getTextRecord's \"\" sentinel) still gets written");
+  });
+
+  test("setTextRecord source wires the pre-check: reads getTextRecord, compares via shouldSkipTextWrite, and returns TX_KIND_SKIPPED on match", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    const setTextIdx = src.indexOf("async setTextRecord(");
+    assert.ok(setTextIdx !== -1, ">> FAIL: setTextRecord wiring: could not locate setTextRecord in src/dotns.ts");
+    const setTextRecordsIdx = src.indexOf("async setTextRecords(");
+    const body = src.slice(setTextIdx, setTextRecordsIdx !== -1 ? setTextRecordsIdx : setTextIdx + 4000);
+    assert.ok(/await this\.getTextRecord\(domainName,\s*key\)/.test(body),
+      ">> FAIL: setTextRecord wiring: pre-check must read the current value via this.getTextRecord(domainName, key)");
+    assert.ok(/shouldSkipTextWrite\(current,\s*value\)/.test(body),
+      ">> FAIL: setTextRecord wiring: pre-check must decide via shouldSkipTextWrite(current, value)");
+    assert.ok(/setDeployAttribute\("deploy\.dotns\.text_unchanged",\s*"true"\)/.test(body),
+      ">> FAIL: setTextRecord wiring: must set deploy.dotns.text_unchanged=true on skip");
+    assert.ok(/setDeployAttribute\("deploy\.dotns\.text_unchanged",\s*"false"\)/.test(body),
+      ">> FAIL: setTextRecord wiring: must set deploy.dotns.text_unchanged=false when proceeding to write");
+    assert.ok(/txHash:\s*TX_KIND_SKIPPED/.test(body),
+      ">> FAIL: setTextRecord wiring: skip-path return must use the TX_KIND_SKIPPED sentinel for txHash");
   });
 });
 

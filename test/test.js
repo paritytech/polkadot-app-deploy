@@ -20118,7 +20118,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -20417,6 +20417,45 @@ describe("resolveEffectiveMnemonic env/flag precedence (#1107)", () => {
     const choice = chooseSignerInput({ mnemonic: resolved, suri: undefined, hasInjectedSigner: false, hasSession: true });
     assert.strictEqual(choice, "mnemonic",
       ">> FAIL: resolveEffectiveMnemonic + chooseSignerInput: an env-only MNEMONIC must still win over a persisted session (#1107 — the bin previously forwarded undefined here, so hasSession made this 'resolve' and the deploy silently used the signed-in session instead)");
+  });
+});
+
+describe("shouldPublishManifest / validateNoManifestFlags — --no-manifest / --content-only (#1163)", () => {
+  test("config present + noManifest → false (skip manifest publish even though a config was discovered)", () => {
+    const result = shouldPublishManifest({ configFound: true, noManifest: true });
+    assert.strictEqual(result, false,
+      ">> FAIL: shouldPublishManifest: --no-manifest must skip manifest publishing even when a polkadot-app-deploy.config.* is discoverable (#1163 — content-only deploy is the whole point of the flag)");
+  });
+
+  test("config present + !noManifest → true (default behavior unchanged: publish when a config is found)", () => {
+    const result = shouldPublishManifest({ configFound: true, noManifest: false });
+    assert.strictEqual(result, true,
+      ">> FAIL: shouldPublishManifest: with no --no-manifest flag, a discovered config must still trigger manifest publishing — default behavior must stay unchanged");
+  });
+
+  test("no config found → false regardless of noManifest (nothing to publish either way)", () => {
+    assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: false }), false,
+      ">> FAIL: shouldPublishManifest: with no config discovered, manifest publishing must stay skipped (legacy contenthash-only path)");
+    assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: true }), false,
+      ">> FAIL: shouldPublishManifest: with no config discovered AND --no-manifest set, manifest publishing must stay skipped");
+  });
+
+  test("--no-manifest + --publish → rejected as a contradiction", () => {
+    const err = validateNoManifestFlags({ noManifest: true, publish: true });
+    assert.match(err, /--no-manifest.*--publish are mutually exclusive/,
+      ">> FAIL: validateNoManifestFlags: --no-manifest + --publish must be rejected — Publisher listing (--publish) depends on the manifest records --no-manifest skips");
+  });
+
+  test("--no-manifest without --publish → not rejected", () => {
+    const err = validateNoManifestFlags({ noManifest: true, publish: false });
+    assert.strictEqual(err, null,
+      ">> FAIL: validateNoManifestFlags: --no-manifest alone (no --publish) must be accepted — it's the normal content-only use case");
+  });
+
+  test("--publish without --no-manifest → not rejected", () => {
+    const err = validateNoManifestFlags({ noManifest: false, publish: true });
+    assert.strictEqual(err, null,
+      ">> FAIL: validateNoManifestFlags: --publish alone (no --no-manifest) must be accepted — unaffected by #1163");
   });
 });
 

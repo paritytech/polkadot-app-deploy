@@ -483,6 +483,41 @@ export function resolveEffectiveMnemonic(opts: {
   return opts.flagMnemonic ?? opts.envMnemonic ?? opts.envDotnsMnemonic;
 }
 
+/**
+ * Decide whether the deploy should publish product-config manifest records
+ * (subname registration + resolver + contenthash + text records), independent
+ * of whether `tryLoadProductConfig` found a config on disk. Exists so the
+ * bin's `--no-manifest` / `--content-only` short-circuit is unit-testable:
+ * with the flag set, manifest publishing is skipped even when a
+ * `polkadot-app-deploy.config.*` is discoverable, producing the same
+ * content-only deploy as when no config exists at all.
+ */
+export function shouldPublishManifest(opts: {
+  configFound: boolean;
+  noManifest: boolean;
+}): boolean {
+  return opts.configFound && !opts.noManifest;
+}
+
+/**
+ * Reject the contradictory `--no-manifest`/`--content-only` + `--publish`
+ * combination up front. `--publish` lists the domain in the on-chain
+ * Publisher registry, which reads the manifest's text records (Browse relies
+ * on them) — skipping manifest publishing while also asking to list the
+ * domain would silently publish a domain with no manifest data. Returns an
+ * error message string to print + exit on, or `null` when the combination is
+ * fine. Exported for unit testing.
+ */
+export function validateNoManifestFlags(opts: {
+  noManifest: boolean;
+  publish: boolean;
+}): string | null {
+  if (opts.noManifest && opts.publish) {
+    return "Error: --no-manifest (--content-only) and --publish are mutually exclusive — --publish requires the manifest records that --no-manifest skips.";
+  }
+  return null;
+}
+
 /** storageSigner > signer > mnemonic > pool precedence for storage routing. Exported for unit testing. */
 export function __selectStorageProviderModeForTest(
   options: Pick<DeployOptions, "storageSigner" | "storageSignerAddress" | "signer" | "signerAddress" | "mnemonic">,

@@ -6,7 +6,7 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish, resolveEffectiveMnemonic } from "../dist/deploy.js";
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish, resolveEffectiveMnemonic, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
@@ -56,6 +56,7 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === "--input-car") { flags.inputCar = args[++i]; }
   else if (args[i] === "--tag") { flags.tag = args[++i]; }
   else if (args[i] === "--config") { flags.config = args[++i]; }
+  else if (args[i] === "--no-manifest" || args[i] === "--content-only") { flags.noManifest = true; }
   else if (args[i] === "--allow-large-deploy") { flags.allowLargeDeploy = true; }
   else if (args[i] === "--reproducible") { flags.reproducibleSource = "commit"; }
   else if (args[i].startsWith("--reproducible=")) { flags.reproducibleSource = args[i].slice("--reproducible=".length); }
@@ -74,6 +75,16 @@ for (let i = 0; i < args.length; i++) {
 
 if (flags.publish && flags.unpublish) {
   console.error("Error: --publish and --unpublish are mutually exclusive.");
+  process.exit(1);
+}
+
+// --no-manifest (--content-only) skips manifest publishing even when a
+// polkadot-app-deploy.config.* is discoverable; --publish depends on those
+// manifest records (Publisher listing -> Browse), so the combination is
+// rejected up front rather than silently publishing a domain with no manifest.
+const noManifestErr = validateNoManifestFlags({ noManifest: !!flags.noManifest, publish: !!flags.publish });
+if (noManifestErr) {
+  console.error(noManifestErr);
   process.exit(1);
 }
 
@@ -287,6 +298,11 @@ Options:
                       <build-dir> looking for polkadot-app-deploy.config.{ts,js,mjs}). When a
                       config is found, deploy ALSO writes the manifest + executable text
                       records on <domain> and its app/widget/worker subnames.
+  --no-manifest, --content-only
+                      Skip manifest publishing entirely, even when a
+                      polkadot-app-deploy.config.* is discoverable — plain
+                      content deploy (storage + root contenthash), same as
+                      having no config at all. Mutually exclusive with --publish.
   --publish           After deploy, list <domain> in the on-chain Publisher
                       registry (Publisher.publish). Only takes effect on envs
                       with a deployed Publisher (currently: paseo-next-v2).
@@ -471,16 +487,22 @@ try {
   // icon/executable files BEFORE any storage or chain work, so config errors
   // fail fast up front instead of after merkleize + upload. No-op (returns
   // null) for contenthash-only deploys with no config.
-  try {
-    const { preflightProductConfig } = await import("../dist/index.js");
-    // config-load resolves a relative cwd internally, so no node:path here
-    // (it's only dynamically imported later, in the publish block).
-    await preflightProductConfig(
-      flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
-    );
-  } catch (err) {
-    console.error(`Error: ${err?.message ?? err}`);
-    process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
+  //
+  // --no-manifest (--content-only) skips this entirely — the deploy is
+  // content-only regardless of any discoverable config, so there's nothing to
+  // preflight.
+  if (!flags.noManifest) {
+    try {
+      const { preflightProductConfig } = await import("../dist/index.js");
+      // config-load resolves a relative cwd internally, so no node:path here
+      // (it's only dynamically imported later, in the publish block).
+      await preflightProductConfig(
+        flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
+      );
+    } catch (err) {
+      console.error(`Error: ${err?.message ?? err}`);
+      process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
+    }
   }
 
   const result = await deploy(buildDir, domain, {
@@ -552,6 +574,12 @@ try {
   // Walks up from <build-dir> (or honours --config) looking for
   // polkadot-app-deploy.config.{ts,js,mjs}. When found, writes the root + per-
   // executable text records, otherwise the legacy flow returns unchanged.
+  //
+  // --no-manifest (--content-only) skips manifest publishing even when a
+  // config is present. shouldPublishManifest() is the single source of truth
+  // for that decision (config discovery still runs either way, so the
+  // "config found but --no-manifest set" case is exercised for real, not just
+  // in unit tests).
   {
     const { tryLoadProductConfig, publishManifest } = await import("../dist/index.js");
     const path = await import("node:path");
@@ -559,7 +587,7 @@ try {
     const loaded = await tryLoadProductConfig(
       flags.config ? { path: flags.config } : { cwd: buildDirAbs, walkUp: true },
     );
-    if (loaded) {
+    if (shouldPublishManifest({ configFound: !!loaded, noManifest: !!flags.noManifest })) {
       try {
         await publishManifest({
           loaded,
@@ -575,7 +603,7 @@ try {
         process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
       }
     }
-    // No config → the contenthash-only deploy above is the whole job; nothing else to do.
+    // No config (or --no-manifest) → the contenthash-only deploy above is the whole job; nothing else to do.
   }
 
   if (!flags.help && !flags.version) {

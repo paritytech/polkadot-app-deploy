@@ -41,6 +41,13 @@ const FLAKE_PATTERNS = [
   // (#1131). A fresh CI retry lands in a recovered window. Not retried before, so a
   // single bad window failed the whole scenario (shifting failure sets across reruns).
   "ReviveApi.address timed out",
+  // IPFS gateway readback timeout in S-INC-ROUNDTRIP. Emitted ONLY by
+  // fetchManifestRoundtrip when the gateway cannot return a valid manifest
+  // (network / HTTP failure) — the deploy itself has already finalised on-chain
+  // and is p2p-retrievable. A genuine manifest CONTENT mismatch is a separate
+  // assertion that never emits this string, so retrying cannot mask a real
+  // integrity regression.
+  "roundtrip budget exhausted",
 ];
 
 // output: combined stdout+stderr text from the child. Any flake pattern

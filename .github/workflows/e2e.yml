@@ -86,6 +86,19 @@ on:
         description: 'Primary E2E environment id (default: paseo-next-v2). Probed first; falls back to other e2eEligible envs if down.'
         type: string
         default: ''
+      # Comma-separated scenario ids for a manual nightly dispatch. Empty (the
+      # default, and the value on every non-dispatch trigger) = run all, so this
+      # is a no-op on schedule/release/PR.
+      # Nonce-chain safety: selecting a chained Alice-pool scenario (e.g. s6)
+      # alone is safe — a filtered-out prerequisite (s5) skips and consumes no
+      # nonces, and the jobs' `if: always()` lets the selected job still run;
+      # when both are selected the existing `needs:` ordering still serializes.
+      # Aggregate verifiers (telemetry / pool-distribution / code-path coverage /
+      # address-drift) deliberately keep no filter — a subset cannot satisfy them.
+      scenarios:
+        description: 'Comma-separated scenario ids to re-run on a manual nightly dispatch (e.g. "s6,s8,s9"). Empty (default) = all. Re-run only the flaky scenarios instead of the whole matrix.'
+        type: string
+        default: ''
 
 permissions:
   # Workflow-level default: read-only. Jobs that need write access carry
@@ -680,7 +693,8 @@ jobs:
     if: |
       always() &&
       needs.build-nightly.result == 'success' &&
-      (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+      (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) &&
+      (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', matrix.scenario)))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -773,7 +787,7 @@ jobs:
   nightly-s1-pool:
     name: Nightly S1 pool/${{ matrix.merkle }} on ${{ matrix.runner }} (${{ matrix.env }})
     needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's1')))
     # No top-level timeout-minutes here: GitHub forbids it on reusable-workflow
     # callers. The cap lives in deploy.yml (timeout-minutes: 30 on the deploy job).
     permissions:
@@ -818,7 +832,7 @@ jobs:
   nightly-s1-direct:
     name: Nightly S1 direct/${{ matrix.merkle }} on ${{ matrix.runner }} (${{ matrix.env }})
     needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's1')))
     # Timeout cap lives in deploy.yml — see nightly-s1-pool note above.
     permissions:
       contents: read
@@ -871,7 +885,7 @@ jobs:
   nightly-s2-fresh:
     name: Nightly S2 fresh / ${{ matrix.signer }} (${{ matrix.env }})
     needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's2')))
     # Timeout cap lives in deploy.yml — see nightly-s1-pool note above.
     permissions:
       contents: read
@@ -909,7 +923,7 @@ jobs:
   nightly-s3:
     name: Nightly S3 owned-elsewhere (${{ matrix.env }})
     needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's3')))
     # S3 is a negative test: polkadot-app-deploy MUST reject the deploy to
     # e2eowned.dot (Bob's domain) with exit 78 + "is already owned by
     # 0x41dccbd4...". Previously this was two jobs — a reusable deploy.yml
@@ -1009,7 +1023,7 @@ jobs:
     # at the same time, causing Stale tx errors. always() ensures S5 still
     # runs even when S1-pool fails.
     needs: [build-nightly, nightly-s1-pool, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's5')))
     # S5 forces the dotns-sdk#105 commit-reveal race by setting buffer=0,
     # which after the isExplicitCommitmentBuffer fix triggers the retry path
     # to escalate to 60s. Validates that the recovery in PR #180 actually
@@ -1121,7 +1135,7 @@ jobs:
     # Runs after nightly-s5 (which runs after nightly-s1-pool) to serialize all
     # Alice-root DotNS jobs: s1-pool → s5 → s6 → s-ext-signer.
     needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s5, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's6')))
     # S6 forces transport-level failover by pointing BULLETIN_RPC at an
     # unroutable address. src/deploy.ts:811-813 prepends user-rpc to
     # BULLETIN_ENDPOINTS, leaving the public Bulletin endpoint as the backup;
@@ -1205,7 +1219,7 @@ jobs:
     # (this scenario kills its own first deploy mid-upload, but the second
     # invocation still talks to chain state).
     needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's7')))
     # S7 forces a SIGINT mid-chunk-upload and verifies the crash-capture
     # infrastructure (#178) actually ran end-to-end: exit code 130, state
     # file correctly populated, relaunch warning fires on the next
@@ -1288,7 +1302,7 @@ jobs:
     # available; polkadot-app-deploy binary is built from source (or from the RC
     # ref when BULLETIN_DEPLOY_REF is set).
     needs: [build-nightly, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's8')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1355,7 +1369,7 @@ jobs:
     # defense works under concurrent chunk-upload contention.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
     needs: [build-nightly, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's9')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 35
     permissions:
@@ -1413,7 +1427,7 @@ jobs:
     # forcing the missing-chunk re-upload path to fire and succeed.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
     needs: [build-nightly, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-grandpa-reupload')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1472,7 +1486,7 @@ jobs:
     # isValid:false → expiry-retry path in storeChunkedContent.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
     needs: [build-nightly, nightly-s1-direct, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-mortality')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 35
     permissions:
@@ -1534,7 +1548,7 @@ jobs:
     # Note: the E2E_REPROVE_MNEMONIC fixture account must be provisioned per env;
     # if not provisioned on an env the test will fail (not silently skip).
     needs: [build-nightly, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-reprove')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1581,7 +1595,7 @@ jobs:
     # (no conflict with e2epoolns01.dot), but we still wait so the pool mnemonic
     # isn't racing S1's Asset Hub transactions.
     needs: [build-nightly, nightly-s1-pool, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-car')))
     # Two consecutive deploys (normal + --input-car) to a fresh per-run label.
     # Runs on both paths: source-build uses node --test test/e2e.test.js;
     # npm-install path writes an inline script so test/ is not required.
@@ -1753,7 +1767,7 @@ jobs:
     # legs deploy to the same stable pool labels (e2einc.dot / e2erot.dot or
     # e2eincpool01.dot / e2erotpool01.dot) — concurrent legs would collide.
     needs: [build-nightly, nightly-s1-pool, nightly-s-car, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', matrix.scenario)))
     # Only runs from source (BULLETIN_DEPLOY_REF path); npm-install path does
     # not carry test/e2e.test.js so the run step is skipped.
     # Short-term scope: source-build path only (issue #349 defers npm-install rewrite).
@@ -1821,7 +1835,7 @@ jobs:
     # All these jobs deploy e2epoolns01.dot (Alice root); running any two concurrently
     # causes Stale tx errors from nonce collisions.
     needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s6, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-ext-signer')))
     # Verifies the in-process Revive transaction path restored by PR #237.
     # playground-cli uses this path when the user authenticates with a phone
     # signer: it passes a PolkadotSigner object to DotNS.connect() instead of

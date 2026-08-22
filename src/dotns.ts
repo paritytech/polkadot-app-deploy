@@ -3960,9 +3960,27 @@ export class DotNS {
   async finalizeRegistration(registration: any, priceWei: bigint): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Finalizing registration for ${registration.label}.${this._tld}...`);
+    // bufferedPaymentWei is the +10%-buffered wei amount, kept only for the
+    // "Paying: X PAS" log line below — purely cosmetic, no chain-arithmetic
+    // risk. The actual msg.value must be computed by bufferedWeiToNative
+    // (the SAME function gateOnFeeBalance's pre-flight quote path already
+    // uses for rentPriceNative, and the one dotns-register-fee.test.js
+    // pins), not by hand-rolled floor division here: the old inline version
+    // did `((priceWei*110n)/100n) / this._nativeToEthRatio` — a pure floor,
+    // whereas bufferedWeiToNative rounds UP on any remainder. The two can
+    // disagree by up to 1 native planck whenever the buffered wei value
+    // isn't an exact multiple of nativeToEthRatio, which is the common case
+    // for an oracle-set price. See dotns-register-fee.test.js for a worked
+    // example and the consequence this had: the old floor-division formula
+    // could spuriously throw "Payment conversion underflow" for a tiny but
+    // genuinely payable priceWei (floors to 0 native units where the correct
+    // rounded-up payment is 1 unit).
     const bufferedPaymentWei = (priceWei * 110n) / 100n;
-    const bufferedPaymentNative = bufferedPaymentWei / this._nativeToEthRatio;
+    const bufferedPaymentNative = bufferedWeiToNative(priceWei, this._nativeToEthRatio);
     if (priceWei > 0n && bufferedPaymentNative === 0n) {
+      // Structurally unreachable now: weiToNative (called by bufferedWeiToNative)
+      // rounds up on any nonzero remainder, so a positive numerator can never
+      // floor to 0. Left as defense-in-depth in case that invariant changes.
       throw new Error(
         `Payment conversion underflow: priceWei=${priceWei} rounds to 0 native units ` +
         `(nativeToEthRatio=${this._nativeToEthRatio}). Cannot call register with zero payment.`

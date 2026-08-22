@@ -3634,24 +3634,42 @@ describe("DotNS initial state", () => {
     );
   });
 
-  // Fix for issue #420: finalizeRegistration must throw on payment underflow
-  test("finalizeRegistration throws when priceWei > 0 rounds to 0 native units", async () => {
+  // Fix for issue #420, later corrected by the storage_deposit_limit-class
+  // audit (registration payment floor-division vs the tested round-up
+  // formula): finalizeRegistration used to compute its native payment as
+  // `((priceWei*110n)/100n) / nativeToEthRatio` — a pure floor — instead of
+  // routing through bufferedWeiToNative (the tested, round-UP-on-remainder
+  // sibling already used by the pre-flight quote path). For priceWei=500n,
+  // nativeToEthRatio=1_000_000n, the old floor formula computed
+  // (500*110/100)/1_000_000 = 550/1_000_000 = 0n and hard-failed with
+  // "Payment conversion underflow" — even though 500n is a genuinely tiny
+  // but payable price. bufferedWeiToNative(500n, 1_000_000n) rounds the same
+  // 550n up to 1n native unit instead, so this case is now payable rather
+  // than a spurious hard failure. The underflow guard itself is unchanged
+  // and still present as defense-in-depth (see finalizeRegistration) — it is
+  // now structurally unreachable for any priceWei > 0, since weiToNative
+  // (which bufferedWeiToNative calls) always rounds a positive numerator up
+  // to at least 1.
+  test("finalizeRegistration: a tiny nonzero priceWei rounds UP to 1 native unit instead of underflowing to 0 and throwing", async () => {
     const d = new DotNS();
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.evmAddress = "0x1111111111111111111111111111111111111111";
-    // priceWei = 500n; nativeToEthRatio = 1_000_000n → bufferedPaymentNative = (500 * 110 / 100) / 1_000_000 = 550 / 1_000_000 = 0n
+    // priceWei = 500n; nativeToEthRatio = 1_000_000n → bufferedWeiToNative(500n, 1_000_000n)
+    // = weiToNative((500*110n)/100n, 1_000_000n) = weiToNative(550n, 1_000_000n) = 1n (rounded up, not 0n).
     d._nativeToEthRatio = 1_000_000n;
+    let capturedValue;
+    d.contractTransaction = async (_addr, value) => {
+      capturedValue = value;
+      return { kind: "hash", hash: "0xtxhash" };
+    };
 
-    await assert.rejects(
+    await assert.doesNotReject(
       () => d.finalizeRegistration({ label: "testlabel" }, 500n),
-      (err) => {
-        assert.match(err.message, /Payment conversion underflow/);
-        assert.match(err.message, /priceWei=500/);
-        assert.match(err.message, /rounds to 0 native units/);
-        return true;
-      },
+      ">> FAIL: finalizeRegistration tiny-price rounding: expected the rounded-up payment path, not the old floor-division underflow throw",
     );
+    assert.equal(capturedValue, 1n,
+      `>> FAIL: finalizeRegistration tiny-price rounding: expected register() to be called with the rounded-up native value 1n, got ${capturedValue}`);
   });
 
   test("finalizeRegistration does not throw when priceWei is 0n (free registration)", async () => {

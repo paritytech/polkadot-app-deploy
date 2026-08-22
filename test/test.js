@@ -9114,14 +9114,50 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     assert.ok(job, "nightly-pr-coverage job must exist");
     assert.match(job, /^ {4}runs-on:\s*ubuntu-latest$/m,
       "nightly-pr-coverage runs on ubuntu-latest");
-    // 10 matrix legs covering 8 distinct scenario names (s1 and s-inc each appear twice).
-    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation"]) {
+    // 13 matrix legs covering 11 distinct scenario names (s1 and s-inc each appear twice).
+    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env"]) {
       assert.match(job, new RegExp(`scenario:\\s*${sc.replace(/-/g, "-")}\\b`),
         `nightly-pr-coverage matrix must include scenario ${sc}`);
     }
     // Schedule trigger must still fire it.
     assert.match(job, /github\.event_name == 'schedule'/,
       "nightly-pr-coverage must trigger on schedule");
+  });
+
+  test(".github/workflows/e2e.yml: nightly-pr-coverage wires #1163 (--no-manifest) and #1094 (manifest --env) legs with isolated pool indices", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const job = jobBlock(e2e, "nightly-pr-coverage");
+    assert.ok(job, "nightly-pr-coverage job must exist");
+
+    // #1163: content-only deploy (product config present + --no-manifest).
+    // signer/merkle/poolIndex live in the matrix include entry; the actual
+    // --no-manifest flag is chosen inside test/e2e.test.js from E2E_SCENARIO
+    // (this job's command is scenario-agnostic), so the flag itself is
+    // asserted where it's built (test/e2e.test.js's S-CONTENT-ONLY block),
+    // not here.
+    assert.match(
+      job,
+      /scenario:\s*s-content-only,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*8\s*}/,
+      "nightly-pr-coverage must wire scenario s-content-only to signer pool, merkle js, poolIndex 8",
+    );
+
+    // #1094: manifest publish on a non-default env (PAD_ENV is always set
+    // from select-env in this job).
+    assert.match(
+      job,
+      /scenario:\s*s-manifest-env,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*9\s*}/,
+      "nightly-pr-coverage must wire scenario s-manifest-env to signer pool, merkle js, poolIndex 9",
+    );
+
+    // Each new leg's poolIndex must be unique within the whole matrix (#863
+    // per-leg nonce isolation) — a collision would reintroduce Alice
+    // Asset-Hub nonce contention between legs.
+    const poolIndices = [...job.matchAll(/poolIndex:\s*(\d+)/g)].map((m) => Number(m[1]));
+    const uniqueIndices = new Set(poolIndices);
+    assert.equal(
+      uniqueIndices.size, poolIndices.length,
+      `nightly-pr-coverage poolIndex values must all be unique, got [${poolIndices.join(", ")}]`,
+    );
   });
 
   test(".github/workflows/e2e.yml: nightly-report depends on nightly-pr-coverage", () => {

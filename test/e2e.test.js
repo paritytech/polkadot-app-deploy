@@ -1553,4 +1553,152 @@ describe("e2e", { skip: !ENABLED }, () => {
       }
     });
   });
+
+  // #1163: --no-manifest (--content-only) must take the content-only path even
+  // when a product config is discoverable — proving shouldPublishManifest()'s
+  // short-circuit actually fires in the real CLI, not just in unit tests.
+  // The per-leg pool domain (BULLETIN_POOL_ACCOUNT_INDEX, #1054) dedicated to
+  // this scenario never sees a manifest publish, so "manifest text record
+  // empty" / "app subname absent" hold across every re-run, not just the first.
+  describe("S-CONTENT-ONLY — --no-manifest skips manifest publishing despite a discoverable config (#1163)", { skip: SCENARIO !== "s-content-only" }, () => {
+    test(`deploy ${SIGNER}/${MERKLE} with --no-manifest takes the content-only path`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      const label = perLegPoolLabel() ?? pickFreshRunLabel("e2enomani");
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.dot` });
+      try {
+        const args = [...buildArgs(fixtureDir, `${label}.dot`), "--config", configPath, "--no-manifest"];
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args,
+          env: rpcEnv(),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-CONTENT-ONLY" });
+
+        // The plain content deploy must still have succeeded and resolve
+        // on-chain — --no-manifest changes ONLY the manifest-publish decision.
+        const deployedCid = parseDeployedCid(stdout, "S-CONTENT-ONLY");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-CONTENT-ONLY", label });
+
+        // #1163: assert the manifest path never ran, despite the config at
+        // configPath being genuinely discoverable (tryLoadProductConfig still
+        // loads it — shouldPublishManifest() is what must gate the skip).
+        const connectOpts = await resolveDotnsEnvConnectOptions();
+        const dotns = new DotNS();
+        await dotns.connect({ mnemonic: ALICE_MNEMONIC, ...connectOpts });
+        try {
+          const manifestText = await dotns.getTextRecord(label, "manifest");
+          if (manifestText !== "") {
+            failWith({
+              scenario: "S-CONTENT-ONLY",
+              message: `root 'manifest' text record must be empty with --no-manifest set, got ${manifestText.length} B`,
+              context: manifestText,
+              hint: "a non-empty record means --no-manifest did not short-circuit shouldPublishManifest() (#1163) even though a config was discoverable.",
+            });
+          }
+
+          const appSub = await dotns.checkSubdomainOwnership("app", label);
+          if (appSub.owner !== null) {
+            failWith({
+              scenario: "S-CONTENT-ONLY",
+              message: `app.${label}.dot subname must not exist with --no-manifest set (owner=${appSub.owner})`,
+              hint: "manifest publish (which registers per-executable subnames) must never run when --no-manifest is set.",
+            });
+          }
+        } finally {
+          dotns.disconnect();
+        }
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // #1094: publishManifest must resolve ITS OWN Bulletin endpoint from the
+  // deploy's --env/--rpc (via resolveBulletinEndpoints/setBulletinEndpoints —
+  // the same precedence deploy() itself uses) before uploading the icon,
+  // otherwise the icon lands on the module's hardcoded DEFAULT_BULLETIN_RPC
+  // regardless of which chain the rest of the deploy targeted.
+  //
+  // This exercises that resolution against a REAL non-default env end-to-end.
+  // Every e2eEligible env in environments.json (paseo-next-v2, devnet) has a
+  // Bulletin endpoint that differs from DEFAULT_BULLETIN_RPC, and
+  // nightly-pr-coverage always sets PAD_ENV via select-env, so this
+  // scenario is "non-default" by construction in CI.
+  //
+  // Note: the exact standalone-call regression #1094 fixed (publishManifest()
+  // invoked without a preceding in-process deploy() in the same process) can't
+  // be reproduced through the CLI, because the CLI always calls deploy()
+  // before publishManifest() in one process, and deploy() sets the
+  // module-level Bulletin endpoint as a side effect either way. That exact
+  // standalone-call shape is unit-tested directly in
+  // test/product-manifest.test.js. This E2E scenario instead proves the real
+  // end-to-end behavior a unit test (which mocks the network) cannot: the
+  // icon actually lands on, and is fetchable from, the resolved env's own
+  // gateway.
+  describe("S-MANIFEST-ENV — manifest publish honors --env for icon Bulletin storage on a non-default env (#1094)", { skip: SCENARIO !== "s-manifest-env" }, () => {
+    test(`deploy ${SIGNER}/${MERKLE} with a manifest lands the icon on the resolved env's Bulletin chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      assert.ok(PAD_ENV,
+        ">> FAIL: S-MANIFEST-ENV: requires PAD_ENV set to a non-default env (e.g. paseo-next-v2) — this scenario specifically exercises publishManifest's --env-aware Bulletin storage (#1094).");
+
+      const label = perLegPoolLabel() ?? pickFreshRunLabel("e2emanenv");
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      const { configPath, iconPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.dot` });
+      try {
+        const args = [...buildArgs(fixtureDir, `${label}.dot`), "--config", configPath];
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args,
+          env: rpcEnv(),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-MANIFEST-ENV" });
+
+        const deployedCid = parseDeployedCid(stdout, "S-MANIFEST-ENV");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-MANIFEST-ENV", label });
+
+        const iconCid = parseLineOrExplain(stdout, {
+          pattern: /Icon CID:\s+(bafy\S+)/,
+          scenario: "S-MANIFEST-ENV",
+          what: "manifest icon CID",
+          hint: "publishManifest logs 'Icon CID: bafk...' right after uploading the icon (src/manifest/publish.ts). Missing means manifest publish either didn't run or failed before reaching the icon upload — check for a preceding 'Manifest publish failed' line.",
+        })[1];
+
+        // Poll the RESOLVED env's own gateway (not the module default) —
+        // gateway indexing lags the on-chain write by a few seconds (same
+        // tolerance pattern as S-INC's root-URL poll above).
+        const gatewayBase = await resolveE2eGateway();
+        const iconUrl = `${gatewayBase}/ipfs/${iconCid}`;
+        const wantBytes = fs.readFileSync(iconPath);
+        let gotBytes = null;
+        let lastStatus = null;
+        const deadline = Date.now() + 5 * 60 * 1000;
+        while (Date.now() < deadline) {
+          try {
+            const res = await fetch(iconUrl, { cache: "no-store" });
+            lastStatus = res.status;
+            if (res.status === 200) {
+              gotBytes = Buffer.from(await res.arrayBuffer());
+              if (gotBytes.equals(wantBytes)) break;
+            }
+          } catch { /* network blips OK — same tolerance as S-INC's poll */ }
+          await new Promise((r) => setTimeout(r, 10_000));
+        }
+
+        if (!gotBytes || !gotBytes.equals(wantBytes)) {
+          failWith({
+            scenario: "S-MANIFEST-ENV",
+            message: `icon CID ${iconCid} not retrievable (byte-identical) from ${PAD_ENV}'s own gateway (${iconUrl}) within 5 min (last HTTP status ${lastStatus})`,
+            hint: "publishManifest may have uploaded the icon to the wrong Bulletin chain (DEFAULT_BULLETIN_RPC instead of the resolved env) — the #1094 regression this scenario guards against.",
+          });
+        }
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
 });

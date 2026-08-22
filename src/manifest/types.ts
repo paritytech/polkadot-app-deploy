@@ -3,7 +3,7 @@
  *
  * Two-level shape: a `RootManifest` written as the `manifest` text record on
  * `<product_id>.dot`, plus one `ExecutableManifest` per modality written as
- * the `executable` text record on `app|widget|worker.<product_id>.dot`.
+ * the `executable` text record on `app|widget|funding|worker.<product_id>.dot`.
  *
  * Unrelated to [src/manifest.ts](../manifest.ts), which models the embedded
  * deploy manifest that ships inside each CAR.
@@ -47,6 +47,13 @@ export interface WidgetManifest extends CommonExecutableFields {
   dimensions: WidgetDimensions;
 }
 
+export type FundingMode = "CARD" | "BANK" | "CRYPTO";
+
+export interface FundingManifest extends CommonExecutableFields {
+  kind: "funding";
+  modes: FundingMode[];
+}
+
 export interface WorkerIncludes {
   chat: boolean;
   pocket: boolean;
@@ -58,7 +65,7 @@ export interface WorkerManifest extends CommonExecutableFields {
   includes: WorkerIncludes;
 }
 
-export type ExecutableManifest = AppManifest | WidgetManifest | WorkerManifest;
+export type ExecutableManifest = AppManifest | WidgetManifest | FundingManifest | WorkerManifest;
 
 export type ExecutableKind = ExecutableManifest["kind"];
 
@@ -76,6 +83,13 @@ export interface WidgetExecutableConfig {
   dimensions: WidgetDimensions;
 }
 
+export interface FundingExecutableConfig {
+  kind: "funding";
+  path: string;
+  appVersion: AppVersion;
+  modes: FundingMode[];
+}
+
 export interface WorkerExecutableConfig {
   kind: "worker";
   path: string;
@@ -87,6 +101,7 @@ export interface WorkerExecutableConfig {
 export type ExecutableConfig =
   | AppExecutableConfig
   | WidgetExecutableConfig
+  | FundingExecutableConfig
   | WorkerExecutableConfig;
 
 export interface IconConfig {

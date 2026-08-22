@@ -150,6 +150,51 @@ describe("validateExecutableManifest — widget", () => {
   });
 });
 
+describe("validateExecutableManifest — funding", () => {
+  test("accepts funding with a single recognised mode", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: ["CARD"],
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("accepts funding with all three modes", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: ["CARD", "BANK", "CRYPTO"],
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("rejects funding with missing modes", () => {
+    const result = validateExecutableManifest({ $v: 1, kind: "funding", appVersion: [1, 0, 0] });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("modes")));
+  });
+
+  test("rejects funding with empty modes", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: [],
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("non-empty")));
+  });
+
+  test("rejects funding with an unrecognised mode (strict on the publishing side)", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: ["CARD", "PAYPAL"],
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("PAYPAL")));
+  });
+
+  test("rejects funding with lowercase mode values", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "funding", appVersion: [1, 0, 0], modes: ["card"],
+    });
+    assert.equal(result.ok, false);
+  });
+});
+
 describe("validateExecutableManifest — worker", () => {
   test("accepts worker with chat=true, pocket=false", () => {
     const result = validateExecutableManifest({
@@ -211,6 +256,7 @@ const VALID_CONFIG = {
       kind: "widget", path: "./dist/widget", appVersion: [1, 0, 0],
       dimensions: { height: [2, 4], width: 1 },
     },
+    { kind: "funding", path: "./dist/funding", appVersion: [1, 0, 0], modes: ["CARD", "BANK"] },
     {
       kind: "worker", path: "./dist/worker", appVersion: [1, 0, 0],
       entrypoint: "index.js", includes: { chat: true, pocket: false },
@@ -219,7 +265,7 @@ const VALID_CONFIG = {
 };
 
 describe("validateProductConfig", () => {
-  test("accepts a full three-variant config", () => {
+  test("accepts a full four-variant config", () => {
     const result = validateProductConfig(VALID_CONFIG);
     assert.equal(result.ok, true);
   });
@@ -284,11 +330,12 @@ describe("validateProductConfig", () => {
       ...VALID_CONFIG,
       executables: [
         { kind: "widget", path: "./w", appVersion: [1, 0, 0] }, // missing dimensions
+        { kind: "funding", path: "./f", appVersion: [1, 0, 0], modes: [] }, // empty modes
         { kind: "worker", path: "./wk", appVersion: [1, 0, 0] }, // missing entrypoint + includes
       ],
     });
     assert.equal(result.ok, false);
-    assert.ok(result.errors.length >= 2);
+    assert.ok(result.errors.length >= 3);
   });
 });
 
@@ -296,7 +343,7 @@ test("defineConfig returns its input unchanged", () => {
   assert.equal(defineConfig(VALID_CONFIG), VALID_CONFIG);
 });
 
-const EXEC_PATHS = ["dist/app", "dist/widget", "dist/worker"];
+const EXEC_PATHS = ["dist/app", "dist/widget", "dist/funding", "dist/worker"];
 async function mkTmp(prefix) { return await fs.mkdtemp(path.join(os.tmpdir(), prefix)); }
 async function seedFiles(dir, { icon = true, execs = EXEC_PATHS } = {}) {
   if (icon) await fs.writeFile(path.join(dir, "icon.png"), "x");
@@ -320,10 +367,11 @@ describe("checkProductConfigFilesExist", () => {
 
   test("flags each missing executable path", async () => {
     const dir = await mkTmp("pcfg-noexec-");
-    await seedFiles(dir, { execs: ["dist/app"] }); // widget + worker missing
+    await seedFiles(dir, { execs: ["dist/app"] }); // widget + funding + worker missing
     const errs = await checkProductConfigFilesExist(VALID_CONFIG, dir);
-    assert.equal(errs.length, 2, errs.join("; "));
+    assert.equal(errs.length, 3, errs.join("; "));
     assert.ok(errs.some(e => e.includes("widget")));
+    assert.ok(errs.some(e => e.includes("funding")));
     assert.ok(errs.some(e => e.includes("worker")));
   });
 
@@ -430,8 +478,8 @@ describe("pessimisticSizePreflight", () => {
   test("passes for a typical config under default budget", () => {
     const report = pessimisticSizePreflight(VALID_CONFIG);
     assert.equal(report.ok, true);
-    // root + 3 executables
-    assert.equal(report.checks.length, 4);
+    // root + 4 executables
+    assert.equal(report.checks.length, 5);
   });
 
   test("flags root manifest exceeding a tiny budget", () => {
@@ -462,7 +510,7 @@ describe("loadProductConfig — auto-discovery", () => {
     const { config, sourcePath } = await loadProductConfig({ cwd: dir });
     assert.equal(sourcePath, configPath);
     assert.equal(config.domain, "demoapp.dot");
-    assert.equal(config.executables.length, 3);
+    assert.equal(config.executables.length, 4);
   });
 
   test("loads a .mjs config natively", async (t) => {

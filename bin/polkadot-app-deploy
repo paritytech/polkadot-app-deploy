@@ -306,7 +306,7 @@ Options:
   --config <path>     Explicit path to a polkadot-app-deploy.config.ts (default: walk up from
                       <build-dir> looking for polkadot-app-deploy.config.{ts,js,mjs}). When a
                       config is found, deploy ALSO writes the manifest + executable text
-                      records on <domain> and its app/widget/worker subnames.
+                      records on <domain> and its app/widget/funding/worker subnames.
   --no-manifest, --content-only
                       Skip manifest publishing entirely, even when a
                       polkadot-app-deploy.config.* is discoverable — plain

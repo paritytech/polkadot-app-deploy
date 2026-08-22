@@ -27,7 +27,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingTransactions, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
@@ -1420,6 +1420,24 @@ describe("classifyErrorKind", () => {
     );
   });
 
+  // Decoded ABI custom-error reverts from src/dotns.ts's Publisher paths
+  // (publishLabel / unpublishLabel) — these have no "Contract reverted" /
+  // flags=N / ContractReverted envelope, so they need their own alternative
+  // on the contract-revert rule.
+  //
+  // Reason deliberately NOT NoPersonhood: the `reverted: NoPersonhood`
+  // rule sits ahead of contract-revert and claims that one for
+  // naming.pop_required (the kind that names the remedy). See the
+  // "naming.pop_required: Publisher.publish NoPersonhood revert reason" test.
+  // Every other decoded Publisher error still lands here.
+  test("contract-revert: Publisher.publish reverted with decoded custom error", () => {
+    assert.strictEqual(classifyErrorKind("Publisher.publish reverted: NotOwner"), "contract-revert");
+  });
+
+  test("contract-revert: Publisher.unpublish reverted with decoded custom error", () => {
+    assert.strictEqual(classifyErrorKind("Publisher.unpublish reverted: CooldownActive"), "contract-revert");
+  });
+
   test("chain-timeout: timed out waiting for block", () => {
     assert.strictEqual(classifyErrorKind("finalize-registration timed out after 90s waiting for block confirmation"), "chain-timeout");
   });
@@ -1730,6 +1748,18 @@ describe("classifyErrorKind", () => {
       "chain.extrinsic_expired",
     );
   });
+  // Verbatim live message from a Sentry span that landed in `unknown`: the
+  // 100-char truncation at src/deploy.ts's re-upload path cut the 17-char
+  // variant name in half, so the rule must match the surviving prefix.
+  test("chain.extrinsic_expired: AncientBirthBlock truncated mid-variant by the 100-char slice", () => {
+    const msg = 'Nonce-collision re-upload of chunk 0 failed after 3 attempts: chunk(nonce:34242) subscription error: {\n  "type": "Invalid",\n  "value": {\n    "type": "AncientBirth';
+    const got = classifyErrorKind(msg);
+    assert.strictEqual(
+      got,
+      "chain.extrinsic_expired",
+      `>> FAIL: truncated AncientBirthBlock: the 100-char inner-error slice cuts the variant name to "AncientBirth", so matching the full name sends the span to unknown; got ${got}`,
+    );
+  });
 
   // chain.quota_exhausted
   test("chain.quota_exhausted: Bulletin quota exhausted", () => {
@@ -1759,6 +1789,143 @@ describe("classifyErrorKind", () => {
       classifyErrorKind("Chunk 3 failed after 3 retries: commit timed out after 300000ms"),
       "chain.tx_timeout",
     );
+  });
+
+  // chain.bad_proof (Sentry 7d sweep: 18/21 unknown-kind spans on current
+  // versions were this family — Invalid::BadProof on chunk upload, truncated
+  // at 100 chars by both src/deploy.ts producer sites, so the JSON is often
+  // cut off mid-object).
+  test("chain.bad_proof: nonce-collision re-upload path, truncated live message", () => {
+    assert.strictEqual(
+      classifyErrorKind(`Nonce-collision re-upload of chunk 0 failed after 3 attempts: chunk(nonce:659) subscription error: {
+  "type": "Invalid",
+  "value": {
+    "type": "BadProof"
+  }`),
+      "chain.bad_proof",
+    );
+  });
+  test("chain.bad_proof: chunk-retry path, truncated live message", () => {
+    assert.strictEqual(
+      classifyErrorKind(`Chunk 6 failed after 3 retries: chunk(nonce:39941) subscription error: {
+  "type": "Invalid",
+  "value": {
+    "type": "BadProof"`),
+      "chain.bad_proof",
+    );
+  });
+  test("chain.bad_proof: bare Invalid::BadProof string", () => {
+    assert.strictEqual(classifyErrorKind("Invalid::BadProof"), "chain.bad_proof");
+  });
+  // Regression guard: chain.bad_proof is inserted right after nonce-stale in
+  // ERROR_KIND_RULES precedence order — pin that a Stale-shaped message still
+  // classifies as nonce-stale and isn't stolen by the new rule.
+  test("chain.bad_proof placement regression: Stale-shaped message still classifies as nonce-stale", () => {
+    const msg = '{"type":"Invalid","value":{"type":"Stale"}}';
+    const got = classifyErrorKind(msg);
+    assert.strictEqual(
+      got,
+      "nonce-stale",
+      `>> FAIL: chain.bad_proof placement: inserting the new rule after nonce-stale must not steal Stale-shaped messages; got ${got}`,
+    );
+  });
+
+  // chain-timeout: commitment poll timeout (src/dotns.ts's POLL_TIMEOUT_MS message)
+  test("chain-timeout: commitment still too new after polling timeout", () => {
+    assert.strictEqual(
+      classifyErrorKind("Commitment still too new after 90s of polling chain time. The chain may be stalled."),
+      "chain-timeout",
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // Kinds added from the 2026-08-06 telemetry sweep. Each of these was the
+  // literal text of a production `deploy.error_kind:unknown` span; the counts
+  // in the comments are non-E2E occurrences over the sweep's 14d window.
+  // ---------------------------------------------------------------------
+
+  // storage.rejected (31 spans, 30 of them env=preview) — src/deploy.ts's
+  // Bulletin storage authorization guard. Largest live unknown at sweep time.
+  test("storage.rejected: verbatim Bulletin storage authorization failure", () => {
+    const msg = "Account 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY is not authorized for Bulletin storage and auto-authorization failed: BadSigner";
+    assert.strictEqual(classifyErrorKind(msg), "storage.rejected",
+      `>> FAIL: storage.rejected: the Bulletin storage authorization guard must not fall through to unknown; got ${classifyErrorKind(msg)}`);
+  });
+  test("storage.rejected: outer wrapper beats the interpolated inner cause", () => {
+    // The guard interpolates `e.message` from the failed auto-authorization
+    // call. When that inner text is itself a revert/timeout, the specific outer
+    // classification must still win — otherwise this kind silently disappears
+    // into contract-revert whenever the underlying call reverts.
+    const msg = "Account 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY is not authorized for Bulletin storage and auto-authorization failed: Contract reverted (flags=1) with data: 0x";
+    assert.strictEqual(classifyErrorKind(msg), "storage.rejected",
+      `>> FAIL: storage.rejected: an embedded 'Contract reverted' in the nested cause stole the classification; got ${classifyErrorKind(msg)}`);
+  });
+  test("storage.rejected: classifies as a user error, not a bug-report prompt", () => {
+    const msg = "Account 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY is not authorized for Bulletin storage and auto-authorization failed: BadSigner";
+    assert.strictEqual(classifyDeployError(msg), "user",
+      `>> FAIL: storage.rejected: an unauthorized signer is an operator/config fault, not an internal bug; got ${classifyDeployError(msg)}`);
+  });
+  test("storage.rejected: unrelated authorization wording does not match", () => {
+    assert.strictEqual(classifyErrorKind("Account is not authorized"), "unknown");
+  });
+
+  // naming.pop_required (9 spans) — Revive surfaces the personhood gate as a
+  // bare revert reason, not the "requires ProofOfPersonhoodX" prose.
+  test("naming.pop_required: Publisher.publish NoPersonhood revert reason", () => {
+    const msg = "Publisher.publish reverted: NoPersonhood";
+    assert.strictEqual(classifyErrorKind(msg), "naming.pop_required",
+      `>> FAIL: naming.pop_required: the NoPersonhood revert reason is the same user-actionable cause as the prose variant and must share its kind; got ${classifyErrorKind(msg)}`);
+  });
+  test("naming.pop_required: a revert without NoPersonhood stays contract-revert", () => {
+    assert.strictEqual(
+      classifyErrorKind("Publisher.publish reverted (flags=1) with data: 0x"),
+      "contract-revert",
+      ">> FAIL: naming.pop_required: the NoPersonhood rule is over-broad — it swallowed a generic revert",
+    );
+  });
+
+  // user.aborted (6 spans) — Ctrl-C. Its own kind so dashboards can exclude
+  // operator interrupts from the deploy failure rate.
+  test("user.aborted: operator interrupt is not a product failure", () => {
+    const msg = "aborted by user";
+    assert.strictEqual(classifyErrorKind(msg), "user.aborted",
+      `>> FAIL: user.aborted: a Ctrl-C counted as an unclassified deploy failure and inflated the error rate; got ${classifyErrorKind(msg)}`);
+  });
+  test("user.aborted: stays anchored so a wrapped failure is not swallowed", () => {
+    // This kind removes spans from the failure rate, so over-matching silently
+    // deletes real failures. A genuine chunk failure that merely mentions the
+    // abort must NOT be reclassified as an operator interrupt.
+    const msg = "Chunk 3 failed after 3 retries: upload aborted by user";
+    assert.notStrictEqual(classifyErrorKind(msg), "user.aborted",
+      ">> FAIL: user.aborted: the rule is unanchored — a real chunk failure was reclassified as an operator interrupt and vanished from the failure rate");
+  });
+
+  // naming.contract_unavailable (1 span) — env config carries a zero/absent
+  // address, caught before the call rather than as empty return data.
+  test("naming.contract_unavailable: invalid configured contract address", () => {
+    const msg = "Invalid contract address for PUBLISHER in environment paseo-next-v2: 0x0000000000000000000000000000000000000000";
+    assert.strictEqual(classifyErrorKind(msg), "naming.contract_unavailable",
+      `>> FAIL: naming.contract_unavailable: a zero/absent configured address is the same failure family as an empty contract read; got ${classifyErrorKind(msg)}`);
+  });
+
+  // Guard against re-entering the trap this PR hit at authoring time: the kind
+  // was first called `storage.not_authorized`, and Sentry's org relayPiiConfig
+  // masks any attribute VALUE containing "auth" — so `deploy.error_kind` came
+  // back as 22 asterisks and the bucket the kind exists to surface stayed
+  // invisible. Masking is on content, not key, and short enum-like values are
+  // masked exactly like long prose. Any new kind must avoid these substrings.
+  test("no DeployErrorKind literal contains a Sentry-scrubbed substring", () => {
+    const src = fs.readFileSync("src/telemetry.ts", "utf8");
+    // Strip `//` comments first: the union is interleaved with them and one
+    // carries a semicolon, which would otherwise end the slice early.
+    const union = src.slice(src.indexOf("export type DeployErrorKind =")).replace(/\/\/[^\n]*/g, "");
+    const kinds = union.slice(0, union.indexOf(";")).match(/'[^']+'/g).map(k => k.slice(1, -1));
+    // Parse sanity: a broken slice must fail loudly rather than pass vacuously.
+    assert.ok(kinds.length >= 20, `>> FAIL: kind-scrub guard: parsed only ${kinds.length} DeployErrorKind members from src/telemetry.ts — the union parse broke, so this guard was not actually checking anything`);
+    assert.ok(kinds.includes("unknown"), ">> FAIL: kind-scrub guard: parsed union does not include 'unknown' — wrong slice of src/telemetry.ts");
+    const scrubbed = kinds.filter(k => /auth|secret|credential|password/i.test(k));
+    assert.deepStrictEqual(scrubbed, [],
+      `>> FAIL: kind-scrub guard: ${scrubbed.join(", ")} contain(s) a substring Sentry's relayPiiConfig masks — the value would render as asterisks in every dashboard grouped by deploy.error_kind. Rename the kind (e.g. storage.rejected, not storage.not_authorized).`);
   });
 });
 
@@ -7470,14 +7637,14 @@ describe("selectAccount", () => {
   const mkAuth = (n) => Array.from({ length: n }, (_, i) => ({
     index: i, path: `//deploy/${i}`, publicKey: new Uint8Array(),
     signer: null, address: `addr-${i}`,
-    transactions: BigInt(1000 + i), bytes: 100_000_000n, expiration: 1_000_000,
+    transactions: BigInt(1000 + i), renewBytes: 100_000_000n, expiration: 1_000_000,
   }));
 
   test("always returns a result (never null) — expired accounts are still selectable", () => {
     // v1 expiration filtering is gone; ensureAuthorized() heals the account.
     // An "expired" pool is not a dead pool; it self-heals on selection.
     const expired = [{ index: 0, path: "", publicKey: new Uint8Array(), signer: null, address: "a",
-      transactions: 1000n, bytes: 100_000_000n, expiration: 100 }];
+      transactions: 1000n, renewBytes: 100_000_000n, expiration: 100 }];
     const result = selectAccount(expired);
     assert.ok(result !== null, "selectAccount must return a result");
     assert.strictEqual(result.account.address, "a");
@@ -7506,9 +7673,9 @@ describe("selectAccount", () => {
 
   test("picks from all accounts regardless of quota or expiration", () => {
     const auths = [
-      { index: 0, path: "", publicKey: new Uint8Array(), signer: null, address: "a", transactions: 1000n, bytes: 100_000_000n, expiration: 1_000_000 },
-      { index: 1, path: "", publicKey: new Uint8Array(), signer: null, address: "b", transactions: 100n, bytes: 100_000_000n, expiration: 100 },
-      { index: 2, path: "", publicKey: new Uint8Array(), signer: null, address: "c", transactions: 0n, bytes: 0n, expiration: 0 },
+      { index: 0, path: "", publicKey: new Uint8Array(), signer: null, address: "a", transactions: 1000n, renewBytes: 100_000_000n, expiration: 1_000_000 },
+      { index: 1, path: "", publicKey: new Uint8Array(), signer: null, address: "b", transactions: 100n, renewBytes: 100_000_000n, expiration: 100 },
+      { index: 2, path: "", publicKey: new Uint8Array(), signer: null, address: "c", transactions: 0n, renewBytes: 0n, expiration: 0 },
     ];
     const picks = new Set();
     for (let i = 0; i < 300; i++) picks.add(selectAccount(auths).account.index);
@@ -7639,9 +7806,9 @@ describe("Phase A storeChunkedContent receives skipRootStore (#512)", () => {
 describe("isAuthorizationSufficient", () => {
   const BLOCK = 1000;
 
-  // Build a mock auth carrying only the fields the check reads (expiration).
+  // Build a mock auth carrying only the field the check reads (expiration).
   function mkAuth({ expiration = BLOCK + 1_000_000 } = {}) {
-    return { expiration, extent: { transactions_allowance: 0, transactions: 0, bytes_allowance: 0, bytes: 0 } };
+    return { expiration };
   }
 
   test("returns false when auth is undefined", () => {
@@ -7668,7 +7835,7 @@ describe("accountsNeedingAuthorization", () => {
   // Minimal PoolAuthorization stubs — the helper only reads .expiration via
   // isAuthorizationSufficient, so only that field matters.
   function mkPoolAuth(index, expiration) {
-    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, bytes: 0n };
+    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, renewBytes: 0n };
   }
 
   test("authorized non-expired account is excluded", () => {
@@ -7716,7 +7883,7 @@ describe("accountsNeedingReauthorization", () => {
   const BLOCK = 100_000;
 
   function mkPoolAuth(index, expiration) {
-    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, bytes: 0n };
+    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, renewBytes: 0n };
   }
 
   test("account far from expiry (> buffer away) is excluded", () => {
@@ -7891,6 +8058,159 @@ describe("#1054 pool-leg DotNS-owner isolation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Bulletin authorization stubs (see readAccountAuthorization in src/pool.ts).
+//   runtimeAuth() — one AccountAuthorization in the chain's own snake_case, as
+//     papi decodes it. The raw shape is the point: it pins the client to the API.
+//   authApi()     — an api stub exposing ONLY that runtime API, so anything still
+//     reaching for query.TransactionStorage throws instead of reading a stale shape.
+// ---------------------------------------------------------------------------
+function runtimeAuth({
+  expiresAt,
+  txsAllowance = 1000,
+  txsUsed = 0,
+  bytesAllowance = 100_000_000n,
+  bytesUsed = 0n,
+  bytesPermanentUsed = 0n,
+} = {}) {
+  return {
+    expires_at: expiresAt,
+    bytes_allowance: bytesAllowance,
+    bytes_used: bytesUsed,
+    bytes_permanent_used: bytesPermanentUsed,
+    transactions_allowance: txsAllowance,
+    transactions_used: txsUsed,
+  };
+}
+
+function authApi(account_authorization, extraApis = {}) {
+  return { apis: { BulletinTransactionStorageApi: { account_authorization, ...extraApis } } };
+}
+
+// ---------------------------------------------------------------------------
+// readAccountAuthorization — pins both halves of the contract: WHICH chain entry
+// point is called, and how its result maps onto the quota numbers pool selection
+// and the ops diagnostics print.
+// ---------------------------------------------------------------------------
+describe("readAccountAuthorization (BulletinTransactionStorageApi::account_authorization)", () => {
+  const ADDRESS = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+
+  // Records the address the runtime API was called with, so a test can pin that
+  // it's a bare SS58 rather than the old Enum("Account", …) storage key.
+  function apiReturning(auth, capture = {}) {
+    return authApi(async (address) => { capture.address = address; return auth; });
+  }
+
+  test("maps the runtime API's AccountAuthorization onto the client shape", async () => {
+    const capture = {};
+    const api = apiReturning(
+      runtimeAuth({
+        expiresAt: 12_345,
+        txsAllowance: 1000,
+        txsUsed: 7,
+        bytesAllowance: 100_000_000n,
+        bytesUsed: 4_000n,
+        bytesPermanentUsed: 1_000n,
+      }),
+      capture,
+    );
+    const auth = await readAccountAuthorization(api, ADDRESS);
+    assert.deepStrictEqual(auth, {
+      expiration: 12_345,
+      transactionsAllowance: 1000,
+      transactionsUsed: 7,
+      bytesAllowance: 100_000_000n,
+      bytesUsed: 4_000n,
+      bytesPermanentUsed: 1_000n,
+    }, ">> FAIL: readAccountAuthorization: the runtime API's snake_case fields must map onto the client's BulletinAuthorization shape");
+    assert.strictEqual(capture.address, ADDRESS,
+      ">> FAIL: readAccountAuthorization: the account must go in as a bare SS58 AccountId — the runtime API takes an AccountId, not the Enum(\"Account\", …) key the storage map needed");
+  });
+
+  test("None (papi undefined) → null, covering both 'never granted' and 'expired'", async () => {
+    assert.strictEqual(await readAccountAuthorization(apiReturning(undefined), ADDRESS), null,
+      ">> FAIL: readAccountAuthorization: Option::None must normalize to null; the runtime API filters expired grants, so null means 'no active authorization'");
+  });
+
+  test("a Some missing a field throws instead of defaulting it to zero", async () => {
+    const { expires_at, ...withoutExpiry } = runtimeAuth({ expiresAt: 10 });
+    await assert.rejects(
+      () => readAccountAuthorization(apiReturning(withoutExpiry), ADDRESS),
+      /expires_at/,
+      ">> FAIL: readAccountAuthorization: a missing or renamed AccountAuthorization field must throw naming it — defaulting to 0 fails every deploy with a message pointing at the account, not the chain",
+    );
+  });
+
+  test("coerces number-typed byte counters to bigint", async () => {
+    // u64s handed back as JS numbers must not leak number/bigint mixing into
+    // remainingRenewBytes' arithmetic (a TypeError at runtime).
+    const auth = await readAccountAuthorization(
+      apiReturning({ ...runtimeAuth({ expiresAt: 10 }), bytes_allowance: 500, bytes_used: 100, bytes_permanent_used: 50 }),
+      ADDRESS,
+    );
+    assert.strictEqual(remainingRenewBytes(auth), 450n,
+      ">> FAIL: readAccountAuthorization: u64 fields must be coerced to bigint so the remaining-quota arithmetic cannot throw on mixed types");
+  });
+});
+
+describe("remaining quota helpers", () => {
+  // The chain's only byte gate is renew: check_renew_authorization rejects when
+  // bytes_permanent + size > bytes_allowance, and `bytes` (store) is not in that
+  // comparison — the pallet calls it a soft priority signal that never gates, and
+  // can_store checks only size + an unexpired authorization. So the headroom the
+  // client reports must subtract the renew counter and ONLY the renew counter.
+  test("remainingRenewBytes subtracts renew bytes and ignores store bytes", () => {
+    const auth = {
+      expiration: 10, transactionsAllowance: 10, transactionsUsed: 0,
+      bytesAllowance: 1_000n, bytesUsed: 400n, bytesPermanentUsed: 300n,
+    };
+    assert.strictEqual(remainingRenewBytes(auth), 700n,
+      ">> FAIL: remainingRenewBytes: must report bytesAllowance - bytesPermanentUsed. Ignoring the renew counter overstates the one real byte cap; subtracting store bytes too under-reports it, since store bytes never draw the cap down");
+  });
+
+  test("both helpers clamp at zero instead of reporting a negative budget", () => {
+    const exhausted = {
+      expiration: 10, transactionsAllowance: 5, transactionsUsed: 9,
+      bytesAllowance: 100n, bytesUsed: 80n, bytesPermanentUsed: 150n,
+    };
+    assert.strictEqual(remainingRenewBytes(exhausted), 0n,
+      ">> FAIL: remainingRenewBytes: an over-consumed allowance must report 0, never a negative number");
+    assert.strictEqual(remainingTransactions(exhausted), 0n,
+      ">> FAIL: remainingTransactions: an over-consumed allowance must report 0, never a negative number");
+  });
+});
+
+describe("fetchPoolAuthorizations reads authorization state through the runtime API", () => {
+  const ACCOUNTS = [
+    { index: 0, address: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" },
+    { index: 1, address: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty" },
+  ];
+
+  test("reports txs left, renew headroom and the expiration block per account", async () => {
+    const api = authApi(async (address) =>
+      address === ACCOUNTS[0].address
+        ? runtimeAuth({ expiresAt: 9_999, txsAllowance: 1000, txsUsed: 40, bytesAllowance: 1_000n, bytesUsed: 100n, bytesPermanentUsed: 200n })
+        : undefined, // no active authorization
+    );
+    const auths = await fetchPoolAuthorizations(api, ACCOUNTS);
+    assert.deepStrictEqual(
+      auths.map(a => ({ index: a.index, transactions: a.transactions, renewBytes: a.renewBytes, expiration: a.expiration })),
+      [
+        { index: 0, transactions: 960n, renewBytes: 800n, expiration: 9_999 },
+        { index: 1, transactions: 0n, renewBytes: 0n, expiration: 0 },
+      ],
+      ">> FAIL: fetchPoolAuthorizations: must report txs left and renew headroom from the account_authorization runtime API, and zeroes where nothing is active",
+    );
+  });
+
+  test("a failed read degrades that account to zero quota rather than rejecting", async () => {
+    const api = authApi(async () => { throw new Error("ChainHead disjointed"); });
+    const auths = await fetchPoolAuthorizations(api, ACCOUNTS);
+    assert.deepStrictEqual(auths.map(a => a.expiration), [0, 0],
+      ">> FAIL: fetchPoolAuthorizations: a transient runtime-API failure must degrade to zero quota for that account, not fail the whole pool read");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ensureAuthorized — existence/expiry gate
 // ---------------------------------------------------------------------------
 describe("ensureAuthorized quota awareness", () => {
@@ -7899,30 +8219,23 @@ describe("ensureAuthorized quota awareness", () => {
 
   function buildApi({ auth }) {
     return {
+      ...authApi(async () => auth),
       query: {
-        TransactionStorage: {
-          Authorizations: { getValue: async () => auth },
-        },
         System: { Number: { getValue: async () => MOCK_BLOCK } },
       },
     };
   }
 
   test("active auth → returns without throwing", async () => {
-    const auth = {
-      expiration: MOCK_BLOCK + 100,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
-    const api = buildApi({ auth });
+    const api = buildApi({ auth: runtimeAuth({ expiresAt: MOCK_BLOCK + 100 }) });
     await ensureAuthorized(api, ADDRESS, "test");
   });
 
+  // A live read never returns an expired grant; this pins the client-side check
+  // that has to cover a lagging or cached one.
   test("expired auth → throws fail-fast (mainnet message)", async () => {
     _resetTestnetCacheForTests();
-    const auth = {
-      expiration: MOCK_BLOCK - 1,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
     // No constants.System.Version → detectTestnet catches → returns false (mainnet)
     const api = buildApi({ auth });
     await assert.rejects(
@@ -7943,10 +8256,8 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
 
   function buildApi({ auth, specName } = {}) {
     return {
+      ...authApi(async () => auth),
       query: {
-        TransactionStorage: {
-          Authorizations: { getValue: async () => auth },
-        },
         System: { Number: { getValue: async () => MOCK_BLOCK } },
       },
       constants: {
@@ -7959,21 +8270,14 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
 
   test("ensureAuthorized: sufficient auth → returns without throwing", async () => {
     _resetTestnetCacheForTests();
-    const auth = {
-      expiration: MOCK_BLOCK + 100,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
-    const api = buildApi({ auth, specName: "paseo-bulletin" });
+    const api = buildApi({ auth: runtimeAuth({ expiresAt: MOCK_BLOCK + 100 }), specName: "paseo-bulletin" });
     // Should not throw
     await ensureAuthorized(api, ADDRESS, "test");
   });
 
   test("ensureAuthorized: expired auth on testnet → throws testnet-specific message", async () => {
     _resetTestnetCacheForTests();
-    const auth = {
-      expiration: MOCK_BLOCK - 1,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
     const api = buildApi({ auth, specName: "paseo-bulletin" });
     await assert.rejects(
       () => ensureAuthorized(api, ADDRESS, "test"),
@@ -7984,10 +8288,7 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
 
   test("ensureAuthorized: expired auth on mainnet → throws mainnet-specific message", async () => {
     _resetTestnetCacheForTests();
-    const auth = {
-      expiration: MOCK_BLOCK - 1,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
     const api = buildApi({ auth, specName: "polkadot-bulletin" });
     await assert.rejects(
       () => ensureAuthorized(api, ADDRESS, "test"),
@@ -8056,15 +8357,11 @@ describe("ensureAuthorized reads authorization from the supplied api", () => {
     let readCalls = 0;
     const MOCK_BLOCK = 1000;
     const api = {
+      ...authApi(async () => {
+        readCalls++;
+        return undefined; // no active authorization — triggers the fail-fast
+      }),
       query: {
-        TransactionStorage: {
-          Authorizations: {
-            getValue: async () => {
-              readCalls++;
-              return undefined; // no authorization — triggers the fail-fast
-            },
-          },
-        },
         System: {
           Number: {
             getValue: async () => MOCK_BLOCK,
@@ -8583,7 +8880,7 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
 // the chain ran a few slow blocks. These tests guard the new semantics.
 //
 // Helpers build the minimal stub required by storeChunkedContent:
-// - unsafeApi.query.TransactionStorage.Authorizations.getValue() → ample quota
+// - unsafeApi.apis.BulletinTransactionStorageApi.account_authorization() → ample quota
 // - unsafeApi.tx.TransactionStorage.store_with_cid_config() → a tx with
 //   .signSubmitAndWatch() that returns a controllable Subscribable
 // - fetchNonce DI (avoids hitting live RPC)
@@ -8591,23 +8888,13 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
 function makeStubApi(makeSubscribable) {
   return {
     query: {
-      TransactionStorage: {
-        Authorizations: {
-          getValue: async () => ({
-            extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
-            expiration: 9_999_999,
-          }),
-        },
-      },
       System: {
         Number: {
           getValue: async () => 1000,
         },
       },
     },
-    apis: {
-      BulletinTransactionStorageApi: { can_store: async () => true },
-    },
+    ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999 }), { can_store: async () => true }),
     tx: {
       TransactionStorage: {
         store_with_cid_config: () => ({
@@ -8802,10 +9089,10 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(txCalls, 3, "must submit chunk 1, chunk 2, and root only; chunk 2 must not be retried after nonce fallback stores it");
   });
 
-  test("authorization read reconnects when stale client passes System.Number but Authorizations is disjointed", async () => {
+  test("authorization read reconnects when stale client passes System.Number but account_authorization is disjointed", async () => {
     let reconnectCalled = false;
     const staleApi = makeStubApi(normalSubscribable);
-    staleApi.query.TransactionStorage.Authorizations.getValue = async () => {
+    staleApi.apis.BulletinTransactionStorageApi.account_authorization = async () => {
       throw new Error("ChainHead disjointed");
     };
     const reconnect = async () => {
@@ -8822,7 +9109,7 @@ describe("watchTransaction found:false handling", () => {
       fetchNonce: async () => 100,
     });
 
-    assert.strictEqual(reconnectCalled, true, "authorization read should refresh a client that only fails on TransactionStorage.Authorizations");
+    assert.strictEqual(reconnectCalled, true, "authorization read should refresh a client that only fails on the account_authorization runtime call");
   });
 });
 
@@ -12640,17 +12927,9 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
   function makeCapturingStubApi(makeSubscribable, capturedNonces) {
     return {
       query: {
-        TransactionStorage: {
-          Authorizations: {
-            getValue: async () => ({
-              extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
-              expiration: 9_999_999,
-            }),
-          },
-        },
         System: { Number: { getValue: async () => 1000 } },
       },
-      apis: { BulletinTransactionStorageApi: { can_store: async () => true } },
+      ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999 }), { can_store: async () => true }),
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({
@@ -12800,17 +13079,9 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
 
     const makeApi = () => ({
       query: {
-        TransactionStorage: {
-          Authorizations: {
-            getValue: async () => ({
-              extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
-              expiration: 9_999_999,
-            }),
-          },
-        },
         System: { Number: { getValue: async () => 1000 } },
       },
-      apis: { BulletinTransactionStorageApi: { can_store: async () => true } },
+      ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999 }), { can_store: async () => true }),
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({

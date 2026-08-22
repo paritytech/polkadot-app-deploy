@@ -38,6 +38,7 @@ import type {
   AppManifest,
   ExecutableConfig,
   ExecutableManifest,
+  FundingManifest,
   ProductConfig,
   RootManifest,
   WidgetManifest,
@@ -80,7 +81,7 @@ export interface PublishManifestResult {
  *
  * Uploads the icon and any executables that aren't covered by `buildDirCid`,
  * then writes the root + per-executable text records on dotNS. Subnames
- * (`app|widget|worker.<domain>`) are created on demand and pointed at the
+ * (`app|widget|funding|worker.<domain>`) are created on demand and pointed at the
  * content resolver before any `setText`.
  */
 export async function publishManifest(opts: PublishManifestOptions): Promise<PublishManifestResult> {
@@ -276,6 +277,9 @@ function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
       dimensions: exec.dimensions,
       ...(exec.description !== undefined ? { description: exec.description } : {}),
     } as WidgetManifest;
+  }
+  if (exec.kind === "funding") {
+    return { $v: 1, kind: "funding", appVersion: exec.appVersion, modes: exec.modes } as FundingManifest;
   }
   return {
     $v: 1,

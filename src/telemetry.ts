@@ -474,7 +474,9 @@ export function computeDeployOutcome(
 //   chain.quota_exhausted          — Bulletin chain storage quota exhausted
 //   chain.bad_proof                — extrinsic rejected with Invalid::BadProof; the signature did not verify (wrong genesis/mortality/spec version or a re-signed payload mismatch)
 //   signer.message_too_large       — mobile signer rejected the payload because it exceeds the signing size limit
-//   storage.rejected               — the chain refused the signer's Bulletin storage write: no authorization, or an expired one, and auto-authorization failed (per-env authorizer mismatch, #1209).
+//   storage.rejected               — the chain refused the signer's Bulletin storage write: the account carries no
+//                                    authorization, or its authorization expired. This tool never grants one (it does not
+//                                    self-authorize); the account must be authorized out of band by the chain's authorizer.
 //                                    NOT named *_not_authorized / *_auth_*: Sentry's org relayPiiConfig masks any attribute VALUE containing "auth", so such a kind would
 //                                    render as asterisks in every dashboard grouped by deploy.error_kind — verified empirically, see the sweep write-up.
 //   user.aborted                   — operator interrupted the run (Ctrl-C / SIGINT); not a product failure

@@ -28,6 +28,7 @@ import * as path from "path";
 import { createClient, Binary, Enum } from "polkadot-api";
 import { getWsProvider } from "polkadot-api/ws";
 import { loadEnvironments } from "../dist/environments.js";
+import { ACCOUNT_AUTHORIZATION_FIELDS } from "../dist/pool.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -95,7 +96,7 @@ async function tryEncode(api, pallet, call, args) {
 // Main encode test suite (requires live chain)
 // ---------------------------------------------------------------------------
 
-describe("chain-call encoding — all 10 extrinsics", { skip: !ENABLED }, () => {
+describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !ENABLED }, () => {
   before(async () => {
     const { doc } = await loadEnvironments();
     for (const chainId of ["asset-hub", "people", "bulletin"]) {
@@ -277,6 +278,30 @@ describe("chain-call encoding — all 10 extrinsics", { skip: !ENABLED }, () => 
         },
         data: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
       });
+    });
+
+    // A runtime API, not an extrinsic — but the same class of assumption this file
+    // guards: it is the only way the client reads storage authorization. An env whose
+    // runtime lacks it fails every deploy at the authorization preflight.
+    test("BulletinTransactionStorageApi.account_authorization resolves against live metadata", async () => {
+      let auth;
+      try {
+        auth = await bulletinApi.apis.BulletinTransactionStorageApi.account_authorization(DUMMY_SS58);
+      } catch (e) {
+        assert.fail(
+          `>> FAIL: chain-call-encoding: BulletinTransactionStorageApi::account_authorization did not resolve on ${ENV_ID}'s Bulletin runtime — polkadot-app-deploy reads every account's storage quota through it, so no deploy can pass its authorization preflight here. Cause: ${e?.message ?? e}`,
+        );
+      }
+      // Option::None → undefined: Alice may hold no authorization here, itself a
+      // valid decode. Only a Some must be shaped — and it is checked against the
+      // client's own field list, so this can never guard fields it no longer reads.
+      if (auth === undefined) return;
+      const missing = ACCOUNT_AUTHORIZATION_FIELDS.filter((f) => !(f in auth));
+      assert.equal(
+        missing.length,
+        0,
+        `>> FAIL: chain-call-encoding: account_authorization returned an AccountAuthorization missing ${missing.join(", ")} — readAccountAuthorization in src/pool.ts maps exactly these fields and throws when one is absent, so a rename on-chain breaks every deploy.`,
+      );
     });
 
     test("teardown bulletin client", async () => {

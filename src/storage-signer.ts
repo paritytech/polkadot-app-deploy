@@ -4,11 +4,12 @@ import { join, dirname } from "node:path";
 import { fromHex, toHex } from "@polkadot-api/utils";
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { sr25519, ss58Address } from "@polkadot-labs/hdkd-helpers";
-import { createClient as createPolkadotClient, Enum } from "polkadot-api";
+import { createClient as createPolkadotClient } from "polkadot-api";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { getWsProvider } from "polkadot-api/ws";
 import type { PolkadotSigner } from "polkadot-api";
 import { BULLETIN_ENDPOINTS, WS_HEARTBEAT_TIMEOUT_MS, makeBulletinStatusHandler } from "./deploy.js";
+import { readAccountAuthorization, type BulletinAuthorization } from "./pool.js";
 import { setDeployAttribute, truncateAddress } from "./telemetry.js";
 
 // Mirrors product-sdk-terminal's sanitizeAppId in host-cache.ts.
@@ -146,8 +147,10 @@ export function extractBulletinSlotKey(
  * usably authorized on-chain.  The `reason` field lets callers produce
  * targeted messages without string-matching.
  *
- *  "missing"  — no Authorizations entry found for the slot account.
- *  "expired"  — entry exists but expiration ≤ current finalized block.
+ *  "missing"  — no active authorization: never granted, or already lapsed
+ *               (account_authorization hides expired entries, so a live read
+ *               cannot tell those apart).
+ *  "expired"  — expiration ≤ finalized block; only a cached/lagging read.
  */
 export class BulletinSlotAuthError extends Error {
   readonly reason: "missing" | "expired";
@@ -167,11 +170,12 @@ export class BulletinSlotAuthError extends Error {
 }
 
 /**
- * Pure active-test for a Bulletin Authorizations entry.
+ * Pure active-test for a Bulletin authorization.
  * Shared by getSlotSignerProvider (single probe) and the poll loop in
  * waitForBulletinAuthorization (repeated probes).
  *
- * @param auth  Raw value from TransactionStorage.Authorizations.getValue — null when absent.
+ * @param auth  Result of readAccountAuthorization — null when nothing is active.
+ *              Structurally typed for the injected-queryFn seam the tests drive.
  * @param blockNumber  Current finalized block number.
  */
 export function isBulletinAuthActive(
@@ -266,7 +270,7 @@ export async function waitForBulletinAuthorization(
     return await pollUntilBulletinAuthorized(
       async () => {
         const [auth, block] = await Promise.all([
-          unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+          readAccountAuthorization(unsafeApi, ss58),
           client.getFinalizedBlock(),
         ]);
         return { auth, blockNumber: block.number };
@@ -287,7 +291,7 @@ export async function waitForBulletinAuthorization(
  * fact, not a network blip — retrying it would just re-read the same state
  * and waste time, so it always propagates on the first attempt.
  *
- * Extracted for #1058: getSlotSignerProvider's connect + Authorizations
+ * Extracted for #1058: getSlotSignerProvider's connect + authorization
  * probe is a single WS round-trip performed once per deploy; a transient
  * WS/RPC hiccup on that one attempt used to permanently commit the whole
  * upload to the pool-account fallback (selectStorageReconnect in
@@ -344,18 +348,20 @@ export async function getSlotSignerProvider(
     ));
     const unsafeApi: any = client.getUnsafeApi();
 
-    let auth: any;
-    let currentBlock: any;
+    let auth: BulletinAuthorization | null = null;
+    let blockNumber = 0;
     try {
-      [auth, currentBlock] = await Promise.all([
-        unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+      const [readAuth, finalized] = await Promise.all([
+        readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
       ]);
+      auth = readAuth;
+      blockNumber = finalized.number;
     } catch (e) {
       client.destroy();
       throw e; // transient connect/query failure — retried by withTransientRetry
     }
-    const result = isBulletinAuthActive(auth, currentBlock.number);
+    const result = isBulletinAuthActive(auth, blockNumber);
     if (!result.active) {
       client.destroy();
       throw new BulletinSlotAuthError(result.reason, ss58, result.expiration);

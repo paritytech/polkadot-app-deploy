@@ -27,7 +27,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingTransactions, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
@@ -7637,14 +7637,14 @@ describe("selectAccount", () => {
   const mkAuth = (n) => Array.from({ length: n }, (_, i) => ({
     index: i, path: `//deploy/${i}`, publicKey: new Uint8Array(),
     signer: null, address: `addr-${i}`,
-    transactions: BigInt(1000 + i), bytes: 100_000_000n, expiration: 1_000_000,
+    transactions: BigInt(1000 + i), renewBytes: 100_000_000n, expiration: 1_000_000,
   }));
 
   test("always returns a result (never null) — expired accounts are still selectable", () => {
     // v1 expiration filtering is gone; ensureAuthorized() heals the account.
     // An "expired" pool is not a dead pool; it self-heals on selection.
     const expired = [{ index: 0, path: "", publicKey: new Uint8Array(), signer: null, address: "a",
-      transactions: 1000n, bytes: 100_000_000n, expiration: 100 }];
+      transactions: 1000n, renewBytes: 100_000_000n, expiration: 100 }];
     const result = selectAccount(expired);
     assert.ok(result !== null, "selectAccount must return a result");
     assert.strictEqual(result.account.address, "a");
@@ -7673,9 +7673,9 @@ describe("selectAccount", () => {
 
   test("picks from all accounts regardless of quota or expiration", () => {
     const auths = [
-      { index: 0, path: "", publicKey: new Uint8Array(), signer: null, address: "a", transactions: 1000n, bytes: 100_000_000n, expiration: 1_000_000 },
-      { index: 1, path: "", publicKey: new Uint8Array(), signer: null, address: "b", transactions: 100n, bytes: 100_000_000n, expiration: 100 },
-      { index: 2, path: "", publicKey: new Uint8Array(), signer: null, address: "c", transactions: 0n, bytes: 0n, expiration: 0 },
+      { index: 0, path: "", publicKey: new Uint8Array(), signer: null, address: "a", transactions: 1000n, renewBytes: 100_000_000n, expiration: 1_000_000 },
+      { index: 1, path: "", publicKey: new Uint8Array(), signer: null, address: "b", transactions: 100n, renewBytes: 100_000_000n, expiration: 100 },
+      { index: 2, path: "", publicKey: new Uint8Array(), signer: null, address: "c", transactions: 0n, renewBytes: 0n, expiration: 0 },
     ];
     const picks = new Set();
     for (let i = 0; i < 300; i++) picks.add(selectAccount(auths).account.index);
@@ -7806,9 +7806,9 @@ describe("Phase A storeChunkedContent receives skipRootStore (#512)", () => {
 describe("isAuthorizationSufficient", () => {
   const BLOCK = 1000;
 
-  // Build a mock auth carrying only the fields the check reads (expiration).
+  // Build a mock auth carrying only the field the check reads (expiration).
   function mkAuth({ expiration = BLOCK + 1_000_000 } = {}) {
-    return { expiration, extent: { transactions_allowance: 0, transactions: 0, bytes_allowance: 0, bytes: 0 } };
+    return { expiration };
   }
 
   test("returns false when auth is undefined", () => {
@@ -7835,7 +7835,7 @@ describe("accountsNeedingAuthorization", () => {
   // Minimal PoolAuthorization stubs — the helper only reads .expiration via
   // isAuthorizationSufficient, so only that field matters.
   function mkPoolAuth(index, expiration) {
-    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, bytes: 0n };
+    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, renewBytes: 0n };
   }
 
   test("authorized non-expired account is excluded", () => {
@@ -7883,7 +7883,7 @@ describe("accountsNeedingReauthorization", () => {
   const BLOCK = 100_000;
 
   function mkPoolAuth(index, expiration) {
-    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, bytes: 0n };
+    return { index, expiration, path: `//deploy/${index}`, publicKey: new Uint8Array(32), signer: null, address: `addr${index}`, transactions: 0n, renewBytes: 0n };
   }
 
   test("account far from expiry (> buffer away) is excluded", () => {
@@ -8058,6 +8058,159 @@ describe("#1054 pool-leg DotNS-owner isolation", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Bulletin authorization stubs (see readAccountAuthorization in src/pool.ts).
+//   runtimeAuth() — one AccountAuthorization in the chain's own snake_case, as
+//     papi decodes it. The raw shape is the point: it pins the client to the API.
+//   authApi()     — an api stub exposing ONLY that runtime API, so anything still
+//     reaching for query.TransactionStorage throws instead of reading a stale shape.
+// ---------------------------------------------------------------------------
+function runtimeAuth({
+  expiresAt,
+  txsAllowance = 1000,
+  txsUsed = 0,
+  bytesAllowance = 100_000_000n,
+  bytesUsed = 0n,
+  bytesPermanentUsed = 0n,
+} = {}) {
+  return {
+    expires_at: expiresAt,
+    bytes_allowance: bytesAllowance,
+    bytes_used: bytesUsed,
+    bytes_permanent_used: bytesPermanentUsed,
+    transactions_allowance: txsAllowance,
+    transactions_used: txsUsed,
+  };
+}
+
+function authApi(account_authorization, extraApis = {}) {
+  return { apis: { BulletinTransactionStorageApi: { account_authorization, ...extraApis } } };
+}
+
+// ---------------------------------------------------------------------------
+// readAccountAuthorization — pins both halves of the contract: WHICH chain entry
+// point is called, and how its result maps onto the quota numbers pool selection
+// and the ops diagnostics print.
+// ---------------------------------------------------------------------------
+describe("readAccountAuthorization (BulletinTransactionStorageApi::account_authorization)", () => {
+  const ADDRESS = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+
+  // Records the address the runtime API was called with, so a test can pin that
+  // it's a bare SS58 rather than the old Enum("Account", …) storage key.
+  function apiReturning(auth, capture = {}) {
+    return authApi(async (address) => { capture.address = address; return auth; });
+  }
+
+  test("maps the runtime API's AccountAuthorization onto the client shape", async () => {
+    const capture = {};
+    const api = apiReturning(
+      runtimeAuth({
+        expiresAt: 12_345,
+        txsAllowance: 1000,
+        txsUsed: 7,
+        bytesAllowance: 100_000_000n,
+        bytesUsed: 4_000n,
+        bytesPermanentUsed: 1_000n,
+      }),
+      capture,
+    );
+    const auth = await readAccountAuthorization(api, ADDRESS);
+    assert.deepStrictEqual(auth, {
+      expiration: 12_345,
+      transactionsAllowance: 1000,
+      transactionsUsed: 7,
+      bytesAllowance: 100_000_000n,
+      bytesUsed: 4_000n,
+      bytesPermanentUsed: 1_000n,
+    }, ">> FAIL: readAccountAuthorization: the runtime API's snake_case fields must map onto the client's BulletinAuthorization shape");
+    assert.strictEqual(capture.address, ADDRESS,
+      ">> FAIL: readAccountAuthorization: the account must go in as a bare SS58 AccountId — the runtime API takes an AccountId, not the Enum(\"Account\", …) key the storage map needed");
+  });
+
+  test("None (papi undefined) → null, covering both 'never granted' and 'expired'", async () => {
+    assert.strictEqual(await readAccountAuthorization(apiReturning(undefined), ADDRESS), null,
+      ">> FAIL: readAccountAuthorization: Option::None must normalize to null; the runtime API filters expired grants, so null means 'no active authorization'");
+  });
+
+  test("a Some missing a field throws instead of defaulting it to zero", async () => {
+    const { expires_at, ...withoutExpiry } = runtimeAuth({ expiresAt: 10 });
+    await assert.rejects(
+      () => readAccountAuthorization(apiReturning(withoutExpiry), ADDRESS),
+      /expires_at/,
+      ">> FAIL: readAccountAuthorization: a missing or renamed AccountAuthorization field must throw naming it — defaulting to 0 fails every deploy with a message pointing at the account, not the chain",
+    );
+  });
+
+  test("coerces number-typed byte counters to bigint", async () => {
+    // u64s handed back as JS numbers must not leak number/bigint mixing into
+    // remainingRenewBytes' arithmetic (a TypeError at runtime).
+    const auth = await readAccountAuthorization(
+      apiReturning({ ...runtimeAuth({ expiresAt: 10 }), bytes_allowance: 500, bytes_used: 100, bytes_permanent_used: 50 }),
+      ADDRESS,
+    );
+    assert.strictEqual(remainingRenewBytes(auth), 450n,
+      ">> FAIL: readAccountAuthorization: u64 fields must be coerced to bigint so the remaining-quota arithmetic cannot throw on mixed types");
+  });
+});
+
+describe("remaining quota helpers", () => {
+  // The chain's only byte gate is renew: check_renew_authorization rejects when
+  // bytes_permanent + size > bytes_allowance, and `bytes` (store) is not in that
+  // comparison — the pallet calls it a soft priority signal that never gates, and
+  // can_store checks only size + an unexpired authorization. So the headroom the
+  // client reports must subtract the renew counter and ONLY the renew counter.
+  test("remainingRenewBytes subtracts renew bytes and ignores store bytes", () => {
+    const auth = {
+      expiration: 10, transactionsAllowance: 10, transactionsUsed: 0,
+      bytesAllowance: 1_000n, bytesUsed: 400n, bytesPermanentUsed: 300n,
+    };
+    assert.strictEqual(remainingRenewBytes(auth), 700n,
+      ">> FAIL: remainingRenewBytes: must report bytesAllowance - bytesPermanentUsed. Ignoring the renew counter overstates the one real byte cap; subtracting store bytes too under-reports it, since store bytes never draw the cap down");
+  });
+
+  test("both helpers clamp at zero instead of reporting a negative budget", () => {
+    const exhausted = {
+      expiration: 10, transactionsAllowance: 5, transactionsUsed: 9,
+      bytesAllowance: 100n, bytesUsed: 80n, bytesPermanentUsed: 150n,
+    };
+    assert.strictEqual(remainingRenewBytes(exhausted), 0n,
+      ">> FAIL: remainingRenewBytes: an over-consumed allowance must report 0, never a negative number");
+    assert.strictEqual(remainingTransactions(exhausted), 0n,
+      ">> FAIL: remainingTransactions: an over-consumed allowance must report 0, never a negative number");
+  });
+});
+
+describe("fetchPoolAuthorizations reads authorization state through the runtime API", () => {
+  const ACCOUNTS = [
+    { index: 0, address: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" },
+    { index: 1, address: "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty" },
+  ];
+
+  test("reports txs left, renew headroom and the expiration block per account", async () => {
+    const api = authApi(async (address) =>
+      address === ACCOUNTS[0].address
+        ? runtimeAuth({ expiresAt: 9_999, txsAllowance: 1000, txsUsed: 40, bytesAllowance: 1_000n, bytesUsed: 100n, bytesPermanentUsed: 200n })
+        : undefined, // no active authorization
+    );
+    const auths = await fetchPoolAuthorizations(api, ACCOUNTS);
+    assert.deepStrictEqual(
+      auths.map(a => ({ index: a.index, transactions: a.transactions, renewBytes: a.renewBytes, expiration: a.expiration })),
+      [
+        { index: 0, transactions: 960n, renewBytes: 800n, expiration: 9_999 },
+        { index: 1, transactions: 0n, renewBytes: 0n, expiration: 0 },
+      ],
+      ">> FAIL: fetchPoolAuthorizations: must report txs left and renew headroom from the account_authorization runtime API, and zeroes where nothing is active",
+    );
+  });
+
+  test("a failed read degrades that account to zero quota rather than rejecting", async () => {
+    const api = authApi(async () => { throw new Error("ChainHead disjointed"); });
+    const auths = await fetchPoolAuthorizations(api, ACCOUNTS);
+    assert.deepStrictEqual(auths.map(a => a.expiration), [0, 0],
+      ">> FAIL: fetchPoolAuthorizations: a transient runtime-API failure must degrade to zero quota for that account, not fail the whole pool read");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // ensureAuthorized — existence/expiry gate
 // ---------------------------------------------------------------------------
 describe("ensureAuthorized quota awareness", () => {
@@ -8066,30 +8219,23 @@ describe("ensureAuthorized quota awareness", () => {
 
   function buildApi({ auth }) {
     return {
+      ...authApi(async () => auth),
       query: {
-        TransactionStorage: {
-          Authorizations: { getValue: async () => auth },
-        },
         System: { Number: { getValue: async () => MOCK_BLOCK } },
       },
     };
   }
 
   test("active auth → returns without throwing", async () => {
-    const auth = {
-      expiration: MOCK_BLOCK + 100,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
-    const api = buildApi({ auth });
+    const api = buildApi({ auth: runtimeAuth({ expiresAt: MOCK_BLOCK + 100 }) });
     await ensureAuthorized(api, ADDRESS, "test");
   });
 
+  // A live read never returns an expired grant; this pins the client-side check
+  // that has to cover a lagging or cached one.
   test("expired auth → throws fail-fast (mainnet message)", async () => {
     _resetTestnetCacheForTests();
-    const auth = {
-      expiration: MOCK_BLOCK - 1,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
     // No constants.System.Version → detectTestnet catches → returns false (mainnet)
     const api = buildApi({ auth });
     await assert.rejects(
@@ -8110,10 +8256,8 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
 
   function buildApi({ auth, specName } = {}) {
     return {
+      ...authApi(async () => auth),
       query: {
-        TransactionStorage: {
-          Authorizations: { getValue: async () => auth },
-        },
         System: { Number: { getValue: async () => MOCK_BLOCK } },
       },
       constants: {
@@ -8126,21 +8270,14 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
 
   test("ensureAuthorized: sufficient auth → returns without throwing", async () => {
     _resetTestnetCacheForTests();
-    const auth = {
-      expiration: MOCK_BLOCK + 100,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
-    const api = buildApi({ auth, specName: "paseo-bulletin" });
+    const api = buildApi({ auth: runtimeAuth({ expiresAt: MOCK_BLOCK + 100 }), specName: "paseo-bulletin" });
     // Should not throw
     await ensureAuthorized(api, ADDRESS, "test");
   });
 
   test("ensureAuthorized: expired auth on testnet → throws testnet-specific message", async () => {
     _resetTestnetCacheForTests();
-    const auth = {
-      expiration: MOCK_BLOCK - 1,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
     const api = buildApi({ auth, specName: "paseo-bulletin" });
     await assert.rejects(
       () => ensureAuthorized(api, ADDRESS, "test"),
@@ -8151,10 +8288,7 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
 
   test("ensureAuthorized: expired auth on mainnet → throws mainnet-specific message", async () => {
     _resetTestnetCacheForTests();
-    const auth = {
-      expiration: MOCK_BLOCK - 1,
-      extent: { transactions_allowance: 1000, transactions: 0, bytes_allowance: 100_000_000, bytes: 0 },
-    };
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
     const api = buildApi({ auth, specName: "polkadot-bulletin" });
     await assert.rejects(
       () => ensureAuthorized(api, ADDRESS, "test"),
@@ -8223,15 +8357,11 @@ describe("ensureAuthorized reads authorization from the supplied api", () => {
     let readCalls = 0;
     const MOCK_BLOCK = 1000;
     const api = {
+      ...authApi(async () => {
+        readCalls++;
+        return undefined; // no active authorization — triggers the fail-fast
+      }),
       query: {
-        TransactionStorage: {
-          Authorizations: {
-            getValue: async () => {
-              readCalls++;
-              return undefined; // no authorization — triggers the fail-fast
-            },
-          },
-        },
         System: {
           Number: {
             getValue: async () => MOCK_BLOCK,
@@ -8750,7 +8880,7 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
 // the chain ran a few slow blocks. These tests guard the new semantics.
 //
 // Helpers build the minimal stub required by storeChunkedContent:
-// - unsafeApi.query.TransactionStorage.Authorizations.getValue() → ample quota
+// - unsafeApi.apis.BulletinTransactionStorageApi.account_authorization() → ample quota
 // - unsafeApi.tx.TransactionStorage.store_with_cid_config() → a tx with
 //   .signSubmitAndWatch() that returns a controllable Subscribable
 // - fetchNonce DI (avoids hitting live RPC)
@@ -8758,23 +8888,13 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
 function makeStubApi(makeSubscribable) {
   return {
     query: {
-      TransactionStorage: {
-        Authorizations: {
-          getValue: async () => ({
-            extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
-            expiration: 9_999_999,
-          }),
-        },
-      },
       System: {
         Number: {
           getValue: async () => 1000,
         },
       },
     },
-    apis: {
-      BulletinTransactionStorageApi: { can_store: async () => true },
-    },
+    ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999 }), { can_store: async () => true }),
     tx: {
       TransactionStorage: {
         store_with_cid_config: () => ({
@@ -8969,10 +9089,10 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(txCalls, 3, "must submit chunk 1, chunk 2, and root only; chunk 2 must not be retried after nonce fallback stores it");
   });
 
-  test("authorization read reconnects when stale client passes System.Number but Authorizations is disjointed", async () => {
+  test("authorization read reconnects when stale client passes System.Number but account_authorization is disjointed", async () => {
     let reconnectCalled = false;
     const staleApi = makeStubApi(normalSubscribable);
-    staleApi.query.TransactionStorage.Authorizations.getValue = async () => {
+    staleApi.apis.BulletinTransactionStorageApi.account_authorization = async () => {
       throw new Error("ChainHead disjointed");
     };
     const reconnect = async () => {
@@ -8989,7 +9109,7 @@ describe("watchTransaction found:false handling", () => {
       fetchNonce: async () => 100,
     });
 
-    assert.strictEqual(reconnectCalled, true, "authorization read should refresh a client that only fails on TransactionStorage.Authorizations");
+    assert.strictEqual(reconnectCalled, true, "authorization read should refresh a client that only fails on the account_authorization runtime call");
   });
 });
 
@@ -12789,17 +12909,9 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
   function makeCapturingStubApi(makeSubscribable, capturedNonces) {
     return {
       query: {
-        TransactionStorage: {
-          Authorizations: {
-            getValue: async () => ({
-              extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
-              expiration: 9_999_999,
-            }),
-          },
-        },
         System: { Number: { getValue: async () => 1000 } },
       },
-      apis: { BulletinTransactionStorageApi: { can_store: async () => true } },
+      ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999 }), { can_store: async () => true }),
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({
@@ -12949,17 +13061,9 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
 
     const makeApi = () => ({
       query: {
-        TransactionStorage: {
-          Authorizations: {
-            getValue: async () => ({
-              extent: { transactions: 0, transactions_allowance: 1000, bytes: 0n, bytes_permanent: 0n, bytes_allowance: BigInt(100_000_000) },
-              expiration: 9_999_999,
-            }),
-          },
-        },
         System: { Number: { getValue: async () => 1000 } },
       },
-      apis: { BulletinTransactionStorageApi: { can_store: async () => true } },
+      ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999 }), { can_store: async () => true }),
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({

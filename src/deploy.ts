@@ -8,7 +8,7 @@ import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { blake2b } from "@noble/hashes/blake2b";
-import { createClient as createPolkadotClient, Enum } from "polkadot-api";
+import { createClient as createPolkadotClient } from "polkadot-api";
 import { getWsProvider, WsEvent } from "polkadot-api/ws";
 import { CID } from "multiformats/cid";
 import { create as createMultihash } from "multiformats/hashes/digest";
@@ -27,8 +27,8 @@ import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLa
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions } from "./dotns.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, detectTestnet } from "./pool.js";
-import type { PoolAuthorization } from "./pool.js";
+import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet } from "./pool.js";
+import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
 import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
@@ -457,15 +457,15 @@ async function getDirectProvider(mnemonic: string, derivationPath: string = ""):
   console.log(`   Using direct signer: ${ss58}${derivationPath ? ` (path: ${derivationPath})` : ""}`);
 
   let [auth, currentBlock] = await Promise.all([
-    unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+    readAccountAuthorization(unsafeApi, ss58),
     client.getFinalizedBlock(),
   ]);
   let now = currentBlock.number;
-  if (!auth || Number(auth.expiration ?? 0) <= now) {
+  if (!isAuthorizationSufficient(auth, now)) {
     try {
       await ensureAuthorized(unsafeApi, ss58 as string, "direct signer");
       [auth, currentBlock] = await Promise.all([
-        unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+        readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
       ]);
       now = currentBlock.number;
@@ -474,7 +474,7 @@ async function getDirectProvider(mnemonic: string, derivationPath: string = ""):
       throw new NonRetryableError(`Account ${ss58} is not authorized for Bulletin storage and auto-authorization failed: ${e.message}`);
     }
   }
-  console.log(`   Authorization: expires at block ${Number(auth?.expiration ?? 0)} (current: ${now})`);
+  console.log(`   Authorization: expires at block ${auth?.expiration ?? 0} (current: ${now})`);
 
   setDeployAttribute("deploy.signer.mode", "direct");
   setDeployAttribute("deploy.signer.address", truncateAddress(ss58) as string);
@@ -493,15 +493,15 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
   console.log(`   Using external signer: ${ss58}`);
 
   let [auth, currentBlock] = await Promise.all([
-    unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+    readAccountAuthorization(unsafeApi, ss58),
     client.getFinalizedBlock(),
   ]);
   let now = currentBlock.number;
-  if (!auth || Number(auth.expiration ?? 0) <= now) {
+  if (!isAuthorizationSufficient(auth, now)) {
     try {
       await ensureAuthorized(unsafeApi, ss58, "external signer");
       [auth, currentBlock] = await Promise.all([
-        unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
+        readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
       ]);
       now = currentBlock.number;
@@ -510,7 +510,7 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
       throw new NonRetryableError(`Account ${ss58} is not authorized for Bulletin storage and auto-authorization failed: ${e.message}`);
     }
   }
-  console.log(`   Authorization: expires at block ${Number(auth?.expiration ?? 0)} (current: ${now})`);
+  console.log(`   Authorization: expires at block ${auth?.expiration ?? 0} (current: ${now})`);
 
   setDeployAttribute("deploy.signer.mode", "external");
   setDeployAttribute("deploy.signer.address", truncateAddress(ss58) as string);
@@ -1017,18 +1017,22 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   // (the allowance fields are no longer the gate). Deploy no longer
   // self-authorizes (#745); fail fast if there is no active authorization —
   // it must be granted out-of-band (testnet faucet / personhood / pool bootstrap).
+  //
+  // Arm order matters: the raw papi read can throw *synchronously* on a destroyed
+  // client, so it goes first — readAccountAuthorization only rejects. Reversed, that
+  // sync throw would orphan the in-flight auth read as an unhandled rejection.
   const readUploadAuthorization = () => Promise.all([
-    unsafeApi.query.TransactionStorage.Authorizations.getValue(Enum("Account", ss58)),
     unsafeApi.query.System.Number.getValue(),
+    readAccountAuthorization(unsafeApi, ss58 as string),
   ]);
-  let uploadAuth: any;
-  let currentBlockNum: any;
+  let uploadAuth: BulletinAuthorization | null = null;
+  let currentBlockNum = 0;
   try {
-    [uploadAuth, currentBlockNum] = await readUploadAuthorization();
+    [currentBlockNum, uploadAuth] = await readUploadAuthorization();
   } catch (e: any) {
     if (existingClient && reconnect && isConnectionError(e)) {
       await refreshExistingClient("authorization preflight hit a stale chainHead");
-      [uploadAuth, currentBlockNum] = await readUploadAuthorization();
+      [currentBlockNum, uploadAuth] = await readUploadAuthorization();
     } else {
       throw e;
     }
@@ -1591,8 +1595,8 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     // resolved via nonce-advance (3-min timeout) before the subscription error
     // could trigger doReconnect, the current client is the original destroyed
     // one. The stale-client probe at phase-B entry may not reliably detect this
-    // (System.Number can resolve on a destroyed client while
-    // TransactionStorage.Authorizations fails with "ChainHead disjointed").
+    // (System.Number can resolve on a destroyed client while the
+    // account_authorization runtime call fails with "ChainHead disjointed").
     // Reconnect here so liveProvider carries a healthy client.
     // ownsClient is reset to false: the fresh client is handed off via
     // liveProvider, not destroyed below.

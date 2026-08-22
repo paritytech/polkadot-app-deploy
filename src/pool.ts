@@ -26,7 +26,9 @@ export interface PoolAccount {
 
 export interface PoolAuthorization extends PoolAccount {
   transactions: bigint;
-  bytes: bigint;
+  // Renew headroom, NOT "bytes left to store" — store is not byte-gated at all.
+  // See remainingRenewBytes.
+  renewBytes: bigint;
   expiration: number;
 }
 
@@ -74,15 +76,95 @@ export function derivePoolAccounts(poolSize: number = 10, mnemonic: string = DEV
   return accounts;
 }
 
-// Checks whether the given authorization is sufficient for the intended use.
-// Returns true when `auth` exists and has not expired relative to `currentBlock`.
+// Client-side view of one account's Bulletin storage authorization. Fields mirror
+// the runtime API's `AccountAuthorization`, except `expiration` (`expires_at`
+// on-chain) — the name every consumer here already speaks.
+export interface BulletinAuthorization {
+  expiration: number;
+  transactionsAllowance: number;
+  transactionsUsed: number;    // store + renew
+  bytesAllowance: bigint;
+  bytesUsed: bigint;           // store — soft, see remainingRenewBytes
+  bytesPermanentUsed: bigint;  // renew — the only counter with a hard cap
+}
+
+// The AccountAuthorization fields readAccountAuthorization maps. Exported so the
+// live chain-call test guards exactly the set the client reads, never a stale copy.
+export const ACCOUNT_AUTHORIZATION_FIELDS = [
+  "expires_at",
+  "bytes_allowance",
+  "bytes_used",
+  "bytes_permanent_used",
+  "transactions_allowance",
+  "transactions_used",
+] as const;
+
+/**
+ * Read an account's Bulletin storage authorization via the
+ * `BulletinTransactionStorageApi::account_authorization` runtime API — the one
+ * chain entry point for this, replacing the old `TransactionStorage.Authorizations`
+ * read. That entry is no longer client-readable: its `AuthorizationExtent` carries
+ * an opaque consumer payload (`extra`) where `bytes_permanent` used to sit.
+ *
+ * Returns null both when the account was never authorized and when its grant has
+ * lapsed — the API filters expired entries, so a non-null result is always active.
+ *
+ * A `Some` missing any field throws instead of defaulting to 0: a renamed field
+ * would otherwise read as "no allowance, expires at block 0" and fail every deploy
+ * with a message pointing at the account rather than at the chain.
+ */
+export async function readAccountAuthorization(api: any, address: string): Promise<BulletinAuthorization | null> {
+  const auth = await api.apis.BulletinTransactionStorageApi.account_authorization(address);
+  if (auth == null) return null;
+  const missing = ACCOUNT_AUTHORIZATION_FIELDS.filter(f => auth[f] == null);
+  if (missing.length > 0) {
+    throw new Error(
+      `Bulletin returned an AccountAuthorization for ${address} without ${missing.join(", ")} — ` +
+      `this chain's BulletinTransactionStorageApi does not match what polkadot-app-deploy reads. Upgrade polkadot-app-deploy.`,
+    );
+  }
+  return {
+    expiration: Number(auth.expires_at),
+    transactionsAllowance: Number(auth.transactions_allowance),
+    transactionsUsed: Number(auth.transactions_used),
+    // u64: a decoder may hand back number or bigint; the quota arithmetic can't mix.
+    bytesAllowance: BigInt(auth.bytes_allowance),
+    bytesUsed: BigInt(auth.bytes_used),
+    bytesPermanentUsed: BigInt(auth.bytes_permanent_used),
+  };
+}
+
+// The only byte budget on an authorization that gates anything: `renew` is
+// rejected when `bytes_permanent + size > bytes_allowance`
+// (pallet_bulletin_data_renewal::check_renew_authorization). `bytesUsed` — the
+// store side — is NOT part of that comparison and never gates: the pallet
+// documents `bytes`/`transactions` as "soft side (priority signal); saturate,
+// never gate", and `can_store` is only `data_size_ok(len) && has active
+// authorization`. So do not subtract store bytes here; they buy nothing back and
+// would under-report real renew headroom.
+//
+// Clamped at 0 — a reporting input, never a negative budget.
+export function remainingRenewBytes(auth: BulletinAuthorization): bigint {
+  const left = auth.bytesAllowance - auth.bytesPermanentUsed;
+  return left > 0n ? left : 0n;
+}
+
+// Transactions left in the granted allowance. Also not a gate — the runtime API
+// documents the pair as predicting whether a `store` gets the *priority boost*.
+export function remainingTransactions(auth: BulletinAuthorization): bigint {
+  const left = auth.transactionsAllowance - auth.transactionsUsed;
+  return left > 0 ? BigInt(left) : 0n;
+}
+
+// True when `auth` exists and has not expired relative to `currentBlock` (also
+// takes a PoolAuthorization — same `expiration` field). A fresh read is always
+// active, so the expiry test is for cached/lagging ones; #1059's reauthorization
+// window generalizes it over a future deadline.
 export function isAuthorizationSufficient(
-  auth: any,
+  auth: { expiration: number } | null | undefined,
   currentBlock: number,
 ): boolean {
-  if (auth === undefined) return false;
-  if (Number(auth.expiration ?? 0) <= currentBlock) return false;
-  return true;
+  return auth != null && auth.expiration > currentBlock;
 }
 
 // Returns the subset of `auths` that require a new authorization grant
@@ -167,17 +249,15 @@ export async function fetchPoolAuthorizations(api: any, accounts: PoolAccount[])
   const results = await Promise.all(
     accounts.map(async (account): Promise<PoolAuthorization> => {
       try {
-        const auth = await api.query.TransactionStorage.Authorizations.getValue(
-          Enum("Account", account.address)
-        );
+        const auth = await readAccountAuthorization(api, account.address);
         return {
           ...account,
-          transactions: auth ? BigInt(auth.extent.transactions_allowance) - BigInt(auth.extent.transactions) : 0n,
-          bytes: auth ? BigInt(auth.extent.bytes_allowance) - BigInt(auth.extent.bytes) : 0n,
-          expiration: auth ? Number(auth.expiration) : 0,
+          transactions: auth ? remainingTransactions(auth) : 0n,
+          renewBytes: auth ? remainingRenewBytes(auth) : 0n,
+          expiration: auth ? auth.expiration : 0,
         };
       } catch {
-        return { ...account, transactions: 0n, bytes: 0n, expiration: 0 };
+        return { ...account, transactions: 0n, renewBytes: 0n, expiration: 0 };
       }
     })
   );
@@ -234,7 +314,7 @@ export async function ensureAuthorized(
   label?: string,
 ): Promise<void> {
   const [auth, currentBlock] = await Promise.all([
-    api.query.TransactionStorage.Authorizations.getValue(Enum("Account", address)),
+    readAccountAuthorization(api, address),
     api.query.System.Number.getValue(),
   ]);
   if (isAuthorizationSufficient(auth, currentBlock)) return;
@@ -357,8 +437,8 @@ export interface BootstrapPoolOptions {
 
 function printAuthStatus(a: PoolAuthorization, currentBlock: number): void {
   if (isAuthorizationSufficient(a, currentBlock)) {
-    const mb = (Number(a.bytes) / 1_000_000).toFixed(1);
-    console.log(`  [${a.index}] ${a.address}  AUTHORIZED — ${a.transactions} txs / ${mb}MB remaining, expires @${a.expiration}`);
+    const mb = (Number(a.renewBytes) / 1_000_000).toFixed(1);
+    console.log(`  [${a.index}] ${a.address}  AUTHORIZED — ${a.transactions} txs left / ${mb}MB renew headroom, expires @${a.expiration}`);
   } else {
     console.log(`  [${a.index}] ${a.address}  NOT AUTHORIZED`);
   }

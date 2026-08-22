@@ -195,6 +195,10 @@ jobs:
           if [ -n "$REF" ]; then
             echo "Building polkadot-app-deploy from source ref: $REF"
             cd polkadot-app-deploy-src
+            # This installs polkadot-app-deploy's OWN npm 11 lockfile, not the
+            # caller's. Scoped to this source-build branch so a consumer that
+            # never source-builds keeps its own npm untouched.
+            npm install -g npm@11.17.0
             npm ci
             cd ..
             BIN="$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy"

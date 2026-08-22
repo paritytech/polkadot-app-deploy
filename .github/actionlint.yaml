@@ -1,0 +1,11 @@
+# actionlint cannot know about self-hosted runner labels, so declare them here
+# rather than suppressing the whole runner-label rule with -ignore. Keeping the
+# rule active means a genuine typo (e.g. "ubunut-latest") is still caught.
+#
+# All runners in this repo are GitHub-hosted (ubuntu-latest) — there are no
+# self-hosted labels to declare. Bulletin's copy of this file declares
+# `parity-default` for its self-hosted fleet; that label is not used here.
+# Kept as an empty list (rather than omitting the file) so the rule stays
+# active and a future self-hosted label has an obvious home.
+self-hosted-runner:
+  labels: []

@@ -76,6 +76,18 @@ test("classifyForRetry: AH ReviveApi.address timeout is retry-eligible (#1131)",
   }
 });
 
+test("classifyForRetry: IPFS gateway roundtrip budget exhaustion is retry-eligible", () => {
+  const out = "S-INC-ROUNDTRIP: roundtrip budget exhausted after 30000ms";
+  assert.strictEqual(classifyForRetry(out, 1), 75,
+    ">> FAIL: retry-classify: gateway roundtrip timeout must be retry-eligible (75) — the deploy already finalised on-chain, only the HTTP readback failed");
+});
+
+test("classifyForRetry: a manifest CONTENT mismatch must NOT be retry-eligible", () => {
+  const out = "S-INC-ROUNDTRIP: manifest content mismatch: expected bafy... got bafk...";
+  assert.notStrictEqual(classifyForRetry(out, 1), 75,
+    ">> FAIL: retry-classify: a real integrity regression must never be retried away");
+});
+
 test("wrapper reads stdout — flake pattern on stdout triggers exit 75", async () => {
   const exitCode = await new Promise((resolve) => {
     const child = spawn(process.execPath, [

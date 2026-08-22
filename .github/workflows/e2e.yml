@@ -451,6 +451,7 @@ jobs:
 
       - name: Render report body
         env:
+          HEAD_REF_OR_NAME: ${{ github.head_ref || github.ref_name }}
           AGGREGATE: ${{ needs.test-pr.result == 'success' && 'success' || 'failure' }}
         run: |
           emoji() { case "$1" in
@@ -461,7 +462,7 @@ jobs:
             *)         echo "❓ $1";;
           esac; }
 
-          BRANCH="${{ github.head_ref || github.ref_name }}"
+          BRANCH="$HEAD_REF_OR_NAME"
           SHA_SHORT="${GITHUB_SHA:0:7}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 

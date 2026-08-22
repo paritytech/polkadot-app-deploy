@@ -95,6 +95,12 @@ on:
       # when both are selected the existing `needs:` ordering still serializes.
       # Aggregate verifiers (telemetry / pool-distribution / code-path coverage /
       # address-drift) deliberately keep no filter — a subset cannot satisfy them.
+      # nightly-pr-coverage and nightly-s-inc are also unfiltered: their scenario
+      # id comes from the matrix, and the `matrix` context is NOT available in a
+      # job-level `if:` (only github / needs / vars / inputs are). Referencing it
+      # there makes the whole workflow invalid — GitHub rejects it at setup and
+      # the run reports failure with zero jobs. A filtered dispatch therefore
+      # still runs both matrices in full.
       scenarios:
         description: 'Comma-separated scenario ids to re-run on a manual nightly dispatch (e.g. "s6,s8,s9"). Empty (default) = all. Re-run only the flaky scenarios instead of the whole matrix.'
         type: string
@@ -693,8 +699,7 @@ jobs:
     if: |
       always() &&
       needs.build-nightly.result == 'success' &&
-      (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) &&
-      (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', matrix.scenario)))
+      (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -1767,7 +1772,7 @@ jobs:
     # legs deploy to the same stable pool labels (e2einc.dot / e2erot.dot or
     # e2eincpool01.dot / e2erotpool01.dot) — concurrent legs would collide.
     needs: [build-nightly, nightly-s1-pool, nightly-s-car, select-env]
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', matrix.scenario)))
+    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     # Only runs from source (BULLETIN_DEPLOY_REF path); npm-install path does
     # not carry test/e2e.test.js so the run step is skipped.
     # Short-term scope: source-build path only (issue #349 defers npm-install rewrite).

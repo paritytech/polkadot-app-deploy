@@ -89,9 +89,9 @@ on:
 
 permissions:
   # Workflow-level default: read-only. Jobs that need write access carry
-  # an explicit per-job permissions: block below (nightly-s4, pr-report,
-  # nightly-report). All other jobs — including every test-pr matrix leg
-  # — run with contents:read only.
+  # an explicit per-job permissions: block below (pr-report, nightly-report).
+  # All other jobs — including every test-pr matrix leg — run with
+  # contents:read only.
   contents: read
 
 concurrency:
@@ -667,7 +667,7 @@ jobs:
 
   nightly-pr-coverage:
     name: Nightly @ HEAD · ${{ matrix.scenario }} ${{ matrix.signer }}/${{ matrix.merkle }}
-    # Waits for the full Alice-pool nonce chain (s1-pool→s5→s6→s4→s-ext-signer).
+    # Waits for the full Alice-pool nonce chain (s1-pool→s5→s6→s-ext-signer).
     # E2E_POOL_LABEL (below) uses a dedicated domain (e2eprpool01) to avoid domain
     # contention with nightly-s1-pool on e2epoolns01.dot. But the pool accounts all
     # derive from the same Alice mnemonic, so nonces are still shared — sequencing
@@ -699,12 +699,6 @@ jobs:
           - { scenario: s1,                       signer: pool,   merkle: js,   poolIndex: 0 }
           - { scenario: s1,                       signer: direct, merkle: kubo }
           - { scenario: s3,                       signer: pool,   merkle: js,   poolIndex: 1 }
-          # s4 deliberately omitted from nightly-pr-coverage: its
-          # --gh-pages-mirror step requires `contents: write` to push to
-          # gh-pages, but this matrix runs on ubuntu-latest with the
-          # workflow's default `contents: read` permission. The dedicated
-          # nightly-s4 job (which uses the reusable deploy.yml with the
-          # correct permission scope) already covers the same scenario.
           # s7 is signer-agnostic (SIGINT crash-capture); empty matrix.signer
           # produces artifact name `e2e-log-night-s7--js` — mirrors the PR-tier
           # pattern at line 199, not a typo.
@@ -1125,7 +1119,7 @@ jobs:
   nightly-s6:
     name: Nightly S6 RPC failover (${{ matrix.env }})
     # Runs after nightly-s5 (which runs after nightly-s1-pool) to serialize all
-    # Alice-root DotNS jobs: s1-pool → s5 → s6 → s4 → s-ext-signer.
+    # Alice-root DotNS jobs: s1-pool → s5 → s6 → s-ext-signer.
     needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s5, select-env]
     if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     # S6 forces transport-level failover by pointing BULLETIN_RPC at an
@@ -1204,100 +1198,6 @@ jobs:
             exit 1
           fi
           echo "::notice::S6 deploy succeeded — papi rotated past the unroutable primary"
-
-  nightly-s4:
-    name: Nightly S4 gh-pages mirror
-    # Serialized in the Alice-root DotNS chain: s1-pool → s5 → s6 → s4.
-    # s4 deploys e2epoolns01.dot (Alice root) so it must not overlap s5 or s6.
-    # `always()` so s4 runs even when an earlier shard has a partial failure.
-    # S4 does NOT fan out across envs: it pushes to the gh-pages branch of
-    # THIS repo, which is a single shared resource. Running it per-env would
-    # race on the gh-pages push and serve stale CARs for one env. Single-env
-    # (selected_env) is intentional here.
-    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s5, nightly-s6, select-env]
-    # `release` intentionally omitted: release-gating runs install the package
-    # from npm (no source ref), so deploy.yml skips the checkout and the
-    # gh-pages mirror has no git repo to push from (git worktree fails). Tracked
-    # in #11. S4 still runs on schedule/dispatch (which carry a source ref).
-    if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
-    # Timeout cap lives in deploy.yml — see nightly-s1-pool note above.
-    permissions:
-      # contents:write is required by the --gh-pages-mirror flag: deploy.yml
-      # pushes the CAR to the gh-pages branch after deploy.
-      contents: write
-    uses: ./.github/workflows/deploy.yml
-    with:
-      artifact-name: e2e-fixture-nightly
-      dotns-domain: e2epoolns01.dot
-      skip-cache: true
-      js-merkle: true
-      runner: ${{ inputs.runner || 'ubuntu-latest' }}
-      tag: ${{ needs.build-nightly.outputs.deploy-tag }}
-      env: ${{ needs.select-env.outputs.selected_env }}
-      polkadot-app-deploy-version: ${{ needs.build-nightly.outputs.test-version }}
-      polkadot-app-deploy-ref: ${{ needs.build-nightly.outputs.polkadot-app-deploy-ref }}
-      gh-pages-mirror: true
-      # Opt-in to flake-class retry (see nightly-s1-pool comment).
-      max-retries: 2
-    secrets:
-      mnemonic: ${{ secrets.DOTNS_MNEMONIC || 'bottom drive obey lake curtain smoke basket hold race lonely fit walk' }}
-      sentry-dsn: ${{ secrets.SENTRY_DSN }}
-
-  nightly-verify-s4:
-    name: Verify nightly S4 mirror URL serves the CAR
-    needs: nightly-s4
-    # See nightly-s4: `release` omitted (npm-mode mirror has no git repo, #11).
-    if: always() && needs.nightly-s4.result == 'success' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - name: Poll Pages URL until 200
-        timeout-minutes: 12
-        run: |
-          URL="https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/bulletin/e2epoolns01.dot.car"
-          MANIFEST="${URL%.car}.json"
-          # Pages builds typically land within 1-2 min of push; first-time
-          # branch creation or busy queue can stretch this. 10 min is a
-          # conservative hedge — the real failure mode may be geo-cache
-          # inconsistency that extra time won't fix, but this leaves room
-          # for slow CDN propagation under a busy Pages build queue.
-          for i in $(seq 1 60); do
-            code=$(curl -sI -o /dev/null -w "%{http_code}" "$URL")
-            if [ "$code" = "200" ]; then
-              echo "CAR served 200 after ${i} attempts: $URL"
-              break
-            fi
-            if [ $i -eq 60 ]; then
-              echo "::group::Diagnostic headers for $URL (final attempt, status $code)"
-              curl -sI -D /tmp/s4-headers "$URL" -o /dev/null
-              echo "--- full response headers ---"
-              cat /tmp/s4-headers
-              echo "--- last-modified ---"
-              grep -i "^last-modified:" /tmp/s4-headers || echo "(last-modified header not present)"
-              echo "--- http status code ---"
-              echo "$code"
-              echo "::endgroup::"
-              echo "::error::$URL never returned 200 within 10 min (last status $code)"
-              exit 1
-            fi
-            sleep 10
-          done
-          code=$(curl -sI -o /dev/null -w "%{http_code}" "$MANIFEST")
-          if [ "$code" != "200" ]; then
-            echo "::group::Diagnostic headers for $MANIFEST (status $code)"
-            curl -sI -D /tmp/s4-manifest-headers "$MANIFEST" -o /dev/null
-            echo "--- full response headers ---"
-            cat /tmp/s4-manifest-headers
-            echo "--- last-modified ---"
-            grep -i "^last-modified:" /tmp/s4-manifest-headers || echo "(last-modified header not present)"
-            echo "--- http status code ---"
-            echo "$code"
-            echo "::endgroup::"
-            echo "::error::Manifest $MANIFEST returned $code"; exit 1
-          fi
-          echo "Manifest served 200: $MANIFEST"
 
   nightly-s7:
     name: Nightly S7 SIGINT crash-capture (${{ matrix.env }})
@@ -1917,10 +1817,10 @@ jobs:
 
   nightly-s-ext-signer:
     name: Nightly S-ext-signer external PolkadotSigner → in-process Revive (${{ matrix.env }})
-    # Last in the Alice-root DotNS chain: s1-pool → s5 → s6 → s4 → s-ext-signer.
+    # Last in the Alice-root DotNS chain: s1-pool → s5 → s6 → s-ext-signer.
     # All these jobs deploy e2epoolns01.dot (Alice root); running any two concurrently
     # causes Stale tx errors from nonce collisions.
-    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s6, nightly-s4, select-env]
+    needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s6, select-env]
     if: always() && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     # Verifies the in-process Revive transaction path restored by PR #237.
     # playground-cli uses this path when the user authenticates with a phone
@@ -2061,7 +1961,7 @@ jobs:
 
   nightly-report:
     name: Nightly E2E Report
-    needs: [build-nightly, select-env, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s4, nightly-verify-s4, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
+    needs: [build-nightly, select-env, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2159,7 +2059,6 @@ jobs:
           NIGHTLY_S1_DIRECT:      ${{ needs.nightly-s1-direct.result }}
           NIGHTLY_S2:             ${{ needs.nightly-s2-fresh.result }}
           VERIFY_S3:              ${{ needs.nightly-s3.result }}
-          VERIFY_S4:              ${{ needs.nightly-verify-s4.result }}
           NIGHTLY_S5:             ${{ needs.nightly-s5.result }}
           NIGHTLY_S6:             ${{ needs.nightly-s6.result }}
           NIGHTLY_S7:             ${{ needs.nightly-s7.result }}
@@ -2249,7 +2148,6 @@ jobs:
             echo "| S1 direct shard (4 legs) | $(emoji "$NIGHTLY_S1_DIRECT") |"
             echo "| S2 fresh (pool + direct) | $(emoji "$NIGHTLY_S2") |"
             echo "| S3 owned-elsewhere | $(emoji "$VERIFY_S3") |"
-            echo "| S4 gh-pages mirror | $(emoji "$VERIFY_S4") |"
             echo "| S5 commit-reveal race + retry | $(emoji "$NIGHTLY_S5") |"
             echo "| S6 RPC failover | $(emoji "$NIGHTLY_S6") |"
             echo "| S7 SIGINT crash-capture | $(emoji "$NIGHTLY_S7") |"
@@ -2334,8 +2232,6 @@ jobs:
             || needs.nightly-s1-direct.result == 'failure'
             || needs.nightly-s2-fresh.result == 'failure'
             || needs.nightly-s3.result == 'failure'
-            || needs.nightly-s4.result == 'failure'
-            || needs.nightly-verify-s4.result == 'failure'
             || needs.nightly-s5.result == 'failure'
             || needs.nightly-s6.result == 'failure'
             || needs.nightly-s8.result == 'failure'
@@ -2355,8 +2251,6 @@ jobs:
             || needs.nightly-s1-direct.result == 'cancelled'
             || needs.nightly-s2-fresh.result == 'cancelled'
             || needs.nightly-s3.result == 'cancelled'
-            || needs.nightly-s4.result == 'cancelled'
-            || needs.nightly-verify-s4.result == 'cancelled'
             || needs.nightly-s5.result == 'cancelled'
             || needs.nightly-s6.result == 'cancelled'
             || needs.nightly-s8.result == 'cancelled'
@@ -2439,11 +2333,9 @@ jobs:
 
   nightly-verify-telemetry:
     name: Nightly — telemetry assertions
-    # Run after the matrix shards whose spans we assert on. S4 is excluded:
-    # its spans share the pool domain with S1-pool and would create
-    # ambiguous double-counts. S4 correctness is covered by nightly-verify-s4
-    # (HTTP endpoint check). `if: always()` so this job runs even when a
-    # matrix shard failed — assertion failures are independent of shard results.
+    # Run after the matrix shards whose spans we assert on. `if: always()` so
+    # this job runs even when a matrix shard failed — assertion failures are
+    # independent of shard results.
     needs: [build-nightly, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3]
     if: false  # disabled in public snapshot: telemetry assertions need Parity Sentry (re-enable when a public Sentry is wired)
     runs-on: ubuntu-latest
@@ -2482,7 +2374,7 @@ jobs:
     # Looks back 24h across all nightly pool-mode deploys; runs even on shard
     # failures since the assertion is independent of any one scenario's
     # success.
-    needs: [build-nightly, nightly-s1-pool, nightly-s2-fresh, nightly-s3, nightly-s4, nightly-s5, nightly-s6, nightly-s-inc]
+    needs: [build-nightly, nightly-s1-pool, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s-inc]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 10

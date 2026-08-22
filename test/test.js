@@ -44,7 +44,6 @@ import * as dagPb from "@ipld/dag-pb";
 import { encodeErrorResult } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
-import { parseGitRemoteUrl, resolveOwnerRepo, normalizeDomainFilename, mirrorUrl, buildManifest, GH_PAGES_MIRROR_MAX_BYTES, MIRROR_BOT_GIT_OVERRIDES } from "../dist/gh-pages-mirror.js";
 import { PassThrough } from "node:stream";
 
 // ---------------------------------------------------------------------------
@@ -1994,14 +1993,14 @@ describe("withDeploySpan", () => {
     // The catch block at #155 delegates classification to isExpectedError.
     // Positive cases are exercised in the "isExpectedError classification"
     // describe block above. Here we pin the negative cases that represent
-    // real tool friction (chunk timeouts, WS halts, gh-pages poll failures)
+    // real tool friction (chunk timeouts, WS halts, gateway poll failures)
     // so a future regex loosening can't silently suppress setStatus errors.
     // Live runtime mocking of the catch block is not feasible: @sentry/node
     // is imported via top-level `await` into a frozen ESM namespace and the
     // telemetry module's own Sentry reference is locked at module-load time.
     assert.strictEqual(isExpectedError("chunk(nonce:5) timed out after 60s"), false);
     assert.strictEqual(isExpectedError("WebSocket halted: RPC unreachable"), false);
-    assert.strictEqual(isExpectedError("gh-pages deploy poll exhausted retries"), false);
+    assert.strictEqual(isExpectedError("gateway manifest poll exhausted retries"), false);
     assert.strictEqual(isExpectedError("unknown CAR transport failure"), false);
   });
 
@@ -6721,9 +6720,8 @@ describe("buildCliFlagsSummary", () => {
   });
 
   test("includes safe flag values verbatim", () => {
-    const s = buildCliFlagsSummary({ jsMerkle: true, ghPagesMirror: true, poolSize: 12, tag: "canary" });
+    const s = buildCliFlagsSummary({ jsMerkle: true, poolSize: 12, tag: "canary" });
     assert.ok(s.includes("--js-merkle"));
-    assert.ok(s.includes("--gh-pages-mirror"));
     assert.ok(s.includes("--pool-size 12"));
     assert.ok(s.includes("--tag canary"));
   });
@@ -7730,40 +7728,6 @@ describe("setDeploySentryTag", () => {
 });
 
 // ---------------------------------------------------------------------------
-// gh-pages mirror freshness poll — non-fatal signal (issue #174)
-// ---------------------------------------------------------------------------
-describe("gh-pages-mirror freshness signalling", () => {
-  // The freshness poll is a courtesy check that times out reliably on slow
-  // GitHub Pages CDN propagation. Calling captureWarning on timeout flips
-  // deploy.sad:true on the root span, contaminating the failure-rate
-  // dashboard widget. Per ratio-attribute convention, both true/false
-  // outcomes must be recorded as a span attribute, not as a warning.
-  test("source: freshness timeout no longer calls captureWarning", () => {
-    // Anchor on the literal captureWarning message that previously fired
-    // on timeout. If anyone re-introduces that exact warning, this test
-    // fails — robust to surrounding reformatting because we're not
-    // matching code structure, just the message string.
-    const src = fs.readFileSync("src/deploy.ts", "utf-8");
-    assert.ok(
-      !src.includes("gh-pages mirror freshness poll timed out"),
-      "freshness timeout branch must not raise the captureWarning that flips deploy.sad and contaminates dashboards (#174)",
-    );
-  });
-
-  test("source: both freshness outcomes set deploy.gh_pages_freshness_verified attribute", () => {
-    const src = fs.readFileSync("src/deploy.ts", "utf-8");
-    assert.ok(
-      /setDeployAttribute\("deploy\.gh_pages_freshness_verified", "true"\)/.test(src),
-      "verified branch must record deploy.gh_pages_freshness_verified=true",
-    );
-    assert.ok(
-      /setDeployAttribute\("deploy\.gh_pages_freshness_verified", "false"\)/.test(src),
-      "timeout branch must record deploy.gh_pages_freshness_verified=false",
-    );
-  });
-});
-
-// ---------------------------------------------------------------------------
 // e2e-sigint-scenario.mjs anchor sync (issue #181 Proposal 4)
 // ---------------------------------------------------------------------------
 // The S7 chaos scenario greps for two literal log strings. If src/ or bin/
@@ -7828,187 +7792,6 @@ describe("S7 SIGINT scenario anchor sync", () => {
         `src/run-state.ts no longer contains ${fragment} — update the harness or remove this guard`,
       );
     }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// gh-pages-mirror — pure helpers (issue #133)
-// ---------------------------------------------------------------------------
-describe("gh-pages-mirror", () => {
-  describe("parseGitRemoteUrl", () => {
-    test("parses https github URLs with .git suffix", () => {
-      assert.deepEqual(parseGitRemoteUrl("https://github.com/paritytech/bulletin-deploy.git"), { owner: "paritytech", repo: "bulletin-deploy" });
-    });
-    test("parses https github URLs without .git suffix", () => {
-      assert.deepEqual(parseGitRemoteUrl("https://github.com/paritytech/bulletin-deploy"), { owner: "paritytech", repo: "bulletin-deploy" });
-    });
-    test("parses https URLs with embedded credentials", () => {
-      assert.deepEqual(parseGitRemoteUrl("https://x-access-token:TOKEN@github.com/paritytech/bulletin-deploy.git"), { owner: "paritytech", repo: "bulletin-deploy" });
-    });
-    test("parses ssh github URLs", () => {
-      assert.deepEqual(parseGitRemoteUrl("git@github.com:paritytech/bulletin-deploy.git"), { owner: "paritytech", repo: "bulletin-deploy" });
-    });
-    test("handles repo names with dots and dashes", () => {
-      assert.deepEqual(parseGitRemoteUrl("git@github.com:EnderOfWorlds007/my.app.git"), { owner: "EnderOfWorlds007", repo: "my.app" });
-    });
-    test("returns null on unrecognised URL shapes", () => {
-      assert.strictEqual(parseGitRemoteUrl("file:///tmp/nope"), null);
-      assert.strictEqual(parseGitRemoteUrl(""), null);
-    });
-  });
-
-  describe("resolveOwnerRepo", () => {
-    const origEnv = process.env.GITHUB_REPOSITORY;
-    test("prefers GITHUB_REPOSITORY env over git remote", () => {
-      process.env.GITHUB_REPOSITORY = "env-owner/env-repo";
-      try {
-        assert.deepEqual(resolveOwnerRepo("/does/not/exist"), { owner: "env-owner", repo: "env-repo" });
-      } finally {
-        if (origEnv === undefined) delete process.env.GITHUB_REPOSITORY;
-        else process.env.GITHUB_REPOSITORY = origEnv;
-      }
-    });
-    test("returns null when neither env nor git remote available", () => {
-      const prev = process.env.GITHUB_REPOSITORY;
-      delete process.env.GITHUB_REPOSITORY;
-      try {
-        const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "mirror-no-remote-"));
-        try {
-          assert.strictEqual(resolveOwnerRepo(tmp), null);
-        } finally {
-          fs.rmSync(tmp, { recursive: true, force: true });
-        }
-      } finally {
-        if (prev !== undefined) process.env.GITHUB_REPOSITORY = prev;
-      }
-    });
-  });
-
-  describe("normalizeDomainFilename", () => {
-    test("adds .dot suffix when missing", () => {
-      assert.strictEqual(normalizeDomainFilename("myapp"), "myapp.dot");
-    });
-    test("preserves an existing .dot suffix", () => {
-      assert.strictEqual(normalizeDomainFilename("myapp.dot"), "myapp.dot");
-    });
-    test("rejects labels with unexpected characters (directory traversal / case)", () => {
-      assert.throws(() => normalizeDomainFilename("../etc/passwd"), /Invalid domain label/);
-      assert.throws(() => normalizeDomainFilename("MyApp"), /Invalid domain label/);
-      assert.throws(() => normalizeDomainFilename("my_app"), /Invalid domain label/);
-      assert.throws(() => normalizeDomainFilename(""), /Invalid domain label/);
-    });
-  });
-
-  describe("mirrorUrl", () => {
-    test("assembles a GitHub Pages URL keyed by domain filename", () => {
-      assert.strictEqual(
-        mirrorUrl("paritytech", "bulletin-deploy", "myapp.dot"),
-        "https://paritytech.github.io/bulletin-deploy/bulletin/myapp.dot.car",
-      );
-    });
-  });
-
-  describe("buildManifest", () => {
-    test("captures the fields a host needs to reason about the mirror", () => {
-      const m = buildManifest({
-        domain: "myapp",
-        cid: "bafybeiabcdef",
-        toolVersion: "0.6.14",
-        bulletinRpc: "wss://paseo-bulletin-rpc.polkadot.io",
-        encrypted: false,
-        deployedAt: "2026-04-19T10:00:00.000Z",
-        sourceRepo: "paritytech/bulletin-deploy",
-        sourceCommit: "abcdef1",
-      });
-      assert.deepEqual(m, {
-        domain: "myapp.dot",
-        cid: "bafybeiabcdef",
-        toolVersion: "0.6.14",
-        deployedAt: "2026-04-19T10:00:00.000Z",
-        encrypted: false,
-        bulletinRpc: "wss://paseo-bulletin-rpc.polkadot.io",
-        sourceRepo: "paritytech/bulletin-deploy",
-        sourceCommit: "abcdef1",
-      });
-    });
-    test("defaults deployedAt to the current time when omitted", () => {
-      const before = Date.now();
-      const m = buildManifest({
-        domain: "myapp.dot",
-        cid: "bafybeia",
-        toolVersion: "0.0.0",
-        bulletinRpc: "wss://x",
-        encrypted: false,
-      });
-      const after = Date.now();
-      const ts = Date.parse(m.deployedAt);
-      assert.ok(ts >= before && ts <= after, `deployedAt ${m.deployedAt} should sit in [${before}, ${after}]`);
-    });
-  });
-
-  describe("size guard constant", () => {
-    test("matches GitHub's 100 MB single-file soft limit", () => {
-      assert.strictEqual(GH_PAGES_MIRROR_MAX_BYTES, 100 * 1024 * 1024);
-    });
-  });
-
-  describe("bot-commit git overrides", () => {
-    test("forces commit.gpgsign=false so a developer's global signing config doesn't time out the auto-commit", () => {
-      assert.ok(
-        MIRROR_BOT_GIT_OVERRIDES.includes("commit.gpgsign=false"),
-        `MIRROR_BOT_GIT_OVERRIDES must contain "commit.gpgsign=false"; got: ${JSON.stringify(MIRROR_BOT_GIT_OVERRIDES)}`,
-      );
-    });
-    test("identifies as bulletin-deploy@noreply (not the developer's identity)", () => {
-      assert.ok(MIRROR_BOT_GIT_OVERRIDES.includes("user.email=bulletin-deploy@noreply.github.com"));
-      assert.ok(MIRROR_BOT_GIT_OVERRIDES.includes("user.name=bulletin-deploy"));
-    });
-    test("uses git's -c <key>=<value> form so config overrides apply only to this invocation", () => {
-      // Each override entry must be paired with a -c flag; check structure.
-      for (let i = 0; i < MIRROR_BOT_GIT_OVERRIDES.length; i += 2) {
-        assert.strictEqual(MIRROR_BOT_GIT_OVERRIDES[i], "-c", `entry ${i} must be "-c"`);
-        assert.match(MIRROR_BOT_GIT_OVERRIDES[i + 1], /^[a-z.]+=/, `entry ${i + 1} must be key=value`);
-      }
-    });
-  });
-
-  describe("PAD_GH_PAGES_REPO env-var threading (issue #11)", () => {
-    // The fix for #11 lives entirely in deploy.ts: both mirrorToGitHubPages call
-    // sites must forward process.env.PAD_GH_PAGES_REPO as repoPath so CI can
-    // point the mirror at a real git checkout instead of the non-git workspace
-    // root. We verify the wiring by source-scanning deploy.ts; a behavioural test
-    // would require a live git push and cannot run offline.
-    const deploySrc = fs.readFileSync("src/deploy.ts", "utf-8");
-    test("both mirrorToGitHubPages call sites thread PAD_GH_PAGES_REPO as repoPath", () => {
-      // Each call site should include `repoPath: process.env.PAD_GH_PAGES_REPO`
-      // (or `|| undefined` variant) in its argument object.
-      const matches = [...deploySrc.matchAll(/repoPath:\s*process\.env\.PAD_GH_PAGES_REPO/g)];
-      assert.strictEqual(
-        matches.length,
-        2,
-        `Expected 2 mirrorToGitHubPages call sites to thread PAD_GH_PAGES_REPO as repoPath, found ${matches.length}. ` +
-          "Both the CAR-bytes path (~line 2929) and the onCarReady callback path (~line 2995) must include " +
-          "`repoPath: process.env.PAD_GH_PAGES_REPO || undefined`."
-      );
-    });
-    test("deploy.yml exports PAD_GH_PAGES_REPO when gh-pages-mirror is true", () => {
-      const deployYml = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
-      assert.ok(
-        deployYml.includes("PAD_GH_PAGES_REPO"),
-        "deploy.yml must export PAD_GH_PAGES_REPO so the CLI child process inherits the git repo context"
-      );
-      assert.ok(
-        deployYml.includes(".gh-pages-mirror-ctx"),
-        "deploy.yml must reference the .gh-pages-mirror-ctx checkout path"
-      );
-    });
-    test("deploy.yml includes a gh-pages mirror checkout step", () => {
-      const deployYml = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
-      assert.ok(
-        deployYml.includes("Checkout repo for gh-pages mirror context"),
-        "deploy.yml must contain a 'Checkout repo for gh-pages mirror context' step (issue #11)"
-      );
-    });
   });
 });
 
@@ -9161,15 +8944,10 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     assert.match(job, /^ {4}runs-on:\s*ubuntu-latest$/m,
       "nightly-pr-coverage runs on ubuntu-latest");
     // 10 matrix legs covering 8 distinct scenario names (s1 and s-inc each appear twice).
-    // s4 is deliberately NOT in this matrix — its --gh-pages-mirror step needs
-    // `contents: write` and this job runs with the workflow's default `contents: read`.
-    // The dedicated nightly-s4 job (via reusable deploy.yml) covers s4 with the right scope.
     for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation"]) {
       assert.match(job, new RegExp(`scenario:\\s*${sc.replace(/-/g, "-")}\\b`),
         `nightly-pr-coverage matrix must include scenario ${sc}`);
     }
-    assert.doesNotMatch(job, /scenario:\s*s4\b/,
-      "nightly-pr-coverage must NOT include scenario s4 — gh-pages push needs contents:write that this matrix doesn't have");
     // Schedule trigger must still fire it.
     assert.match(job, /github\.event_name == 'schedule'/,
       "nightly-pr-coverage must trigger on schedule");
@@ -9179,24 +8957,6 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
     const report = jobBlock(e2e, "nightly-report");
     assert.match(report, /nightly-pr-coverage/, "nightly-report needs: must include nightly-pr-coverage");
-  });
-
-  test("e2e.yml: nightly-verify-s4 step has ≥10 min poll budget and captures headers on failure", () => {
-    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
-    const verifyBlock = jobBlock(e2e, "nightly-verify-s4");
-
-    // Poll budget: 60 × 10s = 10 min (regression guard against dropping back to 5 min).
-    assert.match(verifyBlock, /seq 1 60/, "nightly-verify-s4 poll step must use seq 1 60 (60 × 10 s = 10 min budget)");
-
-    // Job-level cap must leave headroom above the poll budget + setup time.
-    const jobTimeout = Number(verifyBlock.match(/^ {4}timeout-minutes:\s*(\d+)/m)?.[1] ?? 0);
-    assert.ok(jobTimeout >= 15, `nightly-verify-s4 job timeout-minutes is ${jobTimeout}, must be ≥ 15 to cover 10-min poll + setup`);
-
-    // Diagnostic capture: curl -sI -D writes headers to a file on failure.
-    assert.match(verifyBlock, /curl -sI -D/, "nightly-verify-s4 error path must capture full response headers via curl -sI -D");
-
-    // last-modified header must be extracted and printed for CDN geo-cache triage.
-    assert.match(verifyBlock, /last-modified/, "nightly-verify-s4 error path must print the last-modified header value for CDN geo-cache triage");
   });
 
   // ---- publish-wait gate (issue #23) -------------------------------------
@@ -9523,7 +9283,7 @@ describe("classifySadReason", () => {
   });
 
   test("returns 'other' for unclassified warnings", () => {
-    assert.strictEqual(classifySadReason("gh-pages mirror failed"), "other");
+    assert.strictEqual(classifySadReason("unrecognised warning shape"), "other");
     assert.strictEqual(classifySadReason("something unexpected happened"), "other");
   });
 });
@@ -13190,10 +12950,9 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
   });
 
-  test("release/nightly reusable E2E jobs read env from matrix (fan-out) or selected_env (S4 single)", () => {
+  test("release/nightly reusable E2E jobs read env from matrix (fan-out)", () => {
     // In PR #743 (nightly fan-out), nightly reusable-workflow callers pass
     // env: ${{ matrix.env }} (fed by healthy_envs on schedule, or [selected_env] on release).
-    // S4 is intentionally excluded from fan-out (gh-pages is a shared resource).
     const workflow = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
     for (const jobName of ["nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh"]) {
       const block = workflowJobBlock(workflow, jobName);
@@ -13205,14 +12964,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       assert.doesNotMatch(block, /^ {6}env:\s*paseo-next-v2$/m, `${jobName} must NOT hardcode env: paseo-next-v2`);
       assert.doesNotMatch(block, /^ {6}env:\s*paseo-next$/m, `${jobName} must not target the old paseo-next contracts`);
     }
-    // S4: gh-pages mirror uses selected_env (single-env) — intentional, not a bug.
-    const s4 = workflowJobBlock(workflow, "nightly-s4");
-    assert.match(
-      s4,
-      /^ {6}env:\s*\$\{\{\s*needs\.select-env\.outputs\.selected_env\s*\}\}$/m,
-      "nightly-s4 must use selected_env (not matrix.env) — gh-pages is a shared resource",
-    );
-    assert.doesNotMatch(s4, /^ {6}env:\s*paseo-next-v2$/m, "nightly-s4 must NOT hardcode env: paseo-next-v2");
 
     assertNoStatusLabel("e2epoolns01");
     assertNoStatusLabel("e2edirectdp01");
@@ -13222,7 +12973,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.match(workflowJobBlock(workflow, "nightly-s1-pool"), /dotns-domain:\s*e2epoolns01\.dot/, "nightly S1 pool must use a NoStatus label");
     assert.match(workflowJobBlock(workflow, "nightly-s1-direct"), /dotns-domain:\s*e2edirectdp01\.dot/, "nightly S1 direct must use a NoStatus label owned by the direct derivation");
     assert.match(workflowJobBlock(workflow, "nightly-s2-fresh"), /dotns-domain:\s*e2enightly\$\{\{ github\.run_id \}\}\$\{\{ matrix\.signer \}\}00\.dot/, "nightly S2 fresh labels must classify as NoStatus");
-    assert.match(workflowJobBlock(workflow, "nightly-s4"), /dotns-domain:\s*e2epoolns01\.dot/, "nightly S4 mirror must use the NoStatus pool label");
   });
 
   test("release/nightly inline E2E jobs read PAD_ENV from matrix.env (fan-out)", () => {
@@ -13254,7 +13004,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
 
     assert.match(workflowJobBlock(workflow, "nightly-s5"), /LABEL:\s*"e2es5\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00\.dot"/, "nightly S5 must use a dynamic NoStatus label");
     assert.match(workflowJobBlock(workflow, "nightly-s6"), /build e2epoolns01\.dot/, "nightly S6 must deploy the v2 NoStatus pool label");
-    assert.match(workflowJobBlock(workflow, "nightly-verify-s4"), /bulletin\/e2epoolns01\.dot\.car/, "nightly S4 verification must follow the v2 NoStatus pool label");
     assert.match(workflowJobBlock(workflow, "nightly-s7"), /LABEL:\s*e2epoolns01/, "nightly S7 must use the v2 NoStatus pool label");
     assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00\.dot/, "nightly S-CAR must use a dynamic NoStatus label");
     const sExt = workflowJobBlock(workflow, "nightly-s-ext-signer");
@@ -13317,13 +13066,13 @@ describe("paseo-next-v2 E2E harness wiring", () => {
         `>> FAIL: nightly-fan-out: ${jobName} must use fromJSON(needs.select-env.outputs.healthy_envs) in its matrix`,
       );
     }
-    // 5. S4, nightly-pr-coverage, nightly-s-inc intentionally do NOT fan out.
-    for (const jobName of ["nightly-s4", "nightly-pr-coverage", "nightly-s-inc"]) {
+    // 5. nightly-pr-coverage, nightly-s-inc intentionally do NOT fan out.
+    for (const jobName of ["nightly-pr-coverage", "nightly-s-inc"]) {
       const block = workflowJobBlock(wf, jobName);
       assert.doesNotMatch(
         block,
         /fromJSON\(\s*needs\.select-env\.outputs\.healthy_envs\s*\)/,
-        `${jobName} must NOT fan out via healthy_envs (gh-pages shared resource or include-matrix incompatibility)`,
+        `${jobName} must NOT fan out via healthy_envs (include-matrix incompatibility)`,
       );
     }
   });

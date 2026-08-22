@@ -103,11 +103,10 @@ export function scrubSecrets(text: string): string {
 
 // Summarise which flags were passed without ever leaking their values.
 // Presence-only for --mnemonic/--password/--derivation-path/--rpc; values
-// for safe flags (--pool-size, --tag, --js-merkle, --gh-pages-mirror).
+// for safe flags (--pool-size, --tag, --js-merkle).
 export function buildCliFlagsSummary(flags: Record<string, unknown>): string {
   const parts: string[] = [];
   if (flags.jsMerkle) parts.push("--js-merkle");
-  if (flags.ghPagesMirror) parts.push("--gh-pages-mirror");
   if (flags.publish) parts.push("--publish");
   if (flags.unpublish) parts.push("--unpublish");
   if (flags.failOnPublishError) parts.push("--fail-on-publish-error");

@@ -116,6 +116,14 @@ function composePlaceholderExecutable(
         : {}),
     };
   }
+  if (exec.kind === "funding") {
+    return {
+      $v: 1,
+      kind: "funding",
+      appVersion: exec.appVersion,
+      modes: exec.modes,
+    };
+  }
   return {
     $v: 1,
     kind: "worker",

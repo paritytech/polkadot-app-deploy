@@ -135,6 +135,14 @@ case "$MODE" in
     # plus idempotent re-run. Needs a per-run unique label (fresh registration).
     GITHUB_RUN_ID=$(date +%s) GITHUB_SHA=$(openssl rand -hex 4) \
       run s-transfer pool js
+    # S-TRANSFER-SUBNAME: register a parent + app.<parent> subname as Alice,
+    # hand the SUBNAME over via `transfer` (setSubnodeOwner path, bulletin
+    # #150/#151), verify on-chain, idempotent re-run, plus a negative leg
+    # (transfer a subname under a parent you don't own must fail with the
+    # actionable ownership error, not "Invalid domain label"). Needs fresh
+    # unique parent labels each run.
+    GITHUB_RUN_ID=$(date +%s) GITHUB_SHA=$(openssl rand -hex 4) \
+      run s-transfer-subname pool js
     # S-INC: incremental upload v2. Two deploys to e2einc.dot in succession;
     # second must show gateway-probe + chunk-skip signals. Both backends.
     # Same DotNS owner as other s-* scenarios; max-parallel: 1 in CI, here

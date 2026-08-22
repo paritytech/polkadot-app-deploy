@@ -1108,6 +1108,23 @@ export function convertWeiToNative(weiValue: bigint): bigint { return weiValue /
 export function computeDomainTokenId(label: string, tld: string = DEFAULT_TLD): bigint {
   return BigInt(namehash(`${label}.${tld}`));
 }
+
+// Shared by transferName and transferSubname (and the CLI's own --to
+// resolution in src/commands/transfer.ts): a transfer recipient of the zero
+// address (0x0000...0000) is not "nobody's account" here — it's the ERC-721 /
+// registry burn sentinel. Neither transferFrom nor setSubnodeOwner reject it
+// on-chain, so an unguarded `--to 0x000...000` (a plausible typo for an empty
+// --to, or a copy-paste mistake) would silently and irreversibly destroy the
+// name/subname. Fail fast, before any chain read, with a message that names
+// the exact target so the caller understands what almost happened.
+export function assertNotZeroRecipient(toH160: string, fullName: string): void {
+  if (toH160.toLowerCase() === zeroAddress) {
+    throw new Error(
+      `Refusing to transfer ${fullName} to the zero address (${zeroAddress}): this would permanently burn ` +
+      `it — there is no owner to recover it from afterward. Pass a real recipient with --to <0xH160>.`,
+    );
+  }
+}
 export function countTrailingDigits(label: string): number { let count = 0; for (let i = label.length - 1; i >= 0; i--) { const code = label.charCodeAt(i); if (code >= 48 && code <= 57) count++; else break; } return count; }
 export function stripTrailingDigits(label: string): string { return label.replace(/\d+$/, "").replace(/-$/, ""); }
 
@@ -2936,6 +2953,7 @@ export class DotNS {
   ): Promise<{ status: "ok" | "skipped-already-owned"; txHash?: string; feeWei?: bigint }> {
     this.ensureConnected();
     const validated = validateDomainLabel(label);
+    assertNotZeroRecipient(toH160, `${validated}.${this._tld}`);
     const tokenId = computeDomainTokenId(validated, this._tld);
     const owner = (await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_TRANSFER_ABI, "ownerOf", [tokenId]), 30000, "ownerOf")) as string;
     if (owner.toLowerCase() === toH160.toLowerCase()) {
@@ -2980,6 +2998,7 @@ export class DotNS {
   ): Promise<{ status: "ok" | "skipped-already-owned"; txHash?: string }> {
     this.ensureConnected();
     const fullName = `${sublabel}.${parentLabel}.${this._tld}`;
+    assertNotZeroRecipient(toH160, fullName);
     const parentNode = namehash(`${parentLabel}.${this._tld}`);
     const subnode = namehash(fullName);
 

@@ -512,6 +512,139 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
   });
 
+  // S-TRANSFER-SUBNAME — the `transfer` command's subname path (port of
+  // bulletin-deploy PR #150/#151: the `app.<name>` subnames deploy itself
+  // creates could not be moved by `transfer` at all — a subname argument
+  // failed validateDomainLabel's "Invalid domain label" check on the `.`, and
+  // even past that transferName only moves base names as ERC-721 tokens, so
+  // there was no code path for a subname at all). No E2E coverage of this
+  // path existed anywhere before this scenario.
+  //
+  // Two legs under fresh-per-run parents (mirrors S-SUBDOMAIN's before()):
+  //   handover          — register app.<parent> as Alice, hand it to a
+  //                        recipient via the CLI, verify the on-chain subnode
+  //                        owner actually changed, then re-run for idempotency
+  //   not-parent-owner  — attempt to transfer a subname whose parent is owned
+  //                        by Alice, but signed as an account that is NOT
+  //                        Alice; must fail with the actionable
+  //                        parent-ownership error, never the old misleading
+  //                        "Invalid domain label"
+  describe("S-TRANSFER-SUBNAME — transfer a subname via setSubnodeOwner", { skip: SCENARIO !== "s-transfer-subname", concurrency: false }, () => {
+    const RECIPIENT_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+    let freshParent = "";
+    let otherParent = "";
+
+    before(async () => {
+      freshParent = pickFreshRunLabel("e2exfersub");
+      otherParent = pickFreshRunLabel("e2exfernop");
+      const connectOpts = await resolveDotnsEnvConnectOptions();
+      const reg = new DotNS();
+      await reg.connect({ mnemonic: DEFAULT_MNEMONIC, ...connectOpts });
+      try {
+        // freshParent: registered AND given an "app" subname, both owned by
+        // Alice — the handover leg transfers app.<freshParent> to the recipient.
+        await reg.register(freshParent);
+        await reg.registerSubdomain("app", freshParent);
+        // otherParent: registered by Alice only. No subname needed — the
+        // not-parent-owner leg must fail at the parent-ownership check
+        // before transferSubname ever reads the subnode.
+        await reg.register(otherParent);
+      } finally {
+        reg.disconnect();
+      }
+    });
+
+    test("handover — register app.<parent> as Alice, transfer to a recipient, verify on-chain, idempotent re-run", { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
+      const tld = await resolveE2eTld();
+      const target = `app.${freshParent}.${tld}`;
+      const envArgs = PAD_ENV ? ["--env", PAD_ENV] : [];
+
+      const t1 = await runBulletinDeploy({
+        args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
+        env: rpcEnv(),
+        timeoutMs: DEPLOY_TIMEOUT_MS,
+      });
+      assert.equal(
+        t1.code, 0,
+        `>> FAIL: S-TRANSFER-SUBNAME handover: transfer command exited ${t1.code}: ${(t1.stderr || t1.stdout).split("\n").slice(-3).join(" ")}`,
+      );
+      assert.match(
+        t1.stdout, /Transferred .* to 0x41dccbd4/i,
+        ">> FAIL: S-TRANSFER-SUBNAME handover: transfer command did not report a successful handover to the recipient",
+      );
+
+      // On-chain proof the subnode owner actually changed. Any connected
+      // account can read it — checkSubdomainOwnership returns the raw
+      // registry owner regardless of which account is connected; only its
+      // `owned` field is relative to the connected signer, and we don't use
+      // that here.
+      const verifier = new DotNS();
+      await verifier.connect({ mnemonic: DEFAULT_MNEMONIC, ...(await resolveDotnsEnvConnectOptions()) });
+      let onChainOwner;
+      try {
+        ({ owner: onChainOwner } = await verifier.checkSubdomainOwnership("app", freshParent));
+      } finally {
+        verifier.disconnect();
+      }
+      assert.equal(
+        onChainOwner?.toLowerCase(), RECIPIENT_H160.toLowerCase(),
+        `>> FAIL: S-TRANSFER-SUBNAME handover: on-chain subnode owner is ${onChainOwner}, expected the recipient ${RECIPIENT_H160} — the CLI reported success but the registry disagrees`,
+      );
+
+      // Re-run: idempotent no-op (recipient already owns it).
+      const t2 = await runBulletinDeploy({
+        args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
+        env: rpcEnv(),
+        timeoutMs: DEPLOY_TIMEOUT_MS,
+      });
+      assert.equal(
+        t2.code, 0,
+        `>> FAIL: S-TRANSFER-SUBNAME handover: idempotent re-run exited ${t2.code}: ${(t2.stderr || t2.stdout).split("\n").slice(-3).join(" ")}`,
+      );
+      assert.match(
+        t2.stdout, /already owned by/i,
+        ">> FAIL: S-TRANSFER-SUBNAME handover: second transfer should be a no-op (already-owned), not a re-transfer",
+      );
+    });
+
+    // Regression guard for the ORIGINAL bug this scenario exists to cover: a
+    // subname argument must never fall through to validateDomainLabel's
+    // "Invalid domain label" rejection, and the real failure mode (signer
+    // isn't the parent owner) must be reported actionably.
+    test("not-parent-owner — transferring a subname under a parent you don't own fails with the actionable ownership error, not 'Invalid domain label'", { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
+      const tld = await resolveE2eTld();
+      const target = `app.${otherParent}.${tld}`;
+      const envArgs = PAD_ENV ? ["--env", PAD_ENV] : [];
+
+      // otherParent is owned by Alice (root, DEFAULT_MNEMONIC). Sign this
+      // attempt as the well-known dev account //Bob instead — a real, funded
+      // account on this testnet (see attemptTestnetTopUp in src/dotns.ts) but
+      // NOT the parent owner. DOTNS_KEY_URI is read directly by
+      // DotNS.connect() and takes precedence over the CLI's default mnemonic;
+      // unlike --mnemonic (which transfer.ts doesn't expose a
+      // --derivation-path for), it's parsed as a full Substrate URI (phrase +
+      // derivation), giving us a distinct signer identity with zero CLI
+      // plumbing changes.
+      const t = await runBulletinDeploy({
+        args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
+        env: { ...rpcEnv(), DOTNS_KEY_URI: `${DEFAULT_MNEMONIC}//Bob` },
+        timeoutMs: DEPLOY_TIMEOUT_MS,
+      });
+      assert.notEqual(
+        t.code, 0,
+        `>> FAIL: S-TRANSFER-SUBNAME not-parent-owner: expected a non-zero exit (signer //Bob does not own ${otherParent}.${tld}), got exit 0 — the parent-ownership guard did not fire`,
+      );
+      assert.match(
+        t.stderr, /only the owner of the parent/i,
+        `>> FAIL: S-TRANSFER-SUBNAME not-parent-owner: expected the actionable parent-ownership error, got: ${t.stderr.split("\n").slice(-5).join(" ")}`,
+      );
+      assert.doesNotMatch(
+        t.stderr, /Invalid domain label/i,
+        ">> FAIL: S-TRANSFER-SUBNAME not-parent-owner: got the OLD misleading 'Invalid domain label' rejection instead — the subname argument fell through to validateDomainLabel rather than being routed to transferSubname (this is the exact bug #150/#151 fixed)",
+      );
+    });
+  });
+
   describe("S3 — domain owned by different account", { skip: SCENARIO !== "s3" }, () => {
     test(`deploy to pre-owned label rejects with exit 78`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
       const { fixtureDir } = await mutateFixture(RUN_TAG);

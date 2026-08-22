@@ -1420,6 +1420,24 @@ describe("classifyErrorKind", () => {
     );
   });
 
+  // Decoded ABI custom-error reverts from src/dotns.ts's Publisher paths
+  // (publishLabel / unpublishLabel) — these have no "Contract reverted" /
+  // flags=N / ContractReverted envelope, so they need their own alternative
+  // on the contract-revert rule.
+  //
+  // Reason deliberately NOT NoPersonhood: the `reverted: NoPersonhood`
+  // rule sits ahead of contract-revert and claims that one for
+  // naming.pop_required (the kind that names the remedy). See the
+  // "naming.pop_required: Publisher.publish NoPersonhood revert reason" test.
+  // Every other decoded Publisher error still lands here.
+  test("contract-revert: Publisher.publish reverted with decoded custom error", () => {
+    assert.strictEqual(classifyErrorKind("Publisher.publish reverted: NotOwner"), "contract-revert");
+  });
+
+  test("contract-revert: Publisher.unpublish reverted with decoded custom error", () => {
+    assert.strictEqual(classifyErrorKind("Publisher.unpublish reverted: CooldownActive"), "contract-revert");
+  });
+
   test("chain-timeout: timed out waiting for block", () => {
     assert.strictEqual(classifyErrorKind("finalize-registration timed out after 90s waiting for block confirmation"), "chain-timeout");
   });
@@ -1730,6 +1748,18 @@ describe("classifyErrorKind", () => {
       "chain.extrinsic_expired",
     );
   });
+  // Verbatim live message from a Sentry span that landed in `unknown`: the
+  // 100-char truncation at src/deploy.ts's re-upload path cut the 17-char
+  // variant name in half, so the rule must match the surviving prefix.
+  test("chain.extrinsic_expired: AncientBirthBlock truncated mid-variant by the 100-char slice", () => {
+    const msg = 'Nonce-collision re-upload of chunk 0 failed after 3 attempts: chunk(nonce:34242) subscription error: {\n  "type": "Invalid",\n  "value": {\n    "type": "AncientBirth';
+    const got = classifyErrorKind(msg);
+    assert.strictEqual(
+      got,
+      "chain.extrinsic_expired",
+      `>> FAIL: truncated AncientBirthBlock: the 100-char inner-error slice cuts the variant name to "AncientBirth", so matching the full name sends the span to unknown; got ${got}`,
+    );
+  });
 
   // chain.quota_exhausted
   test("chain.quota_exhausted: Bulletin quota exhausted", () => {
@@ -1758,6 +1788,53 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(
       classifyErrorKind("Chunk 3 failed after 3 retries: commit timed out after 300000ms"),
       "chain.tx_timeout",
+    );
+  });
+
+  // chain.bad_proof (Sentry 7d sweep: 18/21 unknown-kind spans on current
+  // versions were this family — Invalid::BadProof on chunk upload, truncated
+  // at 100 chars by both src/deploy.ts producer sites, so the JSON is often
+  // cut off mid-object).
+  test("chain.bad_proof: nonce-collision re-upload path, truncated live message", () => {
+    assert.strictEqual(
+      classifyErrorKind(`Nonce-collision re-upload of chunk 0 failed after 3 attempts: chunk(nonce:659) subscription error: {
+  "type": "Invalid",
+  "value": {
+    "type": "BadProof"
+  }`),
+      "chain.bad_proof",
+    );
+  });
+  test("chain.bad_proof: chunk-retry path, truncated live message", () => {
+    assert.strictEqual(
+      classifyErrorKind(`Chunk 6 failed after 3 retries: chunk(nonce:39941) subscription error: {
+  "type": "Invalid",
+  "value": {
+    "type": "BadProof"`),
+      "chain.bad_proof",
+    );
+  });
+  test("chain.bad_proof: bare Invalid::BadProof string", () => {
+    assert.strictEqual(classifyErrorKind("Invalid::BadProof"), "chain.bad_proof");
+  });
+  // Regression guard: chain.bad_proof is inserted right after nonce-stale in
+  // ERROR_KIND_RULES precedence order — pin that a Stale-shaped message still
+  // classifies as nonce-stale and isn't stolen by the new rule.
+  test("chain.bad_proof placement regression: Stale-shaped message still classifies as nonce-stale", () => {
+    const msg = '{"type":"Invalid","value":{"type":"Stale"}}';
+    const got = classifyErrorKind(msg);
+    assert.strictEqual(
+      got,
+      "nonce-stale",
+      `>> FAIL: chain.bad_proof placement: inserting the new rule after nonce-stale must not steal Stale-shaped messages; got ${got}`,
+    );
+  });
+
+  // chain-timeout: commitment poll timeout (src/dotns.ts's POLL_TIMEOUT_MS message)
+  test("chain-timeout: commitment still too new after polling timeout", () => {
+    assert.strictEqual(
+      classifyErrorKind("Commitment still too new after 90s of polling chain time. The chain may be stalled."),
+      "chain-timeout",
     );
   });
 

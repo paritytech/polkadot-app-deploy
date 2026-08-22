@@ -472,6 +472,7 @@ export function computeDeployOutcome(
 //   chain.tx_silent                — signSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
 //   chain.extrinsic_expired        — tx rejected because the mortality window passed (AncientBirthBlock)
 //   chain.quota_exhausted          — Bulletin chain storage quota exhausted
+//   chain.bad_proof                — extrinsic rejected with Invalid::BadProof; the signature did not verify (wrong genesis/mortality/spec version or a re-signed payload mismatch)
 //   signer.message_too_large       — mobile signer rejected the payload because it exceeds the signing size limit
 //   storage.rejected               — the chain refused the signer's Bulletin storage write: no authorization, or an expired one, and auto-authorization failed (per-env authorizer mismatch, #1209).
 //                                    NOT named *_not_authorized / *_auth_*: Sentry's org relayPiiConfig masks any attribute VALUE containing "auth", so such a kind would
@@ -502,6 +503,7 @@ export type DeployErrorKind =
   | 'chain.tx_silent'
   | 'chain.extrinsic_expired'
   | 'chain.quota_exhausted'
+  | 'chain.bad_proof'
   | 'signer.message_too_large'
   | 'storage.rejected'
   | 'user.aborted'
@@ -542,9 +544,16 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // shows up in the data later, widening this is a one-line change with evidence
   // behind it; over-matching now would be invisible.
   [/^aborted by user\b/i, 'user.aborted'],
-  [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"/i, 'contract-revert'],
-  [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within/i, 'chain-timeout'],
+  // `Publisher\.(?:un)?publish reverted:` — decoded ABI custom-error reverts
+  // from src/dotns.ts's publishLabel/unpublishLabel Publisher call paths.
+  [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"|Publisher\.(?:un)?publish reverted:/i, 'contract-revert'],
+  [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within|Commitment still too new after \d+s/i, 'chain-timeout'],
   [/\bstale\b.*nonce|nonce.*\bstale\b|"type"\s*:\s*"(?:Future|Stale)"|Invalid::Future|tx rejected by pool/i, 'nonce-stale'],
+  // Invalid::BadProof: the extrinsic's signature didn't verify (wrong genesis
+  // hash / mortality window / spec version, or a re-signed payload mismatch).
+  // Bare variant name, not the JSON envelope — both producer sites in
+  // src/deploy.ts truncate the inner chain error at 100 chars.
+  [/BadProof/i, 'chain.bad_proof'],
   [/heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i, 'connection'],
   [/requires ProofOfPersonhood(?:Full|Lite|Light),\s*but this signer is NoStatus/i, 'naming.pop_required'],
   [/requires NoStatus,\s*but this signer is ProofOfPersonhood/i, 'naming.nostatus_required'],
@@ -578,7 +587,11 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   [/ReviveApi\.\w+ returned empty result/i, 'chain.api_timeout'],
   [/transaction watcher silent for \d+s/i, 'chain.tx_silent'],
   [/(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|publish|unpublish|Revive\.call|Utility\.batch_all) timed out after \d+ms/i, 'chain.tx_timeout'],
-  [/AncientBirthBlock/i, 'chain.extrinsic_expired'],
+  // Prefix, not the full `AncientBirthBlock` variant name: at 17 chars it is
+  // long enough to be cut in half by the 100-char truncation both src/deploy.ts
+  // producer sites apply to the inner chain error, which sent a live span to
+  // `unknown` with the message ending `"type": "AncientBirth`.
+  [/AncientBirth/i, 'chain.extrinsic_expired'],
   [/Bulletin quota exhausted/i, 'chain.quota_exhausted'],
   [/Mobile signing (?:failed|rejected).*message too big/i, 'signer.message_too_large'],
   [/^INVARIANT FAILED:/i, 'tool.invariant'],

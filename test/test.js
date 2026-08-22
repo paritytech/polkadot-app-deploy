@@ -1760,6 +1760,96 @@ describe("classifyErrorKind", () => {
       "chain.tx_timeout",
     );
   });
+
+  // ---------------------------------------------------------------------
+  // Kinds added from the 2026-08-06 telemetry sweep. Each of these was the
+  // literal text of a production `deploy.error_kind:unknown` span; the counts
+  // in the comments are non-E2E occurrences over the sweep's 14d window.
+  // ---------------------------------------------------------------------
+
+  // storage.rejected (31 spans, 30 of them env=preview) — src/deploy.ts's
+  // Bulletin storage authorization guard. Largest live unknown at sweep time.
+  test("storage.rejected: verbatim Bulletin storage authorization failure", () => {
+    const msg = "Account 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY is not authorized for Bulletin storage and auto-authorization failed: BadSigner";
+    assert.strictEqual(classifyErrorKind(msg), "storage.rejected",
+      `>> FAIL: storage.rejected: the Bulletin storage authorization guard must not fall through to unknown; got ${classifyErrorKind(msg)}`);
+  });
+  test("storage.rejected: outer wrapper beats the interpolated inner cause", () => {
+    // The guard interpolates `e.message` from the failed auto-authorization
+    // call. When that inner text is itself a revert/timeout, the specific outer
+    // classification must still win — otherwise this kind silently disappears
+    // into contract-revert whenever the underlying call reverts.
+    const msg = "Account 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY is not authorized for Bulletin storage and auto-authorization failed: Contract reverted (flags=1) with data: 0x";
+    assert.strictEqual(classifyErrorKind(msg), "storage.rejected",
+      `>> FAIL: storage.rejected: an embedded 'Contract reverted' in the nested cause stole the classification; got ${classifyErrorKind(msg)}`);
+  });
+  test("storage.rejected: classifies as a user error, not a bug-report prompt", () => {
+    const msg = "Account 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY is not authorized for Bulletin storage and auto-authorization failed: BadSigner";
+    assert.strictEqual(classifyDeployError(msg), "user",
+      `>> FAIL: storage.rejected: an unauthorized signer is an operator/config fault, not an internal bug; got ${classifyDeployError(msg)}`);
+  });
+  test("storage.rejected: unrelated authorization wording does not match", () => {
+    assert.strictEqual(classifyErrorKind("Account is not authorized"), "unknown");
+  });
+
+  // naming.pop_required (9 spans) — Revive surfaces the personhood gate as a
+  // bare revert reason, not the "requires ProofOfPersonhoodX" prose.
+  test("naming.pop_required: Publisher.publish NoPersonhood revert reason", () => {
+    const msg = "Publisher.publish reverted: NoPersonhood";
+    assert.strictEqual(classifyErrorKind(msg), "naming.pop_required",
+      `>> FAIL: naming.pop_required: the NoPersonhood revert reason is the same user-actionable cause as the prose variant and must share its kind; got ${classifyErrorKind(msg)}`);
+  });
+  test("naming.pop_required: a revert without NoPersonhood stays contract-revert", () => {
+    assert.strictEqual(
+      classifyErrorKind("Publisher.publish reverted (flags=1) with data: 0x"),
+      "contract-revert",
+      ">> FAIL: naming.pop_required: the NoPersonhood rule is over-broad — it swallowed a generic revert",
+    );
+  });
+
+  // user.aborted (6 spans) — Ctrl-C. Its own kind so dashboards can exclude
+  // operator interrupts from the deploy failure rate.
+  test("user.aborted: operator interrupt is not a product failure", () => {
+    const msg = "aborted by user";
+    assert.strictEqual(classifyErrorKind(msg), "user.aborted",
+      `>> FAIL: user.aborted: a Ctrl-C counted as an unclassified deploy failure and inflated the error rate; got ${classifyErrorKind(msg)}`);
+  });
+  test("user.aborted: stays anchored so a wrapped failure is not swallowed", () => {
+    // This kind removes spans from the failure rate, so over-matching silently
+    // deletes real failures. A genuine chunk failure that merely mentions the
+    // abort must NOT be reclassified as an operator interrupt.
+    const msg = "Chunk 3 failed after 3 retries: upload aborted by user";
+    assert.notStrictEqual(classifyErrorKind(msg), "user.aborted",
+      ">> FAIL: user.aborted: the rule is unanchored — a real chunk failure was reclassified as an operator interrupt and vanished from the failure rate");
+  });
+
+  // naming.contract_unavailable (1 span) — env config carries a zero/absent
+  // address, caught before the call rather than as empty return data.
+  test("naming.contract_unavailable: invalid configured contract address", () => {
+    const msg = "Invalid contract address for PUBLISHER in environment paseo-next-v2: 0x0000000000000000000000000000000000000000";
+    assert.strictEqual(classifyErrorKind(msg), "naming.contract_unavailable",
+      `>> FAIL: naming.contract_unavailable: a zero/absent configured address is the same failure family as an empty contract read; got ${classifyErrorKind(msg)}`);
+  });
+
+  // Guard against re-entering the trap this PR hit at authoring time: the kind
+  // was first called `storage.not_authorized`, and Sentry's org relayPiiConfig
+  // masks any attribute VALUE containing "auth" — so `deploy.error_kind` came
+  // back as 22 asterisks and the bucket the kind exists to surface stayed
+  // invisible. Masking is on content, not key, and short enum-like values are
+  // masked exactly like long prose. Any new kind must avoid these substrings.
+  test("no DeployErrorKind literal contains a Sentry-scrubbed substring", () => {
+    const src = fs.readFileSync("src/telemetry.ts", "utf8");
+    // Strip `//` comments first: the union is interleaved with them and one
+    // carries a semicolon, which would otherwise end the slice early.
+    const union = src.slice(src.indexOf("export type DeployErrorKind =")).replace(/\/\/[^\n]*/g, "");
+    const kinds = union.slice(0, union.indexOf(";")).match(/'[^']+'/g).map(k => k.slice(1, -1));
+    // Parse sanity: a broken slice must fail loudly rather than pass vacuously.
+    assert.ok(kinds.length >= 20, `>> FAIL: kind-scrub guard: parsed only ${kinds.length} DeployErrorKind members from src/telemetry.ts — the union parse broke, so this guard was not actually checking anything`);
+    assert.ok(kinds.includes("unknown"), ">> FAIL: kind-scrub guard: parsed union does not include 'unknown' — wrong slice of src/telemetry.ts");
+    const scrubbed = kinds.filter(k => /auth|secret|credential|password/i.test(k));
+    assert.deepStrictEqual(scrubbed, [],
+      `>> FAIL: kind-scrub guard: ${scrubbed.join(", ")} contain(s) a substring Sentry's relayPiiConfig masks — the value would render as asterisks in every dashboard grouped by deploy.error_kind. Rename the kind (e.g. storage.rejected, not storage.not_authorized).`);
+  });
 });
 
 // ---------------------------------------------------------------------------

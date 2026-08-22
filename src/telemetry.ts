@@ -473,6 +473,10 @@ export function computeDeployOutcome(
 //   chain.extrinsic_expired        — tx rejected because the mortality window passed (AncientBirthBlock)
 //   chain.quota_exhausted          — Bulletin chain storage quota exhausted
 //   signer.message_too_large       — mobile signer rejected the payload because it exceeds the signing size limit
+//   storage.rejected               — the chain refused the signer's Bulletin storage write: no authorization, or an expired one, and auto-authorization failed (per-env authorizer mismatch, #1209).
+//                                    NOT named *_not_authorized / *_auth_*: Sentry's org relayPiiConfig masks any attribute VALUE containing "auth", so such a kind would
+//                                    render as asterisks in every dashboard grouped by deploy.error_kind — verified empirically, see the sweep write-up.
+//   user.aborted                   — operator interrupted the run (Ctrl-C / SIGINT); not a product failure
 //   tool.invariant                 — internal invariant assertion failed
 //   unknown                        — none of the above patterns matched
 export type DeployErrorKind =
@@ -499,6 +503,8 @@ export type DeployErrorKind =
   | 'chain.extrinsic_expired'
   | 'chain.quota_exhausted'
   | 'signer.message_too_large'
+  | 'storage.rejected'
+  | 'user.aborted'
   | 'tool.invariant'
   | 'unknown';
 
@@ -512,6 +518,30 @@ const TLD_FRAGMENT = "[a-z]{2,}";
 // Precedence-ordered list of (regex, kind) tuples. First match wins.
 // Strong-signal infra kinds first, then naming, then verify, then network/chain, then tool.
 const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
+  // Wrapper messages that interpolate a nested cause must precede the generic
+  // infra patterns below: the interpolated inner error frequently contains
+  // "Contract reverted" or a timeout phrase and would otherwise steal the
+  // classification from the more specific, more actionable outer message.
+  // (2026-08-06 telemetry sweep: this was the largest live `unknown` bucket —
+  // 31 spans, 30 of them env=preview, from the per-env authorizer gap #1209.)
+  [/is not authorized for Bulletin storage/i, 'storage.rejected'],
+  // Revive surfaces the personhood gate as a bare revert reason rather than the
+  // "requires ProofOfPersonhoodX, but this signer is NoStatus" prose matched
+  // further down — same user-actionable cause, so it shares that kind. Ordered
+  // ahead of contract-revert, which would otherwise claim it: both the
+  // "(flags=N)" shape and the decoded `Publisher.publish reverted:` shape are
+  // contract-revert alternatives, and NoPersonhood arrives as the latter. The
+  // specific kind names the remedy, so it wins.
+  [/reverted:\s*NoPersonhood\b/i, 'naming.pop_required'],
+  // Operator interrupt (Ctrl-C). Its own kind so dashboards can exclude it from
+  // the deploy failure rate rather than counting it as an unexplained failure.
+  // Deliberately anchored: because this kind *removes* a span from the failure
+  // rate, a false positive silently deletes a real failure. The phrase does not
+  // originate anywhere in src/ — it arrives verbatim as the whole message — so
+  // matching it as a sub-clause would only ever be a guess. If a wrapped variant
+  // shows up in the data later, widening this is a one-line change with evidence
+  // behind it; over-matching now would be invisible.
+  [/^aborted by user\b/i, 'user.aborted'],
   [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"/i, 'contract-revert'],
   [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within/i, 'chain-timeout'],
   [/\bstale\b.*nonce|nonce.*\bstale\b|"type"\s*:\s*"(?:Future|Stale)"|Invalid::Future|tx rejected by pool/i, 'nonce-stale'],
@@ -525,6 +555,10 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // it the same way instead of letting it fall into 'unknown'.
   [/No contract deployed at .+ returned empty success data/i, 'naming.contract_unavailable'],
   [/Contract call returned empty data — contract=/i, 'naming.contract_unavailable'],
+  // Same failure family caught one step earlier: the environment config carries
+  // a zero/absent address, so the call is refused before it is made rather than
+  // coming back with empty data.
+  [/Invalid contract address for \w+ in environment/i, 'naming.contract_unavailable'],
   [new RegExp(`Domain\\s+\\S+\\.${TLD_FRAGMENT}\\s+is already owned by\\s+0x[a-fA-F0-9]+`, 'i'), 'naming.already_owned'],
   // #1185: formatUnregistrableReason's distinctive phrase — present in both
   // the unregistered ("...is not registered, and bulletin-deploy cannot

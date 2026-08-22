@@ -15,7 +15,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { validateDomainLabel, sanitizeDomainLabel, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
@@ -7741,6 +7741,82 @@ describe("DotNS external signer path (#158)", () => {
     assert.ok(src.includes("this._usesExternalSigner = Boolean(options.signer && options.signerAddress)"));
     assert.ok(src.includes("this.submitCommitment(commitment)"));
     assert.ok(src.includes('"setContenthash", [node, contenthashHex]'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1094: manifest publish uploaded the icon/executables to the DEFAULT
+// Bulletin RPC, ignoring --env/--rpc. deploy() itself resolves its Bulletin
+// endpoint via this exact override precedence before setting the
+// module-level BULLETIN_ENDPOINTS that storeFile/storeDirectory fall back to
+// (getProvider(), no client of their own). resolveBulletinEndpoints/
+// setBulletinEndpoints are extracted so manifest/publish.ts can reuse the
+// SAME mechanism instead of inventing a second one — see
+// test/product-manifest.test.js for the publishManifest-level regression
+// test that exercises the actual wiring.
+// ---------------------------------------------------------------------------
+describe("resolveBulletinEndpoints (#1094)", () => {
+  test("no rpc override, no BULLETIN_RPC env var: env's bulletin list passes through unchanged", () => {
+    const saved = process.env.BULLETIN_RPC;
+    delete process.env.BULLETIN_RPC;
+    try {
+      const envBulletin = ["wss://paseo-bulletin-next-rpc.polkadot.io", "wss://backup.example"];
+      const r = resolveBulletinEndpoints(envBulletin);
+      assert.deepStrictEqual(r, envBulletin,
+        ">> FAIL: resolveBulletinEndpoints no-override: env's bulletin list must pass through unchanged");
+    } finally {
+      if (saved === undefined) delete process.env.BULLETIN_RPC; else process.env.BULLETIN_RPC = saved;
+    }
+  });
+
+  test("explicit rpcOverride wins, placed first, envBulletin de-duplicated", () => {
+    const saved = process.env.BULLETIN_RPC;
+    delete process.env.BULLETIN_RPC;
+    try {
+      const envBulletin = ["wss://paseo-bulletin-next-rpc.polkadot.io", "wss://override.example"];
+      const r = resolveBulletinEndpoints(envBulletin, "wss://override.example");
+      assert.deepStrictEqual(r, ["wss://override.example", "wss://paseo-bulletin-next-rpc.polkadot.io"],
+        ">> FAIL: resolveBulletinEndpoints rpcOverride: override must be primary (index 0) with envBulletin de-duplicated behind it");
+    } finally {
+      if (saved === undefined) delete process.env.BULLETIN_RPC; else process.env.BULLETIN_RPC = saved;
+    }
+  });
+
+  test("BULLETIN_RPC env var is honoured when rpcOverride is not passed", () => {
+    const saved = process.env.BULLETIN_RPC;
+    process.env.BULLETIN_RPC = "wss://from-env-var.example";
+    try {
+      const r = resolveBulletinEndpoints(["wss://paseo-bulletin-next-rpc.polkadot.io"]);
+      assert.deepStrictEqual(r, ["wss://from-env-var.example", "wss://paseo-bulletin-next-rpc.polkadot.io"],
+        ">> FAIL: resolveBulletinEndpoints BULLETIN_RPC fallback: env var override must apply when no explicit rpcOverride is passed");
+    } finally {
+      if (saved === undefined) delete process.env.BULLETIN_RPC; else process.env.BULLETIN_RPC = saved;
+    }
+  });
+
+  test("explicit rpcOverride wins over BULLETIN_RPC env var", () => {
+    const saved = process.env.BULLETIN_RPC;
+    process.env.BULLETIN_RPC = "wss://from-env-var.example";
+    try {
+      const r = resolveBulletinEndpoints(["wss://env.example"], "wss://explicit.example");
+      assert.deepStrictEqual(r, ["wss://explicit.example", "wss://env.example"],
+        ">> FAIL: resolveBulletinEndpoints precedence: explicit rpcOverride must win over BULLETIN_RPC env var");
+    } finally {
+      if (saved === undefined) delete process.env.BULLETIN_RPC; else process.env.BULLETIN_RPC = saved;
+    }
+  });
+});
+
+describe("setBulletinEndpoints (#1094)", () => {
+  test("updates the exported BULLETIN_ENDPOINTS binding read by getProvider()/storeFile/storeDirectory", () => {
+    const before = BULLETIN_ENDPOINTS;
+    try {
+      setBulletinEndpoints(["wss://paseo-bulletin-next-rpc.polkadot.io"]);
+      assert.deepStrictEqual(BULLETIN_ENDPOINTS, ["wss://paseo-bulletin-next-rpc.polkadot.io"],
+        ">> FAIL: setBulletinEndpoints: exported BULLETIN_ENDPOINTS must reflect the setter's argument (live ESM binding) — this is the only way manifest/publish.ts (a different module) can update deploy.ts's module-level state");
+    } finally {
+      setBulletinEndpoints(before);
+    }
   });
 });
 

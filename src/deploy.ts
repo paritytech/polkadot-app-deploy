@@ -100,6 +100,38 @@ export const DEFAULT_POOL_SIZE = 10;
 // backups here once the Bulletin team publishes them (no code change needed).
 export let BULLETIN_ENDPOINTS: string[] = [DEFAULT_BULLETIN_RPC];
 let POOL_SIZE = DEFAULT_POOL_SIZE;
+
+/**
+ * Bulletin RPC override precedence, shared by every caller that resolves an
+ * env's Bulletin endpoint(s): an explicit `rpcOverride` (CLI `--rpc`) wins,
+ * falling back to the `BULLETIN_RPC` env var, else the env-resolved
+ * candidate list is used unchanged. The override is placed first (primary)
+ * with the rest of the env's candidates kept as fail-over backups, minus any
+ * duplicate of the override itself.
+ *
+ * Extracted from `deploy()`'s own resolution so `manifest/publish.ts` can
+ * compute the exact same endpoint `deploy()` would for a given env/--rpc,
+ * instead of inventing a second resolution mechanism.
+ */
+export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: string): string[] {
+  const userRpc = rpcOverride ?? process.env.BULLETIN_RPC;
+  return userRpc ? [userRpc, ...envBulletin.filter(e => e !== userRpc)] : envBulletin;
+}
+
+/**
+ * Set the module-level Bulletin endpoint list that `getProvider()` (and
+ * therefore `storeFile`/`storeDirectory` when called without an explicit
+ * client) connects to. `deploy()` sets this from the resolved env/--rpc at
+ * the top of every run. Exported so callers outside this module — namely
+ * `manifest/publish.ts`'s `publishManifest`, which can run without a
+ * preceding in-process `deploy()` call — can point their own storage
+ * uploads at the same env instead of silently defaulting to
+ * `DEFAULT_BULLETIN_RPC`. ESM named imports are read-only bindings, so a
+ * setter is the only way for another module to update this `let`.
+ */
+export function setBulletinEndpoints(endpoints: string[]): void {
+  BULLETIN_ENDPOINTS = endpoints;
+}
 // Module-level flag: flipped by getWsProvider's onStatusChanged if papi
 // connects to a non-primary endpoint. Flushed into the deploy span at the end
 // of deploy() so the attribute always lands even if the callback fires late
@@ -2886,10 +2918,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   if (options.contracts && Object.keys(options.contracts).length > 0) {
     envContracts = { ...envContracts, ...options.contracts };
   }
-  const userRpc = options.rpc ?? process.env.BULLETIN_RPC;
-  BULLETIN_ENDPOINTS = userRpc
-    ? [userRpc, ...envBulletin.filter(e => e !== userRpc)]
-    : envBulletin;
+  BULLETIN_ENDPOINTS = resolveBulletinEndpoints(envBulletin, options.rpc);
   _deployRpcFailedOver = false;
   POOL_SIZE = options.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
 

@@ -21,8 +21,7 @@ import {
   assertStdoutMatches,
   parseLineOrExplain,
   assertOnChainMatches,
-  failWith,
-} from "./helpers/e2e-failure.js";
+  failWith, classifyFixtureState } from "./helpers/e2e-failure.js";
 
 // The CLI prints "CID: bafy..." at the end of a successful deploy. We parse
 // that — not a client-side recomputation — so we verify "what the CLI said
@@ -486,33 +485,82 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S3 — domain owned by different account", { skip: SCENARIO !== "s3" }, () => {
     test(`deploy to pre-owned label rejects with exit 78`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
       const { fixtureDir } = await mutateFixture(RUN_TAG);
+      // Env-conditional: the two fixtures are provisioned separately, so a
+      // failure must name which one it actually used — otherwise the operator
+      // repairs the wrong label.
+      const ownedLabel = PAD_ENV === "paseo-next-v2"
+        ? "e2eownedns02.dot"
+        : "e2eownedns01.dot";
+      const envLabel = PAD_ENV ?? "paseo-next-v2";
       try {
-        const { code, stderr } = await runBulletinDeploy({
+        const { code, stdout, stderr } = await runBulletinDeploy({
           // S3 needs a label owned by a DIFFERENT account from the deploy signer.
           // `e2eowned.dot` was the historical fixture for PopFull signers but its
           // chain ownership drifted to Alice (see e2e run 26648857693 / v0.7.30-rc.1
           // S3 failure — `transferFrom` reverts with a custom error so we can't easily
           // restore it). Both `e2eownedns01.dot` and `e2eownedns02.dot` are
           // PoP-class-compatible with all signers (≥9-char NoStatus, accepts Full
-          // signers fine) and are stable-owned by Bob on both paseo-next-v2 and
-          // preview — use the same env-conditional for every PoP status.
-          args: buildArgs(fixtureDir, PAD_ENV === "paseo-next-v2" ? "e2eownedns02.dot" : "e2eownedns01.dot"),
+          // signers fine) and are stable-owned by Bob on both envs — use the same
+          // env-conditional for every PoP status.
+          args: buildArgs(fixtureDir, ownedLabel),
           env: rpcEnv(),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
+        // Bob's H160 (from docs/e2e-bootstrap.md).
+        const BOB_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+        const combined = `${stdout}\n${stderr}`;
+
+        // Distinguish FIXTURE DRIFT from a product regression before asserting
+        // on the exit code. Both surface as "got 0", but they need completely
+        // different responses — and a bare exit-code mismatch reads like a
+        // product bug, which is how this sat red for a week in bulletin-deploy.
+        const fixture = classifyFixtureState({ output: combined, expectedOwner: BOB_H160 });
+        const fixtureMissing = fixture.kind === "missing";
+        const driftedTo = fixture.kind === "drifted" ? fixture.owner : null;
+
+        if (fixtureMissing || driftedTo) {
+          const observed = fixtureMissing
+            ? `${ownedLabel} is UNREGISTERED (reported "available")`
+            : `${ownedLabel} is owned by ${driftedTo}, not Bob (${BOB_H160})`;
+          failWith({
+            scenario: "S3",
+            message:
+              `fixture drift on env "${envLabel}" — ${observed}. ` +
+              `This is a test-fixture problem, NOT a polkadot-app-deploy regression: ` +
+              `the CLI behaved correctly for the chain state it was given. ` +
+              `Fix: node tools/register-test-fixture.mjs ${ownedLabel.replace(/\.dot$/, "")} --env ${envLabel}`,
+            context: combined,
+            keywords: ["available", "already owned", "Domain"],
+            hint:
+              "A testnet re-genesis wipes registrations; the next S3 run then finds the label free " +
+              "and the deploy signer registers it to ITSELF, so every later run exits 0 instead of 78. " +
+              "register-test-fixture is idempotent and repairs both cases.",
+          });
+        }
+
         if (code !== 78) {
           failWith({
             scenario: "S3",
-            message: `expected EXIT_CODE_NO_RETRY (78), got ${code}`,
-            context: stderr,
+            message: `expected EXIT_CODE_NO_RETRY (78), got ${code} for ${ownedLabel} on env "${envLabel}"`,
+            context: combined,
             keywords: ["Error", "already owned", "domain"],
             hint: "S3 deploys to a domain owned by a DIFFERENT account; the CLI must refuse with exit 78 (no-retry).",
           });
         }
-        // Bob's H160 (from docs/e2e-bootstrap.md). Pinning to this specific
-        // owner rather than a generic pattern catches regressions where the
-        // preflight rejects for the wrong reason (e.g. network error).
-        assert.match(stderr, /is already owned by 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01/i);
+
+        // Pinning to Bob specifically (not a generic pattern) catches a reject
+        // that happened for the wrong reason — e.g. a network error.
+        if (!new RegExp(`is already owned by ${BOB_H160}`, "i").test(stderr)) {
+          failWith({
+            scenario: "S3",
+            message:
+              `exited 78 but the rejection did not name Bob (${BOB_H160}) as owner of ${ownedLabel} ` +
+              `on env "${envLabel}" — the deploy was refused for the wrong reason`,
+            context: combined,
+            keywords: ["already owned", "Error", "Domain"],
+            hint: "Exit 78 is also used for other non-retryable refusals; S3 must fail specifically on ownership.",
+          });
+        }
       } finally {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
       }
@@ -1447,9 +1495,11 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
 
     // Leg 2: long-digits regression guard (#654 trailing-digit sanitiser bug).
-    // parseDomainName now uses skipSanitize:true for sublabels, so "pr265" is
-    // preserved as-is. This leg MUST pass on current main; the assertion at the
-    // subnode "pr265.<parent>" would return empty if the digit suffix was stripped.
+    // parseDomainName's subname branch never applies any digit-count rule to
+    // a sublabel (validateDomainLabel is contract-syntax-only there), so
+    // "pr265" is preserved as-is. This leg MUST pass on current main; the
+    // assertion at the subnode "pr265.<parent>" would return empty if the
+    // digit suffix was stripped.
     test("long-digits — pr265.<parent>.dot sublabel preserved (regression guard #654)", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
       const target = `pr265.${freshParent}.dot`;
       const { fixtureDir } = await mutateFixture(RUN_TAG + "-sub-digits");

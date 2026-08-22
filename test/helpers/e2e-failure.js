@@ -233,3 +233,32 @@ function extractKeywords(pattern) {
   const tokens = src.match(/[A-Za-z]{4,}/g) ?? [];
   return tokens.slice(0, 3);
 }
+
+/**
+ * Classify an owned-label scenario's output to tell FIXTURE DRIFT apart from a
+ * product regression.
+ *
+ * Both surface identically at the exit-code level ("expected 78, got 0"), but
+ * they demand opposite responses: drift needs a fixture re-registration, a
+ * regression needs a code fix. Reporting only the exit code is what let a
+ * scenario like this sit red for a week in practice — it read like a product
+ * bug, so it was repeatedly dismissed.
+ *
+ * Drift has two shapes after a testnet re-genesis:
+ *   1. `missing`  — the registration was wiped; the CLI reports the label as
+ *                   available and happily deploys.
+ *   2. `drifted`  — a later run found it free and the deploy signer registered
+ *                   it to ITSELF, so it is owned, just by the wrong account.
+ *
+ * @param {object} o
+ * @param {string} o.output          combined stdout+stderr from the deploy
+ * @param {string} o.expectedOwner   0x-prefixed H160 the fixture must belong to
+ * @returns {{kind: "missing"|"drifted"|"ok", owner: string|null}}
+ */
+export function classifyFixtureState({ output, expectedOwner }) {
+  const want = String(expectedOwner).toLowerCase();
+  if (/\bis available\b/i.test(output)) return { kind: "missing", owner: null };
+  const m = output.match(/is already owned by (0x[0-9a-fA-F]{40})/);
+  if (m && m[1].toLowerCase() !== want) return { kind: "drifted", owner: m[1] };
+  return { kind: "ok", owner: m ? m[1] : null };
+}

@@ -13701,9 +13701,9 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assertNoStatusLabel("e2enightly25829471478pool00");
     assertNoStatusLabel("e2enightly25829471478direct00");
 
-    assert.match(workflowJobBlock(workflow, "nightly-s1-pool"), /dotns-domain:\s*e2epoolns01\.dot/, "nightly S1 pool must use a NoStatus label");
-    assert.match(workflowJobBlock(workflow, "nightly-s1-direct"), /dotns-domain:\s*e2edirectdp01\.dot/, "nightly S1 direct must use a NoStatus label owned by the direct derivation");
-    assert.match(workflowJobBlock(workflow, "nightly-s2-fresh"), /dotns-domain:\s*e2enightly\$\{\{ github\.run_id \}\}\$\{\{ matrix\.signer \}\}00\.dot/, "nightly S2 fresh labels must classify as NoStatus");
+    assert.match(workflowJobBlock(workflow, "nightly-s1-pool"), /dotns-domain:\s*e2epoolns01$/m, "nightly S1 pool must use a NoStatus label");
+    assert.match(workflowJobBlock(workflow, "nightly-s1-direct"), /dotns-domain:\s*e2edirectdp01$/m, "nightly S1 direct must use a NoStatus label owned by the direct derivation");
+    assert.match(workflowJobBlock(workflow, "nightly-s2-fresh"), /dotns-domain:\s*e2enightly\$\{\{ github\.run_id \}\}\$\{\{ matrix\.signer \}\}00$/m, "nightly S2 fresh labels must classify as NoStatus");
   });
 
   test("release/nightly inline E2E jobs read PAD_ENV from matrix.env (fan-out)", () => {
@@ -13722,7 +13722,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     }
 
     const s3 = workflowJobBlock(workflow, "nightly-s3");
-    assert.match(s3, /S3_LABEL:\s*e2eownedns02\.dot/, "nightly S3 must use the v2 Bob-owned fixture label");
+    assert.match(s3, /S3_LABEL:\s*e2eownedns03$/m, "nightly S3 must use the Bob-owned fixture label (ns03 — ns02 was squatted after the re-genesis)");
     assert.match(s3, /--env "\$PAD_ENV" build "\$S3_LABEL"/, "nightly S3 must pass --env to bulletin-deploy");
 
     for (const label of [
@@ -13733,10 +13733,11 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       assertNoStatusLabel(label);
     }
 
-    assert.match(workflowJobBlock(workflow, "nightly-s5"), /LABEL:\s*"e2es5\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00\.dot"/, "nightly S5 must use a dynamic NoStatus label");
-    assert.match(workflowJobBlock(workflow, "nightly-s6"), /build e2epoolns01\.dot/, "nightly S6 must deploy the v2 NoStatus pool label");
+    assert.match(workflowJobBlock(workflow, "nightly-s5"), /LABEL:\s*"e2es5\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00"/, "nightly S5 must use a dynamic NoStatus label");
+    assert.match(workflowJobBlock(workflow, "nightly-s6"), /build e2epoolns01\b(?!\.)/, "nightly S6 must deploy the NoStatus pool label as a BARE label — a \".dot\" suffix is rejected on a .paseo environment");
     assert.match(workflowJobBlock(workflow, "nightly-s7"), /LABEL:\s*e2epoolns01/, "nightly S7 must use the v2 NoStatus pool label");
-    assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00\.dot/, "nightly S-CAR must use a dynamic NoStatus label");
+    assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00$/m, "nightly S-CAR must use a dynamic NoStatus label");
+
     const sExt = workflowJobBlock(workflow, "nightly-s-ext-signer");
     assert.match(sExt, /setContenthash\("e2epoolns01", expected\)/, "nightly S-ext-signer must write the v2 NoStatus pool label");
     assert.match(sExt, /import \{ DotNS, loadEnvironments, resolveEndpoints \} from "@parity\/polkadot-app-deploy"/, "npm-installed S-ext must use the package's environment helpers");
@@ -13757,6 +13758,26 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     // hardcoding either suffix here would break exactly one environment.
     assert.match(s7Script, /const args1 = \[FIXTURE_DIR, LABEL, "--js-merkle"/, "S7 harness must pass a bare LABEL (no hardcoded TLD) so the CLI resolves the env's own suffix");
     assert.match(s7Script, /const args2 = \[FIXTURE_DIR, OWNED_LABEL, "--js-merkle"/, "S7 harness must pass a bare OWNED_LABEL (no hardcoded TLD) so the CLI resolves the env's own suffix");
+  });
+
+  // Class-level guard. Six separate assertions in this file pinned ".dot"-suffixed
+  // e2e.yml labels, and they surfaced one failure at a time as each was fixed —
+  // so pin the INVARIANT instead of relying on finding every call site by grep.
+  // parseDomainName refuses a ".dot" name on a ".paseo" environment (it tells you
+  // to pass the bare label), and the nightly matrix includes paseo-next-v2, so a
+  // suffixed label value in e2e.yml is a hard CI failure, not a style question.
+  test("e2e.yml passes BARE domain labels — a hardcoded TLD suffix breaks every non-.dot environment", () => {
+    const workflow = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const offenders = workflow.split("\n")
+      .map((line, i) => ({ line, n: i + 1 }))
+      .filter(({ line }) => !line.trim().startsWith("#"))
+      .filter(({ line }) => /(?:LABEL|dotns-domain|S3_LABEL)\s*:\s*"?[^"\n]*\.dot\b/.test(line)
+                         || /\bbuild\s+\S*\.dot\b/.test(line))
+      .map(({ line, n }) => `    line ${n}: ${line.trim()}`);
+    assert.deepStrictEqual(
+      offenders, [],
+      `>> FAIL: e2e-yml-bare-labels: ${offenders.length} label value(s) in .github/workflows/e2e.yml still carry a ".dot" suffix. The env TLD is appended by the CLI, and parseDomainName REJECTS a ".dot" name on a ".paseo" environment — every one of these fails the nightly against paseo-next-v2. Pass the bare label instead:\n${offenders.join("\\n")}`,
+    );
   });
 
   test("workflow has a select-env job that drives test-pr", () => {

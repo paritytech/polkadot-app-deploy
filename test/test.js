@@ -5237,6 +5237,73 @@ describe("DotNS.preflight", () => {
       `>> FAIL: feeFloorFor already-owned-by-recipient with transferFee: expected owned floor + transferFee`);
   });
 
+  // topUpTargetFor had no direct test coverage even though it computes an
+  // auto-top-up amount that spends real testnet funds (attemptTestnetTopUp),
+  // and its sibling feeFloorFor — identical shape, same isOwnedAction branch —
+  // is tested above and had a real historical bug (#893). Mirrors that test's
+  // matrix, plus the full DotnsSuccessAction union (register /
+  // already-owned-by-us / already-owned-by-recipient), zero, very large
+  // values, and pins the actual decimals this code uses: ONE_PAS =
+  // 10_000_000_000n (10 decimals — Paseo Asset Hub PAS is 10 decimals, NOT
+  // 12; a 1e12 assumption would under-report by 100x and this test would
+  // catch that against the hardcoded expected values below).
+  test("topUpTargetFor returns the right top-up target per plannedAction", async () => {
+    const { topUpTargetFor } = await import("../dist/dotns.js");
+    const TOP_UP_TARGET = 5_000_000_000n; // ONE_PAS(10_000_000_000n) / 2n — 0.5 PAS at 10 decimals
+
+    // Defaults: storageDeposit defaults to MINIMUM_REGISTER_STORAGE_DEPOSIT (2e12),
+    // rentPriceNative and transferFeeNative default to 0n.
+    assert.strictEqual(topUpTargetFor("register"), TOP_UP_TARGET + 2_000_000_000_000n,
+      ">> FAIL: topUpTargetFor register defaults: expected TOP_UP_TARGET + MINIMUM_REGISTER_STORAGE_DEPOSIT");
+    assert.strictEqual(topUpTargetFor("already-owned-by-us"), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-us defaults: owned actions must skip the register storage deposit entirely (#893)");
+    assert.strictEqual(topUpTargetFor("already-owned-by-recipient"), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-recipient defaults: must match already-owned-by-us, not the register floor (#893)");
+
+    // storageDeposit only affects the "register" branch (env-specific override).
+    assert.strictEqual(topUpTargetFor("register", 300_000_000_000_000n), TOP_UP_TARGET + 300_000_000_000_000n,
+      ">> FAIL: topUpTargetFor register storageDeposit override: expected TOP_UP_TARGET + the overridden storageDeposit");
+    assert.strictEqual(topUpTargetFor("already-owned-by-us", 300_000_000_000_000n), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-us storageDeposit: storageDeposit must not affect the owned target");
+    assert.strictEqual(topUpTargetFor("already-owned-by-recipient", 300_000_000_000_000n), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-recipient storageDeposit: storageDeposit must not affect the owned target");
+
+    // rentPriceNative threads through the register branch only.
+    assert.strictEqual(topUpTargetFor("register", 2_000_000_000_000n, 110_000_000_000n), TOP_UP_TARGET + 2_000_000_000_000n + 110_000_000_000n,
+      ">> FAIL: topUpTargetFor register rentPriceNative: expected TOP_UP_TARGET + storageDeposit + rentPriceNative");
+    assert.strictEqual(topUpTargetFor("already-owned-by-us", 2_000_000_000_000n, 110_000_000_000n), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-us rentPriceNative: owned actions never accrue rent (NoStatus-only rent applies to fresh register)");
+
+    // transferFeeNative threads through every branch.
+    assert.strictEqual(topUpTargetFor("register", 2_000_000_000_000n, 0n, 7_000_000n), TOP_UP_TARGET + 2_000_000_000_000n + 7_000_000n,
+      ">> FAIL: topUpTargetFor register transferFee: expected TOP_UP_TARGET + storageDeposit + transferFee");
+    assert.strictEqual(topUpTargetFor("already-owned-by-us", 0n, 0n, 7_000_000n), TOP_UP_TARGET + 7_000_000n,
+      ">> FAIL: topUpTargetFor already-owned-by-us transferFee: expected TOP_UP_TARGET + transferFee");
+    assert.strictEqual(topUpTargetFor("already-owned-by-recipient", 0n, 0n, 7_000_000n), TOP_UP_TARGET + 7_000_000n,
+      ">> FAIL: topUpTargetFor already-owned-by-recipient transferFee: expected TOP_UP_TARGET + transferFee");
+
+    // Zero everything: register still gets the (zeroed) storageDeposit arg passed explicitly.
+    assert.strictEqual(topUpTargetFor("register", 0n, 0n, 0n), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor register all-zero: expected bare TOP_UP_TARGET when every add-on is explicitly zeroed");
+
+    // Very large values (a pathological oracle price or storage deposit) must not
+    // overflow or silently truncate — bigint arithmetic, so this is really pinning
+    // that no accidental Number() coercion crept in anywhere on the call path.
+    const hugeStorageDeposit = 10n ** 30n;
+    const hugeRent = 10n ** 25n;
+    assert.strictEqual(
+      topUpTargetFor("register", hugeStorageDeposit, hugeRent, 0n),
+      TOP_UP_TARGET + hugeStorageDeposit + hugeRent,
+      ">> FAIL: topUpTargetFor huge values: expected exact bigint sum, no overflow/truncation to a Number");
+
+    // Decimals pin: TOP_UP_TARGET must be exactly 0.5 PAS at the 10-decimal
+    // scale this codebase actually uses (ONE_PAS = 10_000_000_000n), not the
+    // 12-decimal figure a careless port from a 12-decimal chain would assume.
+    assert.strictEqual(topUpTargetFor("already-owned-by-us"), 5_000_000_000n,
+      ">> FAIL: topUpTargetFor decimals: expected 5_000_000_000n (0.5 PAS at 10 decimals) — a 12-decimal assumption would under-report by 100x " +
+      "(Paseo Asset Hub PAS is 10 decimals, not 12)");
+  });
+
   test("fmtPas formats plancks to 4 decimals", async () => {
     const { fmtPas } = await import("../dist/dotns.js");
     assert.strictEqual(fmtPas(0n), "0.0000");

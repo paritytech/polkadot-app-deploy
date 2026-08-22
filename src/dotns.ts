@@ -241,7 +241,10 @@ export function feeFloorFor(plannedAction: DotnsSuccessAction, storageDeposit = 
   return FEE_FLOOR_REGISTER + storageDeposit + rentPriceNative + transferFeeNative;
 }
 
-function topUpTargetFor(plannedAction: DotnsSuccessAction, storageDeposit = MINIMUM_REGISTER_STORAGE_DEPOSIT, rentPriceNative = 0n, transferFeeNative = 0n): bigint {
+// Exported for unit tests (issue: topUpTargetFor had no test coverage even
+// though it spends real testnet funds and its sibling feeFloorFor — same
+// shape, same historical bug class — is tested).
+export function topUpTargetFor(plannedAction: DotnsSuccessAction, storageDeposit = MINIMUM_REGISTER_STORAGE_DEPOSIT, rentPriceNative = 0n, transferFeeNative = 0n): bigint {
   if (isOwnedAction(plannedAction)) return TOP_UP_TARGET + transferFeeNative;
   return TOP_UP_TARGET + storageDeposit + rentPriceNative + transferFeeNative;
 }

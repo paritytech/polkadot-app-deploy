@@ -34,18 +34,24 @@ const PNG_1X1 = Buffer.from(
 /**
  * @param {object} opts
  * @param {string} opts.buildDir  Absolute path to the deploy's build directory (the `app` executable bytes).
- * @param {string} opts.label     Domain label as passed to the CLI (with or without `.dot` suffix).
+ * @param {string} opts.label     Domain label as passed to the CLI (bare, or already suffixed with `.<tld>`).
+ * @param {string} [opts.tld]     The environment's DotNS TLD (per-env: "paseo" on paseo-next-v2, "dot"
+ *                                elsewhere). Defaults to "dot". Hardcoding ".dot" here produced a
+ *                                double-suffixed config domain ("e2epoolns01.paseo.dot") once callers
+ *                                began passing a label that already carried the env's TLD, which the
+ *                                CLI rejected as a config/deploy domain mismatch (#1244).
  * @returns {{ sidecarDir: string, configPath: string, iconPath: string }}
  */
-export function buildManifestSidecar({ buildDir, label }) {
+export function buildManifestSidecar({ buildDir, label, tld = "dot" }) {
   const sidecarDir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-manifest-"));
   const iconPath = path.join(sidecarDir, "icon.png");
   fs.writeFileSync(iconPath, PNG_1X1);
 
-  const domain = label.endsWith(".dot") ? label : `${label}.dot`;
+  const suffix = `.${tld}`;
+  const domain = label.endsWith(suffix) ? label : `${label}${suffix}`;
   const config = {
     domain,
-    displayName: domain.replace(/\.dot$/, ""),
+    displayName: domain.slice(0, -suffix.length),
     description: "E2E test fixture",
     icon: { path: "./icon.png", format: "png" },
     executables: [

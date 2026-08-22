@@ -291,7 +291,14 @@ function buildArgs(fixtureDir, label) {
     // label (no dot) falls back to "dot", matching the historical default.
     // Without this the sidecar appended a second ".dot" to "e2epoolns01.paseo"
     // and the CLI rejected the config/deploy domain mismatch (#1244).
-    const { configPath } = buildManifestSidecar({ buildDir: fixtureDir, label });
+    // Every caller passes an already-suffixed domain (`${label}.${tld}`), so the
+    // env's TLD is recoverable from the argument itself — buildArgs is sync and
+    // resolveE2eTld() is async, so re-resolving here isn't an option. A bare
+    // label (no dot) falls back to "dot", matching the historical default.
+    // Without this the sidecar appended a second ".dot" to "e2epoolns01.paseo"
+    // and the CLI rejected the config/deploy domain mismatch (#1244).
+    const sidecarTld = label.includes(".") ? label.slice(label.lastIndexOf(".") + 1) : "dot";
+    const { configPath } = buildManifestSidecar({ buildDir: fixtureDir, label, tld: sidecarTld });
     args.push("--config", configPath);
   }
   return args;
@@ -512,8 +519,16 @@ describe("e2e", { skip: !ENABLED }, () => {
       // Env-conditional: the two fixtures are provisioned separately, so a
       // failure must name which one it actually used — otherwise the operator
       // repairs the wrong label.
+      // Label is e2eownedns03 (not e2eownedns02) on paseo-next-v2: the Asset
+      // Hub re-genesis emptied the .paseo namespace, and by the time this
+      // fixture was (re-)provisioned a third party had already registered
+      // e2eownedns02.paseo (owner 0x237a2b18…, neither Bob nor the funder) —
+      // it can't be repaired, the name simply isn't ours on this chain.
+      // Verified live 2026-08-22 via checkOwnership: e2eownedns02.paseo owner
+      // 0x237a2b1824AC4a87095c25EC30e1431060725909 (squatter), e2eownedns03.paseo
+      // owner 0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01 (Bob, BOB_H160 below).
       const ownedLabel = PAD_ENV === "paseo-next-v2"
-        ? `e2eownedns02.${tld}`
+        ? `e2eownedns03.${tld}`
         : `e2eownedns01.${tld}`;
       const envLabel = PAD_ENV ?? "paseo-next-v2";
       try {
@@ -522,7 +537,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           // `e2eowned.dot` was the historical fixture for PopFull signers but its
           // chain ownership drifted to Alice (see e2e run 26648857693 / v0.7.30-rc.1
           // S3 failure — `transferFrom` reverts with a custom error so we can't easily
-          // restore it). Both `e2eownedns01.<tld>` and `e2eownedns02.<tld>` are
+          // restore it). Both `e2eownedns01.<tld>` and `e2eownedns03.<tld>` are
           // PoP-class-compatible with all signers (≥9-char NoStatus, accepts Full
           // signers fine) and are stable-owned by Bob on both envs — use the same
           // env-conditional for every PoP status.
@@ -1658,7 +1673,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       const label = perLegPoolLabel() ?? pickFreshRunLabel("e2enomani");
       const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
-      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}` });
+      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld });
       try {
         const args = [...buildArgs(fixtureDir, `${label}.${tld}`), "--config", configPath, "--no-manifest"];
         const { code, stdout, stderr } = await runBulletinDeploy({
@@ -1740,7 +1755,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       const label = perLegPoolLabel() ?? pickFreshRunLabel("e2emanenv");
       const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
-      const { configPath, iconPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}` });
+      const { configPath, iconPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld });
       try {
         const args = [...buildArgs(fixtureDir, `${label}.${tld}`), "--config", configPath];
         const { code, stdout, stderr } = await runBulletinDeploy({

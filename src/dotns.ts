@@ -20,7 +20,6 @@ import {
   toHex,
   zeroAddress,
   namehash,
-  concatHex,
 } from "viem";
 import { CID } from "multiformats/cid";
 import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath } from "./telemetry.js";
@@ -1094,13 +1093,20 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationName: s
   return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timer));
 }
 
-export const DOT_NODE: `0x${string}` = "0x3fce7d1364a893e213bc4212792b517ffc88f5b13b86c8ef9c8d390c3a1370ce";
-
 export function convertWeiToNative(weiValue: bigint): bigint { return weiValue / NATIVE_TO_ETH_RATIO; }
-export function computeDomainTokenId(label: string): bigint {
-  const labelhash = keccak256(toBytes(label));
-  const node = keccak256(concatHex([DOT_NODE, labelhash]));
-  return BigInt(node);
+// #1240 follow-up: this used to hardcode a `.dot` TLD node (DOT_NODE) and
+// concat it with the label hash by hand — a SECOND node-derivation path that
+// #1240's `namehash(\`${x}.${this._tld}\`)` template conversion never
+// touched (a grep for "namehash(`" doesn't match a manual concatHex). Every
+// other call site derives the ERC-721 tokenId via namehash of the full
+// "label.tld" string; do the same here so there's exactly one derivation to
+// keep correct. Proven wrong in production (bulletin-deploy, the private
+// twin of this repo): registering "ssoqedtuwf.paseo" on paseo-next-v2 minted
+// namehash("ssoqedtuwf.paseo"), but the post-register ownerOf lookup queried
+// namehash("ssoqedtuwf.dot") (the old hardcoded node) and reverted with
+// ERC721NonexistentToken — after the 11 PAS mint succeeded.
+export function computeDomainTokenId(label: string, tld: string = DEFAULT_TLD): bigint {
+  return BigInt(namehash(`${label}.${tld}`));
 }
 export function countTrailingDigits(label: string): number { let count = 0; for (let i = label.length - 1; i >= 0; i--) { const code = label.charCodeAt(i); if (code >= 48 && code <= 57) count++; else break; } return count; }
 export function stripTrailingDigits(label: string): string { return label.replace(/\d+$/, "").replace(/-$/, ""); }
@@ -2899,7 +2905,7 @@ export class DotNS {
   async checkOwnership(label: string, ownerAddress: string | null = null): Promise<OwnershipResult> {
     this.ensureConnected();
     const checkAddress = (ownerAddress || this.evmAddress!).toLowerCase();
-    const tokenId = computeDomainTokenId(label);
+    const tokenId = computeDomainTokenId(label, this._tld);
     try {
       const owner = await withTimeout(this.contractCallNullable(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [tokenId]), 30000, "ownerOf");
       if (owner === null) return { owned: false, owner: null };
@@ -2930,7 +2936,7 @@ export class DotNS {
   ): Promise<{ status: "ok" | "skipped-already-owned"; txHash?: string; feeWei?: bigint }> {
     this.ensureConnected();
     const validated = validateDomainLabel(label);
-    const tokenId = computeDomainTokenId(validated);
+    const tokenId = computeDomainTokenId(validated, this._tld);
     const owner = (await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_TRANSFER_ABI, "ownerOf", [tokenId]), 30000, "ownerOf")) as string;
     if (owner.toLowerCase() === toH160.toLowerCase()) {
       statusCallback("already owned by recipient");
@@ -3763,7 +3769,7 @@ export class DotNS {
   async ensureNotRegistered(label: string): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Checking availability of ${label}.${this._tld}...`);
-    const tokenId = computeDomainTokenId(label);
+    const tokenId = computeDomainTokenId(label, this._tld);
     try {
       const owner = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [tokenId]), 30000, "Availability check");
       if (owner !== zeroAddress) throw new Error(`Domain ${label}.${this._tld} already owned by ${owner}`);
@@ -3918,7 +3924,7 @@ export class DotNS {
     const registeredLabel = registration.label;
     const verifyRegistered = async (): Promise<boolean> => {
       try {
-        const owner = await this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [computeDomainTokenId(registeredLabel)]);
+        const owner = await this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [computeDomainTokenId(registeredLabel, this._tld)]);
         return typeof owner === "string" && owner.toLowerCase() === this.evmAddress!.toLowerCase();
       } catch { return false; }
     };
@@ -3939,7 +3945,7 @@ export class DotNS {
   async verifyOwnership(label: string): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Verifying ownership...`);
-    const tokenId = computeDomainTokenId(label);
+    const tokenId = computeDomainTokenId(label, this._tld);
     const actualOwner = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_ABI, "ownerOf", [tokenId]), 30000, "ownerOf");
     if (actualOwner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
       console.log(`   Expected: ${this.evmAddress}`);

@@ -25,7 +25,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   sanitizeRepo, setDeploySentryTag, sampleMemory, initTelemetry,
   setDeployAttribute, __setDeployRootSpanForTest,
   flush, closeTelemetry, __setSentryForTest,
-  classifyErrorKind, sanitizeErrorMessage,
+  classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
 import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
@@ -1176,6 +1176,13 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(classifyErrorKind("Contract execution would revert during finalize-registration on DOTNS_REGISTRAR_CONTROLLER"), "contract-revert");
   });
 
+  test("contract-revert: papi 2.x typed ContractReverted dispatch-error shape (#1061)", () => {
+    assert.strictEqual(
+      classifyErrorKind('Transaction failed: {"type":"Module","value":{"type":"Revive","value":{"type":"ContractReverted"}}}'),
+      "contract-revert",
+    );
+  });
+
   test("chain-timeout: timed out waiting for block", () => {
     assert.strictEqual(classifyErrorKind("finalize-registration timed out after 90s waiting for block confirmation"), "chain-timeout");
   });
@@ -1268,6 +1275,12 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(
       classifyErrorKind("parent mysite.dot is owned by 0xabc"),
       "unknown",
+    );
+  });
+  test("naming.subdomain_orphan: 'owned by no one' variant (#1061)", () => {
+    assert.strictEqual(
+      classifyErrorKind("Cannot deploy sub.mysite.dot: parent mysite.dot is owned by no one, not by this signer."),
+      "naming.subdomain_orphan",
     );
   });
 
@@ -1409,11 +1422,13 @@ describe("classifyErrorKind", () => {
     );
   });
 
-  // naming.contract_unavailable
-  test("naming.contract_unavailable: Cannot decode zero data from ABI call", () => {
+  // dotns.abi_decode_empty (#1061 — split out from naming.contract_unavailable:
+  // this is the raw viem decode message, not one of contractCall's own
+  // actionable wrapper messages below, so it gets its own dedicated kind).
+  test("dotns.abi_decode_empty: Cannot decode zero data from ABI call", () => {
     assert.strictEqual(
       classifyErrorKind('Cannot decode zero data ("0x") with ABI parameters.\n\nVersion: viem@2.51.3'),
-      "naming.contract_unavailable",
+      "dotns.abi_decode_empty",
     );
   });
 
@@ -1705,13 +1720,22 @@ describe("withSpan error attribute propagation", () => {
 
   test("source: withDeploySpan catch also sets deploy.error_kind on the root span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    // withDeploySpan's catch sets deploy.status + deploy.error_category, which are unique
-    // to that block. Assert all four error-kind attributes appear in the same region.
+    // #1061: the catch now routes error recording through the single
+    // setDeployErrorOnSpan choke point instead of inlining each setAttribute —
+    // so the invariant (catch sets deploy.error_kind on the root span) is
+    // preserved *via the helper*. Verify BOTH the delegation and that the
+    // helper writes the attribute, so no path can record deploy.error without it.
     const deploySpanCatch = src.match(/setAttribute\("deploy\.status",\s*"error"\)[\s\S]*?throw error;/);
     assert.ok(deploySpanCatch, "withDeploySpan catch block must exist");
     assert.ok(
-      /setAttribute\("deploy\.error_kind",/.test(deploySpanCatch[0]),
-      "withDeploySpan catch must write deploy.error_kind to root span",
+      /setDeployErrorOnSpan\(/.test(deploySpanCatch[0]),
+      "withDeploySpan catch must route error recording through setDeployErrorOnSpan",
+    );
+    const helper = src.match(/function setDeployErrorOnSpan\([\s\S]*?\n}/);
+    assert.ok(helper, "setDeployErrorOnSpan helper must exist");
+    assert.ok(
+      /setAttribute\("deploy\.error_kind",/.test(helper[0]),
+      "setDeployErrorOnSpan must write deploy.error_kind to the span",
     );
   });
 
@@ -1720,8 +1744,14 @@ describe("withSpan error attribute propagation", () => {
     const deploySpanCatch = src.match(/setAttribute\("deploy\.status",\s*"error"\)[\s\S]*?throw error;/);
     assert.ok(deploySpanCatch, "withDeploySpan catch block must exist");
     assert.ok(
-      /setAttribute\("deploy\.error_message",/.test(deploySpanCatch[0]),
-      "withDeploySpan catch must write deploy.error_message to root span",
+      /setDeployErrorOnSpan\(/.test(deploySpanCatch[0]),
+      "withDeploySpan catch must route error recording through setDeployErrorOnSpan",
+    );
+    const helper = src.match(/function setDeployErrorOnSpan\([\s\S]*?\n}/);
+    assert.ok(helper, "setDeployErrorOnSpan helper must exist");
+    assert.ok(
+      /setAttribute\("deploy\.error_message",/.test(helper[0]),
+      "setDeployErrorOnSpan must write deploy.error_message to the span",
     );
   });
 
@@ -12644,6 +12674,57 @@ describe("setDeployAttribute → root span (regression guard)", () => {
       body.includes("deployRootSpan"),
       "captureWarning must reference deployRootSpan for deploy.sad"
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setDeployError — shared choke point for deploy.error + classification (#1061)
+// ---------------------------------------------------------------------------
+describe("setDeployError → root span choke point (#1061)", () => {
+  // Helper: build a simple spy span (same pattern as the setDeployAttribute
+  // regression-guard block above).
+  function makeSpan() {
+    const attrs = new Map();
+    return { setAttribute: (k, v) => attrs.set(k, v), attrs };
+  }
+
+  test("setDeployError populates deploy.error + classification on the root span", () => {
+    const root = makeSpan();
+    __setDeployRootSpanForTest(root);
+    try {
+      const msg = 'Transaction failed: {"type":"Module","value":{"type":"Revive","value":{"type":"ContractReverted"}}}';
+      setDeployError(msg);
+      assert.strictEqual(root.attrs.get("deploy.error"), msg.slice(0, 500),
+        "setDeployError must set deploy.error to the (length-capped) raw message");
+      assert.strictEqual(root.attrs.get("deploy.error_kind"), "contract-revert",
+        "setDeployError must classify the ContractReverted shape as contract-revert");
+      assert.strictEqual(root.attrs.get("deploy.error_message"), sanitizeErrorMessage(msg),
+        "setDeployError must set deploy.error_message to the sanitized message");
+      assert.ok(root.attrs.has("deploy.error_pattern_signature"),
+        "setDeployError must also set deploy.error_pattern_signature");
+    } finally {
+      __setDeployRootSpanForTest(null);
+    }
+  });
+
+  test("setDeployError classifies the subdomain-orphan message and populates all three attributes", () => {
+    const root = makeSpan();
+    __setDeployRootSpanForTest(root);
+    try {
+      const msg = "Cannot deploy sub.mysite.dot: parent mysite.dot is owned by no one, not by this signer.";
+      setDeployError(msg);
+      assert.strictEqual(root.attrs.get("deploy.error_kind"), "naming.subdomain_orphan",
+        "setDeployError must classify the 'owned by no one' subdomain-orphan message");
+      assert.strictEqual(root.attrs.get("deploy.error"), msg.slice(0, 500));
+      assert.strictEqual(root.attrs.get("deploy.error_message"), sanitizeErrorMessage(msg));
+    } finally {
+      __setDeployRootSpanForTest(null);
+    }
+  });
+
+  test("setDeployError is a no-op when deployRootSpan is null (outside a deploy)", () => {
+    __setDeployRootSpanForTest(null);
+    assert.doesNotThrow(() => setDeployError("some error outside a deploy span"));
   });
 });
 

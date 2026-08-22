@@ -454,6 +454,7 @@ export function computeDeployOutcome(
 //   naming.pop_required            — label requires ProofOfPersonhoodFull but signer is NoStatus
 //   naming.nostatus_required       — label requires NoStatus but signer has ProofOfPersonhood
 //   naming.contract_unavailable    — DotNS contract ABI call returned zero data (contract not deployed or wrong address)
+//   dotns.abi_decode_empty          — raw ABI decode of zero/empty ("0x") data outside the DotNS-guard wrapper path
 //   naming.already_owned           — domain is already owned by a different EVM address
 //   naming.subdomain_orphan        — subdomain parent is owned by a different address
 //   verify.contenthash_mismatch    — post-deploy on-chain contenthash differs from what was written
@@ -476,6 +477,7 @@ export type DeployErrorKind =
   | 'naming.pop_required'
   | 'naming.nostatus_required'
   | 'naming.contract_unavailable'
+  | 'dotns.abi_decode_empty'
   | 'naming.already_owned'
   | 'naming.subdomain_orphan'
   | 'verify.contenthash_mismatch'
@@ -496,13 +498,13 @@ export type DeployErrorKind =
 // Precedence-ordered list of (regex, kind) tuples. First match wins.
 // Strong-signal infra kinds first, then naming, then verify, then network/chain, then tool.
 const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
-  [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)/i, 'contract-revert'],
+  [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"/i, 'contract-revert'],
   [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within/i, 'chain-timeout'],
   [/\bstale\b.*nonce|nonce.*\bstale\b|"type"\s*:\s*"(?:Future|Stale)"|Invalid::Future|tx rejected by pool/i, 'nonce-stale'],
   [/heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i, 'connection'],
   [/requires ProofOfPersonhood(?:Full|Lite|Light),\s*but this signer is NoStatus/i, 'naming.pop_required'],
   [/requires NoStatus,\s*but this signer is ProofOfPersonhood/i, 'naming.nostatus_required'],
-  [/Cannot decode zero data.*with ABI parameters/i, 'naming.contract_unavailable'],
+  [/Cannot decode zero data.*with ABI parameters/i, 'dotns.abi_decode_empty'],
   // Issue #1060: contractCall's own empty-`0x`-data guard (src/dotns.ts, #729) throws
   // an actionable wrapper instead of letting the raw viem message above reach a
   // caller. Same failure family (a DotNS contract read came back empty) — classify
@@ -530,6 +532,19 @@ export function classifyErrorKind(msg: string): DeployErrorKind {
     if (re.test(msg)) return kind;
   }
   return 'unknown';
+}
+
+// Single computation for the message-derived classification attributes any
+// error-ending span writes. Every path that stamps `deploy.error` (or a leaf
+// span's `error.message`) must derive kind/message/pattern from here so no
+// path can end up with the raw error recorded but the classification left
+// null.
+function classifyErrorForSpan(msg: string): { kind: DeployErrorKind; message: string; pattern: string } {
+  return {
+    kind: classifyErrorKind(msg),
+    message: sanitizeErrorMessage(msg),
+    pattern: analyseErrorPattern(msg),
+  };
 }
 
 // Sanitize an error message before attaching it to a Sentry span attribute.
@@ -586,10 +601,11 @@ export async function withSpan<T>(op: string, description: string, attributes: R
       return await fn();
     } catch (error) {
       const msg = (error as Error).message ?? String(error);
+      const { kind, message, pattern } = classifyErrorForSpan(msg);
       span.setAttribute("error.message", msg);
-      span.setAttribute("deploy.error_kind", classifyErrorKind(msg));
-      span.setAttribute("deploy.error_message", sanitizeErrorMessage(msg));
-      span.setAttribute("deploy.error_pattern_signature", analyseErrorPattern(msg));
+      span.setAttribute("deploy.error_kind", kind);
+      span.setAttribute("deploy.error_message", message);
+      span.setAttribute("deploy.error_pattern_signature", pattern);
       span.setStatus({ code: 2, message: "internal_error" });
       throw error;
     }
@@ -741,15 +757,12 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
       } catch (error) {
         const msg = (error as Error).message ?? String(error);
         span.setAttribute("deploy.status", "error");
-        span.setAttribute("deploy.error", msg.slice(0, 500));
-        const errorCategory = classifyDeployError(msg);
-        span.setAttribute("deploy.error_category", errorCategory);
         // Mechanism classification (how it failed, not whose fault).
         // Propagated from the leaf chain-op span up to the root deploy span so
         // dashboards can group by deploy.error_kind without drilling into child spans.
-        span.setAttribute("deploy.error_kind", classifyErrorKind(msg));
-        span.setAttribute("deploy.error_message", sanitizeErrorMessage(msg));
-        span.setAttribute("deploy.error_pattern_signature", analyseErrorPattern(msg));
+        setDeployErrorOnSpan(span, msg);
+        const errorCategory = classifyDeployError(msg);
+        span.setAttribute("deploy.error_category", errorCategory);
         currentErrorCategory = errorCategory;
         // Expected refusals (owned-by, reserved label, insufficient balance…)
         // are product rules, not tool friction: keep sad="false" so dashboards
@@ -834,6 +847,31 @@ export function setDeployReportContext(patch: Partial<DeployContextForReport> & 
 export function setDeployAttribute(key: string, value: string | number | boolean): void {
   if (!deployRootSpan) return;
   deployRootSpan.setAttribute(key, value);
+}
+
+// Sets `deploy.error` + its classification (`deploy.error_kind`,
+// `deploy.error_message`, `deploy.error_pattern_signature`) on `span` in one
+// call. Used by withDeploySpan's catch block; also exported (see
+// setDeployError below) as the choke point any future error-ending path
+// should route through instead of setting deploy.error alone.
+function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | number | boolean) => void }, msg: string): void {
+  const { kind, message, pattern } = classifyErrorForSpan(msg);
+  span.setAttribute("deploy.error", msg.slice(0, 500));
+  span.setAttribute("deploy.error_kind", kind);
+  span.setAttribute("deploy.error_message", message);
+  span.setAttribute("deploy.error_pattern_signature", pattern);
+}
+
+// Global-root-span convenience wrapper for setDeployErrorOnSpan, mirroring
+// setDeployAttribute's calling convention (no explicit span argument — writes
+// to the currently active deploy's root span, no-op outside a deploy). Exists
+// so a future caller outside a withDeploySpan callback (e.g. a process-level
+// uncaughtException/unhandledRejection handler) can record deploy.error
+// without bypassing classification, instead of calling setDeployAttribute
+// directly with the raw message.
+export function setDeployError(msg: string): void {
+  if (!deployRootSpan) return;
+  setDeployErrorOnSpan(deployRootSpan, msg);
 }
 
 // @internal — test hook: injects a fake root span so unit tests can assert

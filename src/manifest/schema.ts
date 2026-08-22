@@ -36,7 +36,14 @@ const EXECUTABLE_KINDS = [KIND_APP, KIND_WIDGET, KIND_WORKER] as const satisfies
 
 /** dotNS label rule: 1 to 63 chars of `[a-z0-9-]`, no leading or trailing hyphen. */
 const LABEL = String.raw`(?!-)[a-z0-9-]{1,63}(?<!-)`;
-const DOMAIN_RE = new RegExp(`^${LABEL}(\\.${LABEL})*\\.dot$`, "i");
+// Mirrors src/dotns.ts's KNOWN_TLDS without importing that chain-aware module
+// (see the file doc comment above: this validator stays free of the
+// polkadot-api dep). DotNS's TLD is per-environment — paseo-next-v2 uses
+// ".paseo" — so a hardcoded ".dot$" here would reject every valid
+// paseo-next-v2 product config outright. Keep this list in sync with
+// dotns.ts's KNOWN_TLDS by hand; test/test.js asserts the two never drift.
+const KNOWN_TLDS = ["dot", "paseo"] as const;
+const DOMAIN_RE = new RegExp(`^${LABEL}(\\.${LABEL})*\\.(?:${KNOWN_TLDS.join("|")})$`, "i");
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -148,7 +155,7 @@ export function validateProductConfig(input: unknown): ValidationResult<ProductC
     return { ok: false, errors: ["product config must be an object (did you forget `export default`?)"] };
   }
   if (!isNonEmptyString(input.domain) || !DOMAIN_RE.test(input.domain)) {
-    errors.push("product config domain must be a non-empty dotNS name ending in .dot");
+    errors.push(`product config domain must be a non-empty dotNS name ending in one of: ${KNOWN_TLDS.map(t => `.${t}`).join(", ")}`);
   }
   if (!isNonEmptyString(input.displayName)) errors.push("product config displayName must be a non-empty string");
   if (typeof input.description !== "string") errors.push("product config description must be a string");

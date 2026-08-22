@@ -23,8 +23,8 @@ import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManif
 import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
 import { keccak256, toBytes } from "viem";
-import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI, classifyRegistrability, formatUnregistrableReason } from "./dotns.js";
-import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep } from "./dotns.js";
+import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD } from "./dotns.js";
+import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions } from "./dotns.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, detectTestnet } from "./pool.js";
@@ -2656,7 +2656,22 @@ export function resolveDotnsConnectOptions(
   environmentId?: string,
   popSelfServe?: PopSelfServeConfig | null,
   registerStorageDeposit?: bigint,
-): { signer?: PolkadotSigner; signerAddress?: string; mnemonic?: string; derivationPath?: string; assetHubEndpoints?: string[]; autoAccountMapping?: boolean; contracts?: Record<string, string>; nativeToEthRatio?: bigint; environmentId?: string; popSelfServe?: PopSelfServeConfig | null; registerStorageDeposit?: bigint } {
+  tld?: string,
+): Pick<
+  DotNSConnectOptions,
+  | "signer"
+  | "signerAddress"
+  | "mnemonic"
+  | "derivationPath"
+  | "assetHubEndpoints"
+  | "autoAccountMapping"
+  | "contracts"
+  | "nativeToEthRatio"
+  | "environmentId"
+  | "popSelfServe"
+  | "registerStorageDeposit"
+  | "tld"
+> {
   const tail = assetHubEndpoints && assetHubEndpoints.length > 0 ? { assetHubEndpoints } : {};
   const mappingTail = autoAccountMapping ? { autoAccountMapping } : {};
   const contractsTail = contracts && Object.keys(contracts).length > 0 ? { contracts } : {};
@@ -2664,10 +2679,11 @@ export function resolveDotnsConnectOptions(
   const envTail = environmentId ? { environmentId } : {};
   const popTail = popSelfServe !== undefined ? { popSelfServe } : {};
   const storageTail = registerStorageDeposit !== undefined ? { registerStorageDeposit } : {};
+  const tldTail = tld !== undefined ? { tld } : {};
   if (options.signer && options.signerAddress) {
-    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail };
+    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
   }
-  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail };
+  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
 }
 
 // Upper-bound estimate of how many bytes this deploy will push to Bulletin.
@@ -2710,10 +2726,11 @@ export function assertSubdomainOwnerMatchesSigner(
   signerEvmAddress: string | null | undefined,
   sublabel: string,
   parentLabel: string,
+  tld: string = DEFAULT_TLD,
 ): void {
   if (result.owned && result.owner?.toLowerCase() !== signerEvmAddress?.toLowerCase()) {
     throw new NonRetryableError(
-      `Subdomain ${sublabel}.${parentLabel}.dot is already owned by ${result.owner} (signer is ${signerEvmAddress}). ` +
+      `Subdomain ${sublabel}.${parentLabel}.${tld} is already owned by ${result.owner} (signer is ${signerEvmAddress}). ` +
       `Use a fresh subdomain label, or release the existing registration.`
     );
   }
@@ -2735,15 +2752,16 @@ export function formatSubdomainParentError(
   parentLabel: string,
   parentOwner: string | null,
   selfAddress: string,
+  tld: string = DEFAULT_TLD,
 ): string {
   if (parentOwner !== null) {
-    return `Cannot deploy ${fullName}: parent ${parentLabel}.dot is owned by ${parentOwner}, not by this signer.`;
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${parentOwner}, not by this signer.`;
   }
   const registrability = classifyRegistrability(parentLabel);
   if (registrability.registrable) {
-    return `Cannot deploy ${fullName}: parent ${parentLabel}.dot is owned by no one, not by this signer.`;
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by no one, not by this signer.`;
   }
-  return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress })}`;
+  return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld })}`;
 }
 
 // Publish step. Subdomains are not supported by the Publisher contract (it only
@@ -2788,13 +2806,17 @@ export async function unpublish(
   const { doc } = await loadEnvironments();
   const resolved = resolveEndpoints(doc, envId);
   const popSelfServe = getPopSelfServeConfig(doc, envId);
-  const parsed = parseDomainName(domainName);
+  const tld = resolved.tld ?? DEFAULT_TLD;
+  const parsed = parseDomainName(domainName, tld);
   if (parsed.isSubdomain) {
-    throw new Error(`Subdomains are not supported by the Publisher registry. To unpublish ${parsed.parentLabel}.dot (which controls ${domainName}), pass that label directly.`);
+    throw new Error(`Subdomains are not supported by the Publisher registry. To unpublish ${parsed.parentLabel}.${tld} (which controls ${domainName}), pass that label directly.`);
   }
   const label = parsed.label;
   const dotns = new DotNS();
   try {
+    // Pass resolved.tld (undefined-preserving), NOT the defaulted `tld` above
+    // — otherwise connect()'s on-chain tld() read never fires for an env that
+    // genuinely configures none (see the envConfiguredTld comment in deploy()).
     await dotns.connect(resolveDotnsConnectOptions(
       { mnemonic: options.mnemonic, derivationPath: options.derivationPath },
       resolved.assetHub,
@@ -2804,9 +2826,11 @@ export async function unpublish(
       envId,
       popSelfServe,
       resolved.registerStorageDeposit,
+      resolved.tld,
     ));
     const result = await dotns.unpublishLabel(label);
-    return { domainName: `${label}.dot`, status: result.status, txHash: result.txHash };
+    // Adopt the authoritative, chain-resolved TLD for the returned domain name.
+    return { domainName: `${label}.${dotns.tld}`, status: result.status, txHash: result.txHash };
   } finally {
     try { dotns.disconnect(); } catch {}
   }
@@ -2931,6 +2955,17 @@ export async function deploy(content: DeployContent, domainName: string | null =
   let envNativeToEthRatio: bigint | undefined;
   let envRegisterStorageDeposit: bigint | undefined;
   let envPopSelfServe: PopSelfServeConfig | null = null;
+  let envTld: string = DEFAULT_TLD;
+  // Undefined-preserving twin of envTld: unlike envTld (defaulted to "dot"
+  // for display/pre-connect parsing), this is what actually reaches
+  // DotNS.connect()'s `tld` option below. If it were defaulted here too,
+  // connect()'s `if (options.tld === undefined)` on-chain-read branch would
+  // NEVER fire for an env that genuinely configures no tld (e.g. devnet) —
+  // the whole point of the dotns PR #218 resolution order (env config >
+  // on-chain read > DEFAULT_TLD) would be dead code. Keep this
+  // `string | undefined` all the way to every resolveDotnsConnectOptions()
+  // call site; never apply `?? DEFAULT_TLD` to it.
+  let envConfiguredTld: string | undefined;
   if (options.bulletinEndpoints && options.bulletinEndpoints.length > 0) {
     envBulletin = options.bulletinEndpoints;
     envAssetHub = options.assetHubEndpoints;
@@ -2949,6 +2984,8 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envContracts = resolved.contracts;
       envNativeToEthRatio = resolved.nativeToEthRatio;
       envRegisterStorageDeposit = resolved.registerStorageDeposit;
+      envTld = resolved.tld ?? DEFAULT_TLD;
+      envConfiguredTld = resolved.tld;
       envPopSelfServe = getPopSelfServeConfig(doc, envId);
     } catch (e) {
       if (e instanceof NonRetryableError) throw e;
@@ -2978,7 +3015,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
   // bypasses PopRules on-chain). That decision moved to ownership-aware
   // preflight — see classifyRegistrability/decideRegistrabilityOutcome in
   // src/dotns.ts.
-  const parsed: ParsedDomainName | null = domainName ? parseDomainName(domainName) : null;
+  // `let`, not `const`: refreshed once the preflight connect resolves the
+  // AUTHORITATIVE on-chain TLD (see the `parsed = { ...parsed, fullName: ... }`
+  // reassignment below) — `fullName` embeds whichever `envTld` was current at
+  // THIS parse, which on an env with no configured tld is still the
+  // pre-connect DEFAULT_TLD guess, not necessarily the real one.
+  let parsed: ParsedDomainName | null = domainName ? parseDomainName(domainName, envTld) : null;
 
   let sessionCleanup: (() => void) | undefined;
   // Cheap session-file probe — does NOT load the SSO stack. A logged-in user has
@@ -3162,7 +3204,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
     console.log(`DEPLOYING TO TESTNET                    v${VERSION}`);
     console.log("=".repeat(60));
     if (envName) console.log(`   Environment: ${envName}`);
-    console.log(`   Domain: ${name}.dot`);
+    // NOT printed here: on an env with no configured `tld`, envTld at this
+    // point is still the pre-connect DEFAULT_TLD guess, not the real
+    // on-chain value — printing it now could show "name.dot" for a
+    // paseo-next-v2-shaped env whose actual TLD is ".paseo". The "Domain:"
+    // line prints below, right after the preflight connect resolves the
+    // AUTHORITATIVE tld (see `envTld = preflight.tld` in the Preflight
+    // section) — no user-visible line ever renders the domain with a
+    // not-yet-confirmed TLD.
     if (deployTag) console.log(`   Tag: ${deployTag}`);
     if (options.inputCar) console.log(`   Input CAR: ${path.resolve(options.inputCar)}`);
     else if (typeof content === "string") console.log(`   Build dir: ${path.resolve(content)}`);
@@ -3191,9 +3240,29 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
 
       const preflight = new DotNS();
-      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit));
+      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld));
       // connect() now guarantees the account is mapped before returning — no
       // post-connect mapping wait needed here. See DotNS.connect() in dotns.ts.
+      // Adopt the authoritative, chain-resolved TLD for everything downstream
+      // (display strings, the two later resolveDotnsConnectOptions() calls'
+      // pre-connect siblings, etc.) — envTld before this point may still be
+      // DEFAULT_TLD even on an env whose real on-chain TLD differs, because
+      // it was set before connect() had a chance to read the chain.
+      envTld = preflight.tld;
+      // `fullName` was computed by the pre-connect parseDomainName() call
+      // using whatever envTld was current THEN — refresh it now that envTld
+      // is authoritative, so no downstream message (subdomain ownership
+      // errors, previous-contenthash lookups, etc.) can embed a stale TLD.
+      // `fullName` is always `${label}.${tld}` for both the top-level and
+      // subdomain shapes (see parseDomainName), so this is a safe, complete
+      // recomputation without re-invoking the parser (which could spuriously
+      // re-trigger its wrong-TLD guard on an input that already parsed
+      // successfully once).
+      if (parsed) parsed = { ...parsed, fullName: `${parsed.label}.${envTld}` };
+      // First point in this deploy where the domain's REAL TLD is known — see
+      // the comment at the earlier (now TLD-less) banner print above for why
+      // this line doesn't fire any sooner.
+      console.log(`   Domain: ${name}.${envTld}`);
 
       // Subdomain deploys use a different on-chain path (setSubnodeOwner on
       // the Registry, no commit-reveal or PoP). Skip the TLD preflight and
@@ -3202,12 +3271,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
       if (parsed?.isSubdomain) {
         try {
           const subResult = await preflight.checkSubdomainOwnership(parsed.sublabel!, parsed.parentLabel!);
-          assertSubdomainOwnerMatchesSigner(subResult, preflight.evmAddress, parsed.sublabel!, parsed.parentLabel!);
+          assertSubdomainOwnerMatchesSigner(subResult, preflight.evmAddress, parsed.sublabel!, parsed.parentLabel!, envTld);
           if (!subResult.owned) {
             const { owned: parentOwned, owner: parentOwner } = await preflight.checkOwnership(parsed.parentLabel!);
             if (!parentOwned) {
               throw new NonRetryableError(
-                formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "")
+                formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "", envTld)
               );
             }
           }
@@ -3218,7 +3287,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         } finally {
           preflight.disconnect();
         }
-        console.log(`   Mode: subdomain (parent ${parsed.parentLabel}.dot owned by signer)`);
+        console.log(`   Mode: subdomain (parent ${parsed.parentLabel}.${envTld} owned by signer)`);
       } else {
         // Full DotNS readiness check — runs every view-only rule we know
         // (classification, ownership, reservation, PoP gate) BEFORE touching
@@ -3268,7 +3337,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const alreadyOwned = dotnsPreflight.plannedAction === "already-owned-by-us"
           || dotnsPreflight.plannedAction === "already-owned-by-recipient";
         const reqSuffix = alreadyOwned ? " (already owned, requirement not enforced)" : "";
-        console.log(`   DotNS: ${name}.dot requires ${popStatusName(dotnsPreflight.classification.status)}${reqSuffix}`);
+        console.log(`   DotNS: ${name}.${envTld} requires ${popStatusName(dotnsPreflight.classification.status)}${reqSuffix}`);
         if (dotnsPreflight.canProceed) {
           const fromName = popStatusName(dotnsPreflight.userStatus);
           console.log(`   Your PoP: ${fromName}`);
@@ -3280,7 +3349,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           // content-updated, signed by the owner's phone (no transfer, an extra
           // phone tap). Only meaningful in transfer mode (recipient set).
           if (options.transferTo) {
-            console.log(formatTransferModeDotnsLine(alreadyOwned, `${name}.dot`, options.transferTo));
+            console.log(formatTransferModeDotnsLine(alreadyOwned, `${name}.${envTld}`, options.transferTo));
           }
         }
 
@@ -3471,7 +3540,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         // preflight branch). The worker can't update its content — only the owner
         // is authorised — so re-acquire the session signer and sign as the OWNER.
         if (dotnsPreflight?.plannedAction === "already-owned-by-recipient") {
-          console.log(`   You already own ${name}.dot — updating its content needs your signature.`);
+          console.log(`   You already own ${name}.${envTld} — updating its content needs your signature.`);
           const { getAuthClient } = await import("./auth-config.js");
           const { resolveSigner } = await import("./auth/index.js");
           const authClient = await getAuthClient(envId);
@@ -3490,7 +3559,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             try { owner.destroy(); } catch { /* best-effort */ }
           };
           await ownerDotns.connect({
-            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
+            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld),
             confirmPhoneReady: options.confirmPhoneReady,
             phoneSigner: true, // owner path is always a real phone/session signer
           });
@@ -3508,7 +3577,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
         const dotns = new DotNS();
         await dotns.connect({
-          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit),
+          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld),
           confirmPhoneReady: options.confirmPhoneReady,
           // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
           // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.
@@ -3531,7 +3600,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             throw new Error(`Subdomain ${parsed.fullName} is owned by ${owner}, not ${dotns.evmAddress}`);
           } else {
             const parentOwnership = await dotns.checkOwnership(parsed.parentLabel!);
-            if (!parentOwnership.owned) throw new Error(`You must own ${parsed.parentLabel}.dot to register subdomains under it`);
+            if (!parentOwnership.owned) throw new Error(`You must own ${parsed.parentLabel}.${envTld} to register subdomains under it`);
             console.log(`   Status: Registering subdomain...`);
             await dotns.registerSubdomain(parsed.sublabel!, parsed.parentLabel!);
             registeredFresh = true;
@@ -3569,7 +3638,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         // #928: only hand over a name THIS run freshly registered — re-deploying
         // (updating content of) a pre-existing name must not change its owner.
         if (options.transferTo && !registeredFresh) {
-          console.log(`   ${name}.dot already existed — updated content only; ownership unchanged (not transferred to ${options.transferTo}).`);
+          console.log(`   ${name}.${envTld} already existed — updated content only; ownership unchanged (not transferred to ${options.transferTo}).`);
           // Actionable, because this also fires when a retry re-ran the whole
           // deploy after attempt 1 freshly registered + then flaked on
           // setContenthash/publish: attempt 2 sees "Already owned", so the
@@ -3580,14 +3649,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
         }
         if (shouldHandoverName({ transferTo: options.transferTo, registeredFresh })) {
           const transferTo = options.transferTo!;
-          await withSpan("deploy.transfer", `3. transfer ${name}.dot`, { "deploy.transfer.to": transferTo }, async () => {
+          await withSpan("deploy.transfer", `3. transfer ${name}.${envTld}`, { "deploy.transfer.to": transferTo }, async () => {
             setDeployAttribute("deploy.transfer.worker", truncateAddress(options.signerAddress ?? "") as string);
             setDeployAttribute("deploy.transfer.to", transferTo);
             try {
               const transferRes = await dotns.transferName(name, transferTo, (s) => console.log(`   ${s}`));
               setDeployAttribute("deploy.transfer.status", transferRes.status);
               if (transferRes.feeWei != null) setDeployAttribute("deploy.transfer.fee_wei", transferRes.feeWei.toString());
-              console.log(`   Handed ${name}.dot to ${transferTo} (${transferRes.status}${transferRes.txHash ? `, tx ${transferRes.txHash}` : ""}).`);
+              console.log(`   Handed ${name}.${envTld} to ${transferTo} (${transferRes.status}${transferRes.txHash ? `, tx ${transferRes.txHash}` : ""}).`);
             } catch (e) {
               setDeployAttribute("deploy.transfer.status", "failed");
               const recover = `${CLI_NAME} transfer ${name} --env ${envId}` + (options.suri ? ` --mnemonic "<your worker key>"` : "");
@@ -3625,9 +3694,9 @@ export async function deploy(content: DeployContent, domainName: string | null =
       console.log("=".repeat(60));
       console.log("\nCheck it out here:");
       console.log(`   ${browserUrlFor(name, envId, envWebGateway)}`);
-      console.log(`   ${name}.dot  (in a Polkadot app: mobile or desktop)`);
+      console.log(`   ${name}.${envTld}  (in a Polkadot app: mobile or desktop)`);
       console.log("\n" + "=".repeat(60) + "\n");
-      return { domainName: name, fullDomain: `${name}.dot`, cid: cid as string, ipfsCid };
+      return { domainName: name, fullDomain: `${name}.${envTld}`, cid: cid as string, ipfsCid };
     } finally {
       // Flush the module-level failover flag in case onStatusChanged fired after
       // the deploy span attribute was already written. Idempotent if already set.

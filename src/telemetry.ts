@@ -502,6 +502,13 @@ export type DeployErrorKind =
   | 'tool.invariant'
   | 'unknown';
 
+// DotNS's TLD is per-environment (e.g. "paseo" on paseo-next-v2 — see
+// src/dotns.ts DEFAULT_TLD / src/environments.ts's per-env `tld` field). A
+// hardcoded ".dot" here would stop matching the moment a deploy message
+// embeds a different TLD, silently degrading deploy.error_kind to 'unknown'
+// on those envs. Shared fragment so the two rules below can't drift apart.
+const TLD_FRAGMENT = "[a-z]{2,}";
+
 // Precedence-ordered list of (regex, kind) tuples. First match wins.
 // Strong-signal infra kinds first, then naming, then verify, then network/chain, then tool.
 const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
@@ -518,7 +525,7 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // it the same way instead of letting it fall into 'unknown'.
   [/No contract deployed at .+ returned empty success data/i, 'naming.contract_unavailable'],
   [/Contract call returned empty data — contract=/i, 'naming.contract_unavailable'],
-  [/Domain\s+\S+\.dot\s+is already owned by\s+0x[a-fA-F0-9]+/i, 'naming.already_owned'],
+  [new RegExp(`Domain\\s+\\S+\\.${TLD_FRAGMENT}\\s+is already owned by\\s+0x[a-fA-F0-9]+`, 'i'), 'naming.already_owned'],
   // #1185: formatUnregistrableReason's distinctive phrase — present in both
   // the unregistered ("...is not registered, and bulletin-deploy cannot
   // register it: ...") and owned-by-another-account ("...is owned by
@@ -528,7 +535,7 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // naming.already_owned (whose "already owned by 0x..." phrasing this rule
   // never produces, so there's no overlap either way).
   [/cannot register it/i, 'naming.governance_reserved'],
-  [/Cannot deploy\s+[\w.-]+\.dot:\s*parent\s+[\w.-]+\.dot\s+is owned by/i, 'naming.subdomain_orphan'],
+  [new RegExp(`Cannot deploy\\s+[\\w.-]+\\.${TLD_FRAGMENT}:\\s*parent\\s+[\\w.-]+\\.${TLD_FRAGMENT}\\s+is owned by`, 'i'), 'naming.subdomain_orphan'],
   [/Post-deploy verification failed for .+: on-chain contenthash is /i, 'verify.contenthash_mismatch'],
   [/Deploy verification failed:\s*DAG-PB root.+not finalised/i, 'verify.dagpb_not_finalised'],
   [/Retry budget exhausted:.*recovery attempts/i, 'network.recovery_exhausted'],

@@ -13626,11 +13626,15 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     // pickDirectLabel(). Verify: one fresh-label pick + two buildArgs calls.
     assert.match(e2e, /describe\("S8[\s\S]{0,300}const label = pickFreshRunLabel\("s8smoke"\)/,
       "S8 must pick a fresh per-run label once at describe scope");
-    const s8Args = e2e.match(/const args = buildArgs\(fixtureDir, `\$\{label\}\.dot`\);/g) ?? [];
+    // #paseo-tld: the suffix is now the env's resolved tld (bare "dot" was
+    // hardcoded pre-#1240; the CLI's wrong-TLD guard would reject that on a
+    // .paseo env), so this regex accepts any `.${tld}`-shaped interpolation
+    // instead of a literal ".dot".
+    const s8Args = e2e.match(/const args = buildArgs\(fixtureDir, `\$\{label\}\.\$\{tld\}`\);/g) ?? [];
     assert.equal(
       s8Args.length,
       2,
-      "both S8 deploys must use buildArgs() with the shared label binding so --env paseo-next-v2 is passed in PR CI",
+      "both S8 deploys must use buildArgs() with the shared label binding, suffixed with the resolved env tld (not a hardcoded .dot), so --env paseo-next-v2 is passed in PR CI",
     );
   });
 
@@ -16749,9 +16753,11 @@ describe("deploy.ts: persistent cache write replaces buildDir sidecar", () => {
 describe("deploy.ts: PoP wording uses 'requires' + 'Your PoP'", () => {
   test("DotNS line uses 'requires' verb (not 'classifies as')", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // #paseo-tld: the suffix is now the resolved env tld (envTld), not a
+    // hardcoded ".dot" — match either form.
     assert.ok(
-      /DotNS:.*\.dot\s+requires/.test(src),
-      "deploy.ts: DotNS line must say '<domain>.dot requires <tier>' (verb: 'requires', not 'classifies as')"
+      /DotNS:.*\.\S+\s+requires/.test(src),
+      "deploy.ts: DotNS line must say '<domain>.<tld> requires <tier>' (verb: 'requires', not 'classifies as')"
     );
   });
 

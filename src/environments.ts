@@ -43,6 +43,15 @@ export interface Environment {
    * envs, which are served by "dev-dot.li").
    */
   webGateway?: string;
+  /**
+   * DotNS TLD for names registered on this environment (e.g. "paseo" on
+   * paseo-next-v2 following its redeploy). Defaults to "dot" (DEFAULT_TLD in
+   * src/dotns.ts) when omitted — set this only when an env's DotNS deployment
+   * uses a non-default suffix. devnet is community-operated (we don't control
+   * its deployment) and deliberately omits this, falling back to the code
+   * default.
+   */
+  tld?: string;
   uptimeUrl?: string;
   autoAccountMapping?: boolean;
   nativeToEthRatio?: number;
@@ -93,6 +102,8 @@ export interface ResolvedEndpoints {
   envName: string;
   ipfs?: string;
   webGateway?: string;
+  /** Undefined when the env doesn't declare one — callers fall back to DEFAULT_TLD ("dot") at the point of use, same convention as webGateway. */
+  tld?: string;
   autoAccountMapping: boolean;
   contracts: Record<string, string>;
   nativeToEthRatio: bigint;
@@ -404,6 +415,7 @@ export function resolveEndpoints(
     envName: env.name,
     ipfs: env.ipfs,
     webGateway: env.webGateway,
+    tld: env.tld,
     autoAccountMapping: env.autoAccountMapping ?? false,
     contracts: env.contracts ?? {},
     nativeToEthRatio: BigInt(env.nativeToEthRatio ?? 1_000_000),

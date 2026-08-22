@@ -407,7 +407,12 @@ export function getDeployAttributes(domain: string): Record<string, string | num
 }
 
 export function isExpectedError(msg: string): boolean {
-  return /personhood|owned by|owner mismatch|reserved for original|invalid domain label|not authorized for bulletin|insufficient balance|insufficient funds|quota exhausted|insufficient .* authorization|bip39 mnemonic|ipfs cli not installed|base name is \d+ chars|NameNotAvailable|name must be lowercase/i.test(msg);
+  // "cannot register it" (#1185): formatUnregistrableReason's distinctive
+  // phrase, common to all three classifyRegistrability rules (trailing-digits,
+  // hyphen-base, reserved-base) and both ownership branches. Without it, the
+  // trailing-digits variant has no other matching pattern here and would
+  // fall through to a bug-report prompt for a plain operator naming mistake.
+  return /personhood|owned by|owner mismatch|reserved for original|invalid domain label|not authorized for bulletin|insufficient balance|insufficient funds|quota exhausted|insufficient .* authorization|bip39 mnemonic|ipfs cli not installed|base name is \d+ chars|cannot register it|NameNotAvailable|name must be lowercase/i.test(msg);
 }
 
 export type DeployErrorCategory = 'user' | 'environment' | 'internal' | 'unknown';
@@ -456,6 +461,7 @@ export function computeDeployOutcome(
 //   naming.contract_unavailable    — DotNS contract ABI call returned zero data (contract not deployed or wrong address)
 //   dotns.abi_decode_empty          — raw ABI decode of zero/empty ("0x") data outside the DotNS-guard wrapper path
 //   naming.already_owned           — domain is already owned by a different EVM address
+//   naming.governance_reserved     — label DotNS naming rules forbid registering (Reserved/trailing-digit/hyphen-base), decided by ownership in preflight (#1185)
 //   naming.subdomain_orphan        — subdomain parent is owned by a different address
 //   verify.contenthash_mismatch    — post-deploy on-chain contenthash differs from what was written
 //   verify.dagpb_not_finalised     — DAG-PB root not finalised; chain may have dropped the extrinsic
@@ -479,6 +485,7 @@ export type DeployErrorKind =
   | 'naming.contract_unavailable'
   | 'dotns.abi_decode_empty'
   | 'naming.already_owned'
+  | 'naming.governance_reserved'
   | 'naming.subdomain_orphan'
   | 'verify.contenthash_mismatch'
   | 'verify.dagpb_not_finalised'
@@ -512,6 +519,15 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   [/No contract deployed at .+ returned empty success data/i, 'naming.contract_unavailable'],
   [/Contract call returned empty data — contract=/i, 'naming.contract_unavailable'],
   [/Domain\s+\S+\.dot\s+is already owned by\s+0x[a-fA-F0-9]+/i, 'naming.already_owned'],
+  // #1185: formatUnregistrableReason's distinctive phrase — present in both
+  // the unregistered ("...is not registered, and bulletin-deploy cannot
+  // register it: ...") and owned-by-another-account ("...is owned by
+  // 0x..., and bulletin-deploy cannot register it for a different account:
+  // ...") variants, so one rule classifies both. Ordered before
+  // naming.subdomain_orphan (a different message shape entirely) and after
+  // naming.already_owned (whose "already owned by 0x..." phrasing this rule
+  // never produces, so there's no overlap either way).
+  [/cannot register it/i, 'naming.governance_reserved'],
   [/Cannot deploy\s+[\w.-]+\.dot:\s*parent\s+[\w.-]+\.dot\s+is owned by/i, 'naming.subdomain_orphan'],
   [/Post-deploy verification failed for .+: on-chain contenthash is /i, 'verify.contenthash_mismatch'],
   [/Deploy verification failed:\s*DAG-PB root.+not finalised/i, 'verify.dagpb_not_finalised'],

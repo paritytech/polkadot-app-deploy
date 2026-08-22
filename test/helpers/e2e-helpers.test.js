@@ -4,6 +4,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { mutateFixture } from "./e2e-fixture.js";
 import { runBulletinDeploy } from "./e2e-cli.js";
+import { classifyFixtureState } from "./e2e-failure.js";
 
 describe("mutateFixture", () => {
   test("copies fixture to a fresh tempdir and injects runTag into index.html", async () => {
@@ -338,5 +339,39 @@ describe("e2e-failure: failWith", () => {
         return true;
       },
     );
+  });
+});
+
+// Guards the diagnostic that tells FIXTURE DRIFT apart from a product
+// regression. Both look like "expected exit 78, got 0" at the exit-code level,
+// and conflating them is what let a scenario like this sit red for a week.
+describe("classifyFixtureState", () => {
+  const BOB = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+
+  test("registration wiped by a re-genesis is reported as missing", () => {
+    const out = "   Domain: e2eownedns01.dot\n   Domain: available\n   e2eownedns01.dot is available";
+    assert.deepStrictEqual(classifyFixtureState({ output: out, expectedOwner: BOB }), { kind: "missing", owner: null },
+      ">> FAIL: classifyFixtureState: an unregistered fixture must be reported as missing, not as a product failure");
+  });
+
+  test("label re-registered to the deploy signer is reported as drifted, naming the squatter", () => {
+    const out = "Deployment failed: Domain e2eownedns01.dot is already owned by 0x35Cdb23fF7fc86E8DCcd577CA309bFEA9c978D20.";
+    const got = classifyFixtureState({ output: out, expectedOwner: BOB });
+    assert.strictEqual(got.kind, "drifted",
+      ">> FAIL: classifyFixtureState: a label owned by someone other than the fixture owner must be reported as drifted");
+    assert.strictEqual(got.owner, "0x35Cdb23fF7fc86E8DCcd577CA309bFEA9c978D20",
+      ">> FAIL: classifyFixtureState: must name the actual owner so the operator knows who squatted it");
+  });
+
+  test("correct owner is ok even when the H160 case differs", () => {
+    const out = "Deployment failed: Domain e2eownedns01.dot is already owned by 0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01.";
+    assert.strictEqual(classifyFixtureState({ output: out, expectedOwner: BOB }).kind, "ok",
+      ">> FAIL: classifyFixtureState: H160 comparison must be case-insensitive — chains return EIP-55 checksummed addresses");
+  });
+
+  test("a genuine product failure is NOT misreported as drift", () => {
+    const out = "Deployment failed: chunk upload timed out after 180s";
+    assert.strictEqual(classifyFixtureState({ output: out, expectedOwner: BOB }).kind, "ok",
+      ">> FAIL: classifyFixtureState: unrelated failures must fall through to the normal assertions, not be blamed on fixtures");
   });
 });

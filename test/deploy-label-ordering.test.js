@@ -4,16 +4,30 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { deploy, isPhoneSignerActive, shouldHandoverName } from "../dist/deploy.js";
+import { parseDomainName } from "../dist/dotns.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
 
-// Behavioral guard: an invalid (Reserved, <=5-char base) label must be rejected
+// Behavioral guard (#890): a syntactically invalid label must be rejected
 // up-front — BEFORE the signer-resolution block prints the worker/storage plan.
-// Before the fix, parseDomainName ran after that block, so a doomed deploy first
+// Before that fix, parseDomainName ran after that block, so a doomed deploy first
 // printed a "Using <signer>" / "will transfer …" / "Storage signer:" line that
 // could never matter.
-test("deploy rejects an invalid label before printing any signer plan", async () => {
+//
+// #1185 changed WHICH labels qualify, not the ordering property. This test used
+// "ionut" (5-char base → Reserved) and asserted /Base name is 5 chars/. Post-#1185
+// a Reserved label is deliberately NOT rejected pre-chain — whether it is
+// deployable is an ownership question resolved in preflight, because a name
+// registered via registerReserved bypasses PopRules on-chain and its owner must
+// be able to deploy to it. Left unchanged, this test stopped being hermetic: the
+// deploy sailed past validation, tried to reach wss://example.invalid, and burned
+// ~91s before failing on an unrelated error. It tripled the CI Unit Tests job
+// (7.9min → 25min+) — which is how it was caught.
+//
+// The ordering property is preserved by asserting it with a violation that IS
+// still pre-chain: contract-level syntax (charset / length / edge hyphen).
+test("deploy rejects a syntactically invalid label before printing any signer plan", async () => {
   const logs = [];
   const orig = console.log;
   console.log = (...a) => { logs.push(a.map(String).join(" ")); };
@@ -22,9 +36,9 @@ test("deploy rejects an invalid label before printing any signer plan", async ()
       // suri → forces the "resolve" signer path (the one that prints the plan).
       // bulletinEndpoints → bypasses the env loader, so the test is hermetic
       // (no network, no env file, no session load — the throw fires first).
-      () => deploy(new Uint8Array([0]), "ionut", { suri: "//Alice", bulletinEndpoints: ["wss://example.invalid"] }),
-      /Base name is 5 chars/,
-      ">> FAIL: deploy label ordering: a 5-char Reserved label should be rejected up-front",
+      () => deploy(new Uint8Array([0]), "ab", { suri: "//Alice", bulletinEndpoints: ["wss://example.invalid"] }),
+      /3-63 chars/,
+      ">> FAIL: deploy label ordering: a too-short label should be rejected up-front, before any signer plan",
     );
   } finally {
     console.log = orig;
@@ -34,6 +48,18 @@ test("deploy rejects an invalid label before printing any signer plan", async ()
     leaked,
     undefined,
     `>> FAIL: deploy label ordering: signer-plan line printed before invalid-label validation: ${JSON.stringify(leaked)}`,
+  );
+});
+
+// The other half of the #1185 contract, pinned here where the old assumption
+// lived: a Reserved (<=5-char base) label must NOT be refused during parsing.
+// Hermetic — parseDomainName is pure and makes no chain call.
+test("a Reserved label is NOT rejected during parsing (#1185 — ownership decides, not syntax)", () => {
+  const parsed = parseDomainName("ionut.dot");
+  assert.equal(
+    parsed.fullName,
+    "ionut.dot",
+    `>> FAIL: deploy label ordering: parseDomainName must pass a Reserved label through untouched so preflight can check ownership; got ${JSON.stringify(parsed.fullName)}`,
   );
 });
 

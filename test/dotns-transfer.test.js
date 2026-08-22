@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { weiToNative, DotNS, feeFloorFor } from "../dist/dotns.js";
+import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability } from "../dist/dotns.js";
 
 test("weiToNative: zero stays zero", () => {
   assert.equal(weiToNative(0n, 100000000n), 0n);
@@ -120,4 +120,41 @@ test("feeFloorFor: adds the transfer fee to the already-owned floor", () => {
   const base = feeFloorFor("already-owned-by-us", 2000000000000n, 0n, 0n);
   const withFee = feeFloorFor("already-owned-by-us", 2000000000000n, 0n, 7n);
   assert.equal(withFee - base, 7n);
+});
+
+// Pin: `pad transfer <subname>.<parent>.dot` must still route through
+// DotNS.transferSubname, never get refused as a non-compliant registerable
+// label. transfer.ts's runTransfer dispatches on parseDomainName's
+// isSubdomain flag: `parsed.isSubdomain ? dotns.transferSubname(...) :
+// dotns.transferName(...)`. classifyRegistrability's PopRules-derived rules
+// (trailing-digit count, hyphen-base, reserved-base) apply ONLY to
+// registered top-level names via preflight/register() — parseDomainName's
+// subname branch never calls classifyRegistrability, and validateDomainLabel
+// (which it DOES call, bare, on both halves) is contract-syntax-only
+// (charset/length/edge-hyphen) since #1185. A sublabel that would be
+// refused outright as a top-level registration (here: "app1", 1 trailing
+// digit) must still parse and dispatch to transferSubname untouched.
+test("subname dispatch: a sublabel classifyRegistrability would refuse as a top-level name still reaches transferSubname (#1190/#1185 non-regression)", async () => {
+  // Sanity check the premise: "app1" (1 trailing digit) IS refused by
+  // classifyRegistrability when treated as a registerable top-level name —
+  // otherwise this test wouldn't actually be pinning anything.
+  const registrability = classifyRegistrability("app1");
+  assert.equal(
+    registrability.registrable, false,
+    ">> FAIL: subname dispatch premise: \"app1\" (1 trailing digit) should be non-registrable as a top-level name, or this test isn't exercising the guard it claims to",
+  );
+
+  const parsed = parseDomainName("app1.mydomain.dot");
+  assert.equal(parsed.isSubdomain, true, ">> FAIL: subname dispatch: \"app1.mydomain.dot\" must parse as a subdomain, not throw as a non-compliant label");
+  assert.equal(parsed.sublabel, "app1", ">> FAIL: subname dispatch: sublabel must be the raw \"app1\", untouched by any PopRules rule");
+  assert.equal(parsed.parentLabel, "mydomain", ">> FAIL: subname dispatch: parentLabel must be \"mydomain\"");
+  assert.equal(parsed.fullName, "app1.mydomain.dot", ">> FAIL: subname dispatch: fullName must round-trip the input");
+
+  // Mirror transfer.ts's actual dispatch: `parsed.isSubdomain ? transferSubname(...) : transferName(...)`.
+  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xOLD", afterOwner: "0xRECIP" });
+  const r = parsed.isSubdomain
+    ? await d.transferSubname(parsed.sublabel, parsed.parentLabel, "0xRECIP")
+    : await d.transferName(parsed.label, "0xRECIP");
+  assert.equal(r.status, "ok", ">> FAIL: subname dispatch: transferSubname must complete normally, not be refused as a non-compliant label");
+  assert.equal(r.txHash, "0xsub", ">> FAIL: subname dispatch: expected the transferSubname tx path (txHash 0xsub), not transferName's (0xabc) — confirms the correct method was actually invoked");
 });

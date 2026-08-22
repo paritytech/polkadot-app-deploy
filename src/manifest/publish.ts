@@ -22,7 +22,7 @@ import {
   setBulletinEndpoints,
   type DeployOptions,
 } from "../deploy.js";
-import { DotNS } from "../dotns.js";
+import { DotNS, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
 import {
   loadEnvironments,
@@ -159,17 +159,7 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
       if (!cid) throw new NonRetryableError(`Internal: missing CID for executable kind '${exec.kind}'`);
 
       const ownership = await dotns.checkSubdomainOwnership(exec.kind, baseLabel);
-      if (!ownership.owned) {
-        if (ownership.owner) {
-          throw new NonRetryableError(
-            `Subname ${exec.kind}.${config.domain} is owned by ${ownership.owner}, not the publisher. Aborting.`,
-          );
-        }
-        console.log(`  Registering subname ${exec.kind}.${config.domain}…`);
-        await dotns.registerSubdomain(exec.kind, baseLabel);
-      }
-
-      await dotns.ensureContentResolver(`${exec.kind}.${baseLabel}`);
+      await registerOrEnsureResolver(dotns, ownership, exec.kind, baseLabel, config.domain);
 
       const subContenthash = `0x${encodeContenthash(cid)}`;
       console.log(`  Setting contenthash on ${exec.kind}.${config.domain} → ${cid}…`);
@@ -187,6 +177,46 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   } finally {
     dotns.disconnect();
   }
+}
+
+/**
+ * Perf win: `registerSubdomain` already sets the fresh subname's resolver
+ * to the content resolver atomically (`setSubnodeOwner` + `setResolver`,
+ * batched via `Utility.batch_all` — see dotns.ts `registerSubdomain`).
+ * Calling `ensureContentResolver` again right after a fresh register was
+ * therefore a wasted chain read on every executable of every fresh deploy.
+ * Only the already-owned path still needs it — a pre-existing subname can
+ * have a stale or unset resolver.
+ *
+ * Takes a minimal injectable `dotns`-like interface (rather than the
+ * concrete `DotNS` class) purely so this branch can be unit-tested without a
+ * live chain connection; `publishManifest` always calls it with a real
+ * `DotNS` instance.
+ */
+export interface RegisterOrEnsureResolverDeps {
+  registerSubdomain(sublabel: string, parentLabel: string): Promise<unknown>;
+  ensureContentResolver(domainName: string): Promise<{ changed: boolean }>;
+}
+
+export async function registerOrEnsureResolver(
+  dotns: RegisterOrEnsureResolverDeps,
+  ownership: OwnershipResult,
+  execKind: string,
+  baseLabel: string,
+  domain: string,
+): Promise<{ registered: boolean }> {
+  if (!ownership.owned) {
+    if (ownership.owner) {
+      throw new NonRetryableError(
+        `Subname ${execKind}.${domain} is owned by ${ownership.owner}, not the publisher. Aborting.`,
+      );
+    }
+    console.log(`  Registering subname ${execKind}.${domain}…`);
+    await dotns.registerSubdomain(execKind, baseLabel);
+    return { registered: true };
+  }
+  await dotns.ensureContentResolver(`${execKind}.${baseLabel}`);
+  return { registered: false };
 }
 
 async function readFileOrThrow(p: string, label: string): Promise<Uint8Array> {

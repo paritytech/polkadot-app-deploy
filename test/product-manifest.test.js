@@ -19,6 +19,7 @@ import {
   publishManifest,
   formatConfigLoadError,
 } from "../dist/index.js";
+import { registerOrEnsureResolver } from "../dist/manifest/publish.js";
 import { NonRetryableError } from "../dist/errors.js";
 import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
 
@@ -532,6 +533,67 @@ describe("formatConfigLoadError — pure helper", () => {
   test("a thrown non-Error value is stringified, not [object Object]", () => {
     const message = formatConfigLoadError("/proj/polkadot-app-deploy.config.ts", "plain string throw");
     assert.match(message, /threw while loading: plain string throw\./, `>> FAIL: formatConfigLoadError non-Error throw: expected stringified value (got "${message}")`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Perf win: registerSubdomain already sets a fresh subname's resolver to the
+// content resolver atomically (setSubnodeOwner + setResolver, batched via
+// Utility.batch_all — see dotns.ts registerSubdomain). The manifest publish
+// loop used to call ensureContentResolver unconditionally right after the
+// register-or-not branch, wasting one chain read per executable on every
+// fresh deploy. registerOrEnsureResolver is the extracted decision (only the
+// already-owned branch still calls ensureContentResolver — a pre-existing
+// subname can have a stale/unset resolver) — pulled out of publishManifest
+// and given an injectable dotns-like interface specifically so this
+// call-count regression can be pinned without a live chain connection
+// (publishManifest itself always calls it with a real DotNS instance, which
+// needs one).
+// ---------------------------------------------------------------------------
+describe("registerOrEnsureResolver (resolver-read skip)", () => {
+  function mockDotns() {
+    const calls = { registerSubdomain: 0, ensureContentResolver: 0 };
+    return {
+      calls,
+      async registerSubdomain(sublabel, parentLabel) {
+        calls.registerSubdomain++;
+        return { sublabel, parentLabel, owner: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" };
+      },
+      async ensureContentResolver(domainName) {
+        calls.ensureContentResolver++;
+        return { changed: true };
+      },
+    };
+  }
+
+  test("fresh register (owned:false, no owner): calls registerSubdomain, does NOT call ensureContentResolver", async () => {
+    const dotns = mockDotns();
+    const result = await registerOrEnsureResolver(dotns, { owned: false, owner: null }, "app", "demoapp", "demoapp.dot");
+    assert.equal(result.registered, true, ">> FAIL: registerOrEnsureResolver fresh-register: expected registered:true");
+    assert.equal(dotns.calls.registerSubdomain, 1, ">> FAIL: registerOrEnsureResolver fresh-register: registerSubdomain must be called exactly once");
+    assert.equal(dotns.calls.ensureContentResolver, 0, ">> FAIL: registerOrEnsureResolver fresh-register: ensureContentResolver must NOT be called — registerSubdomain already batches setResolver atomically (dotns.ts), calling it again is exactly the redundant chain read this port removes");
+  });
+
+  test("already owned (owned:true): calls ensureContentResolver, does NOT call registerSubdomain", async () => {
+    const dotns = mockDotns();
+    const result = await registerOrEnsureResolver(dotns, { owned: true, owner: "5FexistingOwner" }, "widget", "demoapp", "demoapp.dot");
+    assert.equal(result.registered, false, ">> FAIL: registerOrEnsureResolver already-owned: expected registered:false");
+    assert.equal(dotns.calls.ensureContentResolver, 1, ">> FAIL: registerOrEnsureResolver already-owned: ensureContentResolver must be called exactly once — a pre-existing subname can have a stale/unset resolver");
+    assert.equal(dotns.calls.registerSubdomain, 0, ">> FAIL: registerOrEnsureResolver already-owned: registerSubdomain must NOT be called for an already-owned subname");
+  });
+
+  test("owned by someone else (owned:false, owner set): throws NonRetryableError, calls neither", async () => {
+    const dotns = mockDotns();
+    await assert.rejects(
+      () => registerOrEnsureResolver(dotns, { owned: false, owner: "5FconflictingOwner" }, "worker", "demoapp", "demoapp.dot"),
+      (e) => {
+        assert.ok(e instanceof NonRetryableError, ">> FAIL: registerOrEnsureResolver owner-conflict: expected NonRetryableError");
+        assert.match(e.message, /worker\.demoapp\.dot is owned by 5FconflictingOwner/, ">> FAIL: registerOrEnsureResolver owner-conflict: error message must name the conflicting owner and subname");
+        return true;
+      },
+    );
+    assert.equal(dotns.calls.registerSubdomain, 0, ">> FAIL: registerOrEnsureResolver owner-conflict: registerSubdomain must NOT be called");
+    assert.equal(dotns.calls.ensureContentResolver, 0, ">> FAIL: registerOrEnsureResolver owner-conflict: ensureContentResolver must NOT be called");
   });
 });
 

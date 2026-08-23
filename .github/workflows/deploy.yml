@@ -77,7 +77,7 @@ on:
         type: string
         default: 'polkadot-app-deploy'
       publish:
-        description: 'After a successful deploy, list <dotns-domain> in the on-chain Publisher registry (Publisher.publish / --publish). Takes effect on any env whose environments.json config has a non-zero PUBLISHER contract (currently paseo-next-v2 and preview/previewnet, which share the same Publisher address); a non-fatal skip on envs without one (e.g. preview-pvm, paseo-next, paseo-review). The DotNS owner mnemonic (secrets.mnemonic) signs it — no direct-signer required. Subdomains are skipped by the registry.'
+        description: 'After a successful deploy, list <dotns-domain> in the on-chain Publisher registry (Publisher.publish / --publish). Takes effect on any env whose environments.json config has a non-zero PUBLISHER contract (currently devnet); a non-fatal skip on envs without one (e.g. paseo-next-v2, whose Publisher was not redeployed with the 2026-08-12 DotNS contracts). The DotNS owner mnemonic (secrets.mnemonic) signs it — no direct-signer required. Subdomains are skipped by the registry.'
         type: boolean
         default: false
       fail-on-publish-error:

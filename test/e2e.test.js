@@ -700,7 +700,7 @@ describe("e2e", { skip: !ENABLED }, () => {
               `fixture drift on env "${envLabel}" — ${observed}. ` +
               `This is a test-fixture problem, NOT a polkadot-app-deploy regression: ` +
               `the CLI behaved correctly for the chain state it was given. ` +
-              `Fix: node tools/register-test-fixture.mjs ${ownedLabel.replace(new RegExp(`\\.${tld}$`), "")} --env ${envLabel}`,
+              `Fix: this scenario needs ${ownedLabel} owned by an account OTHER than the deploy signer. Ask the chain admin to register it to a third party on ${envLabel} — this repo ships no fixture-registration tool.`,
             context: combined,
             keywords: ["available", "already owned", "Domain"],
             hint:

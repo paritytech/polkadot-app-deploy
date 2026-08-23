@@ -3634,24 +3634,42 @@ describe("DotNS initial state", () => {
     );
   });
 
-  // Fix for issue #420: finalizeRegistration must throw on payment underflow
-  test("finalizeRegistration throws when priceWei > 0 rounds to 0 native units", async () => {
+  // Fix for issue #420, later corrected by the storage_deposit_limit-class
+  // audit (registration payment floor-division vs the tested round-up
+  // formula): finalizeRegistration used to compute its native payment as
+  // `((priceWei*110n)/100n) / nativeToEthRatio` — a pure floor — instead of
+  // routing through bufferedWeiToNative (the tested, round-UP-on-remainder
+  // sibling already used by the pre-flight quote path). For priceWei=500n,
+  // nativeToEthRatio=1_000_000n, the old floor formula computed
+  // (500*110/100)/1_000_000 = 550/1_000_000 = 0n and hard-failed with
+  // "Payment conversion underflow" — even though 500n is a genuinely tiny
+  // but payable price. bufferedWeiToNative(500n, 1_000_000n) rounds the same
+  // 550n up to 1n native unit instead, so this case is now payable rather
+  // than a spurious hard failure. The underflow guard itself is unchanged
+  // and still present as defense-in-depth (see finalizeRegistration) — it is
+  // now structurally unreachable for any priceWei > 0, since weiToNative
+  // (which bufferedWeiToNative calls) always rounds a positive numerator up
+  // to at least 1.
+  test("finalizeRegistration: a tiny nonzero priceWei rounds UP to 1 native unit instead of underflowing to 0 and throwing", async () => {
     const d = new DotNS();
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.evmAddress = "0x1111111111111111111111111111111111111111";
-    // priceWei = 500n; nativeToEthRatio = 1_000_000n → bufferedPaymentNative = (500 * 110 / 100) / 1_000_000 = 550 / 1_000_000 = 0n
+    // priceWei = 500n; nativeToEthRatio = 1_000_000n → bufferedWeiToNative(500n, 1_000_000n)
+    // = weiToNative((500*110n)/100n, 1_000_000n) = weiToNative(550n, 1_000_000n) = 1n (rounded up, not 0n).
     d._nativeToEthRatio = 1_000_000n;
+    let capturedValue;
+    d.contractTransaction = async (_addr, value) => {
+      capturedValue = value;
+      return { kind: "hash", hash: "0xtxhash" };
+    };
 
-    await assert.rejects(
+    await assert.doesNotReject(
       () => d.finalizeRegistration({ label: "testlabel" }, 500n),
-      (err) => {
-        assert.match(err.message, /Payment conversion underflow/);
-        assert.match(err.message, /priceWei=500/);
-        assert.match(err.message, /rounds to 0 native units/);
-        return true;
-      },
+      ">> FAIL: finalizeRegistration tiny-price rounding: expected the rounded-up payment path, not the old floor-division underflow throw",
     );
+    assert.equal(capturedValue, 1n,
+      `>> FAIL: finalizeRegistration tiny-price rounding: expected register() to be called with the rounded-up native value 1n, got ${capturedValue}`);
   });
 
   test("finalizeRegistration does not throw when priceWei is 0n (free registration)", async () => {
@@ -5217,6 +5235,73 @@ describe("DotNS.preflight", () => {
     // transferFee still threads through
     assert.strictEqual(feeFloorFor("already-owned-by-recipient", 0n, 0n, 5_000_000_000n), 100_000_000n + 5_000_000_000n,
       `>> FAIL: feeFloorFor already-owned-by-recipient with transferFee: expected owned floor + transferFee`);
+  });
+
+  // topUpTargetFor had no direct test coverage even though it computes an
+  // auto-top-up amount that spends real testnet funds (attemptTestnetTopUp),
+  // and its sibling feeFloorFor — identical shape, same isOwnedAction branch —
+  // is tested above and had a real historical bug (#893). Mirrors that test's
+  // matrix, plus the full DotnsSuccessAction union (register /
+  // already-owned-by-us / already-owned-by-recipient), zero, very large
+  // values, and pins the actual decimals this code uses: ONE_PAS =
+  // 10_000_000_000n (10 decimals — Paseo Asset Hub PAS is 10 decimals, NOT
+  // 12; a 1e12 assumption would under-report by 100x and this test would
+  // catch that against the hardcoded expected values below).
+  test("topUpTargetFor returns the right top-up target per plannedAction", async () => {
+    const { topUpTargetFor } = await import("../dist/dotns.js");
+    const TOP_UP_TARGET = 5_000_000_000n; // ONE_PAS(10_000_000_000n) / 2n — 0.5 PAS at 10 decimals
+
+    // Defaults: storageDeposit defaults to MINIMUM_REGISTER_STORAGE_DEPOSIT (2e12),
+    // rentPriceNative and transferFeeNative default to 0n.
+    assert.strictEqual(topUpTargetFor("register"), TOP_UP_TARGET + 2_000_000_000_000n,
+      ">> FAIL: topUpTargetFor register defaults: expected TOP_UP_TARGET + MINIMUM_REGISTER_STORAGE_DEPOSIT");
+    assert.strictEqual(topUpTargetFor("already-owned-by-us"), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-us defaults: owned actions must skip the register storage deposit entirely (#893)");
+    assert.strictEqual(topUpTargetFor("already-owned-by-recipient"), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-recipient defaults: must match already-owned-by-us, not the register floor (#893)");
+
+    // storageDeposit only affects the "register" branch (env-specific override).
+    assert.strictEqual(topUpTargetFor("register", 300_000_000_000_000n), TOP_UP_TARGET + 300_000_000_000_000n,
+      ">> FAIL: topUpTargetFor register storageDeposit override: expected TOP_UP_TARGET + the overridden storageDeposit");
+    assert.strictEqual(topUpTargetFor("already-owned-by-us", 300_000_000_000_000n), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-us storageDeposit: storageDeposit must not affect the owned target");
+    assert.strictEqual(topUpTargetFor("already-owned-by-recipient", 300_000_000_000_000n), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-recipient storageDeposit: storageDeposit must not affect the owned target");
+
+    // rentPriceNative threads through the register branch only.
+    assert.strictEqual(topUpTargetFor("register", 2_000_000_000_000n, 110_000_000_000n), TOP_UP_TARGET + 2_000_000_000_000n + 110_000_000_000n,
+      ">> FAIL: topUpTargetFor register rentPriceNative: expected TOP_UP_TARGET + storageDeposit + rentPriceNative");
+    assert.strictEqual(topUpTargetFor("already-owned-by-us", 2_000_000_000_000n, 110_000_000_000n), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor already-owned-by-us rentPriceNative: owned actions never accrue rent (NoStatus-only rent applies to fresh register)");
+
+    // transferFeeNative threads through every branch.
+    assert.strictEqual(topUpTargetFor("register", 2_000_000_000_000n, 0n, 7_000_000n), TOP_UP_TARGET + 2_000_000_000_000n + 7_000_000n,
+      ">> FAIL: topUpTargetFor register transferFee: expected TOP_UP_TARGET + storageDeposit + transferFee");
+    assert.strictEqual(topUpTargetFor("already-owned-by-us", 0n, 0n, 7_000_000n), TOP_UP_TARGET + 7_000_000n,
+      ">> FAIL: topUpTargetFor already-owned-by-us transferFee: expected TOP_UP_TARGET + transferFee");
+    assert.strictEqual(topUpTargetFor("already-owned-by-recipient", 0n, 0n, 7_000_000n), TOP_UP_TARGET + 7_000_000n,
+      ">> FAIL: topUpTargetFor already-owned-by-recipient transferFee: expected TOP_UP_TARGET + transferFee");
+
+    // Zero everything: register still gets the (zeroed) storageDeposit arg passed explicitly.
+    assert.strictEqual(topUpTargetFor("register", 0n, 0n, 0n), TOP_UP_TARGET,
+      ">> FAIL: topUpTargetFor register all-zero: expected bare TOP_UP_TARGET when every add-on is explicitly zeroed");
+
+    // Very large values (a pathological oracle price or storage deposit) must not
+    // overflow or silently truncate — bigint arithmetic, so this is really pinning
+    // that no accidental Number() coercion crept in anywhere on the call path.
+    const hugeStorageDeposit = 10n ** 30n;
+    const hugeRent = 10n ** 25n;
+    assert.strictEqual(
+      topUpTargetFor("register", hugeStorageDeposit, hugeRent, 0n),
+      TOP_UP_TARGET + hugeStorageDeposit + hugeRent,
+      ">> FAIL: topUpTargetFor huge values: expected exact bigint sum, no overflow/truncation to a Number");
+
+    // Decimals pin: TOP_UP_TARGET must be exactly 0.5 PAS at the 10-decimal
+    // scale this codebase actually uses (ONE_PAS = 10_000_000_000n), not the
+    // 12-decimal figure a careless port from a 12-decimal chain would assume.
+    assert.strictEqual(topUpTargetFor("already-owned-by-us"), 5_000_000_000n,
+      ">> FAIL: topUpTargetFor decimals: expected 5_000_000_000n (0.5 PAS at 10 decimals) — a 12-decimal assumption would under-report by 100x " +
+      "(Paseo Asset Hub PAS is 10 decimals, not 12)");
   });
 
   test("fmtPas formats plancks to 4 decimals", async () => {
@@ -16304,6 +16389,171 @@ describe("telemetry coverage source scans — dotns.ts (issue #419)", () => {
     assert.ok(ensureMappedIdx !== -1, "ensureMappedAccountReady method must exist in dotns.ts");
     // The mapping_source set call should appear after the ensureMappedAccountReady method definition
     assert.ok(mappingSourceIdx > ensureMappedIdx, "deploy.dotns.mapping_source must be set within or after ensureMappedAccountReady");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// readPreviousContenthashSafe — latent double-TLD-suffix regression guard.
+//
+// deploy.ts's subdomain branch used to call
+// readPreviousContenthashSafe(preflight, parsed.fullName), but
+// ParsedDomainName.fullName already carries the TLD (`${label}.${tld}`), and
+// DotNS.getContenthash() appends `.${this._tld}` itself — so the callee
+// derived namehash("sub.parent.paseo.paseo"), a node that never exists. It
+// was caught by readPreviousContenthashSafe's own try/catch (non-fatal:
+// silently defeats the incremental-deploy optimisation), but it is the exact
+// bug class that, elsewhere in this codebase (computeDomainTokenId's
+// history), caused an 11 PAS mint to succeed and then the follow-up ownerOf
+// lookup to revert with ERC721NonexistentToken because it queried a
+// differently-derived node.
+//
+// A return-value assertion cannot catch this: readPreviousContenthashSafe
+// swallows every error and a stub that ignores its input would return the
+// same happy CID whether the caller double-suffixes or not. So the stub
+// below records the raw argument getContenthash actually received.
+// ---------------------------------------------------------------------------
+
+describe("readPreviousContenthashSafe (subdomain contenthash read — double-TLD-suffix guard)", () => {
+  function makeRecordingDotns(hexToReturn = "0x") {
+    const received = [];
+    const dotns = {
+      async getContenthash(bareLabel) {
+        received.push(bareLabel);
+        return hexToReturn;
+      },
+    };
+    return { dotns, received };
+  }
+
+  test("passes the bare label through unchanged, no TLD appended by the caller", async () => {
+    const { readPreviousContenthashSafe } = await import("../dist/deploy.js");
+    const { dotns, received } = makeRecordingDotns();
+    await readPreviousContenthashSafe(dotns, "mysub.myparent");
+    assert.equal(received.length, 1,
+      ">> FAIL: readPreviousContenthashSafe argument recording: expected exactly one getContenthash call");
+    assert.equal(received[0], "mysub.myparent",
+      `>> FAIL: readPreviousContenthashSafe TLD handling: getContenthash received "${received[0]}", ` +
+      `expected the untouched bare label "mysub.myparent" — the function must not add or expect a TLD suffix itself`);
+  });
+
+  test("is a transparent passthrough regardless of what the caller passes in", async () => {
+    const { readPreviousContenthashSafe } = await import("../dist/deploy.js");
+    const { dotns, received } = makeRecordingDotns();
+    await readPreviousContenthashSafe(dotns, "sub.parent.paseo");
+    assert.equal(received[0], "sub.parent.paseo",
+      `>> FAIL: readPreviousContenthashSafe passthrough: got "${received[0]}", expected the exact input echoed back unmodified`);
+  });
+
+  test("returns null and swallows getContenthash errors (non-fatal by design)", async () => {
+    const { readPreviousContenthashSafe } = await import("../dist/deploy.js");
+    const dotns = { async getContenthash() { throw new Error("simulated RPC failure"); } };
+    const result = await readPreviousContenthashSafe(dotns, "somelabel.parent");
+    assert.equal(result, null,
+      ">> FAIL: readPreviousContenthashSafe error handling: expected null on a thrown getContenthash error, incremental-deploy optimisation must degrade silently");
+  });
+
+  test("returns null for the first-deploy \"0x\" sentinel", async () => {
+    const { readPreviousContenthashSafe } = await import("../dist/deploy.js");
+    const { dotns } = makeRecordingDotns("0x");
+    const result = await readPreviousContenthashSafe(dotns, "freshlabel");
+    assert.equal(result, null,
+      ">> FAIL: readPreviousContenthashSafe first-deploy handling: expected null for the \"0x\" no-contenthash-yet sentinel");
+  });
+
+  // The unit tests above only pin readPreviousContenthashSafe's own contract
+  // (transparent passthrough, no TLD manipulation). They cannot catch a
+  // regression at the CALL SITE — e.g. deploy.ts's subdomain branch
+  // reverting to pass `parsed.fullName` (already TLD-suffixed) instead of
+  // `parsed.label` (bare). Source-scan directly for that.
+  test("deploy.ts: subdomain branch reads previous contenthash with the bare label, not the TLD-suffixed fullName", () => {
+    const deploySrc = fs.readFileSync(new URL("../src/deploy.ts", import.meta.url), "utf-8");
+    const callIdx = deploySrc.indexOf("previousContenthashCid = await readPreviousContenthashSafe(preflight, parsed.label);");
+    assert.ok(callIdx !== -1,
+      ">> FAIL: deploy.ts subdomain contenthash read: expected readPreviousContenthashSafe(preflight, parsed.label) call not found — " +
+      "did the subdomain branch regress to passing parsed.fullName (already TLD-suffixed), reintroducing the double-TLD-suffix bug " +
+      "(namehash(\"sub.parent.paseo.paseo\"))?");
+    const buggyCallIdx = deploySrc.indexOf("readPreviousContenthashSafe(preflight, parsed.fullName)");
+    assert.equal(buggyCallIdx, -1,
+      ">> FAIL: deploy.ts subdomain contenthash read: found readPreviousContenthashSafe(preflight, parsed.fullName) — " +
+      "parsed.fullName already carries the TLD and getContenthash() appends it again, reading a node that doesn't exist");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// computeStorageDepositLimit — storage_deposit_limit buffer helper.
+//
+// ReviveClientWrapper.dryRunReviveCall computes this buffer (20% headroom
+// over the dry-run estimate, floored at a minimum) and is documented as
+// shared between submitTransaction and submitBatchedTransactions so they
+// cannot drift. DotNS.submitBatchedContractCalls (a different class, used by
+// subdomain registration) couldn't call it directly — it's private to
+// ReviveClientWrapper — so it had grown its own inline copy of the identical
+// formula instead. Extracted into this standalone function so both paths
+// share one implementation.
+// ---------------------------------------------------------------------------
+
+describe("computeStorageDepositLimit (storage_deposit_limit buffer helper)", () => {
+  const DEFAULT_MINIMUM = 2_000_000_000_000n; // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT
+
+  test("zero estimate returns the minimum", async () => {
+    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    assert.equal(computeStorageDepositLimit(0n), DEFAULT_MINIMUM,
+      ">> FAIL: computeStorageDepositLimit zero estimate: expected the minimum floor, dry-runs with no storage effect must still get a workable limit");
+  });
+
+  test("a buffered estimate below the minimum is clamped up to the minimum", async () => {
+    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    // 1_000_000_000_000n * 1.2 = 1_200_000_000_000n, still below the 2e12 floor.
+    assert.equal(computeStorageDepositLimit(1_000_000_000_000n), DEFAULT_MINIMUM,
+      ">> FAIL: computeStorageDepositLimit clamp: a thin estimate's 20%-buffered value must not undercut the minimum floor");
+  });
+
+  test("a buffered estimate above the minimum passes through buffered, not clamped", async () => {
+    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    // 10_000_000_000_000n * 120 / 100 = 12_000_000_000_000n, above the 2e12 floor.
+    assert.equal(computeStorageDepositLimit(10_000_000_000_000n), 12_000_000_000_000n,
+      ">> FAIL: computeStorageDepositLimit above-floor case: expected the 20%-buffered estimate, not the floor");
+  });
+
+  test("boundary — buffered value exactly equal to the minimum", async () => {
+    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    // estimate * 120 / 100 lands exactly on 2_000_000_000_000n for this input.
+    const estimate = 1_666_666_666_667n;
+    const buffered = (estimate * 120n) / 100n;
+    assert.equal(buffered, DEFAULT_MINIMUM, "test setup sanity: buffered must land exactly on the minimum for this boundary case");
+    assert.equal(computeStorageDepositLimit(estimate), DEFAULT_MINIMUM,
+      ">> FAIL: computeStorageDepositLimit boundary: a buffered value exactly at the minimum must return the minimum (not clamp-related off-by-one)");
+  });
+
+  test("a custom minimum overrides the default floor", async () => {
+    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    assert.equal(computeStorageDepositLimit(0n, 5_000_000_000n), 5_000_000_000n,
+      ">> FAIL: computeStorageDepositLimit custom minimum: zero estimate must return the caller-supplied minimum, not the hardcoded default");
+    assert.equal(computeStorageDepositLimit(1n, 5_000_000_000n), 5_000_000_000n,
+      ">> FAIL: computeStorageDepositLimit custom minimum clamp: a negligible estimate must clamp to the caller-supplied minimum");
+  });
+
+  // Drift guard: the bug this fixes was the SAME 20%-buffer-floored-at-minimum
+  // formula recomputed inline at a second call site (submitBatchedContractCalls)
+  // instead of going through dryRunReviveCall's helper. A return-value test on
+  // computeStorageDepositLimit alone can't catch a future call site
+  // reintroducing its own inline copy — source-scan for the telltale
+  // "* 120n) / 100n" buffer expression and require it appear exactly once.
+  test("dotns.ts: the 20% buffer formula appears in exactly one place (computeStorageDepositLimit)", () => {
+    const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
+    const matches = dotnsSrc.match(/\*\s*120n\)\s*\/\s*100n/g) || [];
+    assert.equal(matches.length, 1,
+      `>> FAIL: storage_deposit_limit buffer drift-guard: found the "* 120n) / 100n" formula ${matches.length} time(s) in dotns.ts, ` +
+      `expected exactly 1 (inside computeStorageDepositLimit) — a second inline copy means the two call sites can drift again`);
+  });
+
+  test("dotns.ts: both dryRunReviveCall and submitBatchedContractCalls call computeStorageDepositLimit", () => {
+    const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
+    const callSites = (dotnsSrc.match(/computeStorageDepositLimit\(/g) || []).length;
+    // 1 definition + 2 call sites = 3 occurrences of the identifier followed by "(".
+    assert.ok(callSites >= 3,
+      `>> FAIL: storage_deposit_limit helper routing: expected computeStorageDepositLimit referenced at least 3 times ` +
+      `(1 definition + dryRunReviveCall + submitBatchedContractCalls), found ${callSites}`);
   });
 });
 

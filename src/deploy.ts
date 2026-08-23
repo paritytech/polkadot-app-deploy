@@ -1823,9 +1823,22 @@ export async function storeDirectory(directoryPath: string, providerOrOptions: E
 // string for the incremental-upload-v2 manifest fetcher. Best-effort: returns
 // null on first deploy ("0x"), unreadable bytes, or any error. Mirrors the
 // decode logic in dotns.ts:setContenthash without throwing.
-async function readPreviousContenthashSafe(dotns: DotNS, domainName: string): Promise<string | null> {
+//
+// `bareLabel` MUST NOT include the TLD: DotNS.getContenthash() derives the
+// on-chain node as namehash(`${domainName}.${this._tld}`) itself, so passing
+// an already-suffixed name (e.g. ParsedDomainName.fullName, which is always
+// `${label}.${tld}`) makes it read namehash("sub.parent.paseo.paseo") — a
+// node that doesn't exist. That's a *different* instance of the exact bug
+// class documented above computeDomainTokenId in dotns.ts (registering
+// namehash("ssoqedtuwf.paseo") but then querying namehash("ssoqedtuwf.dot")
+// after an 11 PAS mint had already succeeded). Here it's caught by the
+// try/catch below, so it only silently defeats the incremental-deploy
+// optimisation rather than reverting a paid call — but the parameter name
+// is deliberately "bareLabel", not "domainName" or "fullName", so a future
+// caller can't reach for the wrong field again. Exported for unit tests.
+export async function readPreviousContenthashSafe(dotns: DotNS, bareLabel: string): Promise<string | null> {
   try {
-    const hex = await dotns.getContenthash(domainName);
+    const hex = await dotns.getContenthash(bareLabel);
     if (!hex || hex === "0x") return null;
     const bytes = Buffer.from(hex.slice(2), "hex");
     if (bytes[0] !== 0xe3 || bytes.length < 4) return null;
@@ -3306,7 +3319,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
           }
           // Best-effort: read the existing contenthash so the storage phase
           // can drive incremental upload. Non-fatal — first deploy returns "0x".
-          previousContenthashCid = await readPreviousContenthashSafe(preflight, parsed.fullName);
+          // NOTE: readPreviousContenthashSafe wants the bare `sub.parent` label
+          // (no TLD) — it appends `.${tld}` itself. `parsed.label` is that bare
+          // form for a subdomain (see parseDomainName); `parsed.fullName` already
+          // carries the TLD and would double-suffix it (see the function's doc
+          // comment for the historical incident this class of bug caused).
+          previousContenthashCid = await readPreviousContenthashSafe(preflight, parsed.label);
           setDeployAttribute("deploy.incremental", previousContenthashCid ? "true" : "false");
         } finally {
           preflight.disconnect();

@@ -241,7 +241,10 @@ export function feeFloorFor(plannedAction: DotnsSuccessAction, storageDeposit = 
   return FEE_FLOOR_REGISTER + storageDeposit + rentPriceNative + transferFeeNative;
 }
 
-function topUpTargetFor(plannedAction: DotnsSuccessAction, storageDeposit = MINIMUM_REGISTER_STORAGE_DEPOSIT, rentPriceNative = 0n, transferFeeNative = 0n): bigint {
+// Exported for unit tests (issue: topUpTargetFor had no test coverage even
+// though it spends real testnet funds and its sibling feeFloorFor — same
+// shape, same historical bug class — is tested).
+export function topUpTargetFor(plannedAction: DotnsSuccessAction, storageDeposit = MINIMUM_REGISTER_STORAGE_DEPOSIT, rentPriceNative = 0n, transferFeeNative = 0n): bigint {
   if (isOwnedAction(plannedAction)) return TOP_UP_TARGET + transferFeeNative;
   return TOP_UP_TARGET + storageDeposit + rentPriceNative + transferFeeNative;
 }
@@ -1580,6 +1583,37 @@ function parsePersonhoodStatusResult(result: unknown): number {
   return normalizeProofOfPersonhoodStatus(status);
 }
 
+// Floor for a Revive.call dry-run's storage_deposit_limit when the dry-run's
+// own estimate is zero or thin. This is a *different* concept from
+// MINIMUM_REGISTER_STORAGE_DEPOSIT (line ~184 below): that one is the
+// env-configurable (this._registerStorageDeposit) floor for a fresh TLD
+// register() specifically. This one is a generic per-Revive.call floor used
+// by any dry-run, register included. They happen to share the same numeric
+// value today (2_000_000_000_000n / 200 PAS) — that's a coincidence of the
+// current chain's storage pricing, not a coupling. Keep them as separate
+// named constants so an env-specific register-deposit override can never
+// silently change this generic floor, or vice versa.
+const REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT = 2_000_000_000_000n;
+
+// Shared storage_deposit_limit buffer formula for Revive.call dry-runs: 20%
+// headroom over the dry-run's own storageDeposit estimate, floored at
+// REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT so a zero/thin estimate still gets a
+// workable limit. Both the single-call path (ReviveClientWrapper's
+// dryRunReviveCall, used by submitTransaction and submitBatchedTransactions)
+// and the batched contract-call path (DotNS.submitBatchedContractCalls, used
+// by subdomain registration) must go through this one function — duplicating
+// this arithmetic inline at a second call site is exactly how the two drift,
+// leaving one path with a stale buffer and a rejected or underfunded call.
+// Exported for unit tests.
+export function computeStorageDepositLimit(
+  estimatedStorageDeposit: bigint,
+  minimum: bigint = REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT,
+): bigint {
+  if (estimatedStorageDeposit === 0n) return minimum;
+  const buffered = (estimatedStorageDeposit * 120n) / 100n;
+  return buffered < minimum ? minimum : buffered;
+}
+
 export class ReviveClientWrapper {
   static DRY_RUN_STORAGE_LIMIT: bigint = 18446744073709551615n;
   static DRY_RUN_WEIGHT_LIMIT: { ref_time: bigint; proof_size: bigint } = { ref_time: 18446744073709551615n, proof_size: 18446744073709551615n };
@@ -1903,9 +1937,7 @@ export class ReviveClientWrapper {
       });
       throw new ContractDryRunRevertError(msg, (gasEstimate.revertData ?? "0x") as `0x${string}`, gasEstimate.revertFlags ?? 0n);
     }
-    const minimumStorageDeposit = 2_000_000_000_000n;
-    let storageDepositLimit = gasEstimate.storageDeposit === 0n ? minimumStorageDeposit : (gasEstimate.storageDeposit * 120n) / 100n;
-    if (storageDepositLimit < minimumStorageDeposit) storageDepositLimit = minimumStorageDeposit;
+    const storageDepositLimit = computeStorageDepositLimit(gasEstimate.storageDeposit);
     return {
       weight_limit: { ref_time: gasEstimate.gasRequired.referenceTime, proof_size: gasEstimate.gasRequired.proofSize },
       storage_deposit_limit: storageDepositLimit,
@@ -3215,11 +3247,12 @@ export class DotNS {
       proof_size: headEstimate.gasRequired.proofSize,
       ref_time: headEstimate.gasRequired.referenceTime,
     };
-    const minimumStorageDeposit = 2_000_000_000_000n;
-    let storage_deposit_limit = headEstimate.storageDeposit === 0n
-      ? minimumStorageDeposit
-      : (headEstimate.storageDeposit * 120n) / 100n;
-    if (storage_deposit_limit < minimumStorageDeposit) storage_deposit_limit = minimumStorageDeposit;
+    // Route through the same computeStorageDepositLimit() helper
+    // ReviveClientWrapper.dryRunReviveCall uses, instead of recomputing the
+    // 20%-buffer-floored-at-minimum formula inline — the two had drifted
+    // into separate copies of the same arithmetic (issue: storage_deposit_limit
+    // buffer formula duplicated past its own helper).
+    const storage_deposit_limit = computeStorageDepositLimit(headEstimate.storageDeposit);
 
     const client = this.clientWrapper.client;
     const buildBatch = () => {
@@ -3930,9 +3963,27 @@ export class DotNS {
   async finalizeRegistration(registration: any, priceWei: bigint): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Finalizing registration for ${registration.label}.${this._tld}...`);
+    // bufferedPaymentWei is the +10%-buffered wei amount, kept only for the
+    // "Paying: X PAS" log line below — purely cosmetic, no chain-arithmetic
+    // risk. The actual msg.value must be computed by bufferedWeiToNative
+    // (the SAME function gateOnFeeBalance's pre-flight quote path already
+    // uses for rentPriceNative, and the one dotns-register-fee.test.js
+    // pins), not by hand-rolled floor division here: the old inline version
+    // did `((priceWei*110n)/100n) / this._nativeToEthRatio` — a pure floor,
+    // whereas bufferedWeiToNative rounds UP on any remainder. The two can
+    // disagree by up to 1 native planck whenever the buffered wei value
+    // isn't an exact multiple of nativeToEthRatio, which is the common case
+    // for an oracle-set price. See dotns-register-fee.test.js for a worked
+    // example and the consequence this had: the old floor-division formula
+    // could spuriously throw "Payment conversion underflow" for a tiny but
+    // genuinely payable priceWei (floors to 0 native units where the correct
+    // rounded-up payment is 1 unit).
     const bufferedPaymentWei = (priceWei * 110n) / 100n;
-    const bufferedPaymentNative = bufferedPaymentWei / this._nativeToEthRatio;
+    const bufferedPaymentNative = bufferedWeiToNative(priceWei, this._nativeToEthRatio);
     if (priceWei > 0n && bufferedPaymentNative === 0n) {
+      // Structurally unreachable now: weiToNative (called by bufferedWeiToNative)
+      // rounds up on any nonzero remainder, so a positive numerator can never
+      // floor to 0. Left as defense-in-depth in case that invariant changes.
       throw new Error(
         `Payment conversion underflow: priceWei=${priceWei} rounds to 0 native units ` +
         `(nativeToEthRatio=${this._nativeToEthRatio}). Cannot call register with zero payment.`

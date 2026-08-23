@@ -20019,7 +20019,7 @@ describe("verifiablejs beta.4 upgrade + people-collection identifier (handover �
 // ---------------------------------------------------------------------------
 
 describe("test-suite wiring — no orphaned test files", () => {
-  test("every test/**/*.test.js is referenced by package.json, a workflow, or a script", () => {
+  test("every test/**/*.test.js AND test-*.js is referenced by package.json, a workflow, or a script", () => {
     const repoRoot = new URL("..", import.meta.url).pathname;
 
     const readIfExists = (p) => {
@@ -20044,7 +20044,10 @@ describe("test-suite wiring — no orphaned test files", () => {
       for (const e of entries) {
         const full = path.join(dir, e.name);
         if (e.isDirectory()) walk(full);
-        else if (e.name.endsWith(".test.js")) testFiles.push(e.name);
+        // Both naming conventions in use here. Matching only "*.test.js" is how
+        // test/test-release-retry-wrapper.js sat unrun with 11 assertions — it is a
+        // "test-*.js", so this walk never saw it.
+        else if (e.name.endsWith(".test.js") || /^test-[a-z0-9-]+\.js$/.test(e.name)) testFiles.push(e.name);
       }
     };
     walk(path.join(repoRoot, "test"));

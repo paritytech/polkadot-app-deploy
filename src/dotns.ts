@@ -75,8 +75,17 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    * is sent. Resolve when the human is at their phone and ready; reject/throw
    * to abort. The per-signature operation timeout starts only AFTER this
    * resolves. `attempt` >= 2 means a re-sign (principle 4).
+   *
+   * `approvalBudgetMs` (#194) discloses how long the human has to approve
+   * before the watcher gives up as silent (see PHONE_APPROVAL_MS) — the
+   * caller should surface it in the prompt so the deadline is never a
+   * surprise. `reason: "silence"` (#194) marks the re-arm case: the watcher
+   * went silent with no prior event and the caller is re-prompting instead of
+   * failing the run outright (see PHONE_SILENCE_MAX_REARMS); undefined/"resign"
+   * keeps today's "Re-sign needed" wording for the verifyEffect-false-negative
+   * re-sign case.
    */
-  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number }) => Promise<void>;
+  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>;
   /**
    * True when the injected signer is a real phone/session signer that needs the
    * human-ready gate (`_awaitPhoneReady`). False (default) for local workers used
@@ -313,7 +322,21 @@ export const TX_WALL_CLOCK_CEILING_MS: number = 240_000;
 // arrives for this long, the watch is considered silently stalled (papi observable
 // + dead WS) and the promise rejects with a 'transaction watcher silent for Ns
 // after <lastEvent>' error that signAndSubmitWithRetry can retry.
+//
+// #194: this governs MACHINE no-progress only (WS stall, dropped subscription)
+// — see PHONE_APPROVAL_MS for the separate human-approval budget. Before #194
+// this single constant did double duty: on a phone/session signer, lastEventAt
+// can only advance once the human approves (the first event is "signed"), so
+// the silence deadline WAS the approval budget too. Tuning one must not
+// silently retune the other, hence the split.
 export const TX_NO_PROGRESS_MS: number = 90_000;
+// #194: silence deadline used in place of TX_NO_PROGRESS_MS specifically when
+// the signer is a phone/session signer (signAndSubmitExtrinsic's opts.isPhoneSigner
+// === true) — see the comment on TX_NO_PROGRESS_MS above for why these two
+// needed to become independent constants. Same initial value (90_000) so
+// current behaviour is unchanged; a future retune of either no longer affects
+// the other.
+export const PHONE_APPROVAL_MS: number = 90_000;
 // #1108: grace window before the best-block short-circuit engages. Give GRANDPA
 // finality a fair chance first — so a healthy deploy (Asset Hub finality is
 // typically ~12–40s) still resolves via the "finalized" event with a real tx
@@ -372,7 +395,9 @@ export async function verifyEffectWithGrace(
  * event before the silence deadline. On the phone/session-signer path this
  * typically means the user hasn't approved the request on their phone yet.
  * Typed separately from a plain Error so signAndSubmitWithRetry can apply a
- * different policy (pause-and-resume) instead of the default retry.
+ * different policy — pause-and-resume (#194: bounded re-arm, see
+ * PHONE_SILENCE_MAX_REARMS and DotNS.contractTransaction) — instead of the
+ * default retry/backoff loop.
  */
 export class WatcherSilentNoEventError extends Error {
   constructor(silentMs: number) {
@@ -399,23 +424,60 @@ export function classifyTxRetryDecision(err: unknown): "retry" | "abort" {
 }
 
 /**
- * Phone-signer no-event fast-fail (#990, backported from polkadot-app-deploy).
+ * Distinct subclass of NonRetryableError (not a plain one) so a caller can
+ * identify "this specific failure is eligible for a bounded human re-arm"
+ * without string-matching an error message. Anything that merely checks
+ * `instanceof NonRetryableError` (e.g. bin/polkadot-app-deploy's exit-code
+ * branch, or the existing #990 tests) is unaffected — this IS one.
+ */
+export class PhoneSilenceNonRetryableError extends NonRetryableError {}
+
+/**
+ * Phone-signer no-event classification (#990, backported from
+ * polkadot-app-deploy; call-site behaviour updated by #194).
  * WatcherSilentNoEventError means the watcher never saw a single prior event —
  * the phone never approved the request — which is a materially different
- * situation from a WS stall after signing. For a phone signer, retrying pays
- * another ~90s of silence for no better odds (the phone still won't have
- * approved); fail immediately with a clear, actionable message instead.
+ * situation from a WS stall after signing. For a phone signer, generic
+ * attempt/backoff retry would just pay another ~90s of silence for no better
+ * odds (the phone still won't have approved), so this returns a
+ * PhoneSilenceNonRetryableError to keep signAndSubmitWithRetry's generic
+ * retry loop from running.
+ * That does NOT mean the run ends here, though: DotNS.contractTransaction
+ * (NOT signAndSubmitWithRetry — see the comment there for why) treats this
+ * classification as "eligible for a bounded human re-arm": when it's a real
+ * phone signer with a phoneLabel, it re-prompts and resubmits up to
+ * PHONE_SILENCE_MAX_REARMS times before giving up with this exact error,
+ * since the storage work is already sunk (paid + finalised) by this point and
+ * forcing a full re-deploy is strictly worse than asking the human to look at
+ * their phone again.
  * Non-phone signers, or a WatcherSilentNoEventError instance not present (e.g.
  * a plain "watcher silent" Error where a prior event DID arrive), fall through
  * to the default classifyTxRetryDecision/retry path unchanged. Pure so the
- * decision is unit-testable without driving a real retry loop.
+ * classification is unit-testable without driving a real retry loop — the
+ * re-arm loop itself lives at the call site, not here.
  */
-export function classifyWatcherSilentFastFail(err: unknown, isPhoneSigner: boolean | undefined): NonRetryableError | null {
+export function classifyWatcherSilentFastFail(err: unknown, isPhoneSigner: boolean | undefined): PhoneSilenceNonRetryableError | null {
   if (err instanceof WatcherSilentNoEventError && isPhoneSigner === true) {
-    return new NonRetryableError("No signature received from the phone — re-run when you can approve on your phone.");
+    return new PhoneSilenceNonRetryableError("No signature received from the phone — re-run when you can approve on your phone.");
   }
   return null;
 }
+
+// #194: bound on how many times DotNS.contractTransaction will re-prompt a
+// phone signer after the watcher goes silent with no prior event, before
+// giving up with classifyWatcherSilentFastFail's NonRetryableError. Unbounded
+// re-arming risks a hung interactive session (nobody at the phone, Ctrl-C
+// never sent); 3 re-arms is a generous human budget (3 × PHONE_APPROVAL_MS
+// of machine silence alone, on top of the human think-time) while still
+// guaranteeing termination.
+export const PHONE_SILENCE_MAX_REARMS: number = 3;
+
+// #194: onResign's signature widened with an optional `reason` so the same
+// hook serves both the pre-existing verifyEffect-false-negative re-sign case
+// (reason omitted → "Re-sign needed" wording, driven off `attempt`) and the
+// contractTransaction-level silence re-arm case (reason: "silence" → "still
+// nothing from your phone" wording, regardless of `attempt`).
+type PhoneOnResign = (attempt: number, reason?: "resign" | "silence") => Promise<void>;
 
 // Jittered exponential backoff for DotNS tx retries. Bursty nonce contention
 // (parallel deploys briefly sharing the signer's nonce stream) clears within a
@@ -1702,7 +1764,7 @@ export class ReviveClientWrapper {
     extrinsic: any,
     signer: PolkadotSigner,
     statusCallback: (status: string) => void,
-    opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas" } = {},
+    opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean } = {},
   ): Promise<TxResolution> {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -1725,16 +1787,22 @@ export class ReviveClientWrapper {
       // verifies the on-chain effect and resolves without waiting for GRANDPA
       // finality — so a finality-lag window can't time out an already-landed write.
       let bestBlockIncluded = false;
+      // #194: phone/session signers wait out PHONE_APPROVAL_MS (the human
+      // approval budget) instead of TX_NO_PROGRESS_MS (the machine no-progress
+      // budget) — see the comments on those two constants. Same value today,
+      // but resolved independently so retuning one never silently retunes the
+      // other.
+      const silenceDeadlineMs = opts.isPhoneSigner === true ? PHONE_APPROVAL_MS : TX_NO_PROGRESS_MS;
       // Per-call read so tests / slow chains can override without a reimport.
       // Explicit empty/null check (not `|| default`) so "0" — engage immediately —
       // is honoured rather than falling back to the default. Clamped below
-      // TX_NO_PROGRESS_MS so the best-block branch always gets a poll tick before
+      // silenceDeadlineMs so the best-block branch always gets a poll tick before
       // the silence-rejection pre-empts it (an over-large override is otherwise a
       // footgun that disables best-block resolution entirely).
       const graceRawEnv = process.env.BULLETIN_DOTNS_BESTBLOCK_GRACE_MS;
       const bestBlockGraceMs = Math.min(
         graceRawEnv != null && graceRawEnv !== "" ? parseInt(graceRawEnv, 10) : DOTNS_BEST_BLOCK_GRACE_MS,
-        TX_NO_PROGRESS_MS - 5_000,
+        silenceDeadlineMs - 5_000,
       );
 
       const poll = async (): Promise<void> => {
@@ -1788,11 +1856,12 @@ export class ReviveClientWrapper {
             return;
           }
           const silentMs = Date.now() - lastEventAt;
-          if (silentMs > TX_NO_PROGRESS_MS) {
+          if (silentMs > silenceDeadlineMs) {
             statusCallback("failed");
             // No-event case (never reached "signed"/"broadcasted"): throw a typed
             // error so signAndSubmitWithRetry can detect it and apply phone-signer
-            // pause-and-resume instead of the default WS-stall retry.
+            // pause-and-resume (bounded re-arm, #194) instead of the default
+            // WS-stall retry/backoff loop.
             if (lastEventType === "(none)") {
               finish(reject)(new WatcherSilentNoEventError(silentMs));
             } else {
@@ -1843,7 +1912,7 @@ export class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void>; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: PhoneOnResign; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
@@ -1865,8 +1934,17 @@ export class ReviveClientWrapper {
         // Phone-signer no-event fast-fail (#990): checked BEFORE the default
         // retry classification so it pre-empts retry/backoff entirely — a
         // silent watcher that never saw a prior event means the phone never
-        // approved, and retrying just pays another ~90s of silence for the
-        // same non-outcome.
+        // approved, and generic retry/backoff would just pay another ~90s of
+        // silence for the same non-outcome. This method throws immediately —
+        // it does NOT itself implement the #194 bounded re-arm. That lives one
+        // level up, in DotNS.contractTransaction, wrapping the withTimeout()
+        // call: the human wait plus up to PHONE_SILENCE_MAX_REARMS re-arms of
+        // PHONE_APPROVAL_MS machine silence each cannot fit inside a single
+        // OPERATION_TIMEOUT_MS (300s) — 4 attempts × 90s already exceeds it
+        // before any human think-time — so re-arming here would die to a
+        // generic "timed out after 300000ms" partway through instead of ever
+        // reaching the bound. contractTransaction re-invokes this whole method
+        // (fresh withTimeout, fresh attempt counter) per re-arm instead.
         const fastFail = classifyWatcherSilentFastFail(e, opts.isPhoneSigner);
         if (fastFail) {
           filter.flush();
@@ -2249,7 +2327,7 @@ export class DotNS {
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
   private _tld: string = DEFAULT_TLD;
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
-  private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number }) => Promise<void>) | undefined = undefined;
+  private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>) | undefined = undefined;
   /** Total phone-signature count for this DotNS session (drives the `total` field passed to confirmPhoneReady). */
   private _phoneSignatureTotal = 0;
   /** Running attempt counter per label for re-sign detection. Reset at connect/disconnect. */
@@ -2935,8 +3013,12 @@ export class DotNS {
     if (phoneLabel !== undefined) {
       await this._awaitPhoneReady(phoneLabel);
     }
-    return await withTimeout(
-      this.clientWrapper.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, {
+    // #194: each submission attempt (the initial one, and any re-arm below)
+    // gets its OWN fresh OPERATION_TIMEOUT_MS budget — see the re-arm loop
+    // below for why this must be a per-attempt timeout, not one shared across
+    // re-arms.
+    const submitOnce = (): Promise<TxResolution> => withTimeout(
+      this.clientWrapper!.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, {
         rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset,
         // Re-gate phone-signer retries (#39): a verifyEffect false-negative
         // makes signAndSubmitWithRetry re-sign; for a phone signer that needs
@@ -2944,11 +3026,50 @@ export class DotNS {
         // your phone / Press Y") before re-signing. Both _awaitPhoneReady and the
         // retry-loop guard no-op for non-phone signers (local/dev workers).
         isPhoneSigner: this._isPhoneSigner,
-        onResign: phoneLabel !== undefined ? () => this._awaitPhoneReady(phoneLabel) : undefined,
+        // #194: thread the re-arm `reason` (undefined/"resign" for the #39
+        // verifyEffect-false-negative case, "silence" for the watcher-silence
+        // re-arm below) through to _awaitPhoneReady so confirmPhoneReady's
+        // consumer can render the right prompt for each case.
+        onResign: phoneLabel !== undefined ? (_attempt: number, reason?: "resign" | "silence") => this._awaitPhoneReady(phoneLabel, reason) : undefined,
       }),
       OPERATION_TIMEOUT_MS,
       functionName,
     );
+
+    // Non-phone signers (transfer-mode local workers, mnemonic signers) are
+    // entirely unaffected: classifyWatcherSilentFastFail already returns null
+    // when isPhoneSigner !== true, so submitOnce() can never reject with
+    // PhoneSilenceNonRetryableError on this path — this early return is just
+    // the pre-#194 call shape, unchanged.
+    if (phoneLabel === undefined || !this._isPhoneSigner) return await submitOnce();
+
+    // #194: bounded resumable re-arm for a phone signer's watcher-silence.
+    // Deliberately done HERE — wrapping withTimeout, one level above
+    // signAndSubmitWithRetry — rather than inside that method's retry loop,
+    // because the human wait plus PHONE_APPROVAL_MS of machine silence,
+    // repeated up to PHONE_SILENCE_MAX_REARMS times, cannot fit inside a
+    // single OPERATION_TIMEOUT_MS (300s): 1 initial + 3 re-arms = 4 attempts
+    // × 90s of machine silence alone is 360s, before any human think-time.
+    // Re-arming inside signAndSubmitWithRetry would die to a generic "timed
+    // out after 300000ms" partway through the sequence instead of ever
+    // reaching the bound — defeating the whole point of #194. Each re-armed
+    // submitOnce() call above gets its own fresh OPERATION_TIMEOUT_MS budget,
+    // and the human wait sits outside it — the same #969 split-timeout
+    // posture as the initial gate above.
+    const maxAttempts = 1 + PHONE_SILENCE_MAX_REARMS;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await submitOnce();
+      } catch (e: any) {
+        // Anything other than the exact phone-silence classification (a
+        // dispatch error, a real WS blip, the human declining) is not this
+        // loop's concern to reclassify — propagate immediately, no re-arm.
+        if (!(e instanceof PhoneSilenceNonRetryableError) || attempt === maxAttempts) throw e;
+        await this._awaitPhoneReady(phoneLabel, "silence");
+      }
+    }
+    // Unreachable: the loop above always returns or throws by attempt === maxAttempts.
+    throw new Error("contractTransaction: unreachable — phone-silence re-arm loop exited without resolving");
   }
 
   async checkOwnership(label: string, ownerAddress: string | null = null): Promise<OwnershipResult> {
@@ -4562,13 +4683,18 @@ export class DotNS {
    *   in-process).
    * After the gate resolves, fires onPhoneSigningRequired (the "check your
    * phone" notification) so the user knows the request is now being sent.
+   *
+   * `reason` (#194): passed straight through to confirmPhoneReady's context so
+   * the consumer can distinguish a watcher-silence re-arm ("silence") from the
+   * pre-existing verifyEffect-false-negative re-sign case (undefined/"resign",
+   * which keeps rendering off `attempt` as before).
    */
-  private async _awaitPhoneReady(label: string): Promise<void> {
+  private async _awaitPhoneReady(label: string, reason?: "resign" | "silence"): Promise<void> {
     if (!this._isPhoneSigner) return; // only phone/session signers need the gate; local workers (transfer mode) do not
     const attempt = (this._phoneSignatureAttempts.get(label) ?? 0) + 1;
     this._phoneSignatureAttempts.set(label, attempt);
     if (this._confirmPhoneReady) {
-      await this._confirmPhoneReady({ label, attempt, total: this._phoneSignatureTotal });
+      await this._confirmPhoneReady({ label, attempt, total: this._phoneSignatureTotal, approvalBudgetMs: PHONE_APPROVAL_MS, reason });
     }
     // No hook → proceed; in-process external signers (injected PolkadotSigner,
     // mnemonic) need no human gate. Phone signers must supply confirmPhoneReady.

@@ -17,7 +17,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -21200,6 +21200,335 @@ describe("human-first phone signing", () => {
       "deploy.ts must pass phoneSigner: true to ownerDotns.connect >> FAIL: #50 transfer-mode phone gate: phoneSigner:true missing from ownerDotns.connect");
     assert.match(deploySource, /phoneSigner:\s*phoneSignerActive/,
       "deploy.ts must pass phoneSigner: phoneSignerActive to dotns.connect >> FAIL: #50 transfer-mode phone gate: phoneSigner:phoneSignerActive missing from dotns.connect");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #194: phone-signing approval budget was undisclosed + fatal, and the
+// readiness gate accepted bare Enter as consent.
+//
+// This section covers the four changes:
+//   1. PHONE_APPROVAL_MS / TX_NO_PROGRESS_MS are independent constants.
+//   2. The disclosed budget in the CLI prompt is derived from the constant,
+//      never hardcoded (a drift guard).
+//   3. The readiness gate requires an explicit y/yes, not bare Enter.
+//   4. A phone signer's watcher-silence is resumable (bounded re-arm) rather
+//      than immediately fatal.
+//
+// Deviation from the issue's literal wiring suggestion, worth stating up
+// front: the bounded re-arm loop lives in DotNS.contractTransaction (wrapping
+// withTimeout), NOT inside ReviveClientWrapper.signAndSubmitWithRetry's catch.
+// Arithmetic forced this: contractTransaction wraps submitTransaction (which
+// calls signAndSubmitWithRetry) in withTimeout(..., OPERATION_TIMEOUT_MS)
+// (300s). 1 initial attempt + PHONE_SILENCE_MAX_REARMS re-arms, each able to
+// burn up to PHONE_APPROVAL_MS (90s) of machine silence before any human
+// think-time, is 4 x 90s = 360s — already past OPERATION_TIMEOUT_MS before a
+// single human reads the prompt. Re-arming inside signAndSubmitWithRetry (as
+// originally sketched) would die to a generic "timed out after 300000ms"
+// partway through the sequence instead of ever reaching the bound, which is
+// worse than the behaviour it replaced. Hoisting the loop one level up so
+// each re-armed submitOnce() gets a FRESH OPERATION_TIMEOUT_MS budget (and
+// the human wait sits outside it, matching the file's existing #969
+// split-timeout posture) is the only shape that lets the bound actually be
+// reached. classifyWatcherSilentFastFail stays pure and its call site inside
+// signAndSubmitWithRetry throws immediately, exactly as it did pre-#194 —
+// only the layer ABOVE it now treats that as resumable.
+//
+// Changes 2 and 3 live in the interactive CLI script (bin/polkadot-app-deploy),
+// which reads real stdin/stdout and isn't practically drivable from a unit
+// test without a live phone — those are covered with source-scan assertions
+// on the exact wiring, matching this file's established pattern for
+// bin-script behaviour (see e.g. "core src/dotns.ts and src/deploy.ts contain
+// no readline..." and "#289: finalize in bin/polkadot-app-deploy sets
+// deploy.status..." above).
+// ---------------------------------------------------------------------------
+
+describe("PHONE_APPROVAL_MS / TX_NO_PROGRESS_MS independence (#194 change 1)", () => {
+  test("both exported, both 90_000 today — current behaviour is unchanged", () => {
+    assert.strictEqual(PHONE_APPROVAL_MS, 90_000,
+      ">> FAIL: PHONE_APPROVAL_MS: must default to 90_000 so existing phone-signing timing is unchanged by the split");
+    assert.strictEqual(TX_NO_PROGRESS_MS, 90_000,
+      ">> FAIL: TX_NO_PROGRESS_MS: must remain 90_000 — the split must not touch the machine no-progress budget's value");
+  });
+
+  test("src/dotns.ts declares them as two SEPARATE constants, neither derived from the other", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    const phoneLine = src.match(/^export const PHONE_APPROVAL_MS: number = .*/m)?.[0];
+    const machineLine = src.match(/^export const TX_NO_PROGRESS_MS: number = .*/m)?.[0];
+    assert.ok(phoneLine, ">> FAIL: PHONE_APPROVAL_MS: declaration not found in src/dotns.ts — constant may have been removed or renamed");
+    assert.ok(machineLine, ">> FAIL: TX_NO_PROGRESS_MS: declaration not found in src/dotns.ts — constant may have been removed or renamed");
+    // Sabotage this test catches: aliasing one to the other, e.g.
+    // `export const PHONE_APPROVAL_MS: number = TX_NO_PROGRESS_MS;` — that
+    // would make tuning TX_NO_PROGRESS_MS silently retune PHONE_APPROVAL_MS,
+    // exactly the bug #194 change 1 fixes.
+    assert.doesNotMatch(phoneLine, /TX_NO_PROGRESS_MS/,
+      ">> FAIL: PHONE_APPROVAL_MS: declaration references TX_NO_PROGRESS_MS — the two budgets must be independently tunable, not aliased");
+    assert.doesNotMatch(machineLine, /PHONE_APPROVAL_MS/,
+      ">> FAIL: TX_NO_PROGRESS_MS: declaration references PHONE_APPROVAL_MS — the two budgets must be independently tunable, not aliased");
+  });
+
+  test("signAndSubmitExtrinsic's silence deadline branches on opts.isPhoneSigner between the two constants", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    assert.match(src, /const silenceDeadlineMs = opts\.isPhoneSigner === true \? PHONE_APPROVAL_MS : TX_NO_PROGRESS_MS;/,
+      ">> FAIL: #194 wiring: signAndSubmitExtrinsic must select PHONE_APPROVAL_MS for a phone signer and TX_NO_PROGRESS_MS otherwise — changing one constant must not silently retune the other's use site");
+  });
+});
+
+describe("confirmPhoneReady context carries approvalBudgetMs (#194 change 2 — drift guard)", () => {
+  test("_awaitPhoneReady passes approvalBudgetMs === PHONE_APPROVAL_MS to confirmPhoneReady", async () => {
+    const dotns = new DotNS();
+    dotns._usesExternalSigner = true;
+    dotns._isPhoneSigner = true;
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+    let received;
+    dotns._confirmPhoneReady = async (ctx) => { received = ctx; };
+
+    await dotns._awaitPhoneReady("Link content");
+
+    assert.ok(received, ">> FAIL: confirmPhoneReady was never called");
+    assert.strictEqual(received.approvalBudgetMs, PHONE_APPROVAL_MS,
+      `>> FAIL: #194 drift guard: confirmPhoneReady's ctx.approvalBudgetMs must equal the live PHONE_APPROVAL_MS constant, got ${received.approvalBudgetMs}`);
+  });
+
+  test("bin/polkadot-app-deploy derives the disclosed seconds from ctx.approvalBudgetMs, never a hardcoded number", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf8");
+    // Sabotage this test catches: reverting to a literal "~90s" in the prompt
+    // string — that hardcoded number would silently drift the moment
+    // PHONE_APPROVAL_MS is retuned, which is the exact bug #194 change 2 fixes.
+    assert.match(bin, /approvalBudgetMs/,
+      ">> FAIL: #194 drift guard: bin/polkadot-app-deploy's confirmPhoneReady must destructure approvalBudgetMs from its context");
+    assert.match(bin, /Math\.round\(approvalBudgetMs\s*\/\s*1000\)/,
+      ">> FAIL: #194 drift guard: the disclosed seconds must be computed FROM approvalBudgetMs, not hardcoded");
+    assert.match(bin, /you'll have ~\$\{budgetSeconds\}s to approve on your phone/,
+      ">> FAIL: #194: the readiness prompt must disclose the computed budget in seconds");
+  });
+});
+
+describe("readiness gate requires an explicit y/yes (#194 change 3)", () => {
+  test("bin/polkadot-app-deploy's confirmPhoneReady no longer accepts bare Enter", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf8");
+    // The old, now-forbidden shape: `answer === "y" || answer === ""`.
+    assert.doesNotMatch(bin, /answer === "y" \|\| answer === ""/,
+      '>> FAIL: #194: bare Enter (answer === "") must no longer satisfy the readiness gate — it is the input most likely to come from a stray/buffered newline, not a deliberate keypress');
+    assert.match(bin, /answer === "y" \|\| answer === "yes"/,
+      '>> FAIL: #194: the readiness gate must require an explicit "y" or "yes" (line.trim().toLowerCase() already normalizes case)');
+  });
+});
+
+describe("bin/polkadot-app-deploy renders the silence re-arm prompt (#194 change 4 — CLI message guard)", () => {
+  test("confirmPhoneReady branches on reason:\"silence\" and prints the exact re-arm message", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf8");
+    // Sabotage this test catches: deleting the `reason === "silence"` branch
+    // entirely. Without it, a re-arm re-prompt silently falls through to the
+    // "Re-sign needed (attempt N)" wording instead of the issue's specified
+    // "still nothing from your phone" message — every other #194 test in this
+    // file still passes (none of them exercise this specific branch), so this
+    // is the only guard standing between that regression and merge.
+    assert.match(bin, /if \(reason === "silence"\)/,
+      '>> FAIL: #194: confirmPhoneReady must branch on reason:"silence" to render the re-arm prompt distinctly from the ordinary re-sign case');
+    assert.match(bin, /still nothing from your phone — press Y to re-send, Ctrl-C to abort/,
+      '>> FAIL: #194: the silence re-arm prompt must match the issue-specified wording exactly');
+  });
+});
+
+describe("phone-signer silence: signAndSubmitWithRetry throws immediately (no in-place re-arm) — #194 arithmetic guard", () => {
+  test("fast-fail still fires on the FIRST attempt from signAndSubmitWithRetry itself; PHONE_SILENCE_MAX_REARMS re-arming is NOT this method's job", async () => {
+    // Regression guard for the exact mistake #194 review caught: re-arming
+    // INSIDE signAndSubmitWithRetry cannot fit inside OPERATION_TIMEOUT_MS
+    // (see the file-level comment above for the arithmetic). If a future
+    // change moves the re-arm loop back in here, this test starts failing
+    // because signAndSubmitWithRetry would stop throwing on the first
+    // silent-no-event attempt.
+    const w = new ReviveClientWrapper({});
+    let calls = 0;
+    w.signAndSubmitExtrinsic = async () => { calls++; throw new WatcherSilentNoEventError(95_000); };
+    const onResign = async () => { throw new Error("onResign must never be invoked by signAndSubmitWithRetry itself — re-arming is contractTransaction's job"); };
+
+    await assert.rejects(
+      () => w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Register", { isPhoneSigner: true, onResign }),
+      (err) => {
+        assert.ok(err instanceof PhoneSilenceNonRetryableError,
+          `>> FAIL: signAndSubmitWithRetry must throw PhoneSilenceNonRetryableError immediately, got ${err?.constructor?.name}`);
+        return true;
+      },
+    );
+    assert.strictEqual(calls, 1,
+      `>> FAIL: signAndSubmitWithRetry must fail on the FIRST attempt for a phone-signer no-event silence — no in-place re-arm — got ${calls} calls`);
+  });
+
+  test("non-phone signer: silence still routes through classifyTxRetryDecision's generic retry, never fast-fails", async () => {
+    const w = new ReviveClientWrapper({});
+    let calls = 0;
+    w.signAndSubmitExtrinsic = async () => { calls++; throw new WatcherSilentNoEventError(95_000); };
+    const onResign = async () => { throw new Error("onResign must never be called for a non-phone signer"); };
+
+    await assert.rejects(
+      () => w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.map_account", { isPhoneSigner: false, onResign }),
+      (err) => {
+        assert.ok(err instanceof WatcherSilentNoEventError,
+          `>> FAIL: non-phone signer: silence must surface the raw WatcherSilentNoEventError via the generic retry/backoff path (classifyTxRetryDecision treats it as retryable), not a PhoneSilenceNonRetryableError fast-fail, got ${err?.constructor?.name}`);
+        return true;
+      },
+    );
+    assert.strictEqual(calls, DOTNS_TX_MAX_ATTEMPTS,
+      `>> FAIL: non-phone signer: silence must exhaust the ordinary DOTNS_TX_MAX_ATTEMPTS (${DOTNS_TX_MAX_ATTEMPTS}) attempt/backoff loop unchanged, got ${calls} calls`);
+    // Independent confirmation via the pure classifier, matching the #990 tests.
+    assert.strictEqual(classifyWatcherSilentFastFail(new WatcherSilentNoEventError(95_000), false), null,
+      ">> FAIL: classifyWatcherSilentFastFail must return null for a non-phone signer, unchanged by #194");
+    assert.strictEqual(classifyTxRetryDecision(new WatcherSilentNoEventError(95_000)), "retry",
+      ">> FAIL: classifyTxRetryDecision must still classify watcher-silence as retryable, unchanged by #194");
+  });
+});
+
+describe("DotNS.contractTransaction: bounded phone-silence re-arm (#194 change 4)", () => {
+  function phoneDotns({ confirmPhoneReady } = {}) {
+    const dotns = new DotNS();
+    dotns.connected = true;
+    dotns.substrateAddress = "5Signer";
+    dotns.signer = {};
+    dotns._isPhoneSigner = true;
+    dotns._phoneSignatureTotal = 1;
+    dotns._phoneSignatureAttempts = new Map();
+    const gateCalls = [];
+    dotns._confirmPhoneReady = confirmPhoneReady ?? (async (ctx) => { gateCalls.push(ctx); });
+    dotns.gateCalls = gateCalls;
+    return dotns;
+  }
+  const REGISTER_ABI = [{ inputs: [], name: "register", outputs: [], stateMutability: "nonpayable", type: "function" }];
+
+  test("silence -> re-prompt -> approval on the second attempt succeeds", async () => {
+    const dotns = phoneDotns();
+    let submitCalls = 0;
+    dotns.clientWrapper = {
+      submitTransaction: async () => {
+        submitCalls++;
+        if (submitCalls === 1) {
+          throw new PhoneSilenceNonRetryableError("No signature received from the phone — re-run when you can approve on your phone.");
+        }
+        return { kind: "hash", hash: "0xabc" };
+      },
+    };
+
+    const res = await dotns.contractTransaction(
+      "0x732C38082CFAebed505A46e4e2D6414154694580", 0n, REGISTER_ABI, "register", [], () => {},
+      { phoneLabel: "Register" },
+    );
+
+    assert.strictEqual(res.hash, "0xabc",
+      ">> FAIL: re-arm: a successful resubmit after re-prompting must resolve with the real TxResolution, not throw");
+    assert.strictEqual(submitCalls, 2,
+      `>> FAIL: re-arm: expected exactly 1 initial + 1 re-arm submitTransaction call, got ${submitCalls}`);
+    // gateCalls[0] is the initial readiness gate (attempt 1, reason undefined);
+    // gateCalls[1] is the silence re-arm gate.
+    assert.strictEqual(dotns.gateCalls.length, 2,
+      `>> FAIL: re-arm: expected exactly 2 confirmPhoneReady calls (initial + 1 re-arm), got ${dotns.gateCalls.length}`);
+    assert.strictEqual(dotns.gateCalls[1].reason, "silence",
+      `>> FAIL: re-arm: the re-arm gate call must carry reason:"silence" so the CLI renders the re-send prompt, got ${JSON.stringify(dotns.gateCalls[1])}`);
+  });
+
+  test("3-rearm bound enforced: after exhausting rearms, throws the SAME PhoneSilenceNonRetryableError as before #194", async () => {
+    const dotns = phoneDotns();
+    let submitCalls = 0;
+    const FASTFAIL_MESSAGE = "No signature received from the phone — re-run when you can approve on your phone.";
+    dotns.clientWrapper = {
+      submitTransaction: async () => { submitCalls++; throw new PhoneSilenceNonRetryableError(FASTFAIL_MESSAGE); },
+    };
+
+    await assert.rejects(
+      () => dotns.contractTransaction("0x732C38082CFAebed505A46e4e2D6414154694580", 0n, REGISTER_ABI, "register", [], () => {}, { phoneLabel: "Register" }),
+      (err) => {
+        assert.ok(err instanceof NonRetryableError,
+          `>> FAIL: re-arm bound: exhausted re-arms must still throw a NonRetryableError, got ${err?.constructor?.name}`);
+        assert.strictEqual(err.message, FASTFAIL_MESSAGE,
+          `>> FAIL: re-arm bound: exhausted re-arms must throw the EXACT pre-#194 message so the worst case is unchanged, got "${err.message}"`);
+        return true;
+      },
+    );
+    assert.strictEqual(submitCalls, 1 + PHONE_SILENCE_MAX_REARMS,
+      `>> FAIL: re-arm bound: expected 1 initial attempt + PHONE_SILENCE_MAX_REARMS (${PHONE_SILENCE_MAX_REARMS}) re-arm attempts = ${1 + PHONE_SILENCE_MAX_REARMS} total submitTransaction calls, got ${submitCalls}`);
+    // 1 initial gate + PHONE_SILENCE_MAX_REARMS re-arm gates.
+    assert.strictEqual(dotns.gateCalls.length, 1 + PHONE_SILENCE_MAX_REARMS,
+      `>> FAIL: re-arm bound: expected 1 initial + PHONE_SILENCE_MAX_REARMS (${PHONE_SILENCE_MAX_REARMS}) confirmPhoneReady calls, got ${dotns.gateCalls.length}`);
+    assert.ok(dotns.gateCalls.slice(1).every((c) => c.reason === "silence"),
+      ">> FAIL: re-arm bound: every re-arm prompt after the initial gate must carry reason:\"silence\"");
+  });
+
+  test("a non-silence error (e.g. a dispatch revert) during a re-arm attempt propagates immediately — not reclassified, not re-armed further", async () => {
+    const dotns = phoneDotns();
+    let submitCalls = 0;
+    dotns.clientWrapper = {
+      submitTransaction: async () => {
+        submitCalls++;
+        if (submitCalls === 1) throw new PhoneSilenceNonRetryableError("No signature received from the phone — re-run when you can approve on your phone.");
+        throw new Error("InsufficientBalance"); // a genuinely different failure on the re-armed attempt
+      },
+    };
+
+    await assert.rejects(
+      () => dotns.contractTransaction("0x732C38082CFAebed505A46e4e2D6414154694580", 0n, REGISTER_ABI, "register", [], () => {}, { phoneLabel: "Register" }),
+      (err) => {
+        assert.strictEqual(err.message, "InsufficientBalance",
+          `>> FAIL: a non-silence failure during a re-arm must propagate as-is, not be swallowed or reclassified, got "${err.message}"`);
+        return true;
+      },
+    );
+    assert.strictEqual(submitCalls, 2,
+      `>> FAIL: the loop must stop immediately on a non-silence error — no further re-arm attempts — got ${submitCalls} calls`);
+  });
+
+  test("non-phone signer (_isPhoneSigner=false): re-arm loop is bypassed entirely, single submitTransaction call", async () => {
+    const dotns = phoneDotns();
+    dotns._isPhoneSigner = false; // transfer-mode local worker
+    let submitCalls = 0;
+    dotns.clientWrapper = {
+      submitTransaction: async () => { submitCalls++; throw new PhoneSilenceNonRetryableError("should never realistically occur for a non-phone signer, but even if it did:"); },
+    };
+
+    await assert.rejects(
+      () => dotns.contractTransaction("0x732C38082CFAebed505A46e4e2D6414154694580", 0n, REGISTER_ABI, "register", [], () => {}, { phoneLabel: "Register" }),
+    );
+    assert.strictEqual(submitCalls, 1,
+      `>> FAIL: non-phone signer: contractTransaction's re-arm loop must be entirely bypassed (single attempt, no re-arm), got ${submitCalls} calls`);
+    assert.strictEqual(dotns.gateCalls.length, 0,
+      `>> FAIL: non-phone signer: confirmPhoneReady must never be called (_awaitPhoneReady no-ops for !_isPhoneSigner), got ${dotns.gateCalls.length} calls`);
+  });
+
+  test("no phoneLabel: re-arm loop is bypassed entirely, single submitTransaction call", async () => {
+    const dotns = phoneDotns();
+    let submitCalls = 0;
+    dotns.clientWrapper = {
+      submitTransaction: async () => { submitCalls++; throw new PhoneSilenceNonRetryableError("no phoneLabel means no gate to re-arm through"); },
+    };
+
+    await assert.rejects(
+      () => dotns.contractTransaction("0x732C38082CFAebed505A46e4e2D6414154694580", 0n, REGISTER_ABI, "register", [], () => {}), // no phoneLabel
+    );
+    assert.strictEqual(submitCalls, 1,
+      `>> FAIL: no phoneLabel: contractTransaction must not attempt to re-arm (nothing to gate through), got ${submitCalls} calls`);
+  });
+});
+
+describe("stale-comment cleanup (#194)", () => {
+  test("classifyWatcherSilentFastFail's own doc comment describes the bounded re-arm the call site now performs", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    const idx = src.indexOf("export function classifyWatcherSilentFastFail(");
+    assert.ok(idx >= 0, ">> FAIL: could not locate classifyWatcherSilentFastFail in src/dotns.ts");
+    const docStart = src.lastIndexOf("/**", idx);
+    const doc = src.slice(docStart, idx);
+    assert.match(doc, /PHONE_SILENCE_MAX_REARMS/,
+      ">> FAIL: #194: classifyWatcherSilentFastFail's doc comment must describe the bounded re-arm the call site now performs, not just the immediate-fail behaviour it replaced");
+    assert.match(doc, /contractTransaction/,
+      ">> FAIL: #194: classifyWatcherSilentFastFail's doc comment must point at the actual call site (DotNS.contractTransaction) that implements the re-arm — not signAndSubmitWithRetry, which does not");
+  });
+
+  test("signAndSubmitWithRetry's own comment does not claim it implements the re-arm itself", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    const idx = src.indexOf("async signAndSubmitWithRetry(");
+    assert.ok(idx >= 0, ">> FAIL: could not locate signAndSubmitWithRetry in src/dotns.ts");
+    const body = src.slice(idx, idx + 4000);
+    assert.match(body, /OPERATION_TIMEOUT_MS/,
+      ">> FAIL: #194: signAndSubmitWithRetry's comment should explain why re-arming does NOT happen in this method (the OPERATION_TIMEOUT_MS budget arithmetic), so a future reader doesn't reintroduce the mistake");
   });
 });
 

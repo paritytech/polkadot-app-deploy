@@ -544,12 +544,21 @@ try {
         console.log(`   ${display.map(s => s.toLowerCase()).join(" · ")}`);
       }
     },
-    confirmPhoneReady: ({ label, attempt }) => new Promise((resolve, reject) => {
-      if (attempt >= 2) {
+    // #194: `approvalBudgetMs` is threaded through from PHONE_APPROVAL_MS
+    // (src/dotns.ts) rather than hardcoded here, so the disclosed number can
+    // never drift from the constant that actually governs the deadline.
+    // `reason: "silence"` marks a watcher-silence re-arm (no response within
+    // the budget) as distinct from the pre-existing verifyEffect-false-negative
+    // re-sign case (undefined/"resign", still rendered off `attempt`).
+    confirmPhoneReady: ({ label, attempt, approvalBudgetMs, reason }) => new Promise((resolve, reject) => {
+      const budgetSeconds = Math.round(approvalBudgetMs / 1000);
+      if (reason === "silence") {
+        console.log(`\n   still nothing from your phone — press Y to re-send, Ctrl-C to abort`);
+      } else if (attempt >= 2) {
         console.log(`\n   Re-sign needed (attempt ${attempt}) — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
       } else {
         console.log(`\n   Check your phone → ${label}`);
-        console.log(`   Press Y when ready (Ctrl-C to abort):`);
+        console.log(`   Press Y when ready — you'll have ~${budgetSeconds}s to approve on your phone (Ctrl-C to abort):`);
       }
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
       let settled = false;
@@ -558,7 +567,11 @@ try {
       const ask = () => {
         rl.question("   > ", (line) => {
           const answer = line.trim().toLowerCase();
-          if (answer === "y" || answer === "") {
+          // #194: require an EXPLICIT y/yes — bare Enter is the input most
+          // likely to come from something other than a deliberate keypress
+          // (buffered newline, stray Enter, piped stdin), and accepting it
+          // starts a fatal clock with nobody watching.
+          if (answer === "y" || answer === "yes") {
             settle(resolve);
           } else {
             ask();

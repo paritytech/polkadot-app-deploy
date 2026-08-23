@@ -5,6 +5,7 @@
       "name": "Paseo Next v2",
       "network": "testnet",
       "description": "Next iteration of the Paseo Next testnet",
+      "bulletinAuthorizer": "//Alice",
       "e2eEligible": true,
       "ipfs": "https://paseo-bulletin-next-ipfs.polkadot.io",
       "webGateway": "paseo.li",

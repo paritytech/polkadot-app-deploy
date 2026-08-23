@@ -207,14 +207,19 @@ export interface AutoReauthorizeEnv {
 }
 
 // #1059 maintainer constraint: auto-reauthorize is TESTNET-ONLY and must
-// never run on mainnet. `bulletinAutoAuthorize` is the existing
-// environments.json flag that already gates //Alice-based auto-authorize in
-// ensureAuthorized() below — reusing it here keeps one source of truth. The
-// `network !== "mainnet"` check is a deliberate second gate on top of the
+// never run on mainnet. `bulletinAutoAuthorize` is an environments.json flag
+// gating two things ONLY: the #1054 Asset Hub balance pre-fund
+// (ensurePoolAccountsFundedOnAssetHub) and the #1059 hard write-gate in
+// bootstrapPool's reauth pre-check (see allowAutoReauthorize below) — both of
+// which are explicit, human-invoked bootstrap-tool paths, signed with
+// whichever key bootstrapPool resolves as the authorizer (see its
+// `authorizerMnemonic` / `envAuthorizer` precedence). polkadot-app-deploy does
+// NOT self-authorize on the Bulletin chain during a deploy: ensureAuthorized()
+// below never signs anything, it only throws (see its no-self-authorize error
+// text) — unlike bulletin-deploy, which this flag's name is inherited from.
+// The `network !== "mainnet"` check is a deliberate second gate on top of the
 // flag (not redundant with it): it survives a future config mistake where
-// `bulletinAutoAuthorize: true` gets set on a mainnet entry, mirroring the
-// "even if the flag were set by mistake, the dispatch is rejected" fail-safe
-// documented on ensureAuthorized's opts.autoAuthorize path.
+// `bulletinAutoAuthorize: true` gets set on a mainnet entry.
 export function isAutoReauthorizeAllowed(env: AutoReauthorizeEnv | null | undefined): boolean {
   return env?.network !== "mainnet" && env?.bulletinAutoAuthorize === true;
 }
@@ -264,15 +269,20 @@ export async function fetchPoolAuthorizations(api: any, accounts: PoolAccount[])
   return results;
 }
 
-// Returns true when the chain spec name identifies a testnet where Alice has
-// authorization authority. Mainnet Bulletin will not have //Alice as authorizer,
-// so defensive Alice-based top-ups must be gated.
+// Returns true when the chain spec name identifies a Polkadot-ecosystem
+// testnet. This is generic testnet detection, NOT an authorizer check — it
+// only decides which of ensureAuthorized's two (non-signing) error messages
+// to show, and (via detectTestnet/isAutoReauthorizeAllowed) gates the
+// explicit bootstrap-tool write paths. It must not be read as "Alice is the
+// authorizer here": testnets can be community-operated with an authorizer
+// this codebase doesn't know (e.g. devnet — see environments.json
+// `bulletinAuthorizer`, deliberately unset there).
 export function isTestnetSpecName(specName: string | undefined | null): boolean {
   if (!specName) return false;
   const s = specName.toLowerCase();
-  // Polkadot-ecosystem testnets where //Alice has authorization authority.
-  // Bulletin on Paseo reports spec_name "bulletin-westend" (as of 2026-04-17),
-  // so match on the testnet qualifier, not the chain name itself.
+  // Polkadot-ecosystem testnets, matched on the testnet qualifier rather than
+  // chain name — Bulletin on Paseo reports spec_name "bulletin-westend" (as
+  // of 2026-04-17), for example.
   if (s.includes("paseo")) return true;
   if (/\b(westend|rococo)\b/.test(s)) return true;
   if (/\b(testnet|devnet)\b/.test(s)) return true;
@@ -420,6 +430,16 @@ export async function ensurePoolAccountsFundedOnAssetHub(
 
 export interface BootstrapPoolOptions {
   authorizerMnemonic?: string;
+  // The resolved env's `bulletinAuthorizer` (environments.json). Used only
+  // when authorizerMnemonic is not given; takes precedence over guessing.
+  // Needed because //Alice is NOT the authorizer on every testnet-shaped
+  // chain — some (e.g. devnet) are community-operated and their authorizer
+  // is unknown, so there is deliberately no blanket testnet fallback below.
+  envAuthorizer?: string;
+  // Human-readable id/name of the resolved env, used only to name it in the
+  // "no known authorizer" message when neither authorizerMnemonic nor
+  // envAuthorizer is available. Purely cosmetic — does not affect resolution.
+  envLabel?: string;
   bulletinAuthorizeV2?: boolean;
   // #1059 pre-check mode: widen "needs authorization" from "already expired"
   // to "expires within this many blocks" (see accountsNeedingReauthorization).
@@ -505,19 +525,29 @@ export async function bootstrapPool(
       const authKey = keyring.addFromUri(opts.authorizerMnemonic);
       authorizerSigner = getPolkadotSigner(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
       console.log(`Using provided authorizer: ${authKey.address}\n`);
+    } else if (opts.envAuthorizer) {
+      // The env declares which key holds authorizer rights on its Bulletin
+      // chain (environments.json `bulletinAuthorizer`). Preferred over any
+      // blanket guess so `polkadot-app-bootstrap --env <id>` works without a
+      // flag, and so an env with no known authorizer (e.g. devnet) never
+      // gets one guessed on its behalf.
+      const authKey = keyring.addFromUri(opts.envAuthorizer);
+      authorizerSigner = getPolkadotSigner(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
+      console.log(`Using environment authorizer ${opts.envAuthorizer} (${authKey.address})\n`);
     } else {
-      const isTestnet = await detectTestnet(api);
-      if (isTestnet) {
-        const alice = keyring.addFromUri("//Alice");
-        authorizerSigner = getPolkadotSigner(alice.publicKey, "Sr25519", (data: Uint8Array) => alice.sign(data));
-        console.log(`Testnet detected — defaulting to //Alice as authorizer (${alice.address})\n`);
-      } else {
-        console.log(
-          "Authorization is needed but no authorizer key was provided.\n" +
-          "Re-run with --authorizer \"<seed>\" to grant authorization.",
-        );
-        return;
-      }
+      // Deliberately NOT defaulting to //Alice here. That default used to
+      // fire on ANY testnet-shaped chain (detectTestnet), including
+      // community-operated ones (e.g. devnet) where //Alice does not
+      // actually hold authorizer rights — the grant would be silently
+      // rejected on-chain (BadSigner, or a Payment error if Alice is also
+      // unfunded there) instead of failing with a clear, actionable message.
+      const envNote = opts.envLabel ? ` for environment '${opts.envLabel}'` : "";
+      console.log(
+        `No known authorizer${envNote} — this environment does not declare a bulletinAuthorizer ` +
+        "(likely community-operated, so the actual authorizer key is unknown here).\n" +
+        "Re-run with --authorizer \"<seed>\" to grant authorization.",
+      );
+      return;
     }
 
     // --- Step 4: grant authorization for each account that needs it ---

@@ -45,6 +45,13 @@ import { encodeErrorResult } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { PassThrough } from "node:stream";
+import {
+  deriveSignerAccountList, extractJobBlocks, extractDerivationPathsFromJob,
+  extractPoolIndicesFromJob, extractLiteralE2eSigners, resolveMatrixField,
+  stripYamlCommentLines, assertTestnet, requireBulletinAuthorizer, DEV_PHRASE,
+} from "../scripts/e2e-ensure-authorized.mjs";
+import { Keyring as EnsureAuthKeyring } from "@polkadot/keyring";
+import { cryptoWaitReady as ensureAuthCryptoWaitReady } from "@polkadot/util-crypto";
 
 // ---------------------------------------------------------------------------
 // Shared workflow-YAML helper: slices out one job's block of text from a
@@ -22271,5 +22278,272 @@ describe("#1108 best-block resolution (transient finality hardening)", () => {
     const res = await w.signAndSubmitExtrinsic(fakeExtrinsic([bestBlock, finalized]), {}, () => {}, {});
     assert.strictEqual(res.kind, TX_KIND_HASH,
       ">> FAIL: #1108: with no verifyEffect there is no effect to confirm, so best-block must NOT short-circuit — only finalized resolves.");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// scripts/e2e-ensure-authorized.mjs — E2E prerequisite: make every E2E signer
+// account Bulletin-authorized + Asset-Hub-funded before the scenario matrix
+// runs (v0.16.0-rc.2's gating run was 38/4; 3 of the 4 failures were one
+// cause — lapsed/missing Bulletin storage authorization). The mandatory
+// deliverable here is the DRIFT GUARD: the account list is derived from
+// e2e.yml + test/e2e.test.js at run time, not hand-maintained, so it can't
+// silently fall behind the matrix the way a maintainer tool's hardcoded list
+// did for //e2e-fresh-pool.
+// ---------------------------------------------------------------------------
+
+describe("e2e-ensure-authorized: derivation parity (script vs the real E2E signing path)", () => {
+  // The script derives keys via Keyring.addFromUri(DEV_PHRASE + path) — the
+  // SAME code path src/dotns.ts uses to turn --mnemonic + --derivation-path
+  // into a signer (keyring.addFromUri(mnemonic + derivationPath)). Pool
+  // accounts are also derivable via src/pool.ts's derivePoolAccounts (hdkd
+  // sr25519CreateDerive), which is what bootstrapPool authorizes against.
+  // If these two derivation methods ever disagreed, this script would read
+  // and grant authorization for addresses nothing actually signs with — a
+  // silent, total no-op. Pin the agreement so a future crypto-library change
+  // fails this test instead of shipping a script that quietly does nothing.
+  test("Keyring.addFromUri(DEV_PHRASE + path) matches derivePoolAccounts (hdkd) for //deploy/N, including indices 10-11 pinned outside the default pool size", async () => {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    const pool = derivePoolAccounts(12, DEV_PHRASE);
+    for (const idx of [0, 1, 9, 10, 11]) {
+      const viaHdkd = pool[idx].address;
+      const viaKeyring = keyring.addFromUri(DEV_PHRASE + `//deploy/${idx}`).address;
+      assert.strictEqual(viaKeyring, viaHdkd,
+        `>> FAIL: derivation-parity: //deploy/${idx} — Keyring.addFromUri and derivePoolAccounts (hdkd) must derive the SAME address, or the script authorizes an address the E2E harness never signs with.`);
+    }
+  });
+
+  test("bare authorizer URI (\"//Alice\", no phrase) resolves to the well-known Alice address", async () => {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    assert.strictEqual(keyring.addFromUri("//Alice").address, "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+      ">> FAIL: derivation-parity: bare '//Alice' (paseo-next-v2's declared bulletinAuthorizer) must resolve to the standard well-known dev address, matching bootstrapPool's identical resolution.");
+  });
+});
+
+describe("e2e-ensure-authorized: DRIFT GUARD — signer list derived from e2e.yml + test/e2e.test.js", () => {
+  const e2eYmlText = fs.readFileSync(new URL("../.github/workflows/e2e.yml", import.meta.url), "utf8");
+  const e2eTestText = fs.readFileSync(new URL("../test/e2e.test.js", import.meta.url), "utf8");
+
+  // The mandatory guard: pins the FULL derived set against the real checked-
+  // in files. Fails in BOTH directions — a new derivation-path/poolIndex not
+  // reflected here, or one of these disappearing — so it is the reviewer's
+  // signal to look at what changed, not silent scope creep either way.
+  test("derives exactly the known E2E signer set from the real e2e.yml + test/e2e.test.js", () => {
+    const accounts = deriveSignerAccountList(e2eYmlText, e2eTestText);
+    const labels = accounts.map((a) => a.label);
+    const expected = [
+      "//e2e-direct", "//e2e-fresh-direct", "//e2e-fresh-pool", "//e2e-s9", "//e2e-sgrandpa",
+      "//deploy/0", "//deploy/1", "//deploy/2", "//deploy/3", "//deploy/4", "//deploy/5",
+      "//deploy/6", "//deploy/7", "//deploy/8", "//deploy/9", "//deploy/10", "//deploy/11",
+    ];
+    assert.deepStrictEqual(labels, expected,
+      `>> FAIL: e2e-signer-drift-guard: the derived signer set no longer matches the pinned expectation (derived: ${JSON.stringify(labels)}). ` +
+      `If you intentionally added/removed a derivation-path or poolIndex in e2e.yml, or an entry in test/e2e.test.js's ISOLATED_DIRECT_SIGNERS, update the pinned array in this test to match — do NOT silently accept a drifted list, that is the exact v0.16.0-rc.2 bug class.`);
+  });
+
+  test("every derived account address is well-formed and unique (no two labels collide on the same key)", async () => {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    const accounts = deriveSignerAccountList(e2eYmlText, e2eTestText);
+    const addresses = accounts.map((a) => keyring.addFromUri(DEV_PHRASE + a.path).address);
+    assert.strictEqual(new Set(addresses).size, addresses.length,
+      ">> FAIL: e2e-signer-drift-guard: two different derivation paths in e2e.yml/test/e2e.test.js resolved to the same address — one path is very likely a typo of the other.");
+  });
+});
+
+describe("e2e-ensure-authorized: anti-hardcoding property (parser tracks content, not a maintained list)", () => {
+  // This is the property that actually fixes the reported bug class: a NEW
+  // matrix value must appear in the derived list with ZERO code changes to
+  // this script. Proven on a synthetic fixture so it can't be confused with
+  // "the real e2e.yml happens to already include it".
+  test("a brand-new matrix.signer value under a templated derivation-path is picked up automatically", () => {
+    const fixtureYml = [
+      "name: fixture", "jobs:", "  nightly-s2-fresh:", "    strategy:", "      matrix:",
+      "        signer: [pool, direct, brandnewsigner]",
+      "    uses: ./.github/workflows/deploy.yml", "    with:",
+      "      derivation-path: //e2e-fresh-${{ matrix.signer }}",
+    ].join("\n");
+    const accounts = deriveSignerAccountList(fixtureYml, "");
+    const labels = accounts.map((a) => a.label);
+    assert.ok(labels.includes("//e2e-fresh-brandnewsigner"),
+      `>> FAIL: anti-hardcoding: adding 'brandnewsigner' to the matrix must widen the derived list with no script change; got ${JSON.stringify(labels)}.`);
+    assert.deepStrictEqual([...labels].sort(), ["//e2e-fresh-brandnewsigner", "//e2e-fresh-direct", "//e2e-fresh-pool"].sort(),
+      ">> FAIL: anti-hardcoding: expected exactly the 3 matrix.signer values expanded, no more, no fewer.");
+  });
+
+  test("a new poolIndex value in an include-list entry is picked up automatically", () => {
+    const fixtureYml = [
+      "name: fixture", "jobs:", "  some-job:", "    strategy:", "      matrix:",
+      "        include:", "          - { scenario: s1, signer: pool, poolIndex: 42 }",
+    ].join("\n");
+    const accounts = deriveSignerAccountList(fixtureYml, "");
+    assert.ok(accounts.map((a) => a.label).includes("//deploy/42"),
+      ">> FAIL: anti-hardcoding: a new poolIndex entry in e2e.yml must appear as //deploy/N with no script change.");
+  });
+
+  // SABOTAGE-CHECK evidence for the guard's failure mode: a templated
+  // derivation-path that CANNOT be resolved (no matching matrix array/include
+  // entry in that job) must be a hard error, never a silent zero-account skip
+  // — a skip here is exactly how //e2e-fresh-pool went unauthorized.
+  test("a templated derivation-path with no resolvable matrix field is a hard error, not a silent skip", () => {
+    const fixtureYml = [
+      "name: fixture", "jobs:", "  orphan-job:", "    with:",
+      "      derivation-path: //e2e-fresh-${{ matrix.signer }}",
+    ].join("\n");
+    assert.throws(() => deriveSignerAccountList(fixtureYml, ""),
+      /job 'orphan-job'.*no.*array or.*include entry to resolve/s,
+      ">> FAIL: e2e-signer-drift-guard: an unresolvable matrix template must throw naming the job, never silently produce zero accounts.");
+  });
+
+  test("a malformed derivation-path value (not a //-prefixed path) is a hard error", () => {
+    const fixtureYml = [
+      "name: fixture", "jobs:", "  bad-job:", "    with:",
+      "      derivation-path: not-a-path",
+    ].join("\n");
+    assert.throws(() => deriveSignerAccountList(fixtureYml, ""),
+      /job 'bad-job'.*does not look like a Substrate derivation path/s,
+      ">> FAIL: e2e-signer-drift-guard: a derivation-path value that isn't shaped like //segment/segment must be rejected, not silently authorized.");
+  });
+
+  test("a non-integer poolIndex value is a hard error", () => {
+    const fixtureYml = [
+      "name: fixture", "jobs:", "  bad-job:", "    strategy:", "      matrix:",
+      "        include:", "          - { scenario: s1, poolIndex: notanumber }",
+    ].join("\n");
+    assert.throws(() => deriveSignerAccountList(fixtureYml, ""),
+      /poolIndex value "notanumber" is not a non-negative integer/,
+      ">> FAIL: e2e-signer-drift-guard: a non-numeric poolIndex must be rejected, not silently ignored.");
+  });
+
+  test("comment-only lines mentioning derivation-path/poolIndex are ignored, not parsed as real values", () => {
+    const fixtureYml = [
+      "name: fixture", "jobs:", "  commented-job:",
+      "    # the `derivation-path: //should-not-count` below gives this shard its own nonce stream",
+      "    with:",
+      "      derivation-path: //e2e-real-value",
+    ].join("\n");
+    const labels = deriveSignerAccountList(fixtureYml, "").map((a) => a.label);
+    assert.deepStrictEqual(labels, ["//e2e-real-value"],
+      `>> FAIL: e2e-signer-drift-guard: a derivation-path mentioned only in a comment line must not be parsed as a real signer; got ${JSON.stringify(labels)}.`);
+  });
+
+  test("stripYamlCommentLines blanks full comment lines but preserves real content lines", () => {
+    const input = "real: value\n  # a comment\nother: value";
+    const out = stripYamlCommentLines(input);
+    assert.strictEqual(out, "real: value\n\nother: value",
+      ">> FAIL: e2e-signer-drift-guard: stripYamlCommentLines must blank comment-only lines while leaving real lines untouched.");
+  });
+
+  test("extractJobBlocks throws a clear error when the file has no top-level 'jobs:' key", () => {
+    assert.throws(() => extractJobBlocks("name: fixture\nno-jobs-here: true\n"),
+      /could not find a top-level 'jobs:' key/,
+      ">> FAIL: e2e-signer-drift-guard: a file shape change that removes 'jobs:' must fail loudly, not silently parse zero jobs.");
+  });
+});
+
+describe("e2e-ensure-authorized: environment guards (testnet-only, no-guess authorizer)", () => {
+  test("assertTestnet refuses a mainnet-shaped environment", () => {
+    const mainnetLike = { network: "mainnet", bulletinAuthorizer: undefined };
+    assert.throws(() => assertTestnet(mainnetLike, "polkadot"),
+      /refusing to run against 'polkadot'.*network=mainnet.*testnet-only/s,
+      ">> FAIL: env-guards: a mainnet-shaped environment must be refused outright, before any chain connection is opened.");
+  });
+
+  test("assertTestnet allows a testnet-shaped environment", () => {
+    const testnetLike = { network: "testnet" };
+    assert.doesNotThrow(() => assertTestnet(testnetLike, "paseo-next-v2"),
+      ">> FAIL: env-guards: a testnet-shaped environment must be allowed through.");
+  });
+
+  // devnet-shaped: testnet network, but NO declared bulletinAuthorizer (see
+  // environments.json — devnet is community-operated, the field is
+  // deliberately left unset). Must refuse, never guess //Alice.
+  test("requireBulletinAuthorizer refuses a devnet-shaped environment (no declared authorizer) with an actionable message, never guessing", () => {
+    const devnetLike = { network: "testnet", bulletinAuthorizer: undefined };
+    assert.throws(() => requireBulletinAuthorizer(devnetLike, "devnet"),
+      /environment 'devnet' does not declare a bulletinAuthorizer.*community-operated.*Refusing to guess/s,
+      ">> FAIL: env-guards: an environment with no declared bulletinAuthorizer must refuse with an actionable message, and must NEVER fall back to guessing //Alice — that reproduces the exact bug #1213/env-authorizer-read fixed.");
+  });
+
+  test("requireBulletinAuthorizer returns the declared authorizer for a paseo-next-v2-shaped environment", () => {
+    const paseoLike = { network: "testnet", bulletinAuthorizer: "//Alice" };
+    assert.strictEqual(requireBulletinAuthorizer(paseoLike, "paseo-next-v2"), "//Alice",
+      ">> FAIL: env-guards: a declared bulletinAuthorizer must be returned as-is, unmodified.");
+  });
+});
+
+describe("e2e.yml: prerequisites job wiring (ensure-e2e-authorized)", () => {
+  const CHAIN_SCENARIO_JOBS = [
+    "nightly-pr-coverage", "nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh",
+    "nightly-s3", "nightly-s5", "nightly-s6", "nightly-s7", "nightly-s8", "nightly-s9",
+    "nightly-s-grandpa-reupload", "nightly-s-mortality", "nightly-s-reprove",
+    "nightly-s-car", "nightly-s-inc", "nightly-s-ext-signer",
+  ];
+
+  test("e2e.yml defines the ensure-e2e-authorized prerequisites job", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    assert.match(wf, /^\s{2}ensure-e2e-authorized:\s*$/m,
+      ">> FAIL: e2e-prereq-wiring: e2e.yml must define a top-level ensure-e2e-authorized job.");
+  });
+
+  test("every chain-touching scenario job needs: ensure-e2e-authorized and gates its if: on the prerequisite's success", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const blocks = extractJobBlocks(wf);
+    const missing = [];
+    for (const job of CHAIN_SCENARIO_JOBS) {
+      const block = blocks.get(job);
+      if (!block) { missing.push(`${job}: job not found at all`); continue; }
+      const needsMatch = block.match(/needs:\s*\[([^\]]*)\]/);
+      if (!needsMatch || !needsMatch[1].split(",").map((s) => s.trim()).includes("ensure-e2e-authorized")) {
+        missing.push(`${job}: needs: does not include ensure-e2e-authorized`);
+      }
+      if (!/needs\.ensure-e2e-authorized\.result == 'success'/.test(block)) {
+        missing.push(`${job}: if: does not gate on needs.ensure-e2e-authorized.result == 'success'`);
+      }
+    }
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: e2e-prereq-wiring: ${missing.length} chain-touching job(s) not correctly wired to the prerequisites job:\n${missing.join("\n")}`);
+  });
+
+  test("nightly-report needs ensure-e2e-authorized and the failure-issue check covers it", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const blocks = extractJobBlocks(wf);
+    const reportBlock = blocks.get("nightly-report");
+    assert.ok(reportBlock, ">> FAIL: e2e-prereq-wiring: nightly-report job not found.");
+    const needsMatch = reportBlock.match(/needs:\s*\[([^\]]*)\]/);
+    assert.ok(needsMatch && needsMatch[1].split(",").map((s) => s.trim()).includes("ensure-e2e-authorized"),
+      ">> FAIL: e2e-prereq-wiring: nightly-report must needs: ensure-e2e-authorized so a prereq failure is reflected in the nightly report.");
+    assert.match(reportBlock, /needs\.ensure-e2e-authorized\.result == 'failure'/,
+      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must treat a prerequisites failure as a failure condition, not silently omit it.");
+    assert.match(reportBlock, /needs\.ensure-e2e-authorized\.result == 'cancelled'/,
+      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must treat a prerequisites cancellation as a failure condition too.");
+  });
+
+  // The dangling-needs walk mandated by the task brief: parse the YAML,
+  // collect every job name, and validate every needs: entry (bracket-array
+  // OR bare-scalar form, e.g. "needs: detect-noop-push") resolves to a real
+  // job. Re-derives from the live file, not a snapshot, so it catches a
+  // future rename too.
+  test("no needs: edge in e2e.yml points at a job that does not exist (full job-graph walk)", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const blocks = extractJobBlocks(wf);
+    const jobNames = new Set(blocks.keys());
+    assert.ok(jobNames.size >= 28,
+      `>> FAIL: e2e-prereq-wiring: expected at least 28 jobs (27 pre-existing + ensure-e2e-authorized), found ${jobNames.size} — extractJobBlocks may be mis-splitting the file.`);
+    const dangling = [];
+    for (const [name, block] of blocks) {
+      const bracketMatch = block.match(/^\s{4}needs:\s*\[([^\]]*)\]/m);
+      const bareMatch = !bracketMatch && block.match(/^\s{4}needs:\s*(\S+)\s*$/m);
+      const refs = bracketMatch
+        ? bracketMatch[1].split(",").map((s) => s.trim()).filter(Boolean)
+        : bareMatch ? [bareMatch[1].trim()] : [];
+      for (const ref of refs) {
+        if (!jobNames.has(ref)) dangling.push(`${name} -> ${ref}`);
+      }
+    }
+    assert.deepStrictEqual(dangling, [],
+      `>> FAIL: e2e-prereq-wiring: ${dangling.length} dangling needs: reference(s) (job depends on a job that doesn't exist): ${dangling.join(", ")}`);
   });
 });

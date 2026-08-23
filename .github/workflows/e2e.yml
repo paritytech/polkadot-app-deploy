@@ -1968,7 +1968,19 @@ jobs:
           echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-ext"
           mkdir -p /tmp/bd-s-ext
           echo '{"type":"module"}' > /tmp/bd-s-ext/package.json
-          cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring polkadot-api
+          # Install the product FIRST, then pin polkadot-api to whatever version it
+          # actually resolved. A bare `polkadot-api` here takes the registry's latest,
+          # which drifted ahead of our dependency range the moment polkadot-api 3.0.0
+          # shipped (2026-08-18) and DROPPED the `./signer` subpath — so this scenario's
+          # `import { getPolkadotSigner } from "polkadot-api/signer"` dies with
+          # ERR_PACKAGE_PATH_NOT_EXPORTED against papi 3 while the product itself is fine
+          # on its nested 2.x. Pinning to the resolved version also makes the test honest:
+          # an "external PolkadotSigner" must come from the SAME papi instance the product
+          # uses, not a different major.
+          cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring
+          PAPI=$(node -p "require('/tmp/bd-s-ext/node_modules/polkadot-api/package.json').version")
+          echo "@parity/polkadot-app-deploy@${V} resolved polkadot-api ${PAPI} — pinning the scenario to it"
+          cd /tmp/bd-s-ext && npm install "polkadot-api@${PAPI}"
       - name: Write external signer test script
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |

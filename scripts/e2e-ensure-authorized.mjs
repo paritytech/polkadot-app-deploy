@@ -46,7 +46,7 @@ import { createClient, Enum } from "polkadot-api";
 import { getWsProvider } from "polkadot-api/ws";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { loadEnvironments, resolveEndpoints } from "../dist/environments.js";
-import { readAccountAuthorization, isAuthorizationSufficient, assetHubTopUpAmount, formatPasBalance } from "../dist/pool.js";
+import { readAccountAuthorization, isAuthorizationSufficient, assetHubTopUpAmount, formatPasBalance, TOPUP_TRANSACTIONS, TOPUP_BYTES } from "../dist/pool.js";
 import { stripYamlCommentLines, extractJobBlocks } from "./lib/workflow-jobs.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -60,8 +60,9 @@ export const E2E_TEST_PATH = path.join(REPO_ROOT, "test", "e2e.test.js");
 // Public and intentionally so: not a secret, testnet-only.
 export const DEV_PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
 
-const TOPUP_TRANSACTIONS = 1000;
-const TOPUP_BYTES = 100_000_000n;
+// TOPUP_TRANSACTIONS / TOPUP_BYTES imported above from src/pool.ts (via
+// dist/pool.js) — that's the same authorize_account quota src/pool.ts's own
+// auto-reauthorize path grants, now shared instead of hand-copied here.
 // Bulletin and Asset Hub both report tokenDecimals: 10 (see
 // reference_paseo_ah_token_decimals_10 — a 1e12 divisor under-reports 100x).
 export const ONE_PAS = 10_000_000_000n;

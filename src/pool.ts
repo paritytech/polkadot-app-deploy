@@ -55,8 +55,11 @@ export function assetHubTopUpAmount(balanceRaw: bigint, thresholdRaw: bigint, ta
   return amount > 0n ? amount : 0n;
 }
 
-const TOPUP_TRANSACTIONS = 1000;
-const TOPUP_BYTES = 100_000_000n; // 100MB
+// Exported so scripts/e2e-ensure-authorized.mjs (the E2E prerequisites
+// check) can share these quota constants instead of hand-maintaining a
+// second copy that can silently drift from this one.
+export const TOPUP_TRANSACTIONS = 1000;
+export const TOPUP_BYTES = 100_000_000n; // 100MB
 const WS_HEARTBEAT_TIMEOUT_MS = 300_000;
 
 export function derivePoolAccounts(poolSize: number = 10, mnemonic: string = DEV_PHRASE): PoolAccount[] {

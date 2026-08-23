@@ -399,19 +399,35 @@ async function main() {
 
   const bulletinRpc = resolved.bulletin[0];
   const assetHubRpc = resolved.assetHub[0];
+  const floorRaw = resolved.registerStorageDeposit ?? DEFAULT_FUNDING_FLOOR;
+  const targetRaw = floorRaw + DEFAULT_FUNDING_MARGIN;
 
   console.log(`\n== Bulletin storage authorization (${bulletinRpc}) ==`);
-  const authResults = await checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri });
+  console.log(`== Asset Hub balance >= funding floor (${assetHubRpc}) ==`);
+  console.log(`   floor=${formatPasBalance(floorRaw)} PAS target=${formatPasBalance(targetRaw)} PAS`);
+
+  // Bulletin (signed by the env authorizer) and Asset Hub (signed by the dev
+  // phrase) are different chains with different signer keys — no shared
+  // nonce, no data dependency between the two passes — so they run
+  // concurrently instead of one after the other, roughly halving this
+  // gating job's wall clock. Writes stay sequential WITHIN each pass
+  // (unchanged, see runCheckAndAct) — only the two passes overlap.
+  // allSettled (not all): a crash in one pass must not swallow the other
+  // pass's already-computed per-account results.
+  const [authSettled, fundSettled] = await Promise.allSettled([
+    checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri }),
+    checkAndFundAssetHub({ accounts, assetHubRpc, funderUri: DEV_PHRASE, floorRaw, targetRaw }),
+  ]);
+  const authResults = authSettled.status === "fulfilled" ? authSettled.value : [];
+  const fundResults = fundSettled.status === "fulfilled" ? fundSettled.value : [];
+
+  console.log(`\n-- Bulletin storage authorization results --`);
   for (const r of authResults) {
     const suffix = r.action !== "none" ? ` -> ${r.action}` : "";
     console.log(`  [${r.before}${suffix}] ${r.label}  ${r.address}${r.error ? `  (${r.error})` : ""}`);
   }
 
-  const floorRaw = resolved.registerStorageDeposit ?? DEFAULT_FUNDING_FLOOR;
-  const targetRaw = floorRaw + DEFAULT_FUNDING_MARGIN;
-  console.log(`\n== Asset Hub balance >= funding floor (${assetHubRpc}) ==`);
-  console.log(`   floor=${formatPasBalance(floorRaw)} PAS target=${formatPasBalance(targetRaw)} PAS`);
-  const fundResults = await checkAndFundAssetHub({ accounts, assetHubRpc, funderUri: DEV_PHRASE, floorRaw, targetRaw });
+  console.log(`\n-- Asset Hub funding results --`);
   for (const r of fundResults) {
     console.log(`  [${r.action}] ${r.label}  ${r.address}  free=${formatPasBalance(r.freeBefore)} PAS${r.error ? `  (${r.error})` : ""}`);
   }
@@ -420,6 +436,12 @@ async function main() {
     ...authResults.filter((r) => r.action === "FAILED").map((r) => `Bulletin authorize ${r.label} (${r.address}): ${r.error}`),
     ...fundResults.filter((r) => r.action === "FAILED").map((r) => `Asset Hub fund ${r.label} (${r.address}): ${r.error}`),
   ];
+  if (authSettled.status === "rejected") {
+    failures.push(`Bulletin authorization pass crashed before completing: ${authSettled.reason?.message ?? authSettled.reason}`);
+  }
+  if (fundSettled.status === "rejected") {
+    failures.push(`Asset Hub funding pass crashed before completing: ${fundSettled.reason?.message ?? fundSettled.reason}`);
+  }
 
   if (failures.length > 0) {
     console.error(`\n${failures.length} account(s) could NOT be made E2E-ready:`);

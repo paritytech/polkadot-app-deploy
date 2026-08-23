@@ -21,6 +21,15 @@ jobs:
         with:
           node-version: '22'
 
+      # node-version: '22' resolves to a Node 22 line whose BUNDLED npm (10.x)
+      # re-resolves dependency ranges instead of honouring a lockfileVersion 3
+      # lock written by npm 11 — `npm ci` then fails with EUSAGE / "Missing:
+      # esbuild@… from lock file" against a lockfile that is perfectly in sync.
+      # tests.yml, e2e.yml and deploy.yml already pin npm 11 for exactly this;
+      # publish.yml was the one workflow left unpinned, so v0.16.0-rc.1 failed
+      # to publish and its gating E2E then timed out waiting for the artifact.
+      - run: npm install -g npm@11
+
       - run: npm ci
 
       # Full offline suite (test/test.js etc.) — builds internally

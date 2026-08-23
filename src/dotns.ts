@@ -310,7 +310,21 @@ export const TX_WALL_CLOCK_CEILING_MS: number = 240_000;
 // arrives for this long, the watch is considered silently stalled (papi observable
 // + dead WS) and the promise rejects with a 'transaction watcher silent for Ns
 // after <lastEvent>' error that signAndSubmitWithRetry can retry.
+//
+// #194: this governs MACHINE no-progress only (WS stall, dropped subscription)
+// — see PHONE_APPROVAL_MS for the separate human-approval budget. Before #194
+// this single constant did double duty: on a phone/session signer, lastEventAt
+// can only advance once the human approves (the first event is "signed"), so
+// the silence deadline WAS the approval budget too. Tuning one must not
+// silently retune the other, hence the split.
 export const TX_NO_PROGRESS_MS: number = 90_000;
+// #194: silence deadline used in place of TX_NO_PROGRESS_MS specifically when
+// the signer is a phone/session signer (signAndSubmitExtrinsic's opts.isPhoneSigner
+// === true) — see the comment on TX_NO_PROGRESS_MS above for why these two
+// needed to become independent constants. Same initial value (90_000) so
+// current behaviour is unchanged; a future retune of either no longer affects
+// the other.
+export const PHONE_APPROVAL_MS: number = 90_000;
 // #1108: grace window before the best-block short-circuit engages. Give GRANDPA
 // finality a fair chance first — so a healthy deploy (Asset Hub finality is
 // typically ~12–40s) still resolves via the "finalized" event with a real tx
@@ -1668,7 +1682,7 @@ export class ReviveClientWrapper {
     extrinsic: any,
     signer: PolkadotSigner,
     statusCallback: (status: string) => void,
-    opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas" } = {},
+    opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean } = {},
   ): Promise<TxResolution> {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -1691,16 +1705,22 @@ export class ReviveClientWrapper {
       // verifies the on-chain effect and resolves without waiting for GRANDPA
       // finality — so a finality-lag window can't time out an already-landed write.
       let bestBlockIncluded = false;
+      // #194: phone/session signers wait out PHONE_APPROVAL_MS (the human
+      // approval budget) instead of TX_NO_PROGRESS_MS (the machine no-progress
+      // budget) — see the comments on those two constants. Same value today,
+      // but resolved independently so retuning one never silently retunes the
+      // other.
+      const silenceDeadlineMs = opts.isPhoneSigner === true ? PHONE_APPROVAL_MS : TX_NO_PROGRESS_MS;
       // Per-call read so tests / slow chains can override without a reimport.
       // Explicit empty/null check (not `|| default`) so "0" — engage immediately —
       // is honoured rather than falling back to the default. Clamped below
-      // TX_NO_PROGRESS_MS so the best-block branch always gets a poll tick before
+      // silenceDeadlineMs so the best-block branch always gets a poll tick before
       // the silence-rejection pre-empts it (an over-large override is otherwise a
       // footgun that disables best-block resolution entirely).
       const graceRawEnv = process.env.BULLETIN_DOTNS_BESTBLOCK_GRACE_MS;
       const bestBlockGraceMs = Math.min(
         graceRawEnv != null && graceRawEnv !== "" ? parseInt(graceRawEnv, 10) : DOTNS_BEST_BLOCK_GRACE_MS,
-        TX_NO_PROGRESS_MS - 5_000,
+        silenceDeadlineMs - 5_000,
       );
 
       const poll = async (): Promise<void> => {
@@ -1754,7 +1774,7 @@ export class ReviveClientWrapper {
             return;
           }
           const silentMs = Date.now() - lastEventAt;
-          if (silentMs > TX_NO_PROGRESS_MS) {
+          if (silentMs > silenceDeadlineMs) {
             statusCallback("failed");
             // No-event case (never reached "signed"/"broadcasted"): throw a typed
             // error so signAndSubmitWithRetry can detect it and apply phone-signer

@@ -947,7 +947,7 @@ export const PUBLISHER_ABI = [
 // or surface as a fatal error.
 export class PublisherNotSupportedError extends Error {
   constructor(envName: string) {
-    super(`Publisher contract is not configured for environment '${envName}'. Use an env that has a deployed Publisher (currently: paseo-next-v2).`);
+    super(`Publisher contract is not configured for environment '${envName}'. Use an env that has a deployed Publisher (currently: devnet).`);
     this.name = "PublisherNotSupportedError";
   }
 }

@@ -314,7 +314,7 @@ Options:
                       having no config at all. Mutually exclusive with --publish.
   --publish           After deploy, list <domain> in the on-chain Publisher
                       registry (Publisher.publish). Only takes effect on envs
-                      with a deployed Publisher (currently: paseo-next-v2).
+                      with a deployed Publisher (currently: devnet).
                       Requires --mnemonic (the signer must own the label).
   --unpublish         Standalone mode: removes <domain> from the Publisher
                       registry (Publisher.unpublish). Skips the deploy.

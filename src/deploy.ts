@@ -2658,8 +2658,17 @@ export interface DeployOptions {
    * resolves. `attempt` >= 2 means a re-sign.
    * Absent + non-TTY → fail fast (NonRetryableError).
    * Absent + TTY → CLI bin must supply the hook; core does not readline.
+   *
+   * `approvalBudgetMs` and `reason` (#194): widened to match dotns.ts's
+   * ConnectOptions.confirmPhoneReady, which this field is passed straight
+   * through to unchanged (see resolveDotnsConnectOptions call sites below).
+   * `approvalBudgetMs` discloses the phone-approval silence deadline so the
+   * CLI prompt never hardcodes a number that can drift from the constant that
+   * actually governs it. `reason: "silence"` marks a watcher-silence re-arm
+   * (re-prompt after no response) as distinct from the pre-existing re-sign
+   * case (undefined/"resign").
    */
-  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number }) => Promise<void>;
+  confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>;
 }
 
 // Resolve the DeployOptions that affect DotNS authentication into the shape

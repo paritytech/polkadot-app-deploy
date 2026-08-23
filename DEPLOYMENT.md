@@ -64,7 +64,7 @@ polkadot-app-bootstrap --env <id> --authorizer "<seed>"  # grant authorization w
 polkadot-app-bootstrap --env <id> --pool-size 20         # inspect/authorize a larger pool
 ```
 
-On a **testnet** the authorizer defaults to `//Alice` (it holds authorization authority there), so no `--authorizer` is needed. On a **production** chain, pass `--authorizer` with the key that actually holds authorization authority — if it can't grant, the tool reports that rather than pretending. See [`docs/bootstrap.md`](docs/bootstrap.md) for the full reference.
+When you pass `--env <id>`, the authorizer falls back to that environment's declared `bulletinAuthorizer` (e.g. `//Alice` on `paseo-next-v2`), so no `--authorizer` is needed there. Environments with no declared authorizer (community-operated ones, e.g. `devnet`) have none to fall back to — omitting `--authorizer` there prints a clear "no known authorizer" message instead of guessing. On any chain, pass `--authorizer` with the key that actually holds authorization authority if you need to grant. See [`docs/bootstrap.md`](docs/bootstrap.md) for the full reference.
 
 ## 3. Personhood (if your DotNS gates registration)
 
@@ -84,7 +84,7 @@ The accounts that register and transfer names need a balance on your Asset Hub f
 
 ## 5. Content gateway
 
-Deployed content is content-addressed (a CID) on the Bulletin Chain and served over HTTP by the IPFS gateway you set as `ipfs` in step 1. The `.dot` name resolves to that CID via DotNS. Parity's public testnets resolve a deployed name at `https://<name>.dot.li`; your environment uses whatever gateway / resolver you point it at.
+Deployed content is content-addressed (a CID) on the Bulletin Chain and served over HTTP by the IPFS gateway you set as `ipfs` in step 1. The DotNS name resolves to that CID. The browser-facing host is per-environment (`webGateway` in `environments.json`) — e.g. `paseo-next-v2` names resolve at `https://<name>.paseo.li`, `devnet` names at `https://<name>.dev-dot.li`; your environment uses whatever gateway / resolver you point it at.
 
 ## 6. Verify the setup
 
@@ -93,7 +93,7 @@ A **test deploy** is the real check — run one (see the [README](README.md)) an
 - `not authorized to upload` → the storage account lacks authorization (step 2).
 - a personhood / registration gate → the registering account needs PoP (step 3).
 
-If you're working from a **clone of the repository** (not just the npm package), `tools/` has read-only diagnostics that take `--env <id>`: `check-bulletin-auth.mjs` (storage quotas), `check-balances.mjs` (balances + quota), `check-pop-status.mjs` (personhood), `probe-env-health.mjs` (RPC reachability). These ship with the repo, not the published package.
+If you're working from a **clone of the repository** (not just the npm package), `tools/probe-env-health.mjs --env <id>` is a read-only RPC-reachability check. It ships with the repo, not the published package. Authorization and personhood status are otherwise checked the same way `polkadot-app-bootstrap` does — via its status-only mode (omit `--authorizer` — see [`docs/bootstrap.md`](docs/bootstrap.md)) and the chain-admin's own PoP tooling; this repo does not ship separate `check-*` diagnostics for those.
 
 A concrete, fully worked instance of this setup — for the E2E test environment — lives in [`docs/e2e-bootstrap.md`](docs/e2e-bootstrap.md).
 

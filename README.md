@@ -34,12 +34,14 @@ Requires **Node.js ≥ 22**. Content addressing uses the IPFS [Kubo](https://doc
 
 ```sh
 # Build your app, then deploy:
-polkadot-app-deploy ./dist my-app.dot
+polkadot-app-deploy ./dist my-app.paseo
 # or using the short alias:
-pad ./dist my-app.dot
+pad ./dist my-app.paseo
 ```
 
-Once it finishes, your site is served at `https://my-app.dot.li`.
+Once it finishes, your site is served at `https://my-app.paseo.li`.
+
+The name's TLD is per-environment — `paseo-next-v2` (today's default) roots names under `.paseo`; run `--list-environments` to see what another environment uses.
 
 New here? **[DEPLOYMENT.md](DEPLOYMENT.md)** walks you from prerequisites to a viewable app, step by step — including how to acquire a `.dot` name, what authorization a network requires (the raw "not authorized" chain error is a common first-run trap), and where a deployed site is viewable.
 
@@ -55,12 +57,16 @@ polkadot-app-deploy logout   # Sign out and clear the session
 
 After `login`, subsequent deploys hand the name to your signed-in account with **zero mobile signatures** (testnet): a local worker (the default dev account, or your `--mnemonic`) registers the name and uploads the content, then transfers ownership to your signed-in address as the final step. Pass `--no-transfer-to-signedin-user` to sign every DotNS transaction with your mobile session instead.
 
-If a deploy's content lands but the final transfer fails, hand the name over separately:
+When a transaction does need your phone, the CLI prompts `Press Y when ready` and discloses how long you have to approve. It requires an explicit `y`/`yes` — a bare Enter no longer counts as confirmation, so a scripted flow that pipes a newline to auto-confirm will stop working and must send `y` explicitly. If your phone doesn't respond within that window, the CLI re-prompts (up to 3 times) instead of failing the run outright.
+
+If a deploy's content lands but the final transfer fails, hand the name over separately — this also works for a subname you own the parent of (e.g. `app.my-app.paseo`):
 
 ```sh
-polkadot-app-deploy transfer my-app.dot              # → the signed-in account
-polkadot-app-deploy transfer my-app.dot --to 0x...   # → an explicit recipient
+polkadot-app-deploy transfer my-app.paseo              # → the signed-in account
+polkadot-app-deploy transfer my-app.paseo --to 0x...   # → an explicit recipient
 ```
+
+`--to` refuses the zero address rather than silently burning the name.
 
 ## Options
 
@@ -70,11 +76,12 @@ Key options:
 
 | Option | Description |
 |--------|-------------|
-| `--env <id>` | Target environment (default: `paseo-next-v2`). Run `--list-environments` to see available IDs. |
-| `--mnemonic "..."` | DotNS owner mnemonic (or set `MNEMONIC` env var). Alternative to session signing. |
+| `--env <id>` | Target environment (default: `paseo-next-v2`). Also settable session-wide via the `PAD_ENV` env var; `--env` wins if both are given. Run `--list-environments` to see available IDs. |
+| `--mnemonic "..."` | DotNS owner mnemonic (or set `MNEMONIC`, then `DOTNS_MNEMONIC`). Alternative to session signing. |
 | `--no-transfer-to-signedin-user` | When signed in, sign every DotNS tx with your mobile session instead of the default register-as-worker-then-hand-over flow. |
-| `--to <0xH160>` | Recipient address for the `transfer` subcommand. Defaults to the signed-in account. |
+| `--to <0xH160>` | Recipient address for the `transfer` subcommand. Defaults to the signed-in account; the zero address is refused. |
 | `--js-merkle` | Use pure-JS merkleization (no IPFS Kubo binary required). |
+| `--no-manifest`, `--content-only` | Skip manifest publishing even when a `polkadot-app-deploy.config.*` is discoverable — plain content deploy. Mutually exclusive with `--publish`. |
 | `--publish` | List the domain in the on-chain Publisher registry after deploy. |
 | `--config <path>` | Explicit path to `polkadot-app-deploy.config.ts` for product deploys. |
 | `--tag "..."` | Label the deploy in telemetry. |
@@ -84,7 +91,7 @@ Subcommands: `login`, `logout`, `whoami` (session management, above) and `transf
 
 ## Environments
 
-polkadot-app-deploy ships with built-in environment presets (RPC endpoints, contract addresses). The default is `paseo-next-v2`, a Polkadot testnet. Use `--list-environments` to print the table; override individual fields with `--environment-file <path>` or `--contract KEY=0x...`. For what a starting account needs on a given network — funding, a `.dot` name, authorization — see **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+polkadot-app-deploy ships with built-in environment presets (RPC endpoints, contract addresses, DotNS TLD). The default is `paseo-next-v2`, a Polkadot testnet. Use `--list-environments` to print the table; override individual fields with `--environment-file <path>` or `--contract KEY=0x...`. For what a starting account needs on a given network — funding, a DotNS name, authorization — see **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 ## Build from source
 

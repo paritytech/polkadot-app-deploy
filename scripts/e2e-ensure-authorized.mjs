@@ -261,34 +261,41 @@ function deriveSignerKeypair(keyring, account) {
   return keyring.addFromUri(DEV_PHRASE + account.path);
 }
 
-async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri }) {
+// Shared check-first, grant-only-if-needed skeleton. checkAndGrantAuthorizations
+// (Bulletin storage authorization) and checkAndFundAssetHub (Asset Hub balance)
+// differ only in: which chain/key they run against (rpc/signerUri), any
+// once-per-pass setup (prepare), the per-account check (checkFn), and the tx
+// itself (actFn) — everything else (keyring + primary signer setup, opening
+// one client for the whole pass, building each row, catching a failed
+// action into { action: "FAILED", error }, destroying the client) was
+// previously duplicated between the two. This file's own header argues
+// against exactly that kind of copy for computeStorageDepositLimit; this
+// factors it out instead of adding a second instance of the same drift risk.
+//
+// Writes stay SEQUENTIAL within this loop (never Promise.all across
+// accounts within one pass) — a shared signer nonce would race otherwise,
+// same #1054 rationale as ensurePoolAccountsFundedOnAssetHub in src/pool.ts.
+//
+//   prepare(api, primaryKey) -> ctx                      (optional, once per pass)
+//   checkFn(api, key, account, ctx) -> { rowFields, needsAction, actionArgs }
+//   actFn(api, key, account, ctx, actionArgs, primaryKey, primarySigner) -> Promise<string>
+async function runCheckAndAct({ accounts, rpc, signerUri, prepare, checkFn, actFn }) {
   const keyring = new Keyring({ type: "sr25519" });
-  const authorizerKey = keyring.addFromUri(authorizerUri);
-  const authorizerSigner = getPolkadotSigner(authorizerKey.publicKey, "Sr25519", (d) => authorizerKey.sign(d));
+  const primaryKey = keyring.addFromUri(signerUri);
+  const primarySigner = getPolkadotSigner(primaryKey.publicKey, "Sr25519", (d) => primaryKey.sign(d));
 
-  const client = createClient(getWsProvider(bulletinRpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
+  const client = createClient(getWsProvider(rpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
   const api = client.getUnsafeApi();
   const results = [];
   try {
-    const currentBlock = Number(await api.query.System.Number.getValue());
+    const ctx = (await prepare?.(api, primaryKey)) ?? {};
     for (const account of accounts) {
       const key = deriveSignerKeypair(keyring, account);
-      const auth = await readAccountAuthorization(api, key.address);
-      const sufficient = isAuthorizationSufficient(auth, currentBlock);
-      const row = {
-        label: account.label,
-        address: key.address,
-        before: sufficient ? "sufficient" : (auth ? "insufficient" : "absent"),
-        action: "none",
-      };
-      if (!sufficient) {
+      const { rowFields, needsAction, actionArgs } = await checkFn(api, key, account, ctx);
+      const row = { label: account.label, address: key.address, ...rowFields, action: "none" };
+      if (needsAction) {
         try {
-          const tx = api.tx.TransactionStorage.authorize_account({
-            who: key.address, transactions: TOPUP_TRANSACTIONS, bytes: TOPUP_BYTES,
-          });
-          const r = await tx.signAndSubmit(authorizerSigner);
-          if (!r?.ok) throw new Error("dispatch was rejected");
-          row.action = "granted";
+          row.action = await actFn(api, key, account, ctx, actionArgs, primaryKey, primarySigner);
         } catch (e) {
           row.action = "FAILED";
           row.error = e?.message ?? String(e);
@@ -302,48 +309,57 @@ async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUr
   return results;
 }
 
-async function checkAndFundAssetHub({ accounts, assetHubRpc, funderUri, floorRaw, targetRaw }) {
-  const keyring = new Keyring({ type: "sr25519" });
-  const funderKey = keyring.addFromUri(funderUri);
-  const funderSigner = getPolkadotSigner(funderKey.publicKey, "Sr25519", (d) => funderKey.sign(d));
+async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri }) {
+  return runCheckAndAct({
+    accounts,
+    rpc: bulletinRpc,
+    signerUri: authorizerUri,
+    prepare: async (api) => ({ currentBlock: Number(await api.query.System.Number.getValue()) }),
+    checkFn: async (api, key, _account, ctx) => {
+      const auth = await readAccountAuthorization(api, key.address);
+      const sufficient = isAuthorizationSufficient(auth, ctx.currentBlock);
+      return {
+        rowFields: { before: sufficient ? "sufficient" : (auth ? "insufficient" : "absent") },
+        needsAction: !sufficient,
+      };
+    },
+    actFn: async (api, key, _account, _ctx, _actionArgs, _primaryKey, authorizerSigner) => {
+      const tx = api.tx.TransactionStorage.authorize_account({
+        who: key.address, transactions: TOPUP_TRANSACTIONS, bytes: TOPUP_BYTES,
+      });
+      const r = await tx.signAndSubmit(authorizerSigner);
+      if (!r?.ok) throw new Error("dispatch was rejected");
+      return "granted";
+    },
+  });
+}
 
-  const client = createClient(getWsProvider(assetHubRpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
-  const api = client.getUnsafeApi();
-  const results = [];
-  try {
-    // Serial by design — a shared funder nonce would race under Promise.all
-    // (the same #1054 nonce-collision rationale as ensurePoolAccountsFundedOnAssetHub).
-    for (const account of accounts) {
-      const key = deriveSignerKeypair(keyring, account);
+async function checkAndFundAssetHub({ accounts, assetHubRpc, funderUri, floorRaw, targetRaw }) {
+  return runCheckAndAct({
+    accounts,
+    rpc: assetHubRpc,
+    signerUri: funderUri,
+    checkFn: async (api, key, _account) => {
       const info = await api.query.System.Account.getValue(key.address);
       const free = BigInt(info?.data?.free ?? 0n);
       const topUp = assetHubTopUpAmount(free, floorRaw, targetRaw);
-      const row = { label: account.label, address: key.address, freeBefore: free, action: "none" };
-      if (topUp > 0n) {
-        try {
-          const funderInfo = await api.query.System.Account.getValue(funderKey.address);
-          const funderFree = BigInt(funderInfo?.data?.free ?? 0n);
-          if (funderFree < topUp) {
-            throw new Error(
-              `funder ${funderKey.address} has only ${formatPasBalance(funderFree)} PAS, needs ` +
-              `${formatPasBalance(topUp)} PAS — reporting rather than attempting a partial top-up`,
-            );
-          }
-          const tx = api.tx.Balances.transfer_allow_death({ dest: Enum("Id", key.address), value: topUp });
-          const r = await tx.signAndSubmit(funderSigner);
-          if (!r?.ok) throw new Error("dispatch was rejected");
-          row.action = `topped up +${formatPasBalance(topUp)} PAS`;
-        } catch (e) {
-          row.action = "FAILED";
-          row.error = e?.message ?? String(e);
-        }
+      return { rowFields: { freeBefore: free }, needsAction: topUp > 0n, actionArgs: { topUp } };
+    },
+    actFn: async (api, key, _account, _ctx, { topUp }, funderKey, funderSigner) => {
+      const funderInfo = await api.query.System.Account.getValue(funderKey.address);
+      const funderFree = BigInt(funderInfo?.data?.free ?? 0n);
+      if (funderFree < topUp) {
+        throw new Error(
+          `funder ${funderKey.address} has only ${formatPasBalance(funderFree)} PAS, needs ` +
+          `${formatPasBalance(topUp)} PAS — reporting rather than attempting a partial top-up`,
+        );
       }
-      results.push(row);
-    }
-  } finally {
-    client.destroy();
-  }
-  return results;
+      const tx = api.tx.Balances.transfer_allow_death({ dest: Enum("Id", key.address), value: topUp });
+      const r = await tx.signAndSubmit(funderSigner);
+      if (!r?.ok) throw new Error("dispatch was rejected");
+      return `topped up +${formatPasBalance(topUp)} PAS`;
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------

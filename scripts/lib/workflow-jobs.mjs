@@ -19,6 +19,17 @@
 // prevent (see e2e-ensure-authorized.mjs's own header). One canonical
 // regex, one export, both call sites import it — see #893-class-adjacent
 // /simplify finding (2026-08).
+//
+// The canonical regex MUST be the wider of the two former variants
+// (`[\w-]+`, i.e. leading digit/underscore allowed — `2fa-check`,
+// `_internal`) — a /code-review finding on that same simplify PR caught an
+// earlier version of this module that had picked the narrower one instead,
+// preserving the exact drop hazard this header describes. Widening also
+// covers a CRLF checkout or a trailing space after a job header (the header
+// regex tolerates a trailing `\r`), and locates `jobs:` with an anchored
+// multiline regex rather than an exact `\njobs:\n` substring match, which
+// would otherwise throw on a `jobs:` line with trailing whitespace or one
+// that starts the file.
 
 // Blanks every full-line YAML comment (a line whose trimmed content starts
 // with `#`) so prose mentioning field names like "derivation-path" or
@@ -36,15 +47,18 @@ export function stripYamlCommentLines(text) {
 // which live before `jobs:` and are excluded by slicing from the `jobs:`
 // line onward.
 export function extractJobBlocks(workflowYamlText) {
-  const jobsIdx = workflowYamlText.indexOf("\njobs:\n");
-  if (jobsIdx === -1) {
+  // Anchored multiline regex, not an exact `\njobs:\n` substring match — the
+  // latter throws on a `jobs:` line with trailing whitespace/`\r` or one
+  // that starts the file (no leading `\n` to match against).
+  const jobsMatch = workflowYamlText.match(/^jobs:[ \t\r]*$/m);
+  if (!jobsMatch) {
     throw new Error(
       "workflow file: could not find a top-level 'jobs:' key on its own line — file shape changed, " +
       "extractJobBlocks needs updating before any caller can trust a derived job block.",
     );
   }
-  const body = workflowYamlText.slice(jobsIdx + 1);
-  const headerRe = /^ {2}([A-Za-z][A-Za-z0-9_-]*):[ \t]*$/gm;
+  const body = workflowYamlText.slice(jobsMatch.index);
+  const headerRe = /^ {2}([\w-]+):[ \t\r]*$/gm;
   const headers = [];
   let m;
   while ((m = headerRe.exec(body))) headers.push({ name: m[1], start: m.index });

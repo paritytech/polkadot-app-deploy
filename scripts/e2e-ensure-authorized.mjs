@@ -279,7 +279,17 @@ function deriveSignerKeypair(keyring, account) {
 //   prepare(api, primaryKey) -> ctx                      (optional, once per pass)
 //   checkFn(api, key, account, ctx) -> { rowFields, needsAction, actionArgs }
 //   actFn(api, key, account, ctx, actionArgs, primaryKey, primarySigner) -> Promise<string>
-async function runCheckAndAct({ accounts, rpc, signerUri, prepare, checkFn, actFn }) {
+//   onRow(row)                                            (optional, called as each row completes)
+//
+// onRow exists so a caller running this pass concurrently with another
+// (see main()'s Promise.allSettled over the Bulletin + Asset Hub passes)
+// can still print per-account progress AS it happens, instead of only
+// after both passes fully resolve — the previous behaviour meant a job
+// killed mid-run by a timeout (this file's own header calls the WS
+// endpoint "timeout-prone under load") showed two section headers and
+// nothing else, losing exactly the partial progress you'd want at that
+// moment.
+async function runCheckAndAct({ accounts, rpc, signerUri, prepare, checkFn, actFn, onRow }) {
   const keyring = new Keyring({ type: "sr25519" });
   const primaryKey = keyring.addFromUri(signerUri);
   const primarySigner = getPolkadotSigner(primaryKey.publicKey, "Sr25519", (d) => primaryKey.sign(d));
@@ -302,6 +312,7 @@ async function runCheckAndAct({ accounts, rpc, signerUri, prepare, checkFn, actF
         }
       }
       results.push(row);
+      onRow?.(row);
     }
   } finally {
     client.destroy();
@@ -309,11 +320,12 @@ async function runCheckAndAct({ accounts, rpc, signerUri, prepare, checkFn, actF
   return results;
 }
 
-async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri }) {
+async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri, onRow }) {
   return runCheckAndAct({
     accounts,
     rpc: bulletinRpc,
     signerUri: authorizerUri,
+    onRow,
     prepare: async (api) => ({ currentBlock: Number(await api.query.System.Number.getValue()) }),
     checkFn: async (api, key, _account, ctx) => {
       const auth = await readAccountAuthorization(api, key.address);
@@ -334,39 +346,42 @@ async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUr
   });
 }
 
-async function checkAndFundAssetHub({ accounts, assetHubRpc, funderUri, floorRaw, targetRaw }) {
+async function checkAndFundAssetHub({ accounts, assetHubRpc, funderUri, floorRaw, targetRaw, onRow }) {
   return runCheckAndAct({
     accounts,
     rpc: assetHubRpc,
     signerUri: funderUri,
-    // Read the shared funder's own balance ONCE, then track it locally.
-    // Sends within this loop are already sequential and each is checked
-    // for r?.ok before the row is marked "topped up", so a confirmed
-    // transfer's effect on the funder's balance is known without a fresh
-    // chain read — matches src/pool.ts's ensurePoolAccountsFundedOnAssetHub,
-    // which doesn't re-read the funder at all. Saves up to ~17 round trips
-    // per run on a WS endpoint documented as timeout-prone under load.
-    prepare: async (api, funderKey) => {
-      const funderInfo = await api.query.System.Account.getValue(funderKey.address);
-      return { funderFree: BigInt(funderInfo?.data?.free ?? 0n) };
-    },
+    onRow,
     checkFn: async (api, key, _account) => {
       const info = await api.query.System.Account.getValue(key.address);
       const free = BigInt(info?.data?.free ?? 0n);
       const topUp = assetHubTopUpAmount(free, floorRaw, targetRaw);
       return { rowFields: { freeBefore: free }, needsAction: topUp > 0n, actionArgs: { topUp } };
     },
-    actFn: async (api, key, _account, ctx, { topUp }, funderKey, funderSigner) => {
-      if (ctx.funderFree < topUp) {
+    // Re-read the funder's own balance immediately before EACH transfer,
+    // rather than reading it once up front and tracking a locally
+    // decremented estimate. A local estimate only ever subtracts topUp,
+    // never the transaction fee each prior transfer actually paid — over
+    // ~17 accounts that drifts the estimate ~0.17 PAS above the true
+    // balance, which near the boundary lets this guard admit a transfer
+    // that then fails on-chain with a generic "dispatch was rejected"
+    // instead of this actionable message. A fresh read also means a
+    // funder refilled mid-run is seen immediately, same as before this
+    // pass was restructured to read once. The cost is one extra chain
+    // read per ACCOUNT ACTUALLY TOPPED UP (not per account checked), so
+    // the common idempotent no-op run pays zero extra round trips.
+    actFn: async (api, key, _account, _ctx, { topUp }, funderKey, funderSigner) => {
+      const funderInfo = await api.query.System.Account.getValue(funderKey.address);
+      const funderFree = BigInt(funderInfo?.data?.free ?? 0n);
+      if (funderFree < topUp) {
         throw new Error(
-          `funder ${funderKey.address} has only ${formatPasBalance(ctx.funderFree)} PAS, needs ` +
+          `funder ${funderKey.address} has only ${formatPasBalance(funderFree)} PAS, needs ` +
           `${formatPasBalance(topUp)} PAS — reporting rather than attempting a partial top-up`,
         );
       }
       const tx = api.tx.Balances.transfer_allow_death({ dest: Enum("Id", key.address), value: topUp });
       const r = await tx.signAndSubmit(funderSigner);
       if (!r?.ok) throw new Error("dispatch was rejected");
-      ctx.funderFree -= topUp;
       return `topped up +${formatPasBalance(topUp)} PAS`;
     },
   });
@@ -406,6 +421,20 @@ async function main() {
   console.log(`== Asset Hub balance >= funding floor (${assetHubRpc}) ==`);
   console.log(`   floor=${formatPasBalance(floorRaw)} PAS target=${formatPasBalance(targetRaw)} PAS`);
 
+  // Per-account rows print AS EACH ONE COMPLETES (prefixed by pass, since
+  // the two passes below run concurrently and their rows can interleave on
+  // stdout) rather than only after both passes fully resolve — that is the
+  // partial progress you want on stdout if this job gets killed by a
+  // timeout partway through (see runCheckAndAct's onRow comment). The
+  // summary blocks further down still print the full results afterward.
+  const printAuthRow = (r) => {
+    const suffix = r.action !== "none" ? ` -> ${r.action}` : "";
+    console.log(`  [bulletin] [${r.before}${suffix}] ${r.label}  ${r.address}${r.error ? `  (${r.error})` : ""}`);
+  };
+  const printFundRow = (r) => {
+    console.log(`  [assethub] [${r.action}] ${r.label}  ${r.address}  free=${formatPasBalance(r.freeBefore)} PAS${r.error ? `  (${r.error})` : ""}`);
+  };
+
   // Bulletin (signed by the env authorizer) and Asset Hub (signed by the dev
   // phrase) are different chains with different signer keys — no shared
   // nonce, no data dependency between the two passes — so they run
@@ -415,8 +444,8 @@ async function main() {
   // allSettled (not all): a crash in one pass must not swallow the other
   // pass's already-computed per-account results.
   const [authSettled, fundSettled] = await Promise.allSettled([
-    checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri }),
-    checkAndFundAssetHub({ accounts, assetHubRpc, funderUri: DEV_PHRASE, floorRaw, targetRaw }),
+    checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri, onRow: printAuthRow }),
+    checkAndFundAssetHub({ accounts, assetHubRpc, funderUri: DEV_PHRASE, floorRaw, targetRaw, onRow: printFundRow }),
   ]);
   const authResults = authSettled.status === "fulfilled" ? authSettled.value : [];
   const fundResults = fundSettled.status === "fulfilled" ? fundSettled.value : [];

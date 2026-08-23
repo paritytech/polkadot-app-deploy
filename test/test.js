@@ -22601,6 +22601,30 @@ describe("e2e-ensure-authorized + test.js jobBlock(): shared parser agreement", 
         `>> FAIL: shared-parser-agreement: jobBlock('${jobName}') diverged from extractJobBlocks().get('${jobName}') — cause: the two call sites are no longer using the same parser.`);
     }
   });
+
+  // The shared regex must be the WIDER of the two former variants
+  // (`[\w-]+`, not `[A-Za-z][A-Za-z0-9_-]*`) — a job id starting with a
+  // digit or an underscore is a real possibility for a future job (e.g.
+  // "2fa-check", "_internal") and must not be silently dropped from the
+  // derived signer list the way the narrower regex would drop it. Also
+  // pins CRLF/trailing-whitespace tolerance on the job header line and on
+  // the `jobs:` locator itself (a synthetic fixture, not the real e2e.yml,
+  // is enough — this doesn't need a real workflow file).
+  test("extractJobBlocks does not drop a job id with a leading digit or leading underscore, and tolerates CRLF", () => {
+    const fixtureYml = [
+      "name: fixture",
+      "jobs:\r",
+      "  2fa-check:\r",
+      "    runs-on: ubuntu-latest",
+      "  _internal:  ",
+      "    runs-on: ubuntu-latest",
+    ].join("\n");
+    const blocks = extractJobBlocks(fixtureYml);
+    assert.ok(blocks.has("2fa-check"),
+      ">> FAIL: shared-parser-agreement: a job id starting with a digit (e.g. '2fa-check') must not be silently dropped by the header regex.");
+    assert.ok(blocks.has("_internal"),
+      ">> FAIL: shared-parser-agreement: a job id starting with an underscore (e.g. '_internal') must not be silently dropped by the header regex.");
+  });
 });
 
 describe("e2e-ensure-authorized: environment guards (testnet-only, no-guess authorizer)", () => {

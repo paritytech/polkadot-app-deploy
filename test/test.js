@@ -8299,6 +8299,130 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
 });
 
 // ---------------------------------------------------------------------------
+// bootstrapPool authorizer resolution — read/naming port of bulletin's #1213.
+// polkadot-app-deploy does NOT self-authorize during a deploy (ensureAuthorized
+// above only ever throws); bootstrapPool is the pre-existing, human-invoked
+// admin tool that DOES sign authorize_account with an explicitly-resolved key.
+// These are source-scan assertions (bootstrapPool opens its own Bulletin
+// client internally, so its chain calls aren't mockable in a unit test — same
+// constraint noted on the #1059 guard test above).
+// ---------------------------------------------------------------------------
+describe("bootstrapPool authorizer resolution (#1213 port) — no self-authorize regression", () => {
+  test("precedence is authorizerMnemonic > envAuthorizer > no blanket default, in that source order", () => {
+    const src = fs.readFileSync("src/pool.ts", "utf-8");
+    const mnemonicIdx = src.indexOf("if (opts.authorizerMnemonic) {");
+    const envAuthorizerIdx = src.indexOf("} else if (opts.envAuthorizer) {");
+    const fallbackIdx = src.indexOf("No known authorizer");
+    assert.ok(mnemonicIdx !== -1, ">> FAIL: #1213 precedence: bootstrapPool must still resolve opts.authorizerMnemonic first");
+    assert.ok(envAuthorizerIdx !== -1, ">> FAIL: #1213 precedence: bootstrapPool must resolve opts.envAuthorizer (environments.json bulletinAuthorizer) as the second precedence tier");
+    assert.ok(fallbackIdx !== -1, ">> FAIL: #1213 precedence: bootstrapPool must print a \"No known authorizer\" message as the final fallback");
+    assert.ok(
+      mnemonicIdx < envAuthorizerIdx && envAuthorizerIdx < fallbackIdx,
+      ">> FAIL: #1213 precedence: source order must be authorizerMnemonic, then envAuthorizer, then the no-default fallback — reordering silently changes which key wins",
+    );
+  });
+
+  test("no blanket //Alice testnet default remains in the authorizer-resolution block", () => {
+    const src = fs.readFileSync("src/pool.ts", "utf-8");
+    const step3Start = src.indexOf("--- Step 3: resolve authorizer ---");
+    const step4Start = src.indexOf("--- Step 4:");
+    assert.ok(step3Start !== -1 && step4Start !== -1 && step3Start < step4Start,
+      ">> FAIL: #1213 no-default: could not locate bootstrapPool's Step 3/Step 4 markers to scope the check");
+    const step3Block = src.slice(step3Start, step4Start);
+    assert.doesNotMatch(
+      step3Block,
+      /"\/\/Alice"/,
+      ">> FAIL: #1213 no-default: bootstrapPool's authorizer resolution must not hardcode \"//Alice\" anywhere — some testnet-shaped chains (e.g. devnet) are community-operated and //Alice is not their authorizer; guessing produces a silent on-chain rejection instead of the clear \"No known authorizer\" message.",
+    );
+    assert.doesNotMatch(
+      step3Block,
+      /defaulting to .\/\/Alice/i,
+      ">> FAIL: #1213 no-default: bootstrapPool must not default to //Alice merely because detectTestnet() says the chain is testnet-shaped",
+    );
+  });
+
+  test("the no-known-authorizer fallback names the environment when one was resolved", () => {
+    const src = fs.readFileSync("src/pool.ts", "utf-8");
+    const fallbackIdx = src.indexOf("No known authorizer");
+    assert.ok(fallbackIdx !== -1, ">> FAIL: #1213 fallback message: could not find the fallback branch");
+    const fallbackBlock = src.slice(Math.max(0, fallbackIdx - 250), fallbackIdx + 400);
+    assert.match(
+      fallbackBlock,
+      /opts\.envLabel/,
+      ">> FAIL: #1213 fallback message: the fallback must reference opts.envLabel so the failure names which environment has no known authorizer, instead of a generic unattributed message",
+    );
+  });
+
+  test("authorize_account is submitted only from bootstrapPool, never from ensureAuthorized or any deploy-path file", () => {
+    const poolSrc = fs.readFileSync("src/pool.ts", "utf-8");
+    const ensureStart = poolSrc.indexOf("export async function ensureAuthorized(");
+    const nextExportAfterEnsure = poolSrc.indexOf("\nexport ", ensureStart + 1);
+    assert.ok(ensureStart !== -1 && nextExportAfterEnsure !== -1,
+      ">> FAIL: #1213 no-self-authorize: could not locate ensureAuthorized's body to scope the check");
+    const ensureBody = poolSrc.slice(ensureStart, nextExportAfterEnsure);
+    assert.doesNotMatch(
+      ensureBody,
+      /authorize_account|signAndSubmit|addFromUri/,
+      ">> FAIL: #1213 no-self-authorize: ensureAuthorized must never sign or submit authorize_account — this repo's deploy path only ever throws, it never grants",
+    );
+
+    for (const file of ["src/deploy.ts", "src/deploy-actors.ts", "src/storage-signer.ts", "src/dotns.ts"]) {
+      if (!fs.existsSync(file)) continue;
+      const src = fs.readFileSync(file, "utf-8");
+      assert.doesNotMatch(
+        src,
+        /authorize_account/,
+        `>> FAIL: #1213 no-self-authorize: ${file} must not submit TransactionStorage.authorize_account — polkadot-app-deploy no longer self-authorizes on Bulletin (see ensureAuthorized's error text); a hit here means a self-authorization path was reintroduced into the deploy flow`,
+      );
+    }
+  });
+
+  test("bin/polkadot-app-bootstrap help text no longer promises a blanket //Alice testnet default", () => {
+    const src = fs.readFileSync("bin/polkadot-app-bootstrap", "utf-8");
+    assert.doesNotMatch(
+      src,
+      /On testnets, defaults to .\/\/Alice if omitted/,
+      ">> FAIL: #1213 help text: the old blanket claim is wrong for community-operated testnets like devnet, which have no known authorizer",
+    );
+    assert.match(
+      src,
+      /bulletinAuthorizer/,
+      ">> FAIL: #1213 help text: --help should mention the environment's configured bulletinAuthorizer as the fallback source of truth",
+    );
+  });
+
+  test("bin/polkadot-app-bootstrap threads the env's bulletinAuthorizer + envLabel into bootstrapOpts", () => {
+    const src = fs.readFileSync("bin/polkadot-app-bootstrap", "utf-8");
+    assert.match(
+      src,
+      /bootstrapOpts\.envAuthorizer\s*=\s*envEntry\.bulletinAuthorizer/,
+      ">> FAIL: #1213 wiring: bin/polkadot-app-bootstrap must set bootstrapOpts.envAuthorizer from envEntry.bulletinAuthorizer, or --env alone can never resolve a known authorizer",
+    );
+    assert.match(
+      src,
+      /bootstrapOpts\.envLabel\s*=\s*flags\.env/,
+      ">> FAIL: #1213 wiring: bin/polkadot-app-bootstrap must set bootstrapOpts.envLabel so the \"no known authorizer\" failure names the environment",
+    );
+  });
+
+  test("ensureAuthorized's no-self-authorize error text is byte-identical to the pinned strings", () => {
+    const src = fs.readFileSync("src/pool.ts", "utf-8");
+    assert.ok(
+      src.includes(
+        "polkadot-app-deploy no longer self-authorizes on the Bulletin chain — request authorization for this account from the chain's authorizer (testnet faucet / personhood / pool bootstrap), then retry.",
+      ),
+      ">> FAIL: #1213 no-self-authorize: the testnet-path error message must be byte-identical — this text is the user-facing contract that this repo never grants on a deploy",
+    );
+    assert.ok(
+      src.includes(
+        "On production the storage account must already carry its own authorization/allowance — polkadot-app-deploy cannot grant it.",
+      ),
+      ">> FAIL: #1213 no-self-authorize: the production-path error message must be byte-identical",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // isTestnetSpecName — gates Alice-based defensive pre-auth
 // ---------------------------------------------------------------------------
 describe("isTestnetSpecName", () => {

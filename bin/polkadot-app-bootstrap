@@ -49,8 +49,13 @@ Options:
                       Default: the well-known dev phrase (same key the deploy path uses).
   --authorizer "..."  Seed/mnemonic of the key that holds authorization authority
                       on this chain (e.g. "//Alice", a full mnemonic, or a hex seed).
-                      On testnets, defaults to //Alice if omitted.
-                      On non-testnets, required to grant — omit to get status only.
+                      When --env is given and omitted, falls back to that
+                      environment's configured authorizer (environments.json
+                      bulletinAuthorizer field, e.g. //Alice on paseo-next-v2).
+                      There is no other default: some environments (e.g.
+                      devnet) are community-operated and their authorizer is
+                      unknown, so omitting both fails with a clear message
+                      instead of guessing — omit to get status only.
   --rpc wss://...     Bulletin RPC endpoint (or set BULLETIN_RPC env var)
   --env <id>          Load environment by id from environments.json
   --pool-size N       Number of pool accounts to check/initialize (default: 10)
@@ -96,6 +101,15 @@ if (flags.env) {
   }
 
   bootstrapOpts.bulletinAuthorizeV2 = envEntry.bulletinAuthorizeV2 ?? false;
+
+  // Which key holds TransactionStorage authorizer rights on this env's
+  // Bulletin chain (environments.json `bulletinAuthorizer`). Not always
+  // //Alice — e.g. devnet is community-operated and deliberately omits it,
+  // so bootstrapPool refuses to guess and reports a clear message instead.
+  bootstrapOpts.envLabel = flags.env;
+  if (envEntry.bulletinAuthorizer) {
+    bootstrapOpts.envAuthorizer = envEntry.bulletinAuthorizer;
+  }
 }
 
 await bootstrapPool(rpc, poolSize, mnemonic, bootstrapOpts);

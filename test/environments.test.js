@@ -209,6 +209,42 @@ describe("resolveEndpoints — tld (per-environment DotNS TLD)", () => {
   });
 });
 
+describe("resolveEndpoints — bulletinAuthorizer (read-only naming; port of bulletin's #1213)", () => {
+  test("returns env.bulletinAuthorizer when the env sets it", () => {
+    const doc = {
+      ...FIXTURE_DOC,
+      environments: [
+        { id: "paseo-next", name: "Paseo Next", network: "testnet", description: "", bulletinAuthorizer: "//Alice" },
+        { id: "paseo-review", name: "Paseo Review", network: "testnet", description: "" },
+      ],
+    };
+    const r1 = resolveEndpoints(doc, "paseo-next");
+    assert.equal(r1.bulletinAuthorizer, "//Alice",
+      ">> FAIL: resolveEndpoints bulletinAuthorizer: env.bulletinAuthorizer must survive resolution, or bin/polkadot-app-bootstrap can never resolve which key to use for a manual grant without --authorizer");
+
+    const r2 = resolveEndpoints(doc, "paseo-review");
+    assert.equal(r2.bulletinAuthorizer, undefined,
+      ">> FAIL: resolveEndpoints bulletinAuthorizer: an env with no `bulletinAuthorizer` key must resolve to undefined (mirrors tld/webGateway's pattern) — never invent one");
+  });
+
+  test("an env with no bulletinAuthorizer key resolves to undefined, not a guessed default", () => {
+    const r = resolveEndpoints(FIXTURE_DOC, "paseo-next");
+    assert.equal(r.bulletinAuthorizer, undefined,
+      ">> FAIL: resolveEndpoints bulletinAuthorizer: FIXTURE_DOC's paseo-next declares no `bulletinAuthorizer` — resolveEndpoints must not silently substitute \"//Alice\" here");
+  });
+
+  test("real bundled environments.json: paseo-next-v2 resolves bulletinAuthorizer \"//Alice\", devnet resolves undefined (community-operated, authorizer unknown)", async () => {
+    const { doc } = await loadEnvironments();
+    const paseoNextV2 = resolveEndpoints(doc, "paseo-next-v2");
+    assert.equal(paseoNextV2.bulletinAuthorizer, "//Alice",
+      `>> FAIL: resolveEndpoints bulletinAuthorizer: paseo-next-v2 must resolve bulletinAuthorizer "//Alice"; got ${JSON.stringify(paseoNextV2.bulletinAuthorizer)}. If it does not survive resolution, bin/polkadot-app-bootstrap --env paseo-next-v2 falls back to "no known authorizer" even though the key is known.`);
+
+    const devnet = resolveEndpoints(doc, "devnet");
+    assert.equal(devnet.bulletinAuthorizer, undefined,
+      `>> FAIL: resolveEndpoints bulletinAuthorizer: devnet is community-operated and its authorizer is unknown — it must NOT resolve a bulletinAuthorizer; got ${JSON.stringify(devnet.bulletinAuthorizer)}. Guessing one here would let bootstrapPool attempt a grant that is silently rejected on-chain instead of failing with a clear message.`);
+  });
+});
+
 describe("resolveEndpoints — mainnet guard", () => {
   test("polkadot has no bulletin endpoint → throws NonRetryableError pointing at environments.json", () => {
     try {
@@ -313,6 +349,32 @@ describe("bundled snapshot", () => {
       devnet.webGateway,
       "dev-dot.li",
       `>> FAIL: devnet-web-gateway: env '${devnet.id}' must set webGateway to "dev-dot.li"; got ${JSON.stringify(devnet.webGateway)}. Without it the post-deploy link uses the wrong gateway host and resolves the devnet name against the wrong network (issue #142).`,
+    );
+  });
+
+  test("paseo-next-v2 declares bulletinAuthorizer //Alice; devnet declares none (community-operated, authorizer unknown; port of bulletin's #1213)", async () => {
+    // TransactionStorage.authorize_account is only accepted from a key listed
+    // in that chain's AllowedAuthorizers. //Alice is known to hold that role
+    // on paseo-next-v2. devnet is community-operated and its authorizer is
+    // unknown — a guessed value here would let bin/polkadot-app-bootstrap
+    // attempt a grant that fails opaquely on-chain instead of surfacing a
+    // clear "no known authorizer" message. This guard also protects against a
+    // future well-meaning edit adding a guessed value for devnet.
+    const bundled = JSON.parse(await fs.readFile(defaultBundledPath(), "utf8"));
+    const paseoNextV2 = bundled.environments.find(e => e.id === "paseo-next-v2");
+    assert.ok(paseoNextV2, ">> FAIL: env-bulletin-authorizer: bundled snapshot must include paseo-next-v2");
+    assert.equal(
+      paseoNextV2.bulletinAuthorizer,
+      "//Alice",
+      `>> FAIL: env-bulletin-authorizer: paseo-next-v2 must set bulletinAuthorizer to "//Alice"; got ${JSON.stringify(paseoNextV2.bulletinAuthorizer)}.`,
+    );
+
+    const devnet = bundled.environments.find(e => /devnet/i.test(e.id));
+    assert.ok(devnet, ">> FAIL: env-bulletin-authorizer: bundled snapshot must include a devnet-family env");
+    assert.equal(
+      devnet.bulletinAuthorizer,
+      undefined,
+      `>> FAIL: env-bulletin-authorizer: env '${devnet.id}' must NOT declare a bulletinAuthorizer; got ${JSON.stringify(devnet.bulletinAuthorizer)}. Its authorizer is community-operated/unknown; guessing one produces an on-chain rejection rather than a clear "no known authorizer" message (issue #1213).`,
     );
   });
 });

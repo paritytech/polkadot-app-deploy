@@ -58,6 +58,18 @@ export interface Environment {
   registerStorageDeposit?: number;
   contracts?: Record<string, string>;
   popSelfServe?: PopSelfServeConfig;
+  /**
+   * Which key holds `TransactionStorage` authorizer rights on this env's
+   * Bulletin chain (e.g. "//Alice" on paseo-next-v2). Read-only naming —
+   * polkadot-app-deploy does not self-authorize on Bulletin (see
+   * ensureAuthorized in src/pool.ts, which only ever throws, never signs);
+   * this field exists solely so bin/polkadot-app-bootstrap can resolve which
+   * key to use for a manual grant without guessing. Left unset when the
+   * authorizer is unknown — e.g. devnet, which is community-operated — so a
+   * missing value fails with a clear "no known authorizer" message instead
+   * of an opaque on-chain rejection from a wrong guess.
+   */
+  bulletinAuthorizer?: string;
 }
 
 export interface ChainEndpoint {
@@ -108,6 +120,12 @@ export interface ResolvedEndpoints {
   contracts: Record<string, string>;
   nativeToEthRatio: bigint;
   registerStorageDeposit?: bigint;
+  /**
+   * Undefined when the env doesn't declare one (e.g. devnet — community-
+   * operated, authorizer unknown). Read-only naming for bin/polkadot-app-bootstrap;
+   * nothing in the deploy path signs with this.
+   */
+  bulletinAuthorizer?: string;
 }
 
 // ---- Hardcoded ultimate fallback (matches today's default behavior) ---------
@@ -420,6 +438,7 @@ export function resolveEndpoints(
     contracts: env.contracts ?? {},
     nativeToEthRatio: BigInt(env.nativeToEthRatio ?? 1_000_000),
     ...(env.registerStorageDeposit !== undefined ? { registerStorageDeposit: BigInt(env.registerStorageDeposit) } : {}),
+    ...(env.bulletinAuthorizer !== undefined ? { bulletinAuthorizer: env.bulletinAuthorizer } : {}),
   };
 }
 

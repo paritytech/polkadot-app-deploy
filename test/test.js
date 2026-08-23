@@ -46,31 +46,27 @@ import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, prompt
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { PassThrough } from "node:stream";
 import {
-  deriveSignerAccountList, extractJobBlocks, extractDerivationPathsFromJob,
+  deriveSignerAccountList, extractDerivationPathsFromJob,
   extractPoolIndicesFromJob, extractLiteralE2eSigners, resolveMatrixField,
-  stripYamlCommentLines, assertTestnet, requireBulletinAuthorizer, DEV_PHRASE,
+  assertTestnet, requireBulletinAuthorizer, DEV_PHRASE,
 } from "../scripts/e2e-ensure-authorized.mjs";
+import { extractJobBlocks, stripYamlCommentLines, getJobBlock } from "../scripts/lib/workflow-jobs.mjs";
 import { Keyring as EnsureAuthKeyring } from "@polkadot/keyring";
 import { cryptoWaitReady as ensureAuthCryptoWaitReady } from "@polkadot/util-crypto";
 
 // ---------------------------------------------------------------------------
 // Shared workflow-YAML helper: slices out one job's block of text from a
-// GitHub Actions workflow file, keyed by its top-level job id. Treats the
-// YAML as text (regex over indentation) rather than parsing it, matching
-// this file's existing jobBlock-style helpers for workflow assertions.
-// Module-scoped so every describe that needs it (workflow safety nets,
-// nightly-report per-env status, paseo-next-v2 E2E harness wiring) shares
-// one definition instead of each re-declaring an identical copy.
+// GitHub Actions workflow file, keyed by its top-level job id. Module-scoped
+// so every describe that needs it (workflow safety nets, nightly-report
+// per-env status, paseo-next-v2 E2E harness wiring) shares one definition
+// instead of each re-declaring an identical copy. Thin wrapper over the
+// canonical parser in scripts/lib/workflow-jobs.mjs — the same one
+// scripts/e2e-ensure-authorized.mjs uses to derive its E2E signer list, so
+// there is exactly one job-header regex in this repo, not two that can
+// silently drift apart (see that module's header comment).
 // ---------------------------------------------------------------------------
 function jobBlock(text, jobName) {
-  const jobsMatch = text.match(/^jobs:\s*$/m);
-  assert.ok(jobsMatch, "workflow has no jobs: block");
-  const jobsSection = text.slice(jobsMatch.index + jobsMatch[0].length);
-  const headerRe = /^ {2}([\w-]+):\s*$/gm;
-  const matches = [...jobsSection.matchAll(headerRe)];
-  const matchIndex = matches.findIndex(m => m[1] === jobName);
-  assert.notStrictEqual(matchIndex, -1, `workflow has no ${jobName} job`);
-  return jobsSection.slice(matches[matchIndex].index, matches[matchIndex + 1]?.index ?? jobsSection.length);
+  return getJobBlock(text, jobName);
 }
 
 // ---------------------------------------------------------------------------
@@ -22595,6 +22591,35 @@ describe("e2e-ensure-authorized: anti-hardcoding property (parser tracks content
     assert.throws(() => extractJobBlocks("name: fixture\nno-jobs-here: true\n"),
       /could not find a top-level 'jobs:' key/,
       ">> FAIL: e2e-signer-drift-guard: a file shape change that removes 'jobs:' must fail loudly, not silently parse zero jobs.");
+  });
+});
+
+// scripts/e2e-ensure-authorized.mjs (via deriveSignerAccountList) and this
+// test file's own jobBlock() helper used to carry two INDEPENDENTLY
+// hand-rolled job-header regexes that had already diverged
+// (`[A-Za-z][A-Za-z0-9_-]*` vs `[\w-]+`). Both now import the single
+// canonical parser in scripts/lib/workflow-jobs.mjs. This pins that the two
+// former call sites still agree on the real e2e.yml — i.e. that jobBlock()
+// (this file's wrapper) returns byte-identical text to extractJobBlocks()
+// (the script's parser) for every job name either side actually looks up —
+// so a future regression that reintroduces a second, differently-tuned
+// regex on either side is caught here, not by a silently-dropped account.
+describe("e2e-ensure-authorized + test.js jobBlock(): shared parser agreement", () => {
+  const REAL_JOB_NAMES = [
+    "detect-noop-push", "detect-deps-change", "select-env", "test-pr", "pr-report",
+    "chain-call-encoding", "ensure-e2e-authorized", "build-nightly", "nightly-pr-coverage",
+    "nightly-report",
+  ];
+
+  test("jobBlock() and extractJobBlocks() return byte-identical blocks for every known e2e.yml job", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const blocks = extractJobBlocks(wf);
+    for (const jobName of REAL_JOB_NAMES) {
+      assert.ok(blocks.has(jobName),
+        `>> FAIL: shared-parser-agreement: extractJobBlocks found no '${jobName}' job — cause: job renamed/removed or the shared regex stopped matching it.`);
+      assert.strictEqual(jobBlock(wf, jobName), blocks.get(jobName),
+        `>> FAIL: shared-parser-agreement: jobBlock('${jobName}') diverged from extractJobBlocks().get('${jobName}') — cause: the two call sites are no longer using the same parser.`);
+    }
   });
 });
 

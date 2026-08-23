@@ -47,6 +47,7 @@ import { getWsProvider } from "polkadot-api/ws";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { loadEnvironments, resolveEndpoints } from "../dist/environments.js";
 import { readAccountAuthorization, isAuthorizationSufficient, assetHubTopUpAmount, formatPasBalance } from "../dist/pool.js";
+import { stripYamlCommentLines, extractJobBlocks } from "./lib/workflow-jobs.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.join(__dirname, "..");
@@ -77,46 +78,16 @@ const DERIVATION_PATH_RE = /^\/\/[A-Za-z0-9/_-]+$/;
 // actually decide which accounts the E2E matrix signs with.
 // ---------------------------------------------------------------------------
 
-// Blanks every full-line YAML comment (a line whose trimmed content starts
-// with `#`) so prose like "the `derivation-path: //e2e-direct` below gives
-// this shard its own..." never gets mistaken for a real key. Line count is
-// preserved (comments become empty lines) so nothing downstream needs to
-// re-index. Does not strip inline trailing comments — none of the fields
-// this script reads (derivation-path, poolIndex, matrix arrays) carry one
-// anywhere in e2e.yml today (checked by hand); a future one would currently
-// get swallowed into the value and fail validateDerivationPath's shape check
-// or extractPoolIndicesFromJob's integer check, i.e. fail loud, not silent.
-export function stripYamlCommentLines(text) {
-  return text.split("\n").map((line) => (line.trim().startsWith("#") ? "" : line)).join("\n");
-}
-
-// Splits the `jobs:` section of e2e.yml into per-job text blocks, keyed by
-// job name. Job headers are exactly 2-space-indented `name:` lines directly
-// under `jobs:` — every nested key (name, needs, if, strategy, ...) is
-// indented 4+ spaces, and the only OTHER 2-space bare `key:` lines in the
-// file are the `on:` trigger names (pull_request, push, ...), which live
-// before `jobs:` and are excluded by slicing from the `jobs:` line onward.
-export function extractJobBlocks(e2eYmlText) {
-  const jobsIdx = e2eYmlText.indexOf("\njobs:\n");
-  if (jobsIdx === -1) {
-    throw new Error(
-      "e2e.yml: could not find a top-level 'jobs:' key on its own line — file shape changed, " +
-      "extractJobBlocks needs updating before this script can trust its derived account list.",
-    );
-  }
-  const body = e2eYmlText.slice(jobsIdx + 1);
-  const headerRe = /^ {2}([A-Za-z][A-Za-z0-9_-]*):[ \t]*$/gm;
-  const headers = [];
-  let m;
-  while ((m = headerRe.exec(body))) headers.push({ name: m[1], start: m.index });
-  const blocks = new Map();
-  for (let i = 0; i < headers.length; i++) {
-    const start = headers[i].start;
-    const end = i + 1 < headers.length ? headers[i + 1].start : body.length;
-    blocks.set(headers[i].name, body.slice(start, end));
-  }
-  return blocks;
-}
+// stripYamlCommentLines / extractJobBlocks now live in ./lib/workflow-jobs.mjs
+// (imported above) — shared with test/test.js's jobBlock() helper so there is
+// exactly one job-header regex, not two independently drifting copies. See
+// that module's header for why this mattered (list-drift bug class).
+//
+// Does not strip inline trailing comments — none of the fields this script
+// reads (derivation-path, poolIndex, matrix arrays) carry one anywhere in
+// e2e.yml today (checked by hand); a future one would currently get
+// swallowed into the value and fail validateDerivationPath's shape check or
+// extractPoolIndicesFromJob's integer check, i.e. fail loud, not silent.
 
 // Values from a `field: [a, b, c]` free-dimension matrix array anywhere in
 // the job block (e.g. `signer: [pool, direct]`).

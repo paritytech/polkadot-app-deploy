@@ -41,6 +41,6 @@ For one-time chain setup, see [E2E test setup](./e2e-bootstrap.md).
 `.github/workflows/e2e.yml` calls the shipped reusable `.github/workflows/deploy.yml` so the E2E jobs exercise the same path consumers use.
 
 - per-PR: stable happy-path coverage plus negative ownership coverage
-- nightly: broader signer, merkleization, and mirror-path coverage
+- nightly: broader signer and merkleization coverage
 
 E2E deploys are tagged so telemetry can distinguish them from real-user traffic. See [Telemetry](./telemetry.md).

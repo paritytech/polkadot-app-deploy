@@ -15,19 +15,18 @@ Three one-time setup items are needed before the workflow can pass. Do them once
 
 ## Chain-admin prerequisites
 
-Some of this setup needs authority a normal contributor doesn't have — the Bulletin chain's storage **authorizer** key, the DotNS `POP_RULES` contract **owner**, and (on faucet-less testnets) a funding source. A network operator ensures the following before the suite can pass. The check commands are read-only and safe to run anytime; the grant tools are idempotent — they report current status and do only what is missing.
+Some of this setup needs authority a normal contributor doesn't have — the Bulletin chain's storage **authorizer** key, the DotNS `POP_RULES` contract **owner**, and (on faucet-less testnets) a funding source. A network operator ensures the following before the suite can pass.
 
-1. **Personhood (PoP) status.** Registering a PoP-Full base label (e.g. `e2epool.dot`) requires Full Personhood on the DotNS Personhood precompile — Alice for the happy-path scenarios, and Bob once for the `e2eowned.dot` S3 fixture. NoStatus fallback labels (e.g. `e2epoolns01.dot`) need no grant; they auto-register on first deploy.
-   - Check: `node tools/check-pop-status.mjs --env <id>`
+This repo's `tools/` ships one read-only diagnostic, `probe-env-health.mjs --env <id>` (RPC reachability). It does **not** ship personhood/balance/authorization-quota checkers or fixture-registration tools — those are chain-admin operations performed with tooling outside this repository. If you're a contributor without chain-admin access, ask the operator to confirm the three items below rather than trying to check them yourself.
+
+1. **Personhood (PoP) status.** Registering a PoP-Full base label (e.g. `e2epool.dot`) requires Full Personhood on the DotNS Personhood precompile — Alice for the happy-path scenarios. NoStatus fallback labels (e.g. `e2epoolns01.dot`) need no grant; they auto-register on first deploy.
    - Grant: by the `POP_RULES` contract owner — request via an issue on [paritytech/dotns](https://github.com/paritytech/dotns/issues). `polkadot-app-deploy` cannot self-upgrade a signer.
 
 2. **Asset Hub funding (DotNS fees).** The accounts that register or transfer names need a balance on the target Asset Hub.
-   - Check: `node tools/check-balances.mjs --env <id>` (shows balances and Bulletin authorization quota for every E2E signer in one pass)
    - Grant: on Paseo, use the public faucet at [https://faucet.polkadot.io/](https://faucet.polkadot.io/). `paseo-next-v2` has no public faucet — the operator funds the accounts out of band.
 
-3. **Bulletin storage authorization (upload allowance).** Every account that uploads chunks must carry a `TransactionStorage` authorization; `polkadot-app-deploy` never self-authorizes. On testnet the authorizer is `//Alice`.
-   - Check: `node tools/check-bulletin-auth.mjs --env <id>`
-   - Grant: **pool accounts** via `polkadot-app-bootstrap --env <id>` (authorizes and funds them); **direct-mode signers** (the per-shard `//e2e-*` derivation paths) via `node tools/setup-e2e-derivation-signers.mjs --env <id>`. Alice is the authorizer itself, and Bob only owns the S3 fixture name (never uploads), so neither needs its own storage grant.
+3. **Bulletin storage authorization (upload allowance).** Every account that uploads chunks must carry a `TransactionStorage` authorization; `polkadot-app-deploy` never self-authorizes. The authorizer is declared per environment (`bulletinAuthorizer` in `environments.json`) — e.g. `//Alice` on `paseo-next-v2`.
+   - Grant: **pool accounts** via `polkadot-app-bootstrap --env <id>` (authorizes them using the env's declared authorizer — see [`docs/bootstrap.md`](bootstrap.md)); **direct-mode signers** (the per-shard `//e2e-*` derivation paths) are authorized by the same operator out of band. Alice is the authorizer itself, and Bob only owns the S3 fixture name (never uploads), so neither needs its own storage grant.
 
 The per-environment sections below are the step-by-step procedures that satisfy these.
 
@@ -43,38 +42,20 @@ The per-environment sections below are the step-by-step procedures that satisfy 
 
 ### 1. Verify Alice Personhood status
 
-Both happy-path scenarios (S1, S2) deploy as Alice via DotNS. Registering a new un-reserved base name requires Personhood status from the chain's Personhood precompile:
-
-```bash
-node tools/check-pop-status.mjs
-```
-
-Re-run if the check cannot read Alice's status. Self-attestation is no longer available; a signer's Personhood status is granted by the `POP_RULES` contract owner. To request a status grant (whitelisting) for a signer, open an issue on [paritytech/dotns](https://github.com/paritytech/dotns/issues).
+Both happy-path scenarios (S1, S2) deploy as Alice via DotNS. Registering a new un-reserved base name requires Personhood status from the chain's Personhood precompile. This repo ships no personhood-status checker (see "Chain-admin prerequisites" above) — confirm Alice's status with the chain admin. Self-attestation is no longer available; a signer's Personhood status is granted by the `POP_RULES` contract owner. To request a status grant (whitelisting) for a signer, open an issue on [paritytech/dotns](https://github.com/paritytech/dotns/issues).
 
 ### 2. Fund and map Bob on Asset Hub Paseo
 
-Bob (`//Bob` from the dev phrase) is the owner of `e2eowned.dot` (see item 3). He needs:
+Bob (`//Bob` from the dev phrase) is the owner of the S3 fixture (see item 3). He needs:
 
 - **Balance** on Asset Hub Paseo for his on-chain fees. Request ~1 PAS from the Paseo faucet at [https://faucet.polkadot.io/](https://faucet.polkadot.io/) sending to Bob's SS58 address `5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty`.
-- **Revive mapping** so he can sign EVM transactions. `check-pop-status` reports Bob's deterministic H160 and Personhood status without submitting transactions. A later Bob-signed registration or transfer triggers mapping when the chain supports automatic mapping.
+- **Revive mapping** so he can sign EVM transactions. His deterministic H160 is `0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`. A Bob-signed registration or transfer triggers mapping when the chain supports automatic mapping.
 
-```bash
-node tools/check-pop-status.mjs "bottom drive obey lake curtain smoke basket hold race lonely fit walk//Bob"
-```
+### 3. Register the S3 fixture directly as Bob
 
-Expected output: Bob's SS58, his H160 (`0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`), and PoP status (`NoStatus (0)` initially). Idempotent.
+The S3 negative scenario asserts that `polkadot-app-deploy` refuses to deploy to a domain owned by a different account (exit 78 with transfer guidance). On this environment the fixture label is `e2eownedns01.dot` — a NoStatus-compatible label (no PoP grant needed for the registering account), so it works regardless of Bob's own PoP status. Have Bob register it with a DotNS registration tool outside `polkadot-app-deploy` — no Alice intermediary, no Bulletin content needed (S3 never reads content).
 
-### 3. Register `e2eowned.dot` directly as Bob
-
-The S3 negative scenario asserts that `polkadot-app-deploy` refuses to deploy to a domain owned by a different account (exit 78 with transfer guidance). Have Bob register the label with a DotNS registration tool outside `polkadot-app-deploy` — no Alice intermediary, no Bulletin content needed (S3 never reads content).
-
-```bash
-node tools/register-test-fixture.mjs e2eowned
-```
-
-Expected: `e2eowned.dot` is owned by Bob's H160 `0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`. The `e2eowned.dot` label requires PoP Full status and a mature commitment (the tool waits 30s after the minimum commitment age). The tool is idempotent: it exits 0 immediately if Bob already owns it, and transfers the label from Alice back to Bob if fixture drift is detected.
-
-If S3 ever fails because `e2eowned.dot` was transferred back to Alice by mistake, re-run this step to restore Bob's ownership.
+Expected end state: `e2eownedns01.dot` is owned by Bob's H160 `0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`. If S3 ever fails because the label drifted to a different owner, the chain admin restores Bob's ownership the same way.
 
 ---
 
@@ -82,9 +63,9 @@ If S3 ever fails because `e2eowned.dot` was transferred back to Alice by mistake
 
 Paseo Next v2 uses a separate Asset Hub (`wss://paseo-asset-hub-next-rpc.polkadot.io`) and Bulletin chain (`wss://paseo-bulletin-next-rpc.polkadot.io`) with different contract addresses. The `map_account` extrinsic does not exist on this chain — account mapping is triggered automatically when an account submits its first on-chain transaction.
 
-> **Note on PoP grants:** The paseo-next-v2 `POP_RULES` contract (`0x2002C1c15b88632Ad01c7770f6EbE1Ca05c8472E`) is **not permissionless** — `setUserPopStatus` can only be called by its owner. `polkadot-app-deploy` cannot upgrade a signer itself; a status grant (whitelisting) is performed out of band by the contract owner. To request one for a signer, open an issue on [paritytech/dotns](https://github.com/paritytech/dotns/issues). CI scenarios pick labels via `pickStableLabel`/`pickDirectLabel`/`pickIncLabel`/`pickRotLabel`, which auto-select between a PoP-Full base name (e.g. `e2epool.dot`) and a NoStatus fallback (e.g. `e2epoolns01.dot`) based on what `Personhood.personhoodStatus(<signer>)` returns at test start. The setup below covers both modes.
+> **Note on PoP grants:** The paseo-next-v2 `POP_RULES` contract (`0x2002C1c15b88632Ad01c7770f6EbE1Ca05c8472E`) is **not permissionless** — `setUserPopStatus` can only be called by its owner. `polkadot-app-deploy` cannot upgrade a signer itself; a status grant (whitelisting) is performed out of band by the contract owner. To request one for a signer, open an issue on [paritytech/dotns](https://github.com/paritytech/dotns/issues). CI scenarios pick labels via `pickStableLabel`/`pickDirectLabel`/`pickIncLabel`/`pickRotLabel`, which auto-select between a PoP-Full base name (e.g. `e2epool.paseo`) and a NoStatus fallback (e.g. `e2epoolns01.paseo`) based on what `Personhood.personhoodStatus(<signer>)` returns at test start. The setup below covers both modes.
 
-> **⚠ Testnet wipes reset everything.** When paseo-next-v2 is reset (which happens periodically), Alice's Personhood precompile status drops to NoStatus *and* every `e2e*.dot` registration is gone. Re-run the relevant steps below after each wipe — there is no on-chain self-recovery. A subtle failure mode to watch for: Alice's status can come back as Full while `e2epool.dot` is unregistered, so `setContenthash` reverts with `ERC721NonexistentToken`. As long as ownership stays in lockstep with Alice's PoP grade (Full ↔ PoP-Full labels registered; NoStatus ↔ NoStatus labels auto-register on first deploy), the nightly stays green.
+> **⚠ Testnet wipes reset everything.** When paseo-next-v2 is reset (which happens periodically), Alice's Personhood precompile status drops to NoStatus *and* every `e2e*.paseo` registration is gone. Re-run the relevant steps below after each wipe — there is no on-chain self-recovery. A subtle failure mode to watch for: Alice's status can come back as Full while `e2epool.paseo` is unregistered, so `setContenthash` reverts with `ERC721NonexistentToken`. As long as ownership stays in lockstep with Alice's PoP grade (Full ↔ PoP-Full labels registered; NoStatus ↔ NoStatus labels auto-register on first deploy), the nightly stays green.
 
 ### Prerequisites
 
@@ -101,11 +82,7 @@ This grants each pool account `TransactionStorage` quota on Bulletin Next. Alice
 
 ### 2. Verify Alice PoP status
 
-```bash
-node tools/check-pop-status.mjs --env paseo-next-v2
-```
-
-What you see decides which labels need pre-registration:
+This repo ships no personhood-status checker (see "Chain-admin prerequisites" above) — confirm Alice's status with the chain admin. What it is decides which labels need pre-registration:
 
 - **`NoStatus (0)`** → no extra work. The tests pick the NoStatus fallback labels (`e2epoolns01`, `e2edirect01`, `e2eincpool01`, `e2erotpool01`) which auto-register on first deploy because their shape (base length ≥ 9 with two trailing digits) bypasses the `Requires Full personhood verification` gate.
 - **`ProofOfPersonhoodFull (2)`** → Alice has been flipped to Full on the Personhood precompile. The tests will now pick the PoP-Full stable labels (`e2epool`, `e2edirect`, `e2einc`, `e2erot`), and those **must already be registered to Alice** before the matrix runs. Register them once:
@@ -113,7 +90,7 @@ What you see decides which labels need pre-registration:
   ```bash
   # Pre-built fixture is fine — it's the contenthash, not the content, that the tests overwrite.
   for label in e2epool e2edirect e2einc e2erot; do
-    node bin/polkadot-app-deploy test/fixtures/e2e-spa "${label}.dot" --env paseo-next-v2 --js-merkle
+    node bin/polkadot-app-deploy test/fixtures/e2e-spa "${label}.paseo" --env paseo-next-v2 --js-merkle
   done
   ```
 
@@ -121,44 +98,19 @@ What you see decides which labels need pre-registration:
 
 ### 3. Fund Bob and trigger his account mapping
 
-Bob (`5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty`) needs PAS on paseo-next-v2 Asset Hub so he can pay fees for the `e2eowned.dot` registration. As above, this testnet has no public faucet — fund his SS58 address (~1 PAS) out of band. His H160 mapping (`0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`) is triggered automatically when he submits his first on-chain tx.
+Bob (`5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty`) needs PAS on paseo-next-v2 Asset Hub so he can pay fees for the S3 fixture registration (item 4). As above, this testnet has no public faucet — fund his SS58 address (~1 PAS) out of band. His H160 mapping (`0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`) is triggered automatically when he submits his first on-chain tx.
 
-Verify his mapping:
+### 4. Register `e2eownedns03.paseo` directly as Bob
 
-```bash
-node tools/check-pop-status.mjs --env paseo-next-v2 \
-  "bottom drive obey lake curtain smoke basket hold race lonely fit walk//Bob"
-```
+The S3 negative scenario picks its owned-elsewhere fixture purely by environment now, not by Alice's PoP status: on `paseo-next-v2` it's always `e2eownedns03.paseo`, owned by Bob. (An older fixture, `e2eownedns02.paseo`, was squatted by an unrelated third party after a testnet re-genesis and could not be recovered — `e2eownedns03` replaced it. A still-older `e2eowned.dot`, which used to be the separate PoP-Full-only fixture, is no longer read by any scenario.)
 
-Expected output: Bob's SS58, his H160 (`0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`), and PoP status.
+Have Bob register `e2eownedns03.paseo` with a DotNS registration tool outside `polkadot-app-deploy` — no Alice intermediary, no Bulletin content needed (S3 never reads content). This repo ships no fixture-registration tool (see "Chain-admin prerequisites" above); the chain admin performs this out of band.
 
-### 4. Verify Bob PoP status
-
-Bob owns both `e2eownedns02.dot` (NoStatus, used by S3 when Alice is NoStatus) and `e2eowned.dot` (PoP-Full, used by S3 when the Personhood precompile has flipped Alice to Full). The NoStatus branch needs no admin help; the PoP-Full branch needed Bob to register it back when he was granted Full status once. After that one-shot registration the label persists until expiry, so Bob can stay NoStatus going forward — ownership and PoP-grade are decoupled after registration.
-
-### 5. Register `e2eownedns02.dot` directly as Bob
-
-Register the domain using the dedicated tool:
-
-```bash
-node tools/register-test-fixture.mjs e2eownedns02
-```
-
-Expected: `e2eownedns02.dot` is owned by Bob (`0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`).
-The tool is idempotent: it leaves Bob-owned state alone and transfers the label back to Bob if a failed S3 fixture run accidentally left it owned by Alice.
-
-### 6. Ensure Bob owns `e2eowned.dot` on paseo-next-v2
-
-S3 picks `e2eowned.dot` when Alice is PoP-Full at test start. If the label is unregistered, Alice's deploy gets routed through the full register flow and her own H160 lands as owner — at which point every subsequent S3 run on the Full path "succeeds" cleanly (`exit 0`) instead of being rejected (`exit 78`), and the test fails. Bob must own this label.
-
-If Bob already owns it (`ownerOf` on `DOTNS_REGISTRAR` returns `0x41dccbd…`), skip. Otherwise:
-
-- **If nobody owns it yet:** registration needs Bob to hold Full PoP. Request Full PoP for Bob by opening an issue on [paritytech/dotns](https://github.com/paritytech/dotns/issues), then run `node tools/register-test-fixture.mjs e2eowned` (registers the label as Bob via `//Bob`). After registration Bob can drop back to NoStatus.
-- **If Alice (or anyone other than Bob) is squatting:** the owner can call `transferFrom(<current>, Bob, tokenId)` on `DOTNS_REGISTRAR`. ERC721 transfer is unconditional on the recipient (no PoP check) and doesn't need Bob's signer. Run `node tools/transfer-dotns-name.mjs --label e2eowned --to 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01 --env paseo-next-v2` to do this for Alice → Bob in one shot.
+Expected end state: `e2eownedns03.paseo` is owned by Bob's H160 (`0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01`). If S3 ever fails because the label drifted to a different owner, the chain admin restores Bob's ownership the same way — `transferFrom(<current>, Bob, tokenId)` on `DOTNS_REGISTRAR` is unconditional on the recipient (no PoP check).
 
 ---
 
-## No pre-registration needed for `e2epoolns01.dot` / direct NoStatus labels
+## No pre-registration needed for `e2epoolns01.paseo` / direct NoStatus labels
 
 The stable happy-path labels auto-register to the selected test signer on first deploy. Subsequent runs exercise the update path (new contenthash under existing ownership). On paseo-next-v2 these labels must remain NoStatus-compatible because DotNS self-attestation is no longer available.
 

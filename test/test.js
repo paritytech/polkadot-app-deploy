@@ -9979,15 +9979,13 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
   describe("e2e.yml: dependency-bump discriminator (#195)", () => {
     const HEAVY_JOBS = ["select-env", "test-pr", "pr-report", "chain-call-encoding"];
 
-    test("defines a detect-deps-change job, gated to pull_request/push, exposing is_version_only + deps_changed outputs", () => {
+    test("defines a detect-deps-change job, gated to pull_request/push, exposing an is_version_only output", () => {
       const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
       const block = jobBlock(wf, "detect-deps-change");
       assert.match(block, /if:\s*github\.event_name == 'pull_request' \|\| github\.event_name == 'push'/,
         ">> FAIL: deps-discriminator: detect-deps-change must run only on pull_request/push (same restriction as detect-noop-push) — cause: missing or widened `if:` guard");
       assert.match(block, /is_version_only:\s*\$\{\{\s*steps\.classify\.outputs\.is_version_only\s*\}\}/,
         ">> FAIL: deps-discriminator: detect-deps-change must expose an is_version_only output — cause: outputs: block missing or renamed");
-      assert.match(block, /deps_changed:\s*\$\{\{\s*steps\.classify\.outputs\.deps_changed\s*\}\}/,
-        ">> FAIL: deps-discriminator: detect-deps-change must expose a deps_changed output — cause: outputs: block missing or renamed");
     });
 
     // The property the deleted paths-ignore membership used to guarantee,
@@ -10063,27 +10061,23 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       packages: { "": { name: "@parity/polkadot-app-deploy", version: "0.16.0-rc.3", dependencies: { viem: "^2.30.5" } } },
     };
 
-    test("classifier: version field only (package.json + lockfile) -> is_version_only=true, deps_changed=false", () => {
+    test("classifier: version field only (package.json + lockfile) -> is_version_only=true", () => {
       const headPkg = { ...PKG_V1, version: "0.16.0" };
       const headLock = { ...LOCK_V1, version: "0.16.0", packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0" } } };
       const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
       assert.strictEqual(out.is_version_only, "true",
         `>> FAIL: deps-classifier: a pure version bump was classified as is_version_only=${out.is_version_only} — cause: version-field stripping did not neutralize the diff`);
-      assert.strictEqual(out.deps_changed, "false",
-        `>> FAIL: deps-classifier: a pure version bump was classified as deps_changed=${out.deps_changed} — cause: deps_changed must be the negation of is_version_only`);
     });
 
-    test("classifier: dependency version bump (viem ^2.30.5 -> ^2.55.10) -> deps_changed=true", () => {
+    test("classifier: dependency version bump (viem ^2.30.5 -> ^2.55.10) -> is_version_only=false", () => {
       const headPkg = { ...PKG_V1, dependencies: { viem: "^2.55.10" } };
       const headLock = { ...LOCK_V1, packages: { "": { ...LOCK_V1.packages[""], dependencies: { viem: "^2.55.10" } } } };
       const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.deps_changed, "true",
-        `>> FAIL: deps-classifier: a viem dependency bump was classified as deps_changed=${out.deps_changed} — cause: dependency-field diff not detected, this is the exact #190 regression`);
       assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${out.is_version_only} — cause: dependency change incorrectly treated as safe-to-skip`);
+        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${out.is_version_only} — cause: dependency-field diff not detected, this is the exact #190 regression`);
     });
 
-    test("classifier: mixed version bump + dependency change in the same diff -> deps_changed=true (not safe to skip)", () => {
+    test("classifier: mixed version bump + dependency change in the same diff -> is_version_only=false (not safe to skip)", () => {
       const headPkg = { ...PKG_V1, version: "0.16.0", dependencies: { viem: "^2.55.10" } };
       const headLock = {
         ...LOCK_V1,
@@ -10091,13 +10085,11 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0", dependencies: { viem: "^2.55.10" } } },
       };
       const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.deps_changed, "true",
-        `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as deps_changed=${out.deps_changed} — cause: version-field stripping over-matched and hid the real dependency diff`);
       assert.strictEqual(out.is_version_only, "false",
         `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as is_version_only=${out.is_version_only} — cause: mixed changes must never be treated as safe-to-skip`);
     });
 
-    test("classifier: lockfile-tree-only change (no package.json diff, resolved tree changed) -> deps_changed=true", () => {
+    test("classifier: lockfile-tree-only change (no package.json diff, resolved tree changed) -> is_version_only=false", () => {
       const headLock = {
         ...LOCK_V1,
         packages: {
@@ -10106,10 +10098,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         },
       };
       const out = runClassifier({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.deps_changed, "true",
-        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as deps_changed=${out.deps_changed} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
       assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a lockfile-tree-only change was classified as is_version_only=${out.is_version_only} — cause: same as above`);
+        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as is_version_only=${out.is_version_only} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
     });
 
     test("classifier: neither file changed (ordinary source PR) -> is_version_only=false, never gates off a normal PR", () => {

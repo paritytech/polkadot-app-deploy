@@ -9946,22 +9946,178 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     });
   }
 
-  // Only e2e.yml skips pure release version bumps. tests.yml deliberately does
-  // NOT (see the always-run assertion below): "Unit Tests" is a required status
-  // check on main, and a skipped required check never reports → the PR deadlocks.
+  // #195: package.json / package-lock.json used to sit in e2e.yml's
+  // paths-ignore on the theory that any diff confined to those two files is a
+  // free release version bump. That is true for a version bump but false for
+  // a dependency bump (e.g. viem, which encodes every DotNS contract call —
+  // PR #190 shipped a viem+@sentry/node bump that a path filter waved through
+  // with ZERO chain E2E, including the Chain-call arg encoding job that would
+  // have caught an encoding regression). A path filter can't distinguish the
+  // two cases because both touch the same two files — so the fix replaces the
+  // filter with a content-aware discriminator job (detect-deps-change) that
+  // every heavy job gates on instead. These assertions pin: (1) the filter is
+  // gone, (2) the discriminator job exists and is wired the same skip-safe way
+  // as detect-noop-push, (3) every heavy job's `if:` actually references its
+  // output, and (4) the discriminator's classification logic itself is
+  // correct — extracted from the live workflow file and executed against
+  // fixtures, not re-implemented as a parallel copy that could drift from
+  // what actually ships.
   for (const file of [".github/workflows/e2e.yml"]) {
     for (const eventName of ["pull_request", "push"]) {
-      test(`${file}: ${eventName} skips pure release version bumps`, () => {
+      test(`${file}: ${eventName} no longer path-filters package.json/package-lock.json (superseded by detect-deps-change)`, () => {
         const ignored = pathsIgnoredByTrigger(fs.readFileSync(file, "utf-8"), eventName);
         for (const releaseBumpPath of RELEASE_BUMP_PATHS) {
           assert.ok(
-            ignored.includes(releaseBumpPath),
-            `${file}: on.${eventName}.paths-ignore must include ${releaseBumpPath} so release-only version bump PRs and main merges do not run redundant tests`,
+            !ignored.includes(releaseBumpPath),
+            `${file}: on.${eventName}.paths-ignore must NOT list ${releaseBumpPath} — a version-only diff there is now classified by the detect-deps-change job, not skipped at the trigger level (#195)`,
           );
         }
       });
     }
   }
+
+  describe("e2e.yml: dependency-bump discriminator (#195)", () => {
+    const HEAVY_JOBS = ["select-env", "test-pr", "pr-report", "chain-call-encoding"];
+
+    test("defines a detect-deps-change job, gated to pull_request/push, exposing is_version_only + deps_changed outputs", () => {
+      const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+      const block = jobBlock(wf, "detect-deps-change");
+      assert.match(block, /if:\s*github\.event_name == 'pull_request' \|\| github\.event_name == 'push'/,
+        ">> FAIL: deps-discriminator: detect-deps-change must run only on pull_request/push (same restriction as detect-noop-push) — cause: missing or widened `if:` guard");
+      assert.match(block, /is_version_only:\s*\$\{\{\s*steps\.classify\.outputs\.is_version_only\s*\}\}/,
+        ">> FAIL: deps-discriminator: detect-deps-change must expose an is_version_only output — cause: outputs: block missing or renamed");
+      assert.match(block, /deps_changed:\s*\$\{\{\s*steps\.classify\.outputs\.deps_changed\s*\}\}/,
+        ">> FAIL: deps-discriminator: detect-deps-change must expose a deps_changed output — cause: outputs: block missing or renamed");
+    });
+
+    // The property the deleted paths-ignore membership used to guarantee,
+    // reframed against the new mechanism: a release-only version bump must
+    // not trigger any of the jobs that actually cost runner-minutes or chain
+    // capacity. Every heavy job's needs: + if: must reference the
+    // discriminator using the same "skipped predecessor == run normally"
+    // pattern detect-noop-push already established, so a version-only bump
+    // (is_version_only == 'true') is the only value that skips them.
+    for (const job of HEAVY_JOBS) {
+      test(`${job}: gates off detect-deps-change so a release-only version bump skips it`, () => {
+        const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+        const block = jobBlock(wf, job);
+        const needsMatch = block.match(/^\s{4}needs:\s*(?:\[([^\]]*)\]|(\S+))\s*$/m);
+        assert.ok(needsMatch, `>> FAIL: deps-discriminator: ${job} has no needs: — cause: needs: line missing or mis-indented`);
+        const refs = (needsMatch[1] ?? needsMatch[2]).split(",").map((s) => s.trim());
+        assert.ok(refs.includes("detect-deps-change"),
+          `>> FAIL: deps-discriminator: ${job}'s needs: does not include detect-deps-change — cause: gate not wired, a version-only bump would still trigger this job`);
+        assert.match(block, /needs\.detect-deps-change\.result == 'skipped'/,
+          `>> FAIL: deps-discriminator: ${job}'s if: does not treat a skipped detect-deps-change (nightly triggers) as pass-through — cause: missing the 'result == skipped' OR-arm`);
+        assert.match(block, /needs\.detect-deps-change\.outputs\.is_version_only != 'true'/,
+          `>> FAIL: deps-discriminator: ${job}'s if: does not gate on is_version_only — cause: missing or misspelled output reference, a version-only bump would not be skipped`);
+      });
+    }
+
+    test("chain-call-encoding keeps its E2E=1 live-chain assertion after gating", () => {
+      const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+      const block = jobBlock(wf, "chain-call-encoding");
+      assert.match(block, /E2E=1 node --test test\/e2e-chain-calls\.test\.js/,
+        ">> FAIL: deps-discriminator: chain-call-encoding must still run with E2E=1 — cause: the live-chain assertion step was weakened or dropped while adding the gate");
+    });
+
+    // ---- Classification logic: extract the real embedded script from the
+    // live workflow (not a parallel re-implementation) and execute it
+    // against fixture package.json/package-lock.json pairs, so a change to
+    // the actual shipped logic is what gets tested.
+    function extractClassifyScript(wf) {
+      const block = jobBlock(wf, "detect-deps-change");
+      const scriptMatch = block.match(/cat > classify-deps-change\.cjs <<'JSEOF'\n([\s\S]*?)\n\s*JSEOF/);
+      assert.ok(scriptMatch, ">> FAIL: deps-discriminator: could not find the classify-deps-change.cjs heredoc in detect-deps-change — cause: heredoc markers renamed or removed");
+      return scriptMatch[1];
+    }
+
+    function runClassifier({ basePkg, headPkg, baseLock, headLock }) {
+      const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+      const script = extractClassifyScript(wf);
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "deps-classify-"));
+      const write = (name, val) => fs.writeFileSync(path.join(dir, name), val === undefined ? "" : JSON.stringify(val));
+      write("base_pkg.json", basePkg);
+      write("head_pkg.json", headPkg);
+      write("base_lock.json", baseLock);
+      write("head_lock.json", headLock);
+      fs.writeFileSync(path.join(dir, "classify-deps-change.cjs"), script);
+      const outputFile = path.join(dir, "github_output");
+      fs.writeFileSync(outputFile, "");
+      execSync("node classify-deps-change.cjs", { cwd: dir, env: { ...process.env, GITHUB_OUTPUT: outputFile } });
+      const outText = fs.readFileSync(outputFile, "utf-8");
+      const outputs = Object.fromEntries(
+        outText.trim().split("\n").filter(Boolean).map((line) => {
+          const idx = line.indexOf("=");
+          return [line.slice(0, idx), line.slice(idx + 1)];
+        }),
+      );
+      fs.rmSync(dir, { recursive: true, force: true });
+      return outputs;
+    }
+
+    const PKG_V1 = { name: "@parity/polkadot-app-deploy", version: "0.16.0-rc.3", dependencies: { viem: "^2.30.5" } };
+    const LOCK_V1 = {
+      name: "@parity/polkadot-app-deploy",
+      version: "0.16.0-rc.3",
+      lockfileVersion: 3,
+      packages: { "": { name: "@parity/polkadot-app-deploy", version: "0.16.0-rc.3", dependencies: { viem: "^2.30.5" } } },
+    };
+
+    test("classifier: version field only (package.json + lockfile) -> is_version_only=true, deps_changed=false", () => {
+      const headPkg = { ...PKG_V1, version: "0.16.0" };
+      const headLock = { ...LOCK_V1, version: "0.16.0", packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0" } } };
+      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(out.is_version_only, "true",
+        `>> FAIL: deps-classifier: a pure version bump was classified as is_version_only=${out.is_version_only} — cause: version-field stripping did not neutralize the diff`);
+      assert.strictEqual(out.deps_changed, "false",
+        `>> FAIL: deps-classifier: a pure version bump was classified as deps_changed=${out.deps_changed} — cause: deps_changed must be the negation of is_version_only`);
+    });
+
+    test("classifier: dependency version bump (viem ^2.30.5 -> ^2.55.10) -> deps_changed=true", () => {
+      const headPkg = { ...PKG_V1, dependencies: { viem: "^2.55.10" } };
+      const headLock = { ...LOCK_V1, packages: { "": { ...LOCK_V1.packages[""], dependencies: { viem: "^2.55.10" } } } };
+      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(out.deps_changed, "true",
+        `>> FAIL: deps-classifier: a viem dependency bump was classified as deps_changed=${out.deps_changed} — cause: dependency-field diff not detected, this is the exact #190 regression`);
+      assert.strictEqual(out.is_version_only, "false",
+        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${out.is_version_only} — cause: dependency change incorrectly treated as safe-to-skip`);
+    });
+
+    test("classifier: mixed version bump + dependency change in the same diff -> deps_changed=true (not safe to skip)", () => {
+      const headPkg = { ...PKG_V1, version: "0.16.0", dependencies: { viem: "^2.55.10" } };
+      const headLock = {
+        ...LOCK_V1,
+        version: "0.16.0",
+        packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0", dependencies: { viem: "^2.55.10" } } },
+      };
+      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(out.deps_changed, "true",
+        `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as deps_changed=${out.deps_changed} — cause: version-field stripping over-matched and hid the real dependency diff`);
+      assert.strictEqual(out.is_version_only, "false",
+        `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as is_version_only=${out.is_version_only} — cause: mixed changes must never be treated as safe-to-skip`);
+    });
+
+    test("classifier: lockfile-tree-only change (no package.json diff, resolved tree changed) -> deps_changed=true", () => {
+      const headLock = {
+        ...LOCK_V1,
+        packages: {
+          "": LOCK_V1.packages[""],
+          "node_modules/viem": { version: "2.30.6", resolved: "https://registry.npmjs.org/viem/-/viem-2.30.6.tgz" },
+        },
+      };
+      const out = runClassifier({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(out.deps_changed, "true",
+        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as deps_changed=${out.deps_changed} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
+      assert.strictEqual(out.is_version_only, "false",
+        `>> FAIL: deps-classifier: a lockfile-tree-only change was classified as is_version_only=${out.is_version_only} — cause: same as above`);
+    });
+
+    test("classifier: neither file changed (ordinary source PR) -> is_version_only=false, never gates off a normal PR", () => {
+      const out = runClassifier({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock: LOCK_V1 });
+      assert.strictEqual(out.is_version_only, "false",
+        `>> FAIL: deps-classifier: an untouched package.json/lock pair was classified as is_version_only=${out.is_version_only} — cause: "no diff" must not be conflated with "version-only diff", or every ordinary source PR would skip E2E`);
+    });
+  });
 
   // tests.yml MUST run on every PR/push with no path filter. "Unit Tests" is a
   // required status check on main; a `paths-ignore` would skip the workflow on
@@ -10027,8 +10183,11 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
   test(".github/workflows/e2e.yml: pr-report depends on the single test-pr job", () => {
     const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
     const prReport = jobBlock(e2e, "pr-report");
-    assert.match(prReport, /needs:\s*\[\s*test-pr\s*,\s*detect-noop-push\s*\]/,
-      "pr-report needs: must reference single test-pr job + detect-noop-push");
+    // #195 added detect-deps-change to this needs: array (see the
+    // dependency-bump discriminator describe block below) — match it as an
+    // unordered superset rather than pinning the old exact 2-element list.
+    assert.match(prReport, /needs:\s*\[\s*test-pr\s*,\s*detect-noop-push\s*,\s*detect-deps-change\s*\]/,
+      "pr-report needs: must reference single test-pr job + detect-noop-push + detect-deps-change");
     assert.match(prReport, /needs\.test-pr\.result == 'success'/,
       "pr-report AGGREGATE equation must read needs.test-pr.result");
   });
@@ -14349,11 +14508,17 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     const m = wf.match(/^\s{2}test-pr:\s*$([\s\S]*?)(?=^\s{2}[a-z][a-z0-9-]*:\s*$)/m);
     assert.ok(m, "test-pr job not found");
     const block = m[1];
-    assert.match(
-      block,
-      /needs:\s*\[?\s*(?:detect-noop-push\s*,\s*select-env|select-env\s*,\s*detect-noop-push)/,
-      "test-pr must declare both detect-noop-push and select-env as needs",
-    );
+    const needsLine = block.match(/^\s{4}needs:\s*\[([^\]]*)\]/m);
+    assert.ok(needsLine, "test-pr must declare a needs: [...] array");
+    const needsRefs = needsLine[1].split(",").map((s) => s.trim());
+    // #195 added detect-deps-change to this list; assert membership rather
+    // than exact adjacency so that addition doesn't require rewriting this.
+    for (const required of ["detect-noop-push", "select-env"]) {
+      assert.ok(
+        needsRefs.includes(required),
+        `test-pr must declare ${required} in its needs: — got [${needsRefs.join(", ")}]`,
+      );
+    }
     assert.match(
       block,
       /PAD_ENV:\s*\$\{\{\s*needs\.select-env\.outputs\.selected_env\s*\}\}/,

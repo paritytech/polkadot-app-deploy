@@ -21,8 +21,13 @@ on:
   pull_request:
     branches: [main]
     paths-ignore:
-      - package.json
-      - package-lock.json
+      # package.json / package-lock.json deliberately NOT here (see #195):
+      # a pure version bump and a dependency bump both touch only these two
+      # files, and a path filter can't tell them apart — a dependency bump
+      # (e.g. viem, which encodes every DotNS contract call) is exactly the
+      # change class most likely to need chain validation. The
+      # detect-deps-change job below diffs their content and classifies
+      # instead; heavy jobs gate on its output rather than on path membership.
       # Ops scripts under tools/ never participate in the CI deploy paths.
       # Skip E2E when a PR only touches them.
       - tools/**
@@ -42,8 +47,8 @@ on:
   push:
     branches: [main]
     paths-ignore:
-      - package.json
-      - package-lock.json
+      # See the pull_request block above — package.json / package-lock.json
+      # are classified by detect-deps-change, not path-ignored.
       - tools/**
       - '**/*.yml'
       - '**/*.yaml'
@@ -222,6 +227,130 @@ jobs:
             echo "is_noop=false" >> "$GITHUB_OUTPUT"
           fi
 
+  # ---- Dependency-bump discriminator (#195) -----------------------------
+  #
+  # package.json / package-lock.json are no longer in paths-ignore (see the
+  # `on:` block above): a pure version bump and a dependency bump both touch
+  # only these two files, and a path filter cannot tell them apart even
+  # though a dependency bump (e.g. viem, which encodes every DotNS contract
+  # call — see #190) is exactly the change class most likely to need chain
+  # validation. This job fetches both files' content at the PR/push base and
+  # head SHAs and classifies the diff:
+  #   - version field only (package.json .version, and lockfile .version +
+  #     .packages[""].version) → is_version_only=true, deps_changed=false.
+  #     Heavy E2E jobs stay gated off — release/RC version bumps stay free,
+  #     same guarantee the old paths-ignore membership used to give.
+  #   - anything else (dependencies/devDependencies/overrides/
+  #     peerDependencies, or the resolved lockfile tree) → is_version_only=
+  #     false, deps_changed=true. A version bump mixed with a real dependency
+  #     change in the same PR also lands here — mixed is NOT safe to skip.
+  #   - neither file touched at all (the common case: an ordinary source PR)
+  #     → is_version_only=false too, so this job only ever skips the narrow
+  #     release-version-bump shape, never a normal source change.
+  #
+  # Uses the Contents API (full file content) rather than the Compare API's
+  # unified diff: GitHub omits `patch` for large files, and a lockfile is
+  # exactly the file most likely to hit that ceiling as the dependency tree
+  # grows. Comparing full content is correct regardless of file size.
+  detect-deps-change:
+    name: Classify package.json/lock diff (version bump vs dependency change)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      is_version_only: ${{ steps.classify.outputs.is_version_only }}
+      deps_changed: ${{ steps.classify.outputs.deps_changed }}
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - id: classify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch() {
+            # $1=sha $2=path $3=outfile. Missing/404 → empty outfile, treated
+            # as "file did not exist at that ref" by the classifier below.
+            curl -fsSL -H "Authorization: bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" \
+              "https://api.github.com/repos/$REPO/contents/$2?ref=$1" -o "$3" 2>/dev/null || : > "$3"
+          }
+          if [[ -z "${BASE_SHA:-}" || "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "No base SHA to diff against (branch creation) — treating as dependency-affecting to be safe."
+            echo "is_version_only=false" >> "$GITHUB_OUTPUT"
+            echo "deps_changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          fetch "$BASE_SHA" package.json base_pkg.json
+          fetch "$HEAD_SHA" package.json head_pkg.json
+          fetch "$BASE_SHA" package-lock.json base_lock.json
+          fetch "$HEAD_SHA" package-lock.json head_lock.json
+          cat > classify-deps-change.cjs <<'JSEOF'
+          const fs = require("fs");
+
+          function loadJSON(path) {
+            try {
+              const raw = fs.readFileSync(path, "utf8");
+              if (!raw.trim()) return null;
+              return JSON.parse(raw);
+            } catch (e) {
+              return null;
+            }
+          }
+
+          function stripVersionFields(obj, isLockfile) {
+            if (!obj || typeof obj !== "object") return obj;
+            const clone = JSON.parse(JSON.stringify(obj));
+            delete clone.version;
+            if (isLockfile && clone.packages && typeof clone.packages === "object" &&
+                clone.packages[""] && typeof clone.packages[""] === "object") {
+              delete clone.packages[""].version;
+            }
+            return clone;
+          }
+
+          const basePkgRaw = loadJSON("base_pkg.json");
+          const headPkgRaw = loadJSON("head_pkg.json");
+          const baseLockRaw = loadJSON("base_lock.json");
+          const headLockRaw = loadJSON("head_lock.json");
+
+          // Did either file change at all (including a pure version bump)?
+          const anyPackageFileChanged =
+            JSON.stringify(basePkgRaw) !== JSON.stringify(headPkgRaw) ||
+            JSON.stringify(baseLockRaw) !== JSON.stringify(headLockRaw);
+
+          const basePkg = stripVersionFields(basePkgRaw, false);
+          const headPkg = stripVersionFields(headPkgRaw, false);
+          const baseLock = stripVersionFields(baseLockRaw, true);
+          const headLock = stripVersionFields(headLockRaw, true);
+
+          // Is there any diff left once version fields are stripped out?
+          const nonVersionDiff =
+            JSON.stringify(basePkg) !== JSON.stringify(headPkg) ||
+            JSON.stringify(baseLock) !== JSON.stringify(headLock);
+
+          // version-only iff something changed AND the only thing that
+          // changed was a version field. Neither-file-touched (ordinary
+          // source PR) must NOT count as version-only, or this job would
+          // gate off heavy E2E for every normal source change too.
+          const isVersionOnly = anyPackageFileChanged && !nonVersionDiff;
+
+          console.log(`anyPackageFileChanged=${anyPackageFileChanged}`);
+          console.log(`nonVersionDiff=${nonVersionDiff}`);
+          console.log(`is_version_only=${isVersionOnly}`);
+
+          const out = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(out, `is_version_only=${isVersionOnly}\n`);
+          fs.appendFileSync(out, `deps_changed=${!isVersionOnly}\n`);
+          JSEOF
+          node classify-deps-change.cjs
+
   # ---- Env selector ----------------------------------------------------
   #
   # Probes the primary E2E env (paseo-next-v2 by default, override via
@@ -235,10 +364,11 @@ jobs:
 
   select-env:
     name: Select E2E environment (probe + fallback)
-    needs: detect-noop-push
+    needs: [detect-noop-push, detect-deps-change]
     if: |
       always() &&
       (needs.detect-noop-push.result == 'skipped' || needs.detect-noop-push.outputs.is_noop != 'true') &&
+      (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 3
@@ -325,18 +455,22 @@ jobs:
 
   test-pr:
     name: PR · s1-smoke ${{ matrix.signer }}/${{ matrix.merkle }}
-    needs: [detect-noop-push, select-env]
+    needs: [detect-noop-push, detect-deps-change, select-env]
     # Run when one of the trigger paths fires AND either the noop-detect was
     # skipped (workflow_dispatch path) or it ran and the tree actually changed.
     # `always()` is required so a skipped predecessor doesn't auto-skip us.
     # `select-env.result == 'success'` is required so we skip the matrix
     # when all eligible envs are unhealthy — without it, always() would let
     # test-pr run with an empty PAD_ENV and fall back to the
-    # CLI default (paseo-next-v2), defeating the fallback.
+    # CLI default (paseo-next-v2), defeating the fallback. select-env already
+    # cascades the detect-deps-change gate (a version-only bump skips
+    # select-env, which fails this same check), but the explicit check here
+    # keeps the property directly verifiable on this job too (#195).
     if: |
       always() &&
       needs.select-env.result == 'success' &&
       (needs.detect-noop-push.result == 'skipped' || needs.detect-noop-push.outputs.is_noop != 'true') &&
+      (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'pr'))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 20
@@ -408,12 +542,14 @@ jobs:
 
   pr-report:
     name: PR E2E Report
-    needs: [test-pr, detect-noop-push]
-    # Same gate as test-pr: if the push was signature-only, both test-pr and
-    # this report are skipped — the PR keeps its previous green checks.
+    needs: [test-pr, detect-noop-push, detect-deps-change]
+    # Same gate as test-pr: if the push was signature-only OR a release
+    # version-only bump, both test-pr and this report are skipped — the PR
+    # keeps its previous green checks (#195).
     if: |
       always() &&
       (needs.detect-noop-push.result == 'skipped' || needs.detect-noop-push.outputs.is_noop != 'true') &&
+      (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'pr'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2556,11 +2692,23 @@ jobs:
 
   chain-call-encoding:
     name: Chain-call arg encoding (all extrinsics)
-    # No `if:` gate — runs on every trigger (PR / push / schedule / release / dispatch).
-    # Cheap (~seconds of read-only metadata fetch); catches arg-type bugs (e.g. a proof
-    # passed as a hex string instead of a Binary → papi "Incompatible runtime entry") and
-    # chain-side call-signature drift BEFORE the deploy matrix. The chain-free completeness
-    # guard also runs in Unit Tests (npm test); this job adds the live-chain encode check.
+    needs: detect-deps-change
+    # Runs on every trigger (PR / push / schedule / release / dispatch) EXCEPT
+    # a release-only version bump on pull_request/push (#195) — same
+    # skip-safe pattern as detect-noop-push: a skipped predecessor (every
+    # non-PR/push trigger) is treated as "run normally". Cheap (~seconds of
+    # read-only metadata fetch); catches arg-type bugs (e.g. a proof passed
+    # as a hex string instead of a Binary → papi "Incompatible runtime
+    # entry") and chain-side call-signature drift BEFORE the deploy matrix.
+    # This is also the job a dependency bump (e.g. viem, which encodes every
+    # DotNS contract call — see #190) needs most: it now runs with E2E=1
+    # whenever detect-deps-change reports a real dependency change, which a
+    # path filter used to skip entirely. The chain-free completeness guard
+    # also runs in Unit Tests (npm test); this job adds the live-chain
+    # encode check.
+    if: |
+      always() &&
+      (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

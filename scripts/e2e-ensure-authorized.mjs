@@ -339,24 +339,34 @@ async function checkAndFundAssetHub({ accounts, assetHubRpc, funderUri, floorRaw
     accounts,
     rpc: assetHubRpc,
     signerUri: funderUri,
+    // Read the shared funder's own balance ONCE, then track it locally.
+    // Sends within this loop are already sequential and each is checked
+    // for r?.ok before the row is marked "topped up", so a confirmed
+    // transfer's effect on the funder's balance is known without a fresh
+    // chain read — matches src/pool.ts's ensurePoolAccountsFundedOnAssetHub,
+    // which doesn't re-read the funder at all. Saves up to ~17 round trips
+    // per run on a WS endpoint documented as timeout-prone under load.
+    prepare: async (api, funderKey) => {
+      const funderInfo = await api.query.System.Account.getValue(funderKey.address);
+      return { funderFree: BigInt(funderInfo?.data?.free ?? 0n) };
+    },
     checkFn: async (api, key, _account) => {
       const info = await api.query.System.Account.getValue(key.address);
       const free = BigInt(info?.data?.free ?? 0n);
       const topUp = assetHubTopUpAmount(free, floorRaw, targetRaw);
       return { rowFields: { freeBefore: free }, needsAction: topUp > 0n, actionArgs: { topUp } };
     },
-    actFn: async (api, key, _account, _ctx, { topUp }, funderKey, funderSigner) => {
-      const funderInfo = await api.query.System.Account.getValue(funderKey.address);
-      const funderFree = BigInt(funderInfo?.data?.free ?? 0n);
-      if (funderFree < topUp) {
+    actFn: async (api, key, _account, ctx, { topUp }, funderKey, funderSigner) => {
+      if (ctx.funderFree < topUp) {
         throw new Error(
-          `funder ${funderKey.address} has only ${formatPasBalance(funderFree)} PAS, needs ` +
+          `funder ${funderKey.address} has only ${formatPasBalance(ctx.funderFree)} PAS, needs ` +
           `${formatPasBalance(topUp)} PAS — reporting rather than attempting a partial top-up`,
         );
       }
       const tx = api.tx.Balances.transfer_allow_death({ dest: Enum("Id", key.address), value: topUp });
       const r = await tx.signAndSubmit(funderSigner);
       if (!r?.ok) throw new Error("dispatch was rejected");
+      ctx.funderFree -= topUp;
       return `topped up +${formatPasBalance(topUp)} PAS`;
     },
   });

@@ -4100,16 +4100,12 @@ export class DotNS {
     // genuinely payable priceWei (floors to 0 native units where the correct
     // rounded-up payment is 1 unit).
     const bufferedPaymentWei = (priceWei * 110n) / 100n;
+    // Invariant: bufferedWeiToNative (via weiToNative) rounds any nonzero
+    // remainder UP, so a positive priceWei can never convert to 0 native
+    // units — a "payment conversion underflow" guard here is unreachable
+    // and was removed (see dotns-register-fee.test.js for the worked
+    // example pinning this rounding behavior).
     const bufferedPaymentNative = bufferedWeiToNative(priceWei, this._nativeToEthRatio);
-    if (priceWei > 0n && bufferedPaymentNative === 0n) {
-      // Structurally unreachable now: weiToNative (called by bufferedWeiToNative)
-      // rounds up on any nonzero remainder, so a positive numerator can never
-      // floor to 0. Left as defense-in-depth in case that invariant changes.
-      throw new Error(
-        `Payment conversion underflow: priceWei=${priceWei} rounds to 0 native units ` +
-        `(nativeToEthRatio=${this._nativeToEthRatio}). Cannot call register with zero payment.`
-      );
-    }
     setDeployAttribute("deploy.payment_wei", priceWei.toString());
     console.log(`   Oracle price: ${formatEther(priceWei)} PAS`);
     console.log(`   Paying: ${formatEther(bufferedPaymentWei)} PAS`);

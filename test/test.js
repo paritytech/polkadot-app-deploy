@@ -3648,11 +3648,11 @@ describe("DotNS initial state", () => {
   // "Payment conversion underflow" — even though 500n is a genuinely tiny
   // but payable price. bufferedWeiToNative(500n, 1_000_000n) rounds the same
   // 550n up to 1n native unit instead, so this case is now payable rather
-  // than a spurious hard failure. The underflow guard itself is unchanged
-  // and still present as defense-in-depth (see finalizeRegistration) — it is
-  // now structurally unreachable for any priceWei > 0, since weiToNative
-  // (which bufferedWeiToNative calls) always rounds a positive numerator up
-  // to at least 1.
+  // than a spurious hard failure. The underflow guard itself has since been
+  // removed from finalizeRegistration as unreachable dead code (it was
+  // structurally unreachable for any priceWei > 0, since weiToNative, which
+  // bufferedWeiToNative calls, always rounds a positive numerator up to at
+  // least 1) — the invariant is now documented inline there instead.
   test("finalizeRegistration: a tiny nonzero priceWei rounds UP to 1 native unit instead of underflowing to 0 and throwing", async () => {
     const d = new DotNS();
     d.connected = true;

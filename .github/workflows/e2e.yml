@@ -237,16 +237,21 @@ jobs:
   # validation. This job fetches both files' content at the PR/push base and
   # head SHAs and classifies the diff:
   #   - version field only (package.json .version, and lockfile .version +
-  #     .packages[""].version) → is_version_only=true, deps_changed=false.
-  #     Heavy E2E jobs stay gated off — release/RC version bumps stay free,
-  #     same guarantee the old paths-ignore membership used to give.
+  #     .packages[""].version) → is_version_only=true. Heavy E2E jobs stay
+  #     gated off — release/RC version bumps stay free, same guarantee the
+  #     old paths-ignore membership used to give.
   #   - anything else (dependencies/devDependencies/overrides/
   #     peerDependencies, or the resolved lockfile tree) → is_version_only=
-  #     false, deps_changed=true. A version bump mixed with a real dependency
-  #     change in the same PR also lands here — mixed is NOT safe to skip.
+  #     false. A version bump mixed with a real dependency change in the
+  #     same PR also lands here — mixed is NOT safe to skip.
   #   - neither file touched at all (the common case: an ordinary source PR)
   #     → is_version_only=false too, so this job only ever skips the narrow
   #     release-version-bump shape, never a normal source change.
+  #
+  # Every consumer below gates on is_version_only alone; there is no
+  # separate deps_changed output (it would only ever be that field's trivial
+  # negation — see the classify step's log line for the value if you need it
+  # while debugging a run).
   #
   # Uses the Contents API (full file content) rather than the Compare API's
   # unified diff: GitHub omits `patch` for large files, and a lockfile is
@@ -261,7 +266,6 @@ jobs:
       contents: read
     outputs:
       is_version_only: ${{ steps.classify.outputs.is_version_only }}
-      deps_changed: ${{ steps.classify.outputs.deps_changed }}
     steps:
       - uses: actions/setup-node@v6
         with:
@@ -284,7 +288,6 @@ jobs:
           if [[ -z "${BASE_SHA:-}" || "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
             echo "No base SHA to diff against (branch creation) — treating as dependency-affecting to be safe."
             echo "is_version_only=false" >> "$GITHUB_OUTPUT"
-            echo "deps_changed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           fetch "$BASE_SHA" package.json base_pkg.json
@@ -344,10 +347,10 @@ jobs:
           console.log(`anyPackageFileChanged=${anyPackageFileChanged}`);
           console.log(`nonVersionDiff=${nonVersionDiff}`);
           console.log(`is_version_only=${isVersionOnly}`);
+          console.log(`deps_changed=${!isVersionOnly}`); // trivial negation, logged only — not exposed as a job output (nothing reads it)
 
           const out = process.env.GITHUB_OUTPUT;
           fs.appendFileSync(out, `is_version_only=${isVersionOnly}\n`);
-          fs.appendFileSync(out, `deps_changed=${!isVersionOnly}\n`);
           JSEOF
           node classify-deps-change.cjs
 

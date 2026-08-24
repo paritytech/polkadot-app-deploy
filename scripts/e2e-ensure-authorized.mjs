@@ -46,7 +46,8 @@ import { createClient, Enum } from "polkadot-api";
 import { getWsProvider } from "polkadot-api/ws";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { loadEnvironments, resolveEndpoints } from "../dist/environments.js";
-import { readAccountAuthorization, isAuthorizationSufficient, assetHubTopUpAmount, formatPasBalance } from "../dist/pool.js";
+import { readAccountAuthorization, isAuthorizationSufficient, assetHubTopUpAmount, formatPasBalance, TOPUP_TRANSACTIONS, TOPUP_BYTES } from "../dist/pool.js";
+import { stripYamlCommentLines, extractJobBlocks } from "./lib/workflow-jobs.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.join(__dirname, "..");
@@ -59,8 +60,9 @@ export const E2E_TEST_PATH = path.join(REPO_ROOT, "test", "e2e.test.js");
 // Public and intentionally so: not a secret, testnet-only.
 export const DEV_PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
 
-const TOPUP_TRANSACTIONS = 1000;
-const TOPUP_BYTES = 100_000_000n;
+// TOPUP_TRANSACTIONS / TOPUP_BYTES imported above from src/pool.ts (via
+// dist/pool.js) — that's the same authorize_account quota src/pool.ts's own
+// auto-reauthorize path grants, now shared instead of hand-copied here.
 // Bulletin and Asset Hub both report tokenDecimals: 10 (see
 // reference_paseo_ah_token_decimals_10 — a 1e12 divisor under-reports 100x).
 export const ONE_PAS = 10_000_000_000n;
@@ -77,46 +79,16 @@ const DERIVATION_PATH_RE = /^\/\/[A-Za-z0-9/_-]+$/;
 // actually decide which accounts the E2E matrix signs with.
 // ---------------------------------------------------------------------------
 
-// Blanks every full-line YAML comment (a line whose trimmed content starts
-// with `#`) so prose like "the `derivation-path: //e2e-direct` below gives
-// this shard its own..." never gets mistaken for a real key. Line count is
-// preserved (comments become empty lines) so nothing downstream needs to
-// re-index. Does not strip inline trailing comments — none of the fields
-// this script reads (derivation-path, poolIndex, matrix arrays) carry one
-// anywhere in e2e.yml today (checked by hand); a future one would currently
-// get swallowed into the value and fail validateDerivationPath's shape check
-// or extractPoolIndicesFromJob's integer check, i.e. fail loud, not silent.
-export function stripYamlCommentLines(text) {
-  return text.split("\n").map((line) => (line.trim().startsWith("#") ? "" : line)).join("\n");
-}
-
-// Splits the `jobs:` section of e2e.yml into per-job text blocks, keyed by
-// job name. Job headers are exactly 2-space-indented `name:` lines directly
-// under `jobs:` — every nested key (name, needs, if, strategy, ...) is
-// indented 4+ spaces, and the only OTHER 2-space bare `key:` lines in the
-// file are the `on:` trigger names (pull_request, push, ...), which live
-// before `jobs:` and are excluded by slicing from the `jobs:` line onward.
-export function extractJobBlocks(e2eYmlText) {
-  const jobsIdx = e2eYmlText.indexOf("\njobs:\n");
-  if (jobsIdx === -1) {
-    throw new Error(
-      "e2e.yml: could not find a top-level 'jobs:' key on its own line — file shape changed, " +
-      "extractJobBlocks needs updating before this script can trust its derived account list.",
-    );
-  }
-  const body = e2eYmlText.slice(jobsIdx + 1);
-  const headerRe = /^ {2}([A-Za-z][A-Za-z0-9_-]*):[ \t]*$/gm;
-  const headers = [];
-  let m;
-  while ((m = headerRe.exec(body))) headers.push({ name: m[1], start: m.index });
-  const blocks = new Map();
-  for (let i = 0; i < headers.length; i++) {
-    const start = headers[i].start;
-    const end = i + 1 < headers.length ? headers[i + 1].start : body.length;
-    blocks.set(headers[i].name, body.slice(start, end));
-  }
-  return blocks;
-}
+// stripYamlCommentLines / extractJobBlocks now live in ./lib/workflow-jobs.mjs
+// (imported above) — shared with test/test.js's jobBlock() helper so there is
+// exactly one job-header regex, not two independently drifting copies. See
+// that module's header for why this mattered (list-drift bug class).
+//
+// Does not strip inline trailing comments — none of the fields this script
+// reads (derivation-path, poolIndex, matrix arrays) carry one anywhere in
+// e2e.yml today (checked by hand); a future one would currently get
+// swallowed into the value and fail validateDerivationPath's shape check or
+// extractPoolIndicesFromJob's integer check, i.e. fail loud, not silent.
 
 // Values from a `field: [a, b, c]` free-dimension matrix array anywhere in
 // the job block (e.g. `signer: [pool, direct]`).
@@ -289,40 +261,58 @@ function deriveSignerKeypair(keyring, account) {
   return keyring.addFromUri(DEV_PHRASE + account.path);
 }
 
-async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri }) {
+// Shared check-first, grant-only-if-needed skeleton. checkAndGrantAuthorizations
+// (Bulletin storage authorization) and checkAndFundAssetHub (Asset Hub balance)
+// differ only in: which chain/key they run against (rpc/signerUri), any
+// once-per-pass setup (prepare), the per-account check (checkFn), and the tx
+// itself (actFn) — everything else (keyring + primary signer setup, opening
+// one client for the whole pass, building each row, catching a failed
+// action into { action: "FAILED", error }, destroying the client) was
+// previously duplicated between the two. This file's own header argues
+// against exactly that kind of copy for computeStorageDepositLimit; this
+// factors it out instead of adding a second instance of the same drift risk.
+//
+// Writes stay SEQUENTIAL within this loop (never Promise.all across
+// accounts within one pass) — a shared signer nonce would race otherwise,
+// same #1054 rationale as ensurePoolAccountsFundedOnAssetHub in src/pool.ts.
+//
+//   prepare(api, primaryKey) -> ctx                      (optional, once per pass)
+//   checkFn(api, key, account, ctx) -> { rowFields, needsAction, actionArgs }
+//   actFn(api, key, account, ctx, actionArgs, primaryKey, primarySigner) -> Promise<string>
+//   onRow(row)                                            (optional, called as each row completes)
+//
+// onRow exists so a caller running this pass concurrently with another
+// (see main()'s Promise.allSettled over the Bulletin + Asset Hub passes)
+// can still print per-account progress AS it happens, instead of only
+// after both passes fully resolve — the previous behaviour meant a job
+// killed mid-run by a timeout (this file's own header calls the WS
+// endpoint "timeout-prone under load") showed two section headers and
+// nothing else, losing exactly the partial progress you'd want at that
+// moment.
+async function runCheckAndAct({ accounts, rpc, signerUri, prepare, checkFn, actFn, onRow }) {
   const keyring = new Keyring({ type: "sr25519" });
-  const authorizerKey = keyring.addFromUri(authorizerUri);
-  const authorizerSigner = getPolkadotSigner(authorizerKey.publicKey, "Sr25519", (d) => authorizerKey.sign(d));
+  const primaryKey = keyring.addFromUri(signerUri);
+  const primarySigner = getPolkadotSigner(primaryKey.publicKey, "Sr25519", (d) => primaryKey.sign(d));
 
-  const client = createClient(getWsProvider(bulletinRpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
+  const client = createClient(getWsProvider(rpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
   const api = client.getUnsafeApi();
   const results = [];
   try {
-    const currentBlock = Number(await api.query.System.Number.getValue());
+    const ctx = (await prepare?.(api, primaryKey)) ?? {};
     for (const account of accounts) {
       const key = deriveSignerKeypair(keyring, account);
-      const auth = await readAccountAuthorization(api, key.address);
-      const sufficient = isAuthorizationSufficient(auth, currentBlock);
-      const row = {
-        label: account.label,
-        address: key.address,
-        before: sufficient ? "sufficient" : (auth ? "insufficient" : "absent"),
-        action: "none",
-      };
-      if (!sufficient) {
+      const { rowFields, needsAction, actionArgs } = await checkFn(api, key, account, ctx);
+      const row = { label: account.label, address: key.address, ...rowFields, action: "none" };
+      if (needsAction) {
         try {
-          const tx = api.tx.TransactionStorage.authorize_account({
-            who: key.address, transactions: TOPUP_TRANSACTIONS, bytes: TOPUP_BYTES,
-          });
-          const r = await tx.signAndSubmit(authorizerSigner);
-          if (!r?.ok) throw new Error("dispatch was rejected");
-          row.action = "granted";
+          row.action = await actFn(api, key, account, ctx, actionArgs, primaryKey, primarySigner);
         } catch (e) {
           row.action = "FAILED";
           row.error = e?.message ?? String(e);
         }
       }
       results.push(row);
+      onRow?.(row);
     }
   } finally {
     client.destroy();
@@ -330,48 +320,71 @@ async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUr
   return results;
 }
 
-async function checkAndFundAssetHub({ accounts, assetHubRpc, funderUri, floorRaw, targetRaw }) {
-  const keyring = new Keyring({ type: "sr25519" });
-  const funderKey = keyring.addFromUri(funderUri);
-  const funderSigner = getPolkadotSigner(funderKey.publicKey, "Sr25519", (d) => funderKey.sign(d));
+async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri, onRow }) {
+  return runCheckAndAct({
+    accounts,
+    rpc: bulletinRpc,
+    signerUri: authorizerUri,
+    onRow,
+    prepare: async (api) => ({ currentBlock: Number(await api.query.System.Number.getValue()) }),
+    checkFn: async (api, key, _account, ctx) => {
+      const auth = await readAccountAuthorization(api, key.address);
+      const sufficient = isAuthorizationSufficient(auth, ctx.currentBlock);
+      return {
+        rowFields: { before: sufficient ? "sufficient" : (auth ? "insufficient" : "absent") },
+        needsAction: !sufficient,
+      };
+    },
+    actFn: async (api, key, _account, _ctx, _actionArgs, _primaryKey, authorizerSigner) => {
+      const tx = api.tx.TransactionStorage.authorize_account({
+        who: key.address, transactions: TOPUP_TRANSACTIONS, bytes: TOPUP_BYTES,
+      });
+      const r = await tx.signAndSubmit(authorizerSigner);
+      if (!r?.ok) throw new Error("dispatch was rejected");
+      return "granted";
+    },
+  });
+}
 
-  const client = createClient(getWsProvider(assetHubRpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
-  const api = client.getUnsafeApi();
-  const results = [];
-  try {
-    // Serial by design — a shared funder nonce would race under Promise.all
-    // (the same #1054 nonce-collision rationale as ensurePoolAccountsFundedOnAssetHub).
-    for (const account of accounts) {
-      const key = deriveSignerKeypair(keyring, account);
+async function checkAndFundAssetHub({ accounts, assetHubRpc, funderUri, floorRaw, targetRaw, onRow }) {
+  return runCheckAndAct({
+    accounts,
+    rpc: assetHubRpc,
+    signerUri: funderUri,
+    onRow,
+    checkFn: async (api, key, _account) => {
       const info = await api.query.System.Account.getValue(key.address);
       const free = BigInt(info?.data?.free ?? 0n);
       const topUp = assetHubTopUpAmount(free, floorRaw, targetRaw);
-      const row = { label: account.label, address: key.address, freeBefore: free, action: "none" };
-      if (topUp > 0n) {
-        try {
-          const funderInfo = await api.query.System.Account.getValue(funderKey.address);
-          const funderFree = BigInt(funderInfo?.data?.free ?? 0n);
-          if (funderFree < topUp) {
-            throw new Error(
-              `funder ${funderKey.address} has only ${formatPasBalance(funderFree)} PAS, needs ` +
-              `${formatPasBalance(topUp)} PAS — reporting rather than attempting a partial top-up`,
-            );
-          }
-          const tx = api.tx.Balances.transfer_allow_death({ dest: Enum("Id", key.address), value: topUp });
-          const r = await tx.signAndSubmit(funderSigner);
-          if (!r?.ok) throw new Error("dispatch was rejected");
-          row.action = `topped up +${formatPasBalance(topUp)} PAS`;
-        } catch (e) {
-          row.action = "FAILED";
-          row.error = e?.message ?? String(e);
-        }
+      return { rowFields: { freeBefore: free }, needsAction: topUp > 0n, actionArgs: { topUp } };
+    },
+    // Re-read the funder's own balance immediately before EACH transfer,
+    // rather than reading it once up front and tracking a locally
+    // decremented estimate. A local estimate only ever subtracts topUp,
+    // never the transaction fee each prior transfer actually paid — over
+    // ~17 accounts that drifts the estimate ~0.17 PAS above the true
+    // balance, which near the boundary lets this guard admit a transfer
+    // that then fails on-chain with a generic "dispatch was rejected"
+    // instead of this actionable message. A fresh read also means a
+    // funder refilled mid-run is seen immediately, same as before this
+    // pass was restructured to read once. The cost is one extra chain
+    // read per ACCOUNT ACTUALLY TOPPED UP (not per account checked), so
+    // the common idempotent no-op run pays zero extra round trips.
+    actFn: async (api, key, _account, _ctx, { topUp }, funderKey, funderSigner) => {
+      const funderInfo = await api.query.System.Account.getValue(funderKey.address);
+      const funderFree = BigInt(funderInfo?.data?.free ?? 0n);
+      if (funderFree < topUp) {
+        throw new Error(
+          `funder ${funderKey.address} has only ${formatPasBalance(funderFree)} PAS, needs ` +
+          `${formatPasBalance(topUp)} PAS — reporting rather than attempting a partial top-up`,
+        );
       }
-      results.push(row);
-    }
-  } finally {
-    client.destroy();
-  }
-  return results;
+      const tx = api.tx.Balances.transfer_allow_death({ dest: Enum("Id", key.address), value: topUp });
+      const r = await tx.signAndSubmit(funderSigner);
+      if (!r?.ok) throw new Error("dispatch was rejected");
+      return `topped up +${formatPasBalance(topUp)} PAS`;
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -401,19 +414,49 @@ async function main() {
 
   const bulletinRpc = resolved.bulletin[0];
   const assetHubRpc = resolved.assetHub[0];
+  const floorRaw = resolved.registerStorageDeposit ?? DEFAULT_FUNDING_FLOOR;
+  const targetRaw = floorRaw + DEFAULT_FUNDING_MARGIN;
 
   console.log(`\n== Bulletin storage authorization (${bulletinRpc}) ==`);
-  const authResults = await checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri });
+  console.log(`== Asset Hub balance >= funding floor (${assetHubRpc}) ==`);
+  console.log(`   floor=${formatPasBalance(floorRaw)} PAS target=${formatPasBalance(targetRaw)} PAS`);
+
+  // Per-account rows print AS EACH ONE COMPLETES (prefixed by pass, since
+  // the two passes below run concurrently and their rows can interleave on
+  // stdout) rather than only after both passes fully resolve — that is the
+  // partial progress you want on stdout if this job gets killed by a
+  // timeout partway through (see runCheckAndAct's onRow comment). The
+  // summary blocks further down still print the full results afterward.
+  const printAuthRow = (r) => {
+    const suffix = r.action !== "none" ? ` -> ${r.action}` : "";
+    console.log(`  [bulletin] [${r.before}${suffix}] ${r.label}  ${r.address}${r.error ? `  (${r.error})` : ""}`);
+  };
+  const printFundRow = (r) => {
+    console.log(`  [assethub] [${r.action}] ${r.label}  ${r.address}  free=${formatPasBalance(r.freeBefore)} PAS${r.error ? `  (${r.error})` : ""}`);
+  };
+
+  // Bulletin (signed by the env authorizer) and Asset Hub (signed by the dev
+  // phrase) are different chains with different signer keys — no shared
+  // nonce, no data dependency between the two passes — so they run
+  // concurrently instead of one after the other, roughly halving this
+  // gating job's wall clock. Writes stay sequential WITHIN each pass
+  // (unchanged, see runCheckAndAct) — only the two passes overlap.
+  // allSettled (not all): a crash in one pass must not swallow the other
+  // pass's already-computed per-account results.
+  const [authSettled, fundSettled] = await Promise.allSettled([
+    checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUri, onRow: printAuthRow }),
+    checkAndFundAssetHub({ accounts, assetHubRpc, funderUri: DEV_PHRASE, floorRaw, targetRaw, onRow: printFundRow }),
+  ]);
+  const authResults = authSettled.status === "fulfilled" ? authSettled.value : [];
+  const fundResults = fundSettled.status === "fulfilled" ? fundSettled.value : [];
+
+  console.log(`\n-- Bulletin storage authorization results --`);
   for (const r of authResults) {
     const suffix = r.action !== "none" ? ` -> ${r.action}` : "";
     console.log(`  [${r.before}${suffix}] ${r.label}  ${r.address}${r.error ? `  (${r.error})` : ""}`);
   }
 
-  const floorRaw = resolved.registerStorageDeposit ?? DEFAULT_FUNDING_FLOOR;
-  const targetRaw = floorRaw + DEFAULT_FUNDING_MARGIN;
-  console.log(`\n== Asset Hub balance >= funding floor (${assetHubRpc}) ==`);
-  console.log(`   floor=${formatPasBalance(floorRaw)} PAS target=${formatPasBalance(targetRaw)} PAS`);
-  const fundResults = await checkAndFundAssetHub({ accounts, assetHubRpc, funderUri: DEV_PHRASE, floorRaw, targetRaw });
+  console.log(`\n-- Asset Hub funding results --`);
   for (const r of fundResults) {
     console.log(`  [${r.action}] ${r.label}  ${r.address}  free=${formatPasBalance(r.freeBefore)} PAS${r.error ? `  (${r.error})` : ""}`);
   }
@@ -422,6 +465,12 @@ async function main() {
     ...authResults.filter((r) => r.action === "FAILED").map((r) => `Bulletin authorize ${r.label} (${r.address}): ${r.error}`),
     ...fundResults.filter((r) => r.action === "FAILED").map((r) => `Asset Hub fund ${r.label} (${r.address}): ${r.error}`),
   ];
+  if (authSettled.status === "rejected") {
+    failures.push(`Bulletin authorization pass crashed before completing: ${authSettled.reason?.message ?? authSettled.reason}`);
+  }
+  if (fundSettled.status === "rejected") {
+    failures.push(`Asset Hub funding pass crashed before completing: ${fundSettled.reason?.message ?? fundSettled.reason}`);
+  }
 
   if (failures.length > 0) {
     console.error(`\n${failures.length} account(s) could NOT be made E2E-ready:`);

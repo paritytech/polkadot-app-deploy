@@ -46,31 +46,27 @@ import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, prompt
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { PassThrough } from "node:stream";
 import {
-  deriveSignerAccountList, extractJobBlocks, extractDerivationPathsFromJob,
+  deriveSignerAccountList, extractDerivationPathsFromJob,
   extractPoolIndicesFromJob, extractLiteralE2eSigners, resolveMatrixField,
-  stripYamlCommentLines, assertTestnet, requireBulletinAuthorizer, DEV_PHRASE,
+  assertTestnet, requireBulletinAuthorizer, DEV_PHRASE,
 } from "../scripts/e2e-ensure-authorized.mjs";
+import { extractJobBlocks, stripYamlCommentLines, getJobBlock } from "../scripts/lib/workflow-jobs.mjs";
 import { Keyring as EnsureAuthKeyring } from "@polkadot/keyring";
 import { cryptoWaitReady as ensureAuthCryptoWaitReady } from "@polkadot/util-crypto";
 
 // ---------------------------------------------------------------------------
 // Shared workflow-YAML helper: slices out one job's block of text from a
-// GitHub Actions workflow file, keyed by its top-level job id. Treats the
-// YAML as text (regex over indentation) rather than parsing it, matching
-// this file's existing jobBlock-style helpers for workflow assertions.
-// Module-scoped so every describe that needs it (workflow safety nets,
-// nightly-report per-env status, paseo-next-v2 E2E harness wiring) shares
-// one definition instead of each re-declaring an identical copy.
+// GitHub Actions workflow file, keyed by its top-level job id. Module-scoped
+// so every describe that needs it (workflow safety nets, nightly-report
+// per-env status, paseo-next-v2 E2E harness wiring) shares one definition
+// instead of each re-declaring an identical copy. Thin wrapper over the
+// canonical parser in scripts/lib/workflow-jobs.mjs — the same one
+// scripts/e2e-ensure-authorized.mjs uses to derive its E2E signer list, so
+// there is exactly one job-header regex in this repo, not two that can
+// silently drift apart (see that module's header comment).
 // ---------------------------------------------------------------------------
 function jobBlock(text, jobName) {
-  const jobsMatch = text.match(/^jobs:\s*$/m);
-  assert.ok(jobsMatch, "workflow has no jobs: block");
-  const jobsSection = text.slice(jobsMatch.index + jobsMatch[0].length);
-  const headerRe = /^ {2}([\w-]+):\s*$/gm;
-  const matches = [...jobsSection.matchAll(headerRe)];
-  const matchIndex = matches.findIndex(m => m[1] === jobName);
-  assert.notStrictEqual(matchIndex, -1, `workflow has no ${jobName} job`);
-  return jobsSection.slice(matches[matchIndex].index, matches[matchIndex + 1]?.index ?? jobsSection.length);
+  return getJobBlock(text, jobName);
 }
 
 // ---------------------------------------------------------------------------
@@ -3652,11 +3648,11 @@ describe("DotNS initial state", () => {
   // "Payment conversion underflow" — even though 500n is a genuinely tiny
   // but payable price. bufferedWeiToNative(500n, 1_000_000n) rounds the same
   // 550n up to 1n native unit instead, so this case is now payable rather
-  // than a spurious hard failure. The underflow guard itself is unchanged
-  // and still present as defense-in-depth (see finalizeRegistration) — it is
-  // now structurally unreachable for any priceWei > 0, since weiToNative
-  // (which bufferedWeiToNative calls) always rounds a positive numerator up
-  // to at least 1.
+  // than a spurious hard failure. The underflow guard itself has since been
+  // removed from finalizeRegistration as unreachable dead code (it was
+  // structurally unreachable for any priceWei > 0, since weiToNative, which
+  // bufferedWeiToNative calls, always rounds a positive numerator up to at
+  // least 1) — the invariant is now documented inline there instead.
   test("finalizeRegistration: a tiny nonzero priceWei rounds UP to 1 native unit instead of underflowing to 0 and throwing", async () => {
     const d = new DotNS();
     d.connected = true;
@@ -5224,91 +5220,71 @@ describe("DotNS.preflight", () => {
     assert.strictEqual(topUpCalls, 0, "no top-up needed when above floor");
   });
 
-  test("feeFloorFor returns the right floor per plannedAction", async () => {
-    const { feeFloorFor } = await import("../dist/dotns.js");
-    assert.strictEqual(feeFloorFor("already-owned-by-us"), 100_000_000n);
-    // Without explicit rentPriceNative (defaults to 0n): old base floor only.
-    assert.strictEqual(feeFloorFor("register"), 1_000_000_000n + 2_000_000_000_000n); // FEE_FLOOR_REGISTER + MINIMUM_REGISTER_STORAGE_DEPOSIT
-    // With rent included (11 PAS = 110_000_000_000n at 1e8 ratio):
-    assert.strictEqual(feeFloorFor("register", 2_000_000_000_000n, 110_000_000_000n), 2_111_000_000_000n);
-    // env-specific storageDeposit override (rent still threads through)
-    assert.strictEqual(feeFloorFor("register", 300_000_000_000_000n), 1_000_000_000n + 300_000_000_000_000n);
-    assert.strictEqual(feeFloorFor("already-owned-by-us", 300_000_000_000_000n), 100_000_000n); // unaffected
-    // #893: already-owned-by-recipient must return the same owned floor as already-owned-by-us.
-    assert.strictEqual(feeFloorFor("already-owned-by-recipient"), 100_000_000n,
-      `>> FAIL: feeFloorFor already-owned-by-recipient: expected owned floor 100_000_000n`);
-    assert.strictEqual(feeFloorFor("already-owned-by-recipient", 300_000_000_000_000n), 100_000_000n,
-      `>> FAIL: feeFloorFor already-owned-by-recipient with storageDeposit: storageDeposit must not affect owned floor`);
-    // transferFee still threads through
-    assert.strictEqual(feeFloorFor("already-owned-by-recipient", 0n, 0n, 5_000_000_000n), 100_000_000n + 5_000_000_000n,
-      `>> FAIL: feeFloorFor already-owned-by-recipient with transferFee: expected owned floor + transferFee`);
-  });
+  // feeFloorFor and topUpTargetFor share the exact same branch structure
+  // (isOwnedAction: both owned actions — already-owned-by-us and
+  // already-owned-by-recipient — skip storageDeposit/rentPriceNative
+  // entirely and only add transferFeeNative; "register" adds all three on
+  // top of the function's own base constant) and were both hit by the same
+  // historical bug class (#893: already-owned-by-recipient must match
+  // already-owned-by-us, not the register floor). topUpTargetFor used to
+  // have deeper coverage than feeFloorFor (huge-value + decimals-pin cases
+  // it lacked) purely because it was written second and mirrored the first
+  // test's matrix plus extras — an asymmetry with no reason to persist.
+  // One case table, looped over both functions, so the two can't drift back
+  // apart in coverage depth.
+  describe("feeFloorFor / topUpTargetFor parameterized matrix (#893)", () => {
+    // Base constants (mirrors src/dotns.ts's own, which aren't exported —
+    // pinning the literals here is itself the decimals guard: ONE_PAS is
+    // 10_000_000_000n, 10 decimals, NOT 12 — Paseo Asset Hub PAS is
+    // 10-decimal; a careless 12-decimal port would under-report by 100x and
+    // every case below would catch it).
+    const FEE_FLOOR_OWNED = 100_000_000n;      // ONE_PAS / 100n
+    const FEE_FLOOR_REGISTER = 1_000_000_000n; // ONE_PAS / 10n
+    const TOP_UP_TARGET = 5_000_000_000n;      // ONE_PAS / 2n
+    const DEFAULT_STORAGE_DEPOSIT = 2_000_000_000_000n; // MINIMUM_REGISTER_STORAGE_DEPOSIT
 
-  // topUpTargetFor had no direct test coverage even though it computes an
-  // auto-top-up amount that spends real testnet funds (attemptTestnetTopUp),
-  // and its sibling feeFloorFor — identical shape, same isOwnedAction branch —
-  // is tested above and had a real historical bug (#893). Mirrors that test's
-  // matrix, plus the full DotnsSuccessAction union (register /
-  // already-owned-by-us / already-owned-by-recipient), zero, very large
-  // values, and pins the actual decimals this code uses: ONE_PAS =
-  // 10_000_000_000n (10 decimals — Paseo Asset Hub PAS is 10 decimals, NOT
-  // 12; a 1e12 assumption would under-report by 100x and this test would
-  // catch that against the hardcoded expected values below).
-  test("topUpTargetFor returns the right top-up target per plannedAction", async () => {
-    const { topUpTargetFor } = await import("../dist/dotns.js");
-    const TOP_UP_TARGET = 5_000_000_000n; // ONE_PAS(10_000_000_000n) / 2n — 0.5 PAS at 10 decimals
+    const CASES = [
+      { name: "already-owned-by-us: defaults", plannedAction: "already-owned-by-us" },
+      { name: "register: defaults (base + MINIMUM_REGISTER_STORAGE_DEPOSIT)", plannedAction: "register" },
+      { name: "register: storageDeposit + rentPriceNative (11 PAS at 1e8 ratio)", plannedAction: "register", storageDeposit: 2_000_000_000_000n, rentPriceNative: 110_000_000_000n },
+      { name: "register: env-specific storageDeposit override", plannedAction: "register", storageDeposit: 300_000_000_000_000n },
+      { name: "already-owned-by-us: storageDeposit must not affect owned floor", plannedAction: "already-owned-by-us", storageDeposit: 300_000_000_000_000n },
+      { name: "already-owned-by-recipient: defaults must match already-owned-by-us (#893)", plannedAction: "already-owned-by-recipient" },
+      { name: "already-owned-by-recipient: storageDeposit must not affect owned floor", plannedAction: "already-owned-by-recipient", storageDeposit: 300_000_000_000_000n },
+      { name: "already-owned-by-recipient: transferFee threads through", plannedAction: "already-owned-by-recipient", storageDeposit: 0n, rentPriceNative: 0n, transferFeeNative: 5_000_000_000n },
+      { name: "already-owned-by-us: rentPriceNative must not accrue (NoStatus-only rent applies to fresh register)", plannedAction: "already-owned-by-us", storageDeposit: 2_000_000_000_000n, rentPriceNative: 110_000_000_000n },
+      { name: "register: transferFee threads through alongside storageDeposit", plannedAction: "register", storageDeposit: 2_000_000_000_000n, transferFeeNative: 7_000_000n },
+      { name: "already-owned-by-us: transferFee threads through", plannedAction: "already-owned-by-us", storageDeposit: 0n, rentPriceNative: 0n, transferFeeNative: 7_000_000n },
+      { name: "already-owned-by-recipient: transferFee threads through (2nd value)", plannedAction: "already-owned-by-recipient", storageDeposit: 0n, rentPriceNative: 0n, transferFeeNative: 7_000_000n },
+      { name: "register: all add-ons explicitly zeroed", plannedAction: "register", storageDeposit: 0n, rentPriceNative: 0n, transferFeeNative: 0n },
+      { name: "register: huge values (bigint, no overflow/truncation to Number)", plannedAction: "register", storageDeposit: 10n ** 30n, rentPriceNative: 10n ** 25n, transferFeeNative: 0n },
+    ];
 
-    // Defaults: storageDeposit defaults to MINIMUM_REGISTER_STORAGE_DEPOSIT (2e12),
-    // rentPriceNative and transferFeeNative default to 0n.
-    assert.strictEqual(topUpTargetFor("register"), TOP_UP_TARGET + 2_000_000_000_000n,
-      ">> FAIL: topUpTargetFor register defaults: expected TOP_UP_TARGET + MINIMUM_REGISTER_STORAGE_DEPOSIT");
-    assert.strictEqual(topUpTargetFor("already-owned-by-us"), TOP_UP_TARGET,
-      ">> FAIL: topUpTargetFor already-owned-by-us defaults: owned actions must skip the register storage deposit entirely (#893)");
-    assert.strictEqual(topUpTargetFor("already-owned-by-recipient"), TOP_UP_TARGET,
-      ">> FAIL: topUpTargetFor already-owned-by-recipient defaults: must match already-owned-by-us, not the register floor (#893)");
+    function expected(base, { plannedAction, storageDeposit, rentPriceNative, transferFeeNative }) {
+      const fee = transferFeeNative ?? 0n;
+      if (plannedAction !== "register") return base.owned + fee;
+      const sd = storageDeposit ?? DEFAULT_STORAGE_DEPOSIT;
+      const rent = rentPriceNative ?? 0n;
+      return base.register + sd + rent + fee;
+    }
 
-    // storageDeposit only affects the "register" branch (env-specific override).
-    assert.strictEqual(topUpTargetFor("register", 300_000_000_000_000n), TOP_UP_TARGET + 300_000_000_000_000n,
-      ">> FAIL: topUpTargetFor register storageDeposit override: expected TOP_UP_TARGET + the overridden storageDeposit");
-    assert.strictEqual(topUpTargetFor("already-owned-by-us", 300_000_000_000_000n), TOP_UP_TARGET,
-      ">> FAIL: topUpTargetFor already-owned-by-us storageDeposit: storageDeposit must not affect the owned target");
-    assert.strictEqual(topUpTargetFor("already-owned-by-recipient", 300_000_000_000_000n), TOP_UP_TARGET,
-      ">> FAIL: topUpTargetFor already-owned-by-recipient storageDeposit: storageDeposit must not affect the owned target");
+    const FNS = [
+      { label: "feeFloorFor", base: { owned: FEE_FLOOR_OWNED, register: FEE_FLOOR_REGISTER } },
+      { label: "topUpTargetFor", base: { owned: TOP_UP_TARGET, register: TOP_UP_TARGET } },
+    ];
 
-    // rentPriceNative threads through the register branch only.
-    assert.strictEqual(topUpTargetFor("register", 2_000_000_000_000n, 110_000_000_000n), TOP_UP_TARGET + 2_000_000_000_000n + 110_000_000_000n,
-      ">> FAIL: topUpTargetFor register rentPriceNative: expected TOP_UP_TARGET + storageDeposit + rentPriceNative");
-    assert.strictEqual(topUpTargetFor("already-owned-by-us", 2_000_000_000_000n, 110_000_000_000n), TOP_UP_TARGET,
-      ">> FAIL: topUpTargetFor already-owned-by-us rentPriceNative: owned actions never accrue rent (NoStatus-only rent applies to fresh register)");
-
-    // transferFeeNative threads through every branch.
-    assert.strictEqual(topUpTargetFor("register", 2_000_000_000_000n, 0n, 7_000_000n), TOP_UP_TARGET + 2_000_000_000_000n + 7_000_000n,
-      ">> FAIL: topUpTargetFor register transferFee: expected TOP_UP_TARGET + storageDeposit + transferFee");
-    assert.strictEqual(topUpTargetFor("already-owned-by-us", 0n, 0n, 7_000_000n), TOP_UP_TARGET + 7_000_000n,
-      ">> FAIL: topUpTargetFor already-owned-by-us transferFee: expected TOP_UP_TARGET + transferFee");
-    assert.strictEqual(topUpTargetFor("already-owned-by-recipient", 0n, 0n, 7_000_000n), TOP_UP_TARGET + 7_000_000n,
-      ">> FAIL: topUpTargetFor already-owned-by-recipient transferFee: expected TOP_UP_TARGET + transferFee");
-
-    // Zero everything: register still gets the (zeroed) storageDeposit arg passed explicitly.
-    assert.strictEqual(topUpTargetFor("register", 0n, 0n, 0n), TOP_UP_TARGET,
-      ">> FAIL: topUpTargetFor register all-zero: expected bare TOP_UP_TARGET when every add-on is explicitly zeroed");
-
-    // Very large values (a pathological oracle price or storage deposit) must not
-    // overflow or silently truncate — bigint arithmetic, so this is really pinning
-    // that no accidental Number() coercion crept in anywhere on the call path.
-    const hugeStorageDeposit = 10n ** 30n;
-    const hugeRent = 10n ** 25n;
-    assert.strictEqual(
-      topUpTargetFor("register", hugeStorageDeposit, hugeRent, 0n),
-      TOP_UP_TARGET + hugeStorageDeposit + hugeRent,
-      ">> FAIL: topUpTargetFor huge values: expected exact bigint sum, no overflow/truncation to a Number");
-
-    // Decimals pin: TOP_UP_TARGET must be exactly 0.5 PAS at the 10-decimal
-    // scale this codebase actually uses (ONE_PAS = 10_000_000_000n), not the
-    // 12-decimal figure a careless port from a 12-decimal chain would assume.
-    assert.strictEqual(topUpTargetFor("already-owned-by-us"), 5_000_000_000n,
-      ">> FAIL: topUpTargetFor decimals: expected 5_000_000_000n (0.5 PAS at 10 decimals) — a 12-decimal assumption would under-report by 100x " +
-      "(Paseo Asset Hub PAS is 10 decimals, not 12)");
+    for (const fn of FNS) {
+      for (const c of CASES) {
+        test(`${fn.label}: ${c.name}`, async () => {
+          const mod = await import("../dist/dotns.js");
+          const impl = mod[fn.label];
+          const result = impl(c.plannedAction, c.storageDeposit, c.rentPriceNative, c.transferFeeNative);
+          const want = expected(fn.base, c);
+          assert.strictEqual(result, want,
+            `>> FAIL: ${fn.label} ${c.name}: expected ${want}, got ${result}`);
+        });
+      }
+    }
   });
 
   test("fmtPas formats plancks to 4 decimals", async () => {
@@ -9979,15 +9955,13 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
   describe("e2e.yml: dependency-bump discriminator (#195)", () => {
     const HEAVY_JOBS = ["select-env", "test-pr", "pr-report", "chain-call-encoding"];
 
-    test("defines a detect-deps-change job, gated to pull_request/push, exposing is_version_only + deps_changed outputs", () => {
+    test("defines a detect-deps-change job, gated to pull_request/push, exposing an is_version_only output", () => {
       const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
       const block = jobBlock(wf, "detect-deps-change");
       assert.match(block, /if:\s*github\.event_name == 'pull_request' \|\| github\.event_name == 'push'/,
         ">> FAIL: deps-discriminator: detect-deps-change must run only on pull_request/push (same restriction as detect-noop-push) — cause: missing or widened `if:` guard");
       assert.match(block, /is_version_only:\s*\$\{\{\s*steps\.classify\.outputs\.is_version_only\s*\}\}/,
         ">> FAIL: deps-discriminator: detect-deps-change must expose an is_version_only output — cause: outputs: block missing or renamed");
-      assert.match(block, /deps_changed:\s*\$\{\{\s*steps\.classify\.outputs\.deps_changed\s*\}\}/,
-        ">> FAIL: deps-discriminator: detect-deps-change must expose a deps_changed output — cause: outputs: block missing or renamed");
     });
 
     // The property the deleted paths-ignore membership used to guarantee,
@@ -10063,27 +10037,23 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       packages: { "": { name: "@parity/polkadot-app-deploy", version: "0.16.0-rc.3", dependencies: { viem: "^2.30.5" } } },
     };
 
-    test("classifier: version field only (package.json + lockfile) -> is_version_only=true, deps_changed=false", () => {
+    test("classifier: version field only (package.json + lockfile) -> is_version_only=true", () => {
       const headPkg = { ...PKG_V1, version: "0.16.0" };
       const headLock = { ...LOCK_V1, version: "0.16.0", packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0" } } };
       const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
       assert.strictEqual(out.is_version_only, "true",
         `>> FAIL: deps-classifier: a pure version bump was classified as is_version_only=${out.is_version_only} — cause: version-field stripping did not neutralize the diff`);
-      assert.strictEqual(out.deps_changed, "false",
-        `>> FAIL: deps-classifier: a pure version bump was classified as deps_changed=${out.deps_changed} — cause: deps_changed must be the negation of is_version_only`);
     });
 
-    test("classifier: dependency version bump (viem ^2.30.5 -> ^2.55.10) -> deps_changed=true", () => {
+    test("classifier: dependency version bump (viem ^2.30.5 -> ^2.55.10) -> is_version_only=false", () => {
       const headPkg = { ...PKG_V1, dependencies: { viem: "^2.55.10" } };
       const headLock = { ...LOCK_V1, packages: { "": { ...LOCK_V1.packages[""], dependencies: { viem: "^2.55.10" } } } };
       const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.deps_changed, "true",
-        `>> FAIL: deps-classifier: a viem dependency bump was classified as deps_changed=${out.deps_changed} — cause: dependency-field diff not detected, this is the exact #190 regression`);
       assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${out.is_version_only} — cause: dependency change incorrectly treated as safe-to-skip`);
+        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${out.is_version_only} — cause: dependency-field diff not detected, this is the exact #190 regression`);
     });
 
-    test("classifier: mixed version bump + dependency change in the same diff -> deps_changed=true (not safe to skip)", () => {
+    test("classifier: mixed version bump + dependency change in the same diff -> is_version_only=false (not safe to skip)", () => {
       const headPkg = { ...PKG_V1, version: "0.16.0", dependencies: { viem: "^2.55.10" } };
       const headLock = {
         ...LOCK_V1,
@@ -10091,13 +10061,11 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0", dependencies: { viem: "^2.55.10" } } },
       };
       const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.deps_changed, "true",
-        `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as deps_changed=${out.deps_changed} — cause: version-field stripping over-matched and hid the real dependency diff`);
       assert.strictEqual(out.is_version_only, "false",
         `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as is_version_only=${out.is_version_only} — cause: mixed changes must never be treated as safe-to-skip`);
     });
 
-    test("classifier: lockfile-tree-only change (no package.json diff, resolved tree changed) -> deps_changed=true", () => {
+    test("classifier: lockfile-tree-only change (no package.json diff, resolved tree changed) -> is_version_only=false", () => {
       const headLock = {
         ...LOCK_V1,
         packages: {
@@ -10106,10 +10074,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         },
       };
       const out = runClassifier({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.deps_changed, "true",
-        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as deps_changed=${out.deps_changed} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
       assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a lockfile-tree-only change was classified as is_version_only=${out.is_version_only} — cause: same as above`);
+        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as is_version_only=${out.is_version_only} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
     });
 
     test("classifier: neither file changed (ordinary source PR) -> is_version_only=false, never gates off a normal PR", () => {
@@ -22605,6 +22571,59 @@ describe("e2e-ensure-authorized: anti-hardcoding property (parser tracks content
     assert.throws(() => extractJobBlocks("name: fixture\nno-jobs-here: true\n"),
       /could not find a top-level 'jobs:' key/,
       ">> FAIL: e2e-signer-drift-guard: a file shape change that removes 'jobs:' must fail loudly, not silently parse zero jobs.");
+  });
+});
+
+// scripts/e2e-ensure-authorized.mjs (via deriveSignerAccountList) and this
+// test file's own jobBlock() helper used to carry two INDEPENDENTLY
+// hand-rolled job-header regexes that had already diverged
+// (`[A-Za-z][A-Za-z0-9_-]*` vs `[\w-]+`). Both now import the single
+// canonical parser in scripts/lib/workflow-jobs.mjs. This pins that the two
+// former call sites still agree on the real e2e.yml — i.e. that jobBlock()
+// (this file's wrapper) returns byte-identical text to extractJobBlocks()
+// (the script's parser) for every job name either side actually looks up —
+// so a future regression that reintroduces a second, differently-tuned
+// regex on either side is caught here, not by a silently-dropped account.
+describe("e2e-ensure-authorized + test.js jobBlock(): shared parser agreement", () => {
+  const REAL_JOB_NAMES = [
+    "detect-noop-push", "detect-deps-change", "select-env", "test-pr", "pr-report",
+    "chain-call-encoding", "ensure-e2e-authorized", "build-nightly", "nightly-pr-coverage",
+    "nightly-report",
+  ];
+
+  test("jobBlock() and extractJobBlocks() return byte-identical blocks for every known e2e.yml job", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const blocks = extractJobBlocks(wf);
+    for (const jobName of REAL_JOB_NAMES) {
+      assert.ok(blocks.has(jobName),
+        `>> FAIL: shared-parser-agreement: extractJobBlocks found no '${jobName}' job — cause: job renamed/removed or the shared regex stopped matching it.`);
+      assert.strictEqual(jobBlock(wf, jobName), blocks.get(jobName),
+        `>> FAIL: shared-parser-agreement: jobBlock('${jobName}') diverged from extractJobBlocks().get('${jobName}') — cause: the two call sites are no longer using the same parser.`);
+    }
+  });
+
+  // The shared regex must be the WIDER of the two former variants
+  // (`[\w-]+`, not `[A-Za-z][A-Za-z0-9_-]*`) — a job id starting with a
+  // digit or an underscore is a real possibility for a future job (e.g.
+  // "2fa-check", "_internal") and must not be silently dropped from the
+  // derived signer list the way the narrower regex would drop it. Also
+  // pins CRLF/trailing-whitespace tolerance on the job header line and on
+  // the `jobs:` locator itself (a synthetic fixture, not the real e2e.yml,
+  // is enough — this doesn't need a real workflow file).
+  test("extractJobBlocks does not drop a job id with a leading digit or leading underscore, and tolerates CRLF", () => {
+    const fixtureYml = [
+      "name: fixture",
+      "jobs:\r",
+      "  2fa-check:\r",
+      "    runs-on: ubuntu-latest",
+      "  _internal:  ",
+      "    runs-on: ubuntu-latest",
+    ].join("\n");
+    const blocks = extractJobBlocks(fixtureYml);
+    assert.ok(blocks.has("2fa-check"),
+      ">> FAIL: shared-parser-agreement: a job id starting with a digit (e.g. '2fa-check') must not be silently dropped by the header regex.");
+    assert.ok(blocks.has("_internal"),
+      ">> FAIL: shared-parser-agreement: a job id starting with an underscore (e.g. '_internal') must not be silently dropped by the header regex.");
   });
 });
 

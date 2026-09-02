@@ -29,6 +29,8 @@ import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
+import { classifyProtocolVersion, getAdapter } from "./dotns-protocol.js";
+import type { DotnsProtocolAdapter, DotnsProtocolVersion, DotnsPricingInput } from "./dotns-protocol.js";
 
 /** One step in the phone-signature plan fired at preflight. */
 export type PhoneSignatureStep = "Commitment" | "Register" | "Link content" | "Publish to registry";
@@ -96,6 +98,18 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    * transfer-aware predicate that `isPhoneSignerActive` in deploy.ts already uses.
    */
   phoneSigner?: boolean;
+  /**
+   * Optional per-environment pin for the DotNS protocol generation (e.g. from
+   * environments.json's per-env `dotnsProtocol` field). ASSERTED against the
+   * live connect()-time probe, never used to override it — connect() throws
+   * naming both values when they disagree. A pin that silently overrode the
+   * probe would recreate exactly the "addresses are identical across
+   * generations so nothing flags a drift" failure this detection exists to
+   * prevent (2026-09-01 outage). Not wired from environments.json yet — that
+   * plumbing is a follow-up; this option exists so connect() can already
+   * honour it once it is.
+   */
+  dotnsProtocol?: DotnsProtocolVersion;
 }
 export interface OwnershipResult { owned: boolean; owner: string | null; }
 
@@ -132,7 +146,19 @@ export function shouldSkipTextWrite(current: string, target: string): boolean {
   return current === target;
 }
 
-export interface PriceValidationResult { priceWei: bigint; requiredStatus: number; userStatus: number; message: string; }
+export interface PriceValidationResult {
+  priceWei: bigint;
+  requiredStatus: number;
+  userStatus: number;
+  message: string;
+  /**
+   * The PopRules.pricingVersion() this price was resolved against — set only
+   * on protocol v2 (needsPricingBeforeCommit), where the committed
+   * registration tuple must carry the SAME version this price came from.
+   * Undefined on v1, where pricing has no versioning concept.
+   */
+  pricingVersion?: bigint;
+}
 export interface ParsedDomainName {
   isSubdomain: boolean;
   label: string;
@@ -192,12 +218,16 @@ const SOURCE_BUFFER = ONE_PAS;
 // pallet-revive dry-run returns flags=1 data=0x when free balance < this amount.
 export const MINIMUM_REGISTER_STORAGE_DEPOSIT = 2_000_000_000_000n; // 200 PAS
 // The register() msg.value is the tier-resolved deposit from PopRules, NOT a
-// fixed RENT_PRICE: 0 for a verified (Lite/Full) signer, PopRules.startingPrice
-// for a NoStatus signer. It is a refundable escrow deposit, not a burned fee.
-// startingPrice is owner-updatable per env, so it is read live (see
-// gateOnFeeBalance) — an on-chain updateStartingPrice is picked up with no
-// release. The old hardcoded RENT_PRICE (dotns commit f8a0f963) no longer
-// matches the deployed DotnsRegistrarController. See issue #884.
+// fixed RENT_PRICE: 0 for a verified (Lite/Full) signer, PopRules's live
+// deposit read for a NoStatus signer. It is a refundable escrow deposit, not a
+// burned fee. The deposit read is owner-updatable per env, so it is read live
+// (see gateOnFeeBalance) — an on-chain update is picked up with no release.
+// The old hardcoded RENT_PRICE (dotns commit f8a0f963) no longer matches the
+// deployed DotnsRegistrarController. See issue #884.
+// Which view function resolves the deposit is protocol-version-dependent
+// (2026-09-01 drift): v1 calls the flat PopRules.startingPrice(); v2 removed
+// that function and calls the per-label PopRules.price(label) instead —
+// startingPrice is v1-only now. See src/dotns-protocol.ts's depositCall().
 export function registerDepositWei(userStatus: number, startingPriceWei: bigint): bigint {
   return userStatus === ProofOfPersonhoodStatus.NoStatus ? startingPriceWei : 0n;
 }
@@ -2326,6 +2356,19 @@ export class DotNS {
   private _popSelfServe: PopSelfServeConfig | null = null;
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
   private _tld: string = DEFAULT_TLD;
+  // Defaults to v1 so every existing test/library caller that constructs a
+  // DotNS instance and stubs its chain-accessing methods WITHOUT ever calling
+  // connect() keeps today's exact v1 behaviour (call order, ABI shape,
+  // deposit-gate function) — connect()'s live probe overwrites both fields
+  // once it runs. Never left unset/throwing: that would break every such
+  // caller, which is most of the existing unit suite.
+  // Production can never reach a register with an unprobed adapter: connect()
+  // always runs detectProtocolVersion(), and every register-path method calls
+  // ensureConnected() first. That is what makes a default safe here rather
+  // than the silent-fallback hazard it would otherwise be — do not "simplify"
+  // this into a throw-if-unset without re-checking both of those.
+  private _protocolVersion: DotnsProtocolVersion = "v1";
+  private _adapter: DotnsProtocolAdapter = getAdapter("v1");
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
   private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>) | undefined = undefined;
   /** Total phone-signature count for this DotNS session (drives the `total` field passed to confirmPhoneReady). */
@@ -2370,6 +2413,15 @@ export class DotNS {
    * getter instead of re-deriving their own value.
    */
   get tld(): string { return this._tld; }
+
+  /** The DotNS protocol generation detected by connect()'s live probe (readonly; for telemetry and tests). Defaults to "v1" before connect() runs — see the field's own comment. */
+  get protocolVersion(): DotnsProtocolVersion { return this._protocolVersion; }
+
+  /** Test-only: bypass connect()'s live probe and pin the adapter directly, for unit tests that stub chain calls without going through connect(). */
+  __setProtocolVersionForTest(version: DotnsProtocolVersion): void {
+    this._protocolVersion = version;
+    this._adapter = getAdapter(version);
+  }
 
   /**
    * Module-scope memoization for the tldNode() consistency check (#218 perf
@@ -2549,6 +2601,23 @@ export class DotNS {
       // rationale: see dryRunRegistryString's doc comment above). Memoization
       // of the tldNode round trip: see resolveAndVerifyTld.
       await this.resolveAndVerifyTld(options.tld);
+
+      // 2026-09-01 drift: detect the live DotNS protocol generation BEFORE
+      // any DotNS operation — never trust configured addresses (CREATE3 keeps
+      // them identical across generations, which is exactly why the address
+      // drift guardrail never caught this). See detectProtocolVersion's doc
+      // comment for the three-valued classification this relies on.
+      await this.detectProtocolVersion();
+      // Optional pin (e.g. environments.json's per-env `dotnsProtocol`):
+      // ASSERTED against the live probe, never obeyed over it. A pin that
+      // silently overrode the probe would recreate exactly the failure this
+      // detection exists to prevent.
+      if (options.dotnsProtocol && options.dotnsProtocol !== this._protocolVersion) {
+        this.connected = false;
+        throw new Error(
+          `DotNS protocol mismatch on ${this._environmentId ?? "unknown"}: environments.json pins dotnsProtocol="${options.dotnsProtocol}" but the live probe detected "${this._protocolVersion}". The pin and the chain disagree — update the pin or investigate why the chain doesn't match it.`,
+        );
+      }
 
       // Ensure the account is mapped before any dry-run that requires a mapped
       // origin. Auto-map chains may reject explicit map_account; fall back to
@@ -2901,6 +2970,71 @@ export class DotNS {
     if (rawData.length <= 2) return { ok: false };
     const value = decodeFunctionResult({ abi: DOTNS_PROTOCOL_REGISTRY_ABI, functionName, data: rawData as `0x${string}` }) as string;
     return { ok: true, value };
+  }
+
+  /**
+   * Low-level "did this view function answer" probe, used by the DotNS
+   * protocol-version detection below. Same non-throwing-on-revert posture as
+   * dryRunRegistryString and for the same reason: "the function doesn't
+   * exist on this generation" (a revert or empty data) must be
+   * distinguishable from "the RPC call itself never completed" (a THROW,
+   * which propagates here — a network blip must never be silently read as
+   * "this probe says no").
+   */
+  private async probeViewFunctionOk(contractAddress: string, abi: readonly any[], functionName: string, args: unknown[] = []): Promise<boolean> {
+    this.ensureConnected();
+    if (!this.clientWrapper) throw new Error(`DotNS protocol probe (${functionName}): polkadot-api client not available`);
+    const encodedCallData = encodeFunctionData({ abi, functionName, args });
+    const callResult = await this.clientWrapper.performDryRunCall(this.substrateAddress!, contractAddress, 0n, encodedCallData);
+    if (!callResult.result.isOk) return false;
+    const rawData: string = callResult.result.value.data ?? "0x";
+    return rawData.length > 2;
+  }
+
+  /**
+   * Detect the live DotNS protocol generation by probing POP_RULES — never by
+   * trusting configured addresses, since CREATE3 keeps them identical across
+   * generations (the exact reason the 2026-09-01 outage went unflagged by the
+   * address-drift guardrail). Dry-run read only: no transactions, no state
+   * writes. Caches nothing itself — connect() calls this once per instance
+   * and stores the result on _protocolVersion/_adapter.
+   *
+   * Three-valued by construction (classifyProtocolVersion does the actual
+   * classification): "no contract code at POP_RULES" is a config problem,
+   * not a version verdict, and reuses the SAME wording contractCall already
+   * uses for that case elsewhere in this file, for consistency. "Code
+   * present but neither probe answers" is a distinct, explicit
+   * unknown-version error naming both probes and this env id — v1 must never
+   * be a silent fallback for "everything that isn't v2".
+   */
+  private async detectProtocolVersion(): Promise<void> {
+    this.ensureConnected();
+    const popRulesAddress = this._contracts.POP_RULES;
+    const env = this._environmentId ?? "unknown";
+    const hasCodeResult = await this.clientWrapper!.hasContractCode(popRulesAddress);
+    const hasCode = hasCodeResult === true;
+    if (!hasCode) {
+      throw new Error(
+        `No contract deployed at ${popRulesAddress} (POP_RULES) env=${env} — could not detect the DotNS protocol version because no contract code was found at this address. Check environments.json / --contract config for this network.`,
+      );
+    }
+    const [pricingVersionOk, startingPriceOk] = await Promise.all([
+      this.probeViewFunctionOk(popRulesAddress, getAdapter("v2").popRulesAbi, "pricingVersion", []),
+      this.probeViewFunctionOk(popRulesAddress, getAdapter("v1").popRulesAbi, "startingPrice", []),
+    ]);
+    const classification = classifyProtocolVersion({ hasCode, pricingVersionOk, startingPriceOk });
+    if (classification.version === null) {
+      // Always name the POP_RULES address too: not every caller passes an
+      // environmentId (secondary DotNS instances connect without one and log
+      // env as "unknown"), and the address is what actually identifies which
+      // deployment failed to classify.
+      throw new Error(`${env} (POP_RULES ${popRulesAddress}): ${classification.reason}`);
+    }
+    const version = classification.version;
+    this._protocolVersion = version;
+    this._adapter = getAdapter(version);
+    setDeployAttribute("deploy.dotns.protocol_version", version);
+    console.log(`   DotNS protocol ${version} detected on ${env}`);
   }
 
   async contractCall(contractAddress: string, contractAbi: readonly any[], functionName: string, args: any[] = []): Promise<any> {
@@ -3959,13 +4093,14 @@ export class DotNS {
     console.log(`   ${label}.${this._tld} is available`);
   }
 
-  async generateCommitment(label: string, includeReverse: boolean = false): Promise<{ commitment: any; registration: any }> {
+  async generateCommitment(label: string, includeReverse: boolean = false, pricing?: DotnsPricingInput): Promise<{ commitment: any; registration: any }> {
     this.ensureConnected();
     console.log(`\n   Generating commitment hash...`);
     label = validateDomainLabel(label);
     const secret = `0x${crypto.randomBytes(32).toString("hex")}`;
-    const registration = { label, owner: this.evmAddress, secret, reserved: includeReverse };
-    const commitment = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "makeCommitment", [registration]), 30000, "Commitment generation");
+    const base = { label, owner: this.evmAddress!, secret, reserved: includeReverse };
+    const registration = this._adapter.buildRegistration(base, pricing ?? {});
+    const commitment = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "makeCommitment", [registration]), 30000, "Commitment generation");
     console.log(`   Commitment: ${commitment}`);
     return { commitment, registration };
   }
@@ -3980,11 +4115,11 @@ export class DotNS {
     // resolution here is safe and self-consistent.
     const verifyCommitted = async (): Promise<boolean> => {
       try {
-        const ts = await this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "commitments", [commitment]);
+        const ts = await this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "commitments", [commitment]);
         return ts != null && BigInt(ts as any) > 0n;
       } catch { return false; }
     };
-    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, DOTNS_REGISTRAR_CONTROLLER_ABI, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment", verifyEffect: verifyCommitted });
+    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, this._adapter.controllerAbi, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment", verifyEffect: verifyCommitted });
     logTxResolution(commitTxRes);
     console.log(`   Committed at: ${new Date().toISOString()}`);
   }
@@ -3996,9 +4131,9 @@ export class DotNS {
 
     console.log(`\n   Reading minimum commitment age...`);
     const [minimumAge, maximumAge, initialCommitTimestamp] = await Promise.all([
-      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "minCommitmentAge", []), 30000, "minCommitmentAge"),
-      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "maxCommitmentAge", []), 30000, "maxCommitmentAge"),
-      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, DOTNS_REGISTRAR_CONTROLLER_ABI, "commitments", [commitment]), 30000, "commitments"),
+      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "minCommitmentAge", []), 30000, "minCommitmentAge"),
+      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "maxCommitmentAge", []), 30000, "maxCommitmentAge"),
+      withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "commitments", [commitment]), 30000, "commitments"),
     ]);
 
     const minimumAgeSeconds = typeof minimumAge === "bigint" ? Number(minimumAge) : minimumAge;
@@ -4065,20 +4200,51 @@ export class DotNS {
           : "Requires Personhood Lite verification",
       );
     }
-    const priceMeta = await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "priceWithCheck", [label, this.evmAddress!]), 30000, "priceWithCheck");
-    const priceRaw = (priceMeta as any)?.price;
-    if (priceRaw == null) {
-      throw new Error(
-        `priceWithCheck returned unexpected shape (expected object with .price): ` +
-        JSON.stringify(priceMeta, (_, v) => typeof v === "bigint" ? v.toString() : v)
+    // v2 (needsPricingBeforeCommit): pricing is versioned and must be read
+    // via priceWithCheckAtVersion against a LIVE pricingVersion() read, so the
+    // resolved price and the version the caller commits provably come from
+    // the same read (commit() stamps pricingVersion() live at commit time;
+    // register() requires the tuple's pricingVersion to equal that stamp —
+    // reading it here, before commit, is correct; a cost-model change landing
+    // in the window between this read and commit is an inherent upstream
+    // race, not something this call can prevent).
+    // v1: unchanged — priceWithCheck via the shared, version-agnostic ABI,
+    // exactly as before this change.
+    let priceWei: bigint;
+    let pricingVersion: bigint | undefined;
+    if (this._adapter.needsPricingBeforeCommit) {
+      pricingVersion = (await withTimeout(
+        this.contractCall(this._contracts.POP_RULES, this._adapter.popRulesAbi, "pricingVersion", []),
+        30000, "pricingVersion",
+      )) as bigint;
+      const priceMeta = await withTimeout(
+        this.contractCall(this._contracts.POP_RULES, this._adapter.popRulesAbi, "priceWithCheckAtVersion", [label, this.evmAddress!, pricingVersion]),
+        30000, "priceWithCheckAtVersion",
       );
+      const priceRaw = (priceMeta as any)?.price;
+      if (priceRaw == null) {
+        throw new Error(
+          `priceWithCheckAtVersion returned unexpected shape (expected object with .price): ` +
+          JSON.stringify(priceMeta, (_, v) => typeof v === "bigint" ? v.toString() : v)
+        );
+      }
+      priceWei = typeof priceRaw === "bigint" ? priceRaw : BigInt(priceRaw);
+    } else {
+      const priceMeta = await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "priceWithCheck", [label, this.evmAddress!]), 30000, "priceWithCheck");
+      const priceRaw = (priceMeta as any)?.price;
+      if (priceRaw == null) {
+        throw new Error(
+          `priceWithCheck returned unexpected shape (expected object with .price): ` +
+          JSON.stringify(priceMeta, (_, v) => typeof v === "bigint" ? v.toString() : v)
+        );
+      }
+      priceWei = typeof priceRaw === "bigint" ? priceRaw : BigInt(priceRaw);
     }
-    const priceWei = typeof priceRaw === "bigint" ? priceRaw : BigInt(priceRaw);
     // Required status was already printed by classifyName() above; only the new
     // facts (the signer's own status + the resolved price) need printing here.
     console.log(`   User status: ${popStatusName(userStatus)}`);
     console.log(`   Price: ${formatEther(priceWei)} PAS`);
-    return { priceWei, requiredStatus, userStatus, message };
+    return { priceWei, requiredStatus, userStatus, message, pricingVersion };
   }
 
   async finalizeRegistration(registration: any, priceWei: bigint): Promise<void> {
@@ -4121,7 +4287,7 @@ export class DotNS {
         return typeof owner === "string" && owner.toLowerCase() === this.evmAddress!.toLowerCase();
       } catch { return false; }
     };
-    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, DOTNS_REGISTRAR_CONTROLLER_ABI, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register", verifyEffect: verifyRegistered });
+    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, this._adapter.controllerAbi, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register", verifyEffect: verifyRegistered });
     logTxResolution(registerTxRes);
     if (registerTxRes.kind === TX_KIND_HASH) {
       setDeployAttribute("deploy.register.tx", registerTxRes.hash);
@@ -4417,16 +4583,19 @@ export class DotNS {
     transferFeeNative = 0n,
   ): Promise<DotnsPreflightResult> {
     // Register deposit is tier-resolved and read live (issue #884): a verified
-    // (Lite/Full) signer is charged 0; a NoStatus signer pays PopRules.startingPrice,
-    // which is owner-updatable per env. Already-owned (setContenthash-only) and
-    // verified-register paths add nothing here.
+    // (Lite/Full) signer is charged 0; a NoStatus signer pays PopRules's live
+    // deposit read, which is owner-updatable per env. Already-owned
+    // (setContenthash-only) and verified-register paths add nothing here.
+    // Which view function resolves the deposit is protocol-version-dependent
+    // (v1: startingPrice(); v2: price(label) — see adapter.depositCall()).
     let rentPriceNative = 0n;
     if (candidate.plannedAction === "register" && candidate.userStatus === ProofOfPersonhoodStatus.NoStatus) {
-      const startingPriceWei = (await withTimeout(
-        this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "startingPrice", []),
-        30000, "startingPrice",
+      const deposit = this._adapter.depositCall(candidate.label);
+      const depositWei = (await withTimeout(
+        this.contractCall(this._contracts.POP_RULES, this._adapter.popRulesAbi, deposit.functionName, deposit.args),
+        30000, deposit.functionName,
       )) as bigint;
-      rentPriceNative = bufferedWeiToNative(startingPriceWei, this._nativeToEthRatio);
+      rentPriceNative = bufferedWeiToNative(depositWei, this._nativeToEthRatio);
     }
     const feeFloor = feeFloorFor(candidate.plannedAction, this._registerStorageDeposit, rentPriceNative, transferFeeNative);
     let effectiveBalance = signerFreeBalance;
@@ -4549,10 +4718,22 @@ export class DotNS {
       }
 
       const doCommitAndRegister = async (): Promise<void> => {
-        const { commitment, registration } = await this.generateCommitment(label, reverse);
+        // v2 (needsPricingBeforeCommit): maxPrice + pricingVersion are part of
+        // the COMMITTED tuple, so pricing must be resolved before
+        // makeCommitment/commit — moved ahead of the commitment here. v1:
+        // pricingEarly stays null, so the call order below is byte-for-byte
+        // identical to before this change (generate → submit → wait → price →
+        // finalize) — this is the global constraint that v1 must never change.
+        const pricingEarly = this._adapter.needsPricingBeforeCommit
+          ? await withSpan("deploy.dotns.price-validation", "2a-0. price-validation", {}, () => this.getPriceAndValidate(label))
+          : null;
+        const { commitment, registration } = await this.generateCommitment(
+          label, reverse,
+          pricingEarly ? { priceWei: pricingEarly.priceWei, pricingVersion: pricingEarly.pricingVersion } : undefined,
+        );
         await withSpan("deploy.dotns.submit-commitment", "2a-i. submit-commitment", {}, () => this.submitCommitment(commitment));
         await withSpan("deploy.dotns.wait-commitment-age", "2a-ii. wait-commitment-age", {}, () => this.waitForCommitmentAge(commitment));
-        const pricing = await withSpan("deploy.dotns.price-validation", "2a-iii. price-validation", {}, () => this.getPriceAndValidate(label));
+        const pricing = pricingEarly ?? await withSpan("deploy.dotns.price-validation", "2a-iii. price-validation", {}, () => this.getPriceAndValidate(label));
         await withSpan("deploy.dotns.finalize-registration", "2a-iv. finalize-registration", {}, () => this.finalizeRegistration(registration, pricing.priceWei));
       };
 

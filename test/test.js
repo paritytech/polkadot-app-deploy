@@ -4539,6 +4539,121 @@ describe("DotNS.register contract path", () => {
 });
 
 // ---------------------------------------------------------------------------
+// DotNS protocol-version-aware registration (2026-09-01 ABI drift fix)
+//
+// v1 (preview) and v2 (paseo-next-v2) are live at the same time on
+// mutually-incompatible ABIs — the Registration tuple went from 4 to 6
+// fields (maxPrice, pricingVersion appended) and the NoStatus deposit gate
+// moved from PopRules.startingPrice() to PopRules.price(label). These tests
+// exercise generateCommitment's real (non-stubbed) tuple-building through
+// __setProtocolVersionForTest, and gateOnFeeBalance's adapter-routed deposit
+// read — the two call sites the drift actually broke.
+// ---------------------------------------------------------------------------
+describe("DotNS protocol-version-aware registration", () => {
+  test("generateCommitment: v1 (default, no override) builds the unchanged 4-field tuple", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.evmAddress = "0xabcd000000000000000000000000000000000001";
+    d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
+    let seenAbiFnCount = null;
+    d.contractCall = async (_addr, abi, fn) => {
+      if (fn === "makeCommitment") { seenAbiFnCount = abi.length; return "0xcommitment"; }
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const { registration } = await d.generateCommitment("protov1registerlabel");
+    assert.deepStrictEqual(Object.keys(registration), ["label", "owner", "secret", "reserved"],
+      ">> FAIL: v1-tuple: v1's registration must stay the unchanged 4-field tuple");
+    assert.ok(seenAbiFnCount > 0, ">> FAIL: v1-tuple: makeCommitment must be routed through an adapter ABI");
+  });
+
+  test("generateCommitment: v2 builds the 6-field tuple with maxPrice then pricingVersion appended, buffered +10%", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.evmAddress = "0xabcd000000000000000000000000000000000001";
+    d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
+    d.__setProtocolVersionForTest("v2");
+    d.contractCall = async (_addr, _abi, fn) => {
+      if (fn === "makeCommitment") return "0xcommitment";
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const { registration } = await d.generateCommitment("protov2registerlabel", false, { priceWei: 100n, pricingVersion: 7n });
+    assert.deepStrictEqual(Object.keys(registration), ["label", "owner", "secret", "reserved", "maxPrice", "pricingVersion"],
+      ">> FAIL: v2-tuple: v2's registration must carry all 6 fields, maxPrice before pricingVersion");
+    assert.strictEqual(registration.maxPrice, 110n, ">> FAIL: v2-tuple: maxPrice must be priceWei + the same 10% buffer finalizeRegistration applies");
+    assert.strictEqual(registration.pricingVersion, 7n, ">> FAIL: v2-tuple: pricingVersion must be the value read from PopRules.pricingVersion()");
+  });
+
+  test("generateCommitment: v2 without pricing throws naming pricingVersion, before any chain call", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.evmAddress = "0xabcd000000000000000000000000000000000001";
+    d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
+    d.__setProtocolVersionForTest("v2");
+    let chainCalled = false;
+    d.contractCall = async () => { chainCalled = true; throw new Error("should not be called"); };
+    await assert.rejects(
+      () => d.generateCommitment("protov2nopricing"),
+      /pricingVersion/,
+      ">> FAIL: v2-missing-pricing: must throw naming pricingVersion when pricing is omitted on v2",
+    );
+    assert.strictEqual(chainCalled, false, ">> FAIL: v2-missing-pricing: must fail before any chain call, not after a doomed makeCommitment");
+  });
+
+  test("gateOnFeeBalance (via preflight): v1 reads startingPrice() with no args for the NoStatus deposit gate", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    const myAddr = "0xabcd000000000000000000000000000000000001";
+    d.evmAddress = myAddr;
+    d.substrateAddress = "5".padEnd(48, "x");
+    d.checkOwnership = async () => ({ owned: false, owner: null });
+    d.getUserPopStatus = async () => ProofOfPersonhoodStatus.NoStatus;
+    d.isTestnet = async () => false;
+    d.readFreeBalance = async () => 10_000_000_000_000n; // 1000 PAS — well above any floor
+    d.attemptTestnetTopUp = async () => null;
+    d._nativeToEthRatio = 100_000_000n;
+    let calledFn = null;
+    let calledArgs = null;
+    d.contractCall = async (_contract, _abi, fn, args) => {
+      if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
+      if (fn === "startingPrice") { calledFn = fn; calledArgs = args; return 10n * 10n ** 18n; }
+      if (fn === "price") throw new Error("v1 must not call price(label) — that is v2-only");
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const r = await d.preflight("v1depositgatelabel");
+    assert.strictEqual(r.canProceed, true, `>> FAIL: v1-deposit-gate: expected canProceed=true; reason=${r.reason}`);
+    assert.strictEqual(calledFn, "startingPrice", ">> FAIL: v1-deposit-gate: v1 must call startingPrice for the NoStatus deposit gate");
+    assert.deepStrictEqual(calledArgs, [], ">> FAIL: v1-deposit-gate: startingPrice takes no args");
+  });
+
+  test("gateOnFeeBalance (via preflight): v2 reads price(label) and REJECTS startingPrice for the NoStatus deposit gate", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    const myAddr = "0xabcd000000000000000000000000000000000001";
+    d.evmAddress = myAddr;
+    d.substrateAddress = "5".padEnd(48, "x");
+    d.__setProtocolVersionForTest("v2");
+    d.checkOwnership = async () => ({ owned: false, owner: null });
+    d.getUserPopStatus = async () => ProofOfPersonhoodStatus.NoStatus;
+    d.isTestnet = async () => false;
+    d.readFreeBalance = async () => 10_000_000_000_000n;
+    d.attemptTestnetTopUp = async () => null;
+    d._nativeToEthRatio = 100_000_000n;
+    let calledFn = null;
+    let calledArgs = null;
+    d.contractCall = async (_contract, _abi, fn, args) => {
+      if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
+      if (fn === "startingPrice") throw new Error("v2 must not call startingPrice() — it was removed upstream and this stub rejects it");
+      if (fn === "price") { calledFn = fn; calledArgs = args; return 10n * 10n ** 18n; }
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const r = await d.preflight("v2depositgatelabel");
+    assert.strictEqual(r.canProceed, true, `>> FAIL: v2-deposit-gate: expected canProceed=true; reason=${r.reason}`);
+    assert.strictEqual(calledFn, "price", ">> FAIL: v2-deposit-gate: v2 must call price(label), not startingPrice");
+    assert.deepStrictEqual(calledArgs, ["v2depositgatelabel"], ">> FAIL: v2-deposit-gate: price must be called with the label");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // waitForCommitmentAge expiry guard
 // ---------------------------------------------------------------------------
 describe("waitForCommitmentAge expiry guard", () => {

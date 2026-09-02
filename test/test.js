@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 // Personhood bootstrap imports (loaded after build)
 import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow } from "../dist/dotns.js";
+import { getAdapter } from "../dist/dotns-protocol.js";
 import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
 import { probeBootstrapState, nextBootstrapAction, runBootstrap } from "../dist/personhood/bootstrap.js";
@@ -41,7 +42,7 @@ import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
-import { encodeErrorResult } from "viem";
+import { encodeErrorResult, encodeFunctionData } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { PassThrough } from "node:stream";
@@ -4536,6 +4537,168 @@ describe("DotNS.register contract path", () => {
     assert.ok(caught instanceof NonRetryableError,
       `>> FAIL: register-guard-hyphen-uniformity: hyphen-base must throw NonRetryableError just like the other two rules (no more plain-Error carve-out); got ${caught?.constructor?.name}: ${caught?.message}`);
   });
+});
+
+// ---------------------------------------------------------------------------
+// DotNS protocol-version-aware registration (2026-09-01 ABI drift fix)
+//
+// v1 (preview) and v2 (paseo-next-v2) are live at the same time on
+// mutually-incompatible ABIs — the Registration tuple went from 4 to 6
+// fields (maxPrice, pricingVersion appended) and the NoStatus deposit gate
+// moved from PopRules.startingPrice() to PopRules.price(label). These tests
+// exercise generateCommitment's real (non-stubbed) tuple-building through
+// __setProtocolVersionForTest, and gateOnFeeBalance's adapter-routed deposit
+// read — the two call sites the drift actually broke.
+// ---------------------------------------------------------------------------
+describe("DotNS protocol-version-aware registration", () => {
+  test("generateCommitment: v1 (default, no override) builds the unchanged 4-field tuple", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.evmAddress = "0xabcd000000000000000000000000000000000001";
+    d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
+    let seenAbiFnCount = null;
+    d.contractCall = async (_addr, abi, fn) => {
+      if (fn === "makeCommitment") { seenAbiFnCount = abi.length; return "0xcommitment"; }
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const { registration } = await d.generateCommitment("protov1registerlabel");
+    assert.deepStrictEqual(Object.keys(registration), ["label", "owner", "secret", "reserved"],
+      ">> FAIL: v1-tuple: v1's registration must stay the unchanged 4-field tuple");
+    assert.ok(seenAbiFnCount > 0, ">> FAIL: v1-tuple: makeCommitment must be routed through an adapter ABI");
+  });
+
+  test("generateCommitment: v2 builds the 6-field tuple with maxPrice then pricingVersion appended, buffered +10%", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.evmAddress = "0xabcd000000000000000000000000000000000001";
+    d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
+    d.__setProtocolVersionForTest("v2");
+    d.contractCall = async (_addr, _abi, fn) => {
+      if (fn === "makeCommitment") return "0xcommitment";
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const { registration } = await d.generateCommitment("protov2registerlabel", false, { priceWei: 100n, pricingVersion: 7n });
+    assert.deepStrictEqual(Object.keys(registration), ["label", "owner", "secret", "reserved", "maxPrice", "pricingVersion"],
+      ">> FAIL: v2-tuple: v2's registration must carry all 6 fields, maxPrice before pricingVersion");
+    assert.strictEqual(registration.maxPrice, 110n, ">> FAIL: v2-tuple: maxPrice must be priceWei + the same 10% buffer finalizeRegistration applies");
+    assert.strictEqual(registration.pricingVersion, 7n, ">> FAIL: v2-tuple: pricingVersion must be the value read from PopRules.pricingVersion()");
+  });
+
+  test("generateCommitment: v2 without pricing throws naming pricingVersion, before any chain call", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.evmAddress = "0xabcd000000000000000000000000000000000001";
+    d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
+    d.__setProtocolVersionForTest("v2");
+    let chainCalled = false;
+    d.contractCall = async () => { chainCalled = true; throw new Error("should not be called"); };
+    await assert.rejects(
+      () => d.generateCommitment("protov2nopricing"),
+      /pricingVersion/,
+      ">> FAIL: v2-missing-pricing: must throw naming pricingVersion when pricing is omitted on v2",
+    );
+    assert.strictEqual(chainCalled, false, ">> FAIL: v2-missing-pricing: must fail before any chain call, not after a doomed makeCommitment");
+  });
+
+  test("gateOnFeeBalance (via preflight): v1 reads startingPrice() with no args for the NoStatus deposit gate", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    const myAddr = "0xabcd000000000000000000000000000000000001";
+    d.evmAddress = myAddr;
+    d.substrateAddress = "5".padEnd(48, "x");
+    d.checkOwnership = async () => ({ owned: false, owner: null });
+    d.getUserPopStatus = async () => ProofOfPersonhoodStatus.NoStatus;
+    d.isTestnet = async () => false;
+    d.readFreeBalance = async () => 10_000_000_000_000n; // 1000 PAS — well above any floor
+    d.attemptTestnetTopUp = async () => null;
+    d._nativeToEthRatio = 100_000_000n;
+    let calledFn = null;
+    let calledArgs = null;
+    d.contractCall = async (_contract, _abi, fn, args) => {
+      if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
+      if (fn === "startingPrice") { calledFn = fn; calledArgs = args; return 10n * 10n ** 18n; }
+      if (fn === "price") throw new Error("v1 must not call price(label) — that is v2-only");
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const r = await d.preflight("v1depositgatelabel");
+    assert.strictEqual(r.canProceed, true, `>> FAIL: v1-deposit-gate: expected canProceed=true; reason=${r.reason}`);
+    assert.strictEqual(calledFn, "startingPrice", ">> FAIL: v1-deposit-gate: v1 must call startingPrice for the NoStatus deposit gate");
+    assert.deepStrictEqual(calledArgs, [], ">> FAIL: v1-deposit-gate: startingPrice takes no args");
+  });
+
+  test("gateOnFeeBalance (via preflight): v2 reads price(label) and REJECTS startingPrice for the NoStatus deposit gate", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    const myAddr = "0xabcd000000000000000000000000000000000001";
+    d.evmAddress = myAddr;
+    d.substrateAddress = "5".padEnd(48, "x");
+    d.__setProtocolVersionForTest("v2");
+    d.checkOwnership = async () => ({ owned: false, owner: null });
+    d.getUserPopStatus = async () => ProofOfPersonhoodStatus.NoStatus;
+    d.isTestnet = async () => false;
+    d.readFreeBalance = async () => 10_000_000_000_000n;
+    d.attemptTestnetTopUp = async () => null;
+    d._nativeToEthRatio = 100_000_000n;
+    let calledFn = null;
+    let calledArgs = null;
+    d.contractCall = async (_contract, _abi, fn, args) => {
+      if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
+      if (fn === "startingPrice") throw new Error("v2 must not call startingPrice() — it was removed upstream and this stub rejects it");
+      if (fn === "price") { calledFn = fn; calledArgs = args; return 10n * 10n ** 18n; }
+      throw new Error(`unexpected contractCall in stub: ${fn}`);
+    };
+    const r = await d.preflight("v2depositgatelabel");
+    assert.strictEqual(r.canProceed, true, `>> FAIL: v2-deposit-gate: expected canProceed=true; reason=${r.reason}`);
+    assert.strictEqual(calledFn, "price", ">> FAIL: v2-deposit-gate: v2 must call price(label), not startingPrice");
+    assert.deepStrictEqual(calledArgs, ["v2depositgatelabel"], ">> FAIL: v2-deposit-gate: price must be called with the label");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectProtocolVersion: hasContractCode's result must reach
+// classifyProtocolVersion UNFLATTENED. All three-valued (true/false/null)
+// handling now lives in the pure classifier (test/dotns-protocol.test.js) —
+// see that file for full coverage (bug background: paritytech/bulletin-deploy
+// #1349, and the design decision to move the null-handling into the
+// classifier rather than check it at this call site). This one thin test
+// stays here as a pass-through guard: if a future refactor re-flattens
+// hasCodeResult before calling classifyProtocolVersion (e.g. back to
+// `hasCode: true` or `=== true`), this is what would catch it — the pure
+// classifier tests can't, since they call classifyProtocolVersion directly
+// and never touch detectProtocolVersion's plumbing.
+// ---------------------------------------------------------------------------
+test("detectProtocolVersion passes hasContractCode's result through to classifyProtocolVersion unflattened (null stays null)", async () => {
+  const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
+  const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v2").popRulesAbi, functionName: "pricingVersion", args: [] });
+  const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("v1").popRulesAbi, functionName: "startingPrice", args: [] });
+  const PROBE_REVERTS = { result: { isOk: false, value: { data: "0x" } } };
+
+  const d = new DotNS();
+  d.connected = true;
+  d.substrateAddress = "5Signer";
+  d._environmentId = "paseo-next-v2";
+  d["_contracts"] = { ...d["_contracts"], POP_RULES: POP_RULES_ADDR };
+  d.clientWrapper = {
+    hasContractCode: async () => null, // unverified, not "no code" — see hasContractCode's own doc comment
+    performDryRunCall: async (_signer, _addr, _value, encodedData) => {
+      if (encodedData === PRICING_VERSION_CALLDATA || encodedData === STARTING_PRICE_CALLDATA) return PROBE_REVERTS;
+      throw new Error(`unexpected encodedData in protocol-detect stub: ${encodedData}`);
+    },
+  };
+
+  // Neither probe answers, so the only way this message can carry the
+  // "could not be verified" note is if classifyProtocolVersion actually
+  // received hasCode: null. If detectProtocolVersion flattened it to
+  // `false`, this would throw the "No contract deployed" config error
+  // instead; if flattened to `true`, the note would be missing.
+  await assert.rejects(
+    () => d["detectProtocolVersion"](),
+    (err) => {
+      assert.doesNotMatch(err.message, /No contract deployed/, ">> FAIL: detect-passthrough: null must not be flattened to false (would wrongly throw the config error)");
+      assert.match(err.message, /could not be verified/i, ">> FAIL: detect-passthrough: null must reach the classifier unflattened (note is only present for hasCode:null, not hasCode:true)");
+      return true;
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

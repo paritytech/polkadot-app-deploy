@@ -3013,8 +3013,13 @@ export class DotNS {
     this.ensureConnected();
     const popRulesAddress = this._contracts.POP_RULES;
     const env = this._environmentId ?? "unknown";
-    const hasCodeResult = await this.clientWrapper!.hasContractCode(popRulesAddress);
-    const [pricingVersionOk, startingPriceOk] = await Promise.all([
+    // All three reads go in one Promise.all: there is no data dependency
+    // between them, because "no code" is only ever concluded from
+    // hasCodeResult === false (in the classifier) and never from a silent
+    // probe. Awaiting the code-presence read first would cost connect() an
+    // extra RTT layer on every deploy for nothing.
+    const [hasCodeResult, pricingVersionOk, startingPriceOk] = await Promise.all([
+      this.clientWrapper!.hasContractCode(popRulesAddress),
       this.probeViewFunctionOk(popRulesAddress, getAdapter("v2").popRulesAbi, "pricingVersion", []),
       this.probeViewFunctionOk(popRulesAddress, getAdapter("v1").popRulesAbi, "startingPrice", []),
     ]);

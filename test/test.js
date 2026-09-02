@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 // Personhood bootstrap imports (loaded after build)
 import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow } from "../dist/dotns.js";
+import { getAdapter } from "../dist/dotns-protocol.js";
 import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
 import { probeBootstrapState, nextBootstrapAction, runBootstrap } from "../dist/personhood/bootstrap.js";
@@ -41,7 +42,7 @@ import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
-import { encodeErrorResult } from "viem";
+import { encodeErrorResult, encodeFunctionData } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { PassThrough } from "node:stream";
@@ -4650,6 +4651,86 @@ describe("DotNS protocol-version-aware registration", () => {
     assert.strictEqual(r.canProceed, true, `>> FAIL: v2-deposit-gate: expected canProceed=true; reason=${r.reason}`);
     assert.strictEqual(calledFn, "price", ">> FAIL: v2-deposit-gate: v2 must call price(label), not startingPrice");
     assert.deepStrictEqual(calledArgs, ["v2depositgatelabel"], ">> FAIL: v2-deposit-gate: price must be called with the label");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectProtocolVersion: hasContractCode's three-valued null must not
+// collapse into "no contract" (bug found in the same code shape upstream
+// carries in bulletin-deploy PR #1338; fixed here first, flagged back as
+// paritytech/bulletin-deploy#1349).
+//
+// hasContractCode returns true / false / null -- null means the runtime
+// doesn't expose Revive.AccountInfoOf OR the query itself threw (see its own
+// doc comment: "caller must not treat null as 'no code'"). Collapsing null
+// into false (as detectProtocolVersion originally did, `=== true` then
+// `!hasCode`) means a single transient RPC blip on that one storage read
+// aborts EVERY connect() -- v1 and v2 alike -- with a confidently wrong "No
+// contract deployed" verdict. These tests drive the real (private, but
+// callable from plain JS at runtime -- TS `private` is compile-time only)
+// detectProtocolVersion method directly, with a stubbed clientWrapper, to
+// pin the fix: only hasContractCode===false is a config verdict; null falls
+// through to the live probes, and a probe answering is itself positive proof
+// the contract exists.
+// ---------------------------------------------------------------------------
+describe("detectProtocolVersion: hasContractCode null must not collapse into no-contract", () => {
+  const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
+  const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v2").popRulesAbi, functionName: "pricingVersion", args: [] });
+  const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("v1").popRulesAbi, functionName: "startingPrice", args: [] });
+  const PROBE_OK = { result: { isOk: true, value: { data: "0x" + "00".repeat(31) + "01" } } };
+  const PROBE_REVERTS = { result: { isOk: false, value: { data: "0x" } } };
+
+  function makeDotnsForProtocolDetect({ hasContractCode, pricingVersionOk, startingPriceOk }) {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d._environmentId = "paseo-next-v2";
+    d["_contracts"] = { ...d["_contracts"], POP_RULES: POP_RULES_ADDR };
+    d.clientWrapper = {
+      hasContractCode: async () => hasContractCode,
+      performDryRunCall: async (_signer, _addr, _value, encodedData) => {
+        if (encodedData === PRICING_VERSION_CALLDATA) return pricingVersionOk ? PROBE_OK : PROBE_REVERTS;
+        if (encodedData === STARTING_PRICE_CALLDATA) return startingPriceOk ? PROBE_OK : PROBE_REVERTS;
+        throw new Error(`unexpected encodedData in protocol-detect stub: ${encodedData}`);
+      },
+    };
+    return d;
+  }
+
+  test("hasContractCode -> null, pricingVersion() answers => detects v2, does NOT throw", async () => {
+    const d = makeDotnsForProtocolDetect({ hasContractCode: null, pricingVersionOk: true, startingPriceOk: false });
+    await d["detectProtocolVersion"]();
+    assert.strictEqual(d.protocolVersion, "v2",
+      ">> FAIL: hascode-null-v2: a null hasContractCode (unverified, not 'no code') must not block a positively-answering pricingVersion() probe from detecting v2");
+  });
+
+  test("hasContractCode -> null, startingPrice() answers => detects v1, does NOT throw", async () => {
+    const d = makeDotnsForProtocolDetect({ hasContractCode: null, pricingVersionOk: false, startingPriceOk: true });
+    await d["detectProtocolVersion"]();
+    assert.strictEqual(d.protocolVersion, "v1",
+      ">> FAIL: hascode-null-v1: a null hasContractCode (unverified, not 'no code') must not block a positively-answering startingPrice() probe from detecting v1");
+  });
+
+  test("hasContractCode -> null, neither probe answers => throws naming both probes AND the unverified code-presence", async () => {
+    const d = makeDotnsForProtocolDetect({ hasContractCode: null, pricingVersionOk: false, startingPriceOk: false });
+    await assert.rejects(
+      () => d["detectProtocolVersion"](),
+      (err) => {
+        assert.match(err.message, /pricingVersion/, ">> FAIL: hascode-null-unknown: message must name pricingVersion");
+        assert.match(err.message, /startingPrice/, ">> FAIL: hascode-null-unknown: message must name startingPrice");
+        assert.match(err.message, /could not be verified|code presence/i, ">> FAIL: hascode-null-unknown: message must note that code presence itself is unverified (hasContractCode was null, not false)");
+        return true;
+      },
+    );
+  });
+
+  test("hasContractCode -> false => still throws the 'No contract deployed' config error (regression guard)", async () => {
+    const d = makeDotnsForProtocolDetect({ hasContractCode: false, pricingVersionOk: false, startingPriceOk: false });
+    await assert.rejects(
+      () => d["detectProtocolVersion"](),
+      /No contract deployed at .*POP_RULES/,
+      ">> FAIL: hascode-false-regression: hasContractCode===false must still be treated as a genuine config verdict, not diluted by the null-handling fix",
+    );
   });
 });
 

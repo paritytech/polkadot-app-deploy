@@ -1,11 +1,14 @@
 // DotNS protocol-version abstraction.
 //
-// polkadot-app-deploy talks to two DotNS deployment generations that are live
-// at the same time (2026-09-01 drift — paseo-next-v2 redeployed its DotNS
-// contracts at identical CREATE3 addresses with a changed ABI while preview
-// still runs the old bytecode):
+// Two DotNS deployment generations are live at the same time (2026-09-01
+// drift — paseo-next-v2 redeployed its DotNS contracts at identical CREATE3
+// addresses with a changed ABI, while other deployments still run the old
+// bytecode). Of the environments configured here, paseo-next-v2 is v2 and
+// devnet is not E2E-eligible, so v1 has no CI coverage in this repo — which
+// is exactly why the v1 path below must stay behaviour-identical to what
+// shipped before this change rather than being "cleaned up" alongside v2.
 //
-//   v1 (`preview`):
+//   v1 (the pre-drift generation):
 //     - Registration tuple: (label, owner, secret, reserved) — 4 fields.
 //     - NoStatus deposit gate reads PopRules.startingPrice() (flat, no args).
 //     - PopRules.pricingVersion() does not exist (reverts).

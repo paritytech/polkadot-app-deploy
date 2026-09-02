@@ -2999,63 +2999,34 @@ export class DotNS {
    * writes. Caches nothing itself — connect() calls this once per instance
    * and stores the result on _protocolVersion/_adapter.
    *
-   * Three-valued by construction (classifyProtocolVersion does the actual
-   * classification): "no contract code at POP_RULES" is a config problem,
-   * not a version verdict, and reuses the SAME wording contractCall already
-   * uses for that case elsewhere in this file, for consistency. "Code
-   * present but neither probe answers" is a distinct, explicit
-   * unknown-version error naming both probes and this env id — v1 must never
-   * be a silent fallback for "everything that isn't v2".
-   *
-   * hasContractCode itself is ALSO three-valued (true/false/null — see its
-   * own doc comment: null means the runtime doesn't expose the storage map,
-   * OR the query itself threw; "caller must not treat null as 'no code'").
-   * Diverges from bulletin-deploy #1338 on purpose here — see
-   * paritytech/bulletin-deploy#1349 (a real bug found during the p-a-d
-   * port, flagged back to bulletin-deploy): upstream collapsed
-   * `hasCodeResult === true` into a boolean and threw "No contract deployed"
-   * on BOTH false and null, so a single transient RPC blip on this one
-   * storage read aborted connect() on EVERY deploy — v1 and v2 alike — with
-   * a confidently wrong verdict. Only `hasCodeResult === false` is an actual
-   * configuration verdict; `null` just means code presence is unverified, so
-   * this falls through to the two live probes instead — a probe that
-   * answers is itself positive proof the contract is there, so a transient
-   * hasContractCode blip becomes a non-event and classification still can
-   * never be wrong (it always requires a positive probe answer either way).
+   * All classification — including the three-valued handling of
+   * hasContractCode's own true/false/null result (see its doc comment: null
+   * means the runtime doesn't expose the storage map, or the query itself
+   * threw, and callers must not treat it as "no code") — lives in
+   * classifyProtocolVersion. This method's only job is to gather the three
+   * live inputs and pass them through unflattened; see that function's doc
+   * comment for the full reasoning, including paritytech/bulletin-deploy#1349
+   * (the bug that motivated moving the null-handling here rather than
+   * checking hasCodeResult at this call site).
    */
   private async detectProtocolVersion(): Promise<void> {
     this.ensureConnected();
     const popRulesAddress = this._contracts.POP_RULES;
     const env = this._environmentId ?? "unknown";
     const hasCodeResult = await this.clientWrapper!.hasContractCode(popRulesAddress);
-    if (hasCodeResult === false) {
-      throw new Error(
-        `No contract deployed at ${popRulesAddress} (POP_RULES) env=${env} — could not detect the DotNS protocol version because no contract code was found at this address. Check environments.json / --contract config for this network.`,
-      );
-    }
     const [pricingVersionOk, startingPriceOk] = await Promise.all([
       this.probeViewFunctionOk(popRulesAddress, getAdapter("v2").popRulesAbi, "pricingVersion", []),
       this.probeViewFunctionOk(popRulesAddress, getAdapter("v1").popRulesAbi, "startingPrice", []),
     ]);
-    // hasCodeResult is narrowed to `true | null` here (the `false` case
-    // already threw above); either way a positive probe answer is valid
-    // evidence of a version, so classifyProtocolVersion sees hasCode:true in
-    // both cases — TS can prove `!== false` always holds post-narrowing, so
-    // it's spelled as a literal rather than a tautological comparison.
-    const classification = classifyProtocolVersion({ hasCode: true, pricingVersionOk, startingPriceOk });
+    const classification = classifyProtocolVersion({ hasCode: hasCodeResult, pricingVersionOk, startingPriceOk });
     if (classification.version === null) {
-      // Always name the POP_RULES address too: not every caller passes an
-      // environmentId (secondary DotNS instances connect without one and log
-      // env as "unknown"), and the address is what actually identifies which
-      // deployment failed to classify.
-      // When hasContractCode itself came back null (unverified, not a
-      // confirmed "no code"), say so — a wrong/undeployed POP_RULES address
-      // is also a possible explanation for two silent probes, not just a
-      // genuinely unrecognised protocol generation.
-      const codePresenceNote = hasCodeResult === null
-        ? " Code presence at this address could not be verified either (the runtime code-presence query failed), so a wrong/undeployed POP_RULES address is also possible."
-        : "";
-      throw new Error(`${env} (POP_RULES ${popRulesAddress}): ${classification.reason}${codePresenceNote}`);
+      // Always name env + the POP_RULES address here: not every caller passes
+      // an environmentId (secondary DotNS instances connect without one and
+      // log env as "unknown"), and the address is what actually identifies
+      // which deployment failed to classify. The reason text itself —
+      // including which case it is and any code-presence caveat — comes
+      // entirely from classifyProtocolVersion.
+      throw new Error(`${env} (POP_RULES ${popRulesAddress}): ${classification.reason}`);
     }
     const version = classification.version;
     this._protocolVersion = version;

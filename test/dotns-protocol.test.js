@@ -19,7 +19,18 @@ test("classifyProtocolVersion: startingPrice present => v1", () => {
 test("classifyProtocolVersion: no contract code is NOT a version verdict", () => {
   const r = classifyProtocolVersion({ hasCode: false, pricingVersionOk: false, startingPriceOk: false });
   assert.equal(r.version, null);
-  assert.match(r.reason, /no contract code/i);
+  assert.match(r.reason, /no contract (code|deployed)/i);
+  assert.match(r.reason, /Check environments\.json \/ --contract config for this network/, "config-error guidance must survive the move from the call site");
+});
+
+test("classifyProtocolVersion: hasCode===false wins even if a probe happens to answer", () => {
+  // hasCode===false is a definitive config verdict — checked before the
+  // probes, so it can never be overridden by a probe answering (which
+  // shouldn't happen for a genuinely code-less address, but the check order
+  // must not depend on that).
+  const r = classifyProtocolVersion({ hasCode: false, pricingVersionOk: true, startingPriceOk: false });
+  assert.equal(r.version, null);
+  assert.match(r.reason, /no contract (code|deployed)/i);
 });
 
 test("classifyProtocolVersion: code present but neither probe answers => unknown, names both probes", () => {
@@ -27,6 +38,7 @@ test("classifyProtocolVersion: code present but neither probe answers => unknown
   assert.equal(r.version, null);
   assert.match(r.reason, /pricingVersion/);
   assert.match(r.reason, /startingPrice/);
+  assert.doesNotMatch(r.reason, /could not be verified/i, "hasCode:true must NOT carry the unverified-code-presence note");
 });
 
 test("classifyProtocolVersion: both probes answering prefers v2", () => {
@@ -34,6 +46,37 @@ test("classifyProtocolVersion: both probes answering prefers v2", () => {
     classifyProtocolVersion({ hasCode: true, pricingVersionOk: true, startingPriceOk: true }).version,
     "v2",
   );
+});
+
+// ---------------------------------------------------------------------------
+// hasCode: null (code presence unverified — see DotnsProtocolProbe.hasCode's
+// doc comment: null must never be read as "no code"). Moved here from
+// test/test.js's heavier stub-based detectProtocolVersion tests now that the
+// null-handling lives in this pure classifier rather than at the dotns.ts
+// call site (paritytech/bulletin-deploy#1349's fix, relocated per design
+// decision: the call site should just pass hasCodeResult through).
+// ---------------------------------------------------------------------------
+
+test("classifyProtocolVersion: hasCode null, pricingVersion answers => v2 (a probe answering is itself proof of the contract)", () => {
+  assert.equal(
+    classifyProtocolVersion({ hasCode: null, pricingVersionOk: true, startingPriceOk: false }).version,
+    "v2",
+  );
+});
+
+test("classifyProtocolVersion: hasCode null, startingPrice answers => v1", () => {
+  assert.equal(
+    classifyProtocolVersion({ hasCode: null, pricingVersionOk: false, startingPriceOk: true }).version,
+    "v1",
+  );
+});
+
+test("classifyProtocolVersion: hasCode null, neither probe answers => unknown, names both probes AND notes code presence was unverified", () => {
+  const r = classifyProtocolVersion({ hasCode: null, pricingVersionOk: false, startingPriceOk: false });
+  assert.equal(r.version, null);
+  assert.match(r.reason, /pricingVersion/);
+  assert.match(r.reason, /startingPrice/);
+  assert.match(r.reason, /could not be verified/i, "hasCode:null must carry the unverified-code-presence note — a wrong/undeployed address is also possible, not just a genuinely unrecognised generation");
 });
 
 test("v1 buildRegistration keeps the 4-field tuple", () => {

@@ -4655,83 +4655,50 @@ describe("DotNS protocol-version-aware registration", () => {
 });
 
 // ---------------------------------------------------------------------------
-// detectProtocolVersion: hasContractCode's three-valued null must not
-// collapse into "no contract" (bug found in the same code shape upstream
-// carries in bulletin-deploy PR #1338; fixed here first, flagged back as
-// paritytech/bulletin-deploy#1349).
-//
-// hasContractCode returns true / false / null -- null means the runtime
-// doesn't expose Revive.AccountInfoOf OR the query itself threw (see its own
-// doc comment: "caller must not treat null as 'no code'"). Collapsing null
-// into false (as detectProtocolVersion originally did, `=== true` then
-// `!hasCode`) means a single transient RPC blip on that one storage read
-// aborts EVERY connect() -- v1 and v2 alike -- with a confidently wrong "No
-// contract deployed" verdict. These tests drive the real (private, but
-// callable from plain JS at runtime -- TS `private` is compile-time only)
-// detectProtocolVersion method directly, with a stubbed clientWrapper, to
-// pin the fix: only hasContractCode===false is a config verdict; null falls
-// through to the live probes, and a probe answering is itself positive proof
-// the contract exists.
+// detectProtocolVersion: hasContractCode's result must reach
+// classifyProtocolVersion UNFLATTENED. All three-valued (true/false/null)
+// handling now lives in the pure classifier (test/dotns-protocol.test.js) —
+// see that file for full coverage (bug background: paritytech/bulletin-deploy
+// #1349, and the design decision to move the null-handling into the
+// classifier rather than check it at this call site). This one thin test
+// stays here as a pass-through guard: if a future refactor re-flattens
+// hasCodeResult before calling classifyProtocolVersion (e.g. back to
+// `hasCode: true` or `=== true`), this is what would catch it — the pure
+// classifier tests can't, since they call classifyProtocolVersion directly
+// and never touch detectProtocolVersion's plumbing.
 // ---------------------------------------------------------------------------
-describe("detectProtocolVersion: hasContractCode null must not collapse into no-contract", () => {
+test("detectProtocolVersion passes hasContractCode's result through to classifyProtocolVersion unflattened (null stays null)", async () => {
   const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
   const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v2").popRulesAbi, functionName: "pricingVersion", args: [] });
   const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("v1").popRulesAbi, functionName: "startingPrice", args: [] });
-  const PROBE_OK = { result: { isOk: true, value: { data: "0x" + "00".repeat(31) + "01" } } };
   const PROBE_REVERTS = { result: { isOk: false, value: { data: "0x" } } };
 
-  function makeDotnsForProtocolDetect({ hasContractCode, pricingVersionOk, startingPriceOk }) {
-    const d = new DotNS();
-    d.connected = true;
-    d.substrateAddress = "5Signer";
-    d._environmentId = "paseo-next-v2";
-    d["_contracts"] = { ...d["_contracts"], POP_RULES: POP_RULES_ADDR };
-    d.clientWrapper = {
-      hasContractCode: async () => hasContractCode,
-      performDryRunCall: async (_signer, _addr, _value, encodedData) => {
-        if (encodedData === PRICING_VERSION_CALLDATA) return pricingVersionOk ? PROBE_OK : PROBE_REVERTS;
-        if (encodedData === STARTING_PRICE_CALLDATA) return startingPriceOk ? PROBE_OK : PROBE_REVERTS;
-        throw new Error(`unexpected encodedData in protocol-detect stub: ${encodedData}`);
-      },
-    };
-    return d;
-  }
+  const d = new DotNS();
+  d.connected = true;
+  d.substrateAddress = "5Signer";
+  d._environmentId = "paseo-next-v2";
+  d["_contracts"] = { ...d["_contracts"], POP_RULES: POP_RULES_ADDR };
+  d.clientWrapper = {
+    hasContractCode: async () => null, // unverified, not "no code" — see hasContractCode's own doc comment
+    performDryRunCall: async (_signer, _addr, _value, encodedData) => {
+      if (encodedData === PRICING_VERSION_CALLDATA || encodedData === STARTING_PRICE_CALLDATA) return PROBE_REVERTS;
+      throw new Error(`unexpected encodedData in protocol-detect stub: ${encodedData}`);
+    },
+  };
 
-  test("hasContractCode -> null, pricingVersion() answers => detects v2, does NOT throw", async () => {
-    const d = makeDotnsForProtocolDetect({ hasContractCode: null, pricingVersionOk: true, startingPriceOk: false });
-    await d["detectProtocolVersion"]();
-    assert.strictEqual(d.protocolVersion, "v2",
-      ">> FAIL: hascode-null-v2: a null hasContractCode (unverified, not 'no code') must not block a positively-answering pricingVersion() probe from detecting v2");
-  });
-
-  test("hasContractCode -> null, startingPrice() answers => detects v1, does NOT throw", async () => {
-    const d = makeDotnsForProtocolDetect({ hasContractCode: null, pricingVersionOk: false, startingPriceOk: true });
-    await d["detectProtocolVersion"]();
-    assert.strictEqual(d.protocolVersion, "v1",
-      ">> FAIL: hascode-null-v1: a null hasContractCode (unverified, not 'no code') must not block a positively-answering startingPrice() probe from detecting v1");
-  });
-
-  test("hasContractCode -> null, neither probe answers => throws naming both probes AND the unverified code-presence", async () => {
-    const d = makeDotnsForProtocolDetect({ hasContractCode: null, pricingVersionOk: false, startingPriceOk: false });
-    await assert.rejects(
-      () => d["detectProtocolVersion"](),
-      (err) => {
-        assert.match(err.message, /pricingVersion/, ">> FAIL: hascode-null-unknown: message must name pricingVersion");
-        assert.match(err.message, /startingPrice/, ">> FAIL: hascode-null-unknown: message must name startingPrice");
-        assert.match(err.message, /could not be verified|code presence/i, ">> FAIL: hascode-null-unknown: message must note that code presence itself is unverified (hasContractCode was null, not false)");
-        return true;
-      },
-    );
-  });
-
-  test("hasContractCode -> false => still throws the 'No contract deployed' config error (regression guard)", async () => {
-    const d = makeDotnsForProtocolDetect({ hasContractCode: false, pricingVersionOk: false, startingPriceOk: false });
-    await assert.rejects(
-      () => d["detectProtocolVersion"](),
-      /No contract deployed at .*POP_RULES/,
-      ">> FAIL: hascode-false-regression: hasContractCode===false must still be treated as a genuine config verdict, not diluted by the null-handling fix",
-    );
-  });
+  // Neither probe answers, so the only way this message can carry the
+  // "could not be verified" note is if classifyProtocolVersion actually
+  // received hasCode: null. If detectProtocolVersion flattened it to
+  // `false`, this would throw the "No contract deployed" config error
+  // instead; if flattened to `true`, the note would be missing.
+  await assert.rejects(
+    () => d["detectProtocolVersion"](),
+    (err) => {
+      assert.doesNotMatch(err.message, /No contract deployed/, ">> FAIL: detect-passthrough: null must not be flattened to false (would wrongly throw the config error)");
+      assert.match(err.message, /could not be verified/i, ">> FAIL: detect-passthrough: null must reach the classifier unflattened (note is only present for hasCode:null, not hasCode:true)");
+      return true;
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

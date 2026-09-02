@@ -32,8 +32,17 @@ export type DotnsProtocolVersion = "v1" | "v2";
 
 /** Inputs to classifyProtocolVersion — the live dry-run results from connect(). */
 export interface DotnsProtocolProbe {
-  /** Whether POP_RULES has contract code at all (a prerequisite, not a verdict). */
-  hasCode: boolean;
+  /**
+   * Whether POP_RULES has contract code at all (a prerequisite, not a
+   * verdict) — `false` is a definitive "no code here" and `null` means code
+   * presence could not be verified (the underlying `hasContractCode` read is
+   * itself three-valued for the same reason: its own doc comment says
+   * callers must not read `null` as "no code"). Only `false` short-circuits
+   * classification; `null` falls through to the two live probes below,
+   * because a probe answering is itself positive proof the contract exists
+   * regardless of whether the code-presence read could confirm it.
+   */
+  hasCode: boolean | null;
   /** Whether a dry-run call to PopRules.pricingVersion() completed without reverting. */
   pricingVersionOk: boolean;
   /** Whether a dry-run call to PopRules.startingPrice() completed without reverting. */
@@ -46,14 +55,32 @@ export type DotnsProtocolClassification =
 
 /**
  * Pure, three-valued classification of the live DotNS protocol generation.
+ * Owns all three outcome branches AND their wording, including the
+ * `hasCode === null` (code presence unverified) case — see
+ * paritytech/bulletin-deploy#1349: that bug shipped because the null branch
+ * lived at the dotns.ts call site instead of here, where it was one
+ * incomplete `hasCodeResult === true` check away from collapsing `null` into
+ * "no code" and aborting every deploy on a single transient RPC blip. Moving
+ * it into this pure classifier means every caller gets the null-handling for
+ * free and it is unit-testable without a stubbed clientWrapper.
  *
- * - No contract code at POP_RULES is NOT a version verdict — it is a
- *   configuration problem (wrong/undeployed address), so it gets its own
- *   reason distinct from "unknown generation".
- * - Code present but neither probe answers is an explicit unknown-version
- *   error naming BOTH probes, so the failure is diagnosable rather than
- *   silently falling back to v1 (a silent v1 fallback here is exactly the
- *   failure mode this whole module exists to prevent).
+ * - `hasCode === false` is NOT a version verdict — it is a configuration
+ *   problem (wrong/undeployed address), checked first so it always wins even
+ *   if a probe happens to answer, and it gets its own reason distinct from
+ *   "unknown generation". This is the same wording the dotns.ts call site
+ *   used to throw directly; it has just moved here.
+ * - `hasCode === null` does NOT short-circuit — code presence being
+ *   unverified is not the same as code being absent, so classification falls
+ *   through to the two live probes below: a probe answering is itself
+ *   positive proof the contract exists, regardless of whether the
+ *   code-presence read could confirm it.
+ * - Neither probe answering is an explicit unknown-version error naming BOTH
+ *   probes, so the failure is diagnosable rather than silently falling back
+ *   to v1 (a silent v1 fallback here is exactly the failure mode this whole
+ *   module exists to prevent). When `hasCode` was `null` rather than `true`,
+ *   the reason also notes that code presence itself couldn't be verified —
+ *   a wrong/undeployed POP_RULES address is then also a possible
+ *   explanation, not just a genuinely unrecognised protocol generation.
  * - Both probes answering (a hypothetical future overlap) prefers v2 — v2 is
  *   the superset generation, and preferring the newer one avoids stranding a
  *   fully-upgraded deployment on the old ABI just because the old function
@@ -61,15 +88,20 @@ export type DotnsProtocolClassification =
  */
 export function classifyProtocolVersion(probe: DotnsProtocolProbe): DotnsProtocolClassification {
   const { hasCode, pricingVersionOk, startingPriceOk } = probe;
-  if (!hasCode) {
-    return { version: null, reason: "No contract code at POP_RULES — cannot determine the DotNS protocol version." };
+  if (hasCode === false) {
+    return {
+      version: null,
+      reason:
+        "No contract deployed at this address — could not detect the DotNS protocol version because no contract code was found here. Check environments.json / --contract config for this network.",
+    };
   }
   if (pricingVersionOk) return { version: "v2" };
   if (startingPriceOk) return { version: "v1" };
-  return {
-    version: null,
-    reason: "Could not determine the DotNS protocol version: contract code is present at POP_RULES, but neither pricingVersion() (v2) nor startingPrice() (v1) answered.",
-  };
+  const reason =
+    hasCode === true
+      ? "Could not determine the DotNS protocol version: contract code is present at POP_RULES, but neither pricingVersion() (v2) nor startingPrice() (v1) answered."
+      : "Could not determine the DotNS protocol version: neither pricingVersion() (v2) nor startingPrice() (v1) answered. Code presence at this address could not be verified either (the runtime code-presence query failed), so a wrong/undeployed POP_RULES address is also possible.";
+  return { version: null, reason };
 }
 
 /** The 4 fields every registration carries, regardless of protocol version. */

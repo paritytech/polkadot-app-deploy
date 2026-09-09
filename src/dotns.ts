@@ -29,8 +29,8 @@ import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
-import { classifyProtocolVersion, getAdapter } from "./dotns-protocol.js";
-import type { DotnsProtocolAdapter, DotnsProtocolVersion, DotnsPricingInput } from "./dotns-protocol.js";
+import { classifyProtocolVersion, getAdapter, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
+import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
 
 /** One step in the phone-signature plan fired at preflight. */
 export type PhoneSignatureStep = "Commitment" | "Register" | "Link content" | "Publish to registry";
@@ -109,7 +109,7 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    * plumbing is a follow-up; this option exists so connect() can already
    * honour it once it is.
    */
-  dotnsProtocol?: DotnsProtocolVersion;
+  dotnsProtocol?: DotnsAbiProfile;
 }
 export interface OwnershipResult { owned: boolean; owner: string | null; }
 
@@ -634,6 +634,14 @@ export const DEFAULT_MNEMONIC: string = "bottom drive obey lake curtain smoke ba
 // consumed as a library by playground-cli, so per-instance/per-call state is
 // required, never a process-wide default that a concurrent caller could flip).
 export const DEFAULT_TLD: string = "dot";
+
+// The default profile every classifyLabelStatus/classifyRegistrability/
+// classifyDotnsLabel/buildLabelAlternatives/formatUnregistrableReason/
+// decideRegistrabilityOutcome call falls back to when no profile is passed —
+// so every existing call/test built before profile-awareness existed keeps
+// its exact prior verdict, byte-for-byte. Also DotNS's own pre-connect()
+// default (see _protocolVersion's own comment).
+export const DEFAULT_DOTNS_PROFILE: DotnsAbiProfile = "poprules-startingPrice";
 
 // Every TLD DotNS has ever minted names under. Used only by parseDomainName's
 // wrong-TLD guard: an input ending in a DIFFERENT known TLD than the one this
@@ -1265,6 +1273,23 @@ export function sanitizeDomainLabel(label: string): string {
   return stripped;
 }
 
+// Gateway-issued Personhood-Lite username shape, v0.6.0's PopRules.sol /
+// StringUtils.sol read directly: `isLitePersonLabel` matches a letters-only
+// stem, one ASCII full stop (0x2e — StringUtils.LABEL_SEPARATOR, the dot,
+// NOT a hyphen), then exactly 2 digits (StringUtils.LITE_SUFFIX_DIGITS).
+// "The only label shape in DotNS permitted to carry a separator;
+// `_isDnsLabel` rejects it everywhere else." This shape can NEVER reach
+// classifyLabelStatus through polkadot-app-deploy's own call paths —
+// validateDomainLabel's charset (`[a-z0-9-]`) has no room for '.', so every
+// one of our own callers (all of which validate first) would already have
+// thrown before getting here. Recognised anyway because
+// classifyRegistrability/classifyDotnsLabel/buildLabelAlternatives are
+// PUBLIC exports a library caller could hand an unvalidated string to.
+// PopLite is therefore UNREACHABLE from polkadot-app-deploy's own public
+// register()/preflight path on v0.6.0 — a fact, pinned by a test, not an
+// accident.
+const LITE_USERNAME_RE = /^([a-z]+)\.(\d{2})$/;
+
 // Pure, non-recursive status classifier — the numeric-only half of
 // classifyDotnsLabel. Split out so buildLabelAlternatives can filter candidate
 // labels (including candidates that turn out Reserved) WITHOUT calling
@@ -1275,16 +1300,102 @@ export function sanitizeDomainLabel(label: string): string {
 // Mirrors PopRules._classifyValidatedName exactly. classifyDotnsLabel below
 // calls this for its status/baseLength/trailingDigits rather than
 // re-deriving them, so the branch logic has one source of truth.
-function classifyLabelStatus(label: string): { status: number; trailingDigits: number; baseLength: number } {
-  const trailingDigits = countTrailingDigits(label);
-  const baseLength = label.length - trailingDigits;
-  if (trailingDigits === 1 || trailingDigits > 2 || baseLength <= 5) {
-    return { status: ProofOfPersonhoodStatus.Reserved, trailingDigits, baseLength };
-  }
+//
+// `profile` defaults to "poprules-startingPrice" so every existing call site
+// this function had before v0.6.0 existed — including every test that
+// doesn't pass a profile — keeps its EXACT prior verdict, byte-for-byte.
+// poprules-startingPrice and v0.5.8-rc1 share one branch below (their
+// PopRules digit-stripping behaviour is unchanged); only v0.6.0 gets new
+// semantics.
+// The 3-tier ladder every profile's branch below reduces to (only the
+// INPUTS differ per profile — how baseLength is computed, and what counts
+// as the Lite signal — never the <=5/<=8 boundaries themselves). One
+// function owns the boundaries so a third generation can slot in by
+// computing its own inputs, never by copying these numbers again.
+function classifyByLadder(baseLength: number, isLiteSignal: boolean): number {
+  if (baseLength <= 5) return ProofOfPersonhoodStatus.Reserved;
   if (baseLength <= 8) {
-    return { status: trailingDigits === 2 ? ProofOfPersonhoodStatus.ProofOfPersonhoodLite : ProofOfPersonhoodStatus.ProofOfPersonhoodFull, trailingDigits, baseLength };
+    return isLiteSignal ? ProofOfPersonhoodStatus.ProofOfPersonhoodLite : ProofOfPersonhoodStatus.ProofOfPersonhoodFull;
   }
-  return { status: ProofOfPersonhoodStatus.NoStatus, trailingDigits, baseLength };
+  return ProofOfPersonhoodStatus.NoStatus;
+}
+
+// Per-profile trailing-digit-count gate: whether "exactly 0 or 2 trailing
+// digits, else reject" applies at all. v0.6.0 drops this rule entirely (see
+// classifyLabelStatus's "v0.6.0" case below); both older profiles still
+// enforce it. A Record, not a `profile !== "v0.6.0"` negation, so a profile
+// added to DotnsAbiProfile without an entry here is a TYPE ERROR — the same
+// discipline dotns-protocol.ts's ADAPTERS Record already applies to adapter
+// selection, rather than a silent "rule still applies" default for a
+// generation nobody has checked yet. Shared by classifyRegistrability and
+// classifyDotnsLabel so the two can't drift.
+const TRAILING_DIGIT_COUNT_GATE_APPLIES: Record<DotnsAbiProfile, boolean> = {
+  "poprules-startingPrice": true,
+  "v0.5.8-rc1": true,
+  "v0.6.0": false,
+};
+
+// Exhaustive switch, not an if/else keyed off one profile name: a profile
+// added to DotnsAbiProfile without a case here is a TYPE ERROR (the `never`
+// check in `default`), not a silent fall-through into whichever branch
+// happens to be last — the same discipline dotns-protocol.ts's ADAPTERS
+// Record already applies to adapter selection.
+function classifyLabelStatus(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): { status: number; trailingDigits: number; baseLength: number } {
+  const trailingDigits = countTrailingDigits(label);
+  switch (profile) {
+    case "v0.6.0": {
+      // v0.6.0's PopRules._classifyValidatedName, read directly from source:
+      // "Every label is measured as written, except a lite label, whose
+      // allocated suffix is not part of the name the candidate chose... no
+      // digit count is privileged or rejected." Three rules from the older
+      // profiles are GONE here, not merely inactive:
+      //   1. baseLength = length - trailingDigits  → now length AS WRITTEN.
+      //   2. "1 or 3+ trailing digits is Reserved"  → deleted entirely; a
+      //      label like "myapp-pr7" (1 trailing digit) is now a perfectly
+      //      valid NoStatus name.
+      //   3. "exactly 2 trailing digits ⇒ PopLite"  → PopLite is now decided
+      //      SOLELY by isLitePersonLabel (the gateway-issued stem.NN shape
+      //      above), never by an ordinary name's digit count.
+      // trailingDigits is still reported (classifyRegistrability's hyphen-base
+      // rule and telemetry both read it), just no longer used to DECIDE
+      // status here.
+      //
+      // NOT modelled here (out of scope for this classifier): `_requireShortNamesOpen`
+      // additionally gates the 6-8 band on an owner-settable `shortNamesEnabled`
+      // flag — `require(shortNamesEnabled || baseLength >= 9, "Short names
+      // are not for sale")`. A signer holding PopFull/PopLite is therefore
+      // NOT guaranteed to register a 6-8 char name; this preflight only
+      // reports the personhood-tier requirement, not whether short names are
+      // currently on sale at all. Reading that flag would need a new
+      // on-chain call this classifier doesn't make. Two things a reader must
+      // not assume: that the flag is off (or on) anywhere in particular —
+      // run tools/probe-dotns-v060.mjs, do not trust a date in a comment —
+      // and that a failed read means `false`; on older deployments the
+      // accessor reverts outright, which is "unknown", not "off".
+      const lite = LITE_USERNAME_RE.exec(label);
+      const baseLength = lite ? lite[1].length : label.length;
+      return { status: classifyByLadder(baseLength, lite !== null), trailingDigits, baseLength };
+    }
+    case "poprules-startingPrice":
+    case "v0.5.8-rc1": {
+      // Shared branch (PopRules digit-stripping behaviour is unchanged
+      // between these two profiles) — only v0.6.0 gets new semantics.
+      const baseLength = label.length - trailingDigits;
+      // Independent Reserved trigger, layered ON TOP of the shared ladder: 1
+      // or 3+ trailing digits is Reserved regardless of baseLength (e.g. a
+      // 6-char base with 1 trailing digit is Reserved here even though a
+      // 6-8 baseLength would otherwise be Lite/Full). Gone entirely on
+      // v0.6.0 — see that case above.
+      if (trailingDigits === 1 || trailingDigits > 2) {
+        return { status: ProofOfPersonhoodStatus.Reserved, trailingDigits, baseLength };
+      }
+      return { status: classifyByLadder(baseLength, trailingDigits === 2), trailingDigits, baseLength };
+    }
+    default: {
+      const unhandled: never = profile;
+      throw new Error(`classifyLabelStatus: unhandled DotNS profile ${String(unhandled)}`);
+    }
+  }
 }
 
 function tierDescriptionFor(status: number): string {
@@ -1317,7 +1428,7 @@ export interface DomainLabelAlternative {
 // Personhood tier it needs. Never returns a candidate that is itself Reserved
 // or otherwise invalid; the NoStatus fallback (c) always survives because it's
 // engineered to be 9+ chars with exactly 2 trailing digits.
-export function buildLabelAlternatives(label: string): DomainLabelAlternative[] {
+export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): DomainLabelAlternative[] {
   const trailingRun = label.slice(label.length - countTrailingDigits(label));
   const base = stripTrailingDigits(label);
   // Preserve the operator's own digits: last 2 of the original run if it's
@@ -1339,7 +1450,7 @@ export function buildLabelAlternatives(label: string): DomainLabelAlternative[] 
     if (!/^[a-z0-9-]{3,63}$/.test(candidate)) continue;
     if (candidate.startsWith("-") || candidate.endsWith("-")) continue;
     if (/-\d+$/.test(candidate)) continue;
-    const { status, baseLength } = classifyLabelStatus(candidate);
+    const { status, baseLength } = classifyLabelStatus(candidate, profile);
     if (status === ProofOfPersonhoodStatus.Reserved) continue;
     alternatives.push({ label: candidate, baseLength, status, tierDescription: tierDescriptionFor(status) });
   }
@@ -1374,10 +1485,17 @@ export type Registrability =
 // already compliant (mirrors #1189's ordering decision for the same reason).
 // Reuses classifyLabelStatus for baseLength/trailingDigits so the thresholds
 // can't drift from classifyDotnsLabel's.
-export function classifyRegistrability(label: string): Registrability {
-  const { trailingDigits, baseLength } = classifyLabelStatus(label);
+export function classifyRegistrability(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): Registrability {
+  const { trailingDigits, baseLength } = classifyLabelStatus(label, profile);
 
-  if (trailingDigits !== 0 && trailingDigits !== 2) {
+  // v0.6.0 (PopRules._classifyValidatedName, read from source) DOES NOT gate
+  // on trailing-digit count at all any more — "no digit count is privileged
+  // or rejected". A label like "myapp-pr7" (1 trailing digit) is valid on
+  // v0.6.0 even though it was Reserved on the older profiles.
+  // TRAILING_DIGIT_COUNT_GATE_APPLIES (above classifyLabelStatus) is the
+  // single source of truth for which profiles enforce this — shared with
+  // classifyDotnsLabel so the two can't drift apart.
+  if (TRAILING_DIGIT_COUNT_GATE_APPLIES[profile] && trailingDigits !== 0 && trailingDigits !== 2) {
     const digitWord = trailingDigits === 1 ? "digit" : "digits";
     return {
       registrable: false,
@@ -1393,6 +1511,12 @@ export function classifyRegistrability(label: string): Registrability {
   // `isBaseNameReserved(baseName)` reverts with
   // PopError("Name must be lowercase ASCII DNS label"). Tested on the RAW
   // label (trailing-digit count is already known-compliant at this point).
+  //
+  // UNCHANGED on v0.6.0, deliberately: `_enforceReservationRules` still
+  // calls `_stripDigits(name)` for the on-chain reservation lookup even
+  // though digit-stripping is gone from classification above — this is a
+  // different mechanism that happens to reuse the same stripping idea, not
+  // the rule the v0.6.0 branch above removed. Do not "unify" the two.
   if (/-\d+$/.test(label)) {
     const baseWithHyphen = label.replace(/\d+$/, "");
     return {
@@ -1425,9 +1549,10 @@ export function formatUnregistrableReason(args: {
   existingOwner: string | null;   // lowercased H160, or null when unregistered
   selfAddress: string;            // lowercased H160 of the signer
   tld?: string;
+  profile?: DotnsAbiProfile;
 }): string {
-  const { label, registrability, existingOwner, tld = DEFAULT_TLD } = args;
-  const alternatives = buildLabelAlternatives(label);
+  const { label, registrability, existingOwner, tld = DEFAULT_TLD, profile = DEFAULT_DOTNS_PROFILE } = args;
+  const alternatives = buildLabelAlternatives(label, profile);
   const alternativesBlock = alternatives.length > 0
     ? `\n\nAlternatively, use a name you can register yourself:\n${formatAlternativesList(alternatives, tld)}`
     : "";
@@ -1463,8 +1588,9 @@ export function decideRegistrabilityOutcome(args: {
   existingOwner: string | null;
   selfAddress: string;
   tld?: string;
+  profile?: DotnsAbiProfile;
 }): { canProceed: boolean; plannedAction: "already-owned-by-us" | "register" | "abort"; reason?: string } {
-  const { label, registrability, existingOwner, selfAddress, tld = DEFAULT_TLD } = args;
+  const { label, registrability, existingOwner, selfAddress, tld = DEFAULT_TLD, profile = DEFAULT_DOTNS_PROFILE } = args;
   // Ownership is checked FIRST and reported distinctly from registrability.
   // These two must not be collapsed into one branch: `plannedAction` is a
   // load-bearing string elsewhere (src/deploy.ts reads "already-owned-by-us"
@@ -1483,7 +1609,7 @@ export function decideRegistrabilityOutcome(args: {
   return {
     canProceed: false,
     plannedAction: "abort",
-    reason: formatUnregistrableReason({ label, registrability, existingOwner, selfAddress, tld }),
+    reason: formatUnregistrableReason({ label, registrability, existingOwner, selfAddress, tld, profile }),
   };
 }
 
@@ -1541,13 +1667,21 @@ export function isCommitmentTimingBarerevert(msg: string): boolean {
 //   PopFull required: userStatus must be PopFull
 //   PopLite required: userStatus in { PopLite, PopFull }
 //   NoStatus required: any user tier may register
-export function classifyDotnsLabel(label: string, tld: string = DEFAULT_TLD): { status: number; message: string } {
+export function classifyDotnsLabel(label: string, tld: string = DEFAULT_TLD, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): { status: number; message: string } {
   // Status/baseLength/trailingDigits all come from the single shared
   // classifier — this function only turns that decision into a message.
-  const { status, trailingDigits, baseLength } = classifyLabelStatus(label);
+  const { status, trailingDigits, baseLength } = classifyLabelStatus(label, profile);
   if (status === ProofOfPersonhoodStatus.Reserved) {
-    // PopRules requires exactly 0 or 2 trailing digits; 1 or 3+ revert on-chain.
-    if (trailingDigits === 1 || trailingDigits > 2) {
+    // PopRules requires exactly 0 or 2 trailing digits; 1 or 3+ revert
+    // on-chain — poprules-startingPrice/v0.5.8-rc1 only. v0.6.0 dropped this
+    // rule entirely (classifyLabelStatus's v0.6.0 case never returns
+    // Reserved for a digit-count reason any more), so gate this branch by
+    // TRAILING_DIGIT_COUNT_GATE_APPLIES (shared with classifyRegistrability,
+    // above classifyLabelStatus) — otherwise a v0.6.0 label whose Reserved
+    // verdict is actually about base length (e.g. "web3", trailingDigits=1,
+    // baseLength=4) would get a misleading "fix your trailing digits"
+    // message when the real, and only, reason is base length.
+    if (TRAILING_DIGIT_COUNT_GATE_APPLIES[profile] && (trailingDigits === 1 || trailingDigits > 2)) {
       return {
         status,
         message: `Name has ${trailingDigits} trailing digit${trailingDigits === 1 ? "" : "s"}; DotNS allows exactly 0 or 2 trailing digits. Use a base name with no trailing digits or a 2-digit suffix.`,
@@ -1558,7 +1692,7 @@ export function classifyDotnsLabel(label: string, tld: string = DEFAULT_TLD): { 
     // which means nothing to an external consumer. Replaced with alternatives
     // derived from the operator's own input, same as validateDomainLabel's
     // digit-count refusal message.
-    const alternatives = buildLabelAlternatives(label);
+    const alternatives = buildLabelAlternatives(label, profile);
     const suggestion = alternatives.length > 0
       ? `\n\nUse a name you can register instead:\n${formatAlternativesList(alternatives, tld)}`
       : "";
@@ -1569,7 +1703,9 @@ export function classifyDotnsLabel(label: string, tld: string = DEFAULT_TLD): { 
   }
   if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodLite) return { status, message: "Requires Light personhood verification" };
   if (status === ProofOfPersonhoodStatus.ProofOfPersonhoodFull) return { status, message: "Requires Full personhood verification" };
-  // NoStatus: baseLength >= 9, open to any caller (0 or 2 trailing digits already enforced above).
+  // NoStatus: baseLength >= 9, open to any caller. (0-or-2 trailing digits is
+  // enforced above for poprules-startingPrice/v0.5.8-rc1 only — v0.6.0 has no
+  // digit-count gate at all, see classifyLabelStatus's v0.6.0 branch.)
   return { status, message: "Available to all" };
 }
 
@@ -2350,25 +2486,25 @@ export class DotNS {
   /** True only when the signer is a real phone/session signer that needs `_awaitPhoneReady`. */
   private _isPhoneSigner = false;
   private _localMnemonic: string | null = null;
-  private _contracts: typeof CONTRACTS & { PUBLISHER?: string; DOTNS_PROTOCOL_REGISTRY?: string } = CONTRACTS;
+  private _contracts: typeof CONTRACTS & { PUBLISHER?: string; DOTNS_PROTOCOL_REGISTRY?: string; DOTNS_POP_CONTROLLER?: string } = CONTRACTS;
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
   private _environmentId: string | null = null;
   private _popSelfServe: PopSelfServeConfig | null = null;
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
   private _tld: string = DEFAULT_TLD;
-  // Defaults to v1 so every existing test/library caller that constructs a
-  // DotNS instance and stubs its chain-accessing methods WITHOUT ever calling
-  // connect() keeps today's exact v1 behaviour (call order, ABI shape,
-  // deposit-gate function) — connect()'s live probe overwrites both fields
-  // once it runs. Never left unset/throwing: that would break every such
-  // caller, which is most of the existing unit suite.
+  // Defaults to poprules-startingPrice so every existing test/library caller
+  // that constructs a DotNS instance and stubs its chain-accessing methods
+  // WITHOUT ever calling connect() keeps today's exact prior behaviour (call
+  // order, ABI shape, deposit-gate function) — connect()'s live probe
+  // overwrites both fields once it runs. Never left unset/throwing: that
+  // would break every such caller, which is most of the existing unit suite.
   // Production can never reach a register with an unprobed adapter: connect()
   // always runs detectProtocolVersion(), and every register-path method calls
   // ensureConnected() first. That is what makes a default safe here rather
   // than the silent-fallback hazard it would otherwise be — do not "simplify"
   // this into a throw-if-unset without re-checking both of those.
-  private _protocolVersion: DotnsProtocolVersion = "v1";
-  private _adapter: DotnsProtocolAdapter = getAdapter("v1");
+  private _protocolVersion: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE;
+  private _adapter: DotnsProtocolAdapter = getAdapter(DEFAULT_DOTNS_PROFILE);
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
   private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>) | undefined = undefined;
   /** Total phone-signature count for this DotNS session (drives the `total` field passed to confirmPhoneReady). */
@@ -2414,13 +2550,13 @@ export class DotNS {
    */
   get tld(): string { return this._tld; }
 
-  /** The DotNS protocol generation detected by connect()'s live probe (readonly; for telemetry and tests). Defaults to "v1" before connect() runs — see the field's own comment. */
-  get protocolVersion(): DotnsProtocolVersion { return this._protocolVersion; }
+  /** The DotNS ABI profile detected by connect()'s live probe (readonly; for telemetry and tests). Defaults to DEFAULT_DOTNS_PROFILE before connect() runs — see the field's own comment. */
+  get protocolVersion(): DotnsAbiProfile { return this._protocolVersion; }
 
   /** Test-only: bypass connect()'s live probe and pin the adapter directly, for unit tests that stub chain calls without going through connect(). */
-  __setProtocolVersionForTest(version: DotnsProtocolVersion): void {
-    this._protocolVersion = version;
-    this._adapter = getAdapter(version);
+  __setProtocolVersionForTest(profile: DotnsAbiProfile): void {
+    this._protocolVersion = profile;
+    this._adapter = getAdapter(profile);
   }
 
   /**
@@ -2992,39 +3128,53 @@ export class DotNS {
   }
 
   /**
-   * Detect the live DotNS protocol generation by probing POP_RULES — never by
-   * trusting configured addresses, since CREATE3 keeps them identical across
-   * generations (the exact reason the 2026-09-01 outage went unflagged by the
-   * address-drift guardrail). Dry-run read only: no transactions, no state
-   * writes. Caches nothing itself — connect() calls this once per instance
-   * and stores the result on _protocolVersion/_adapter.
+   * Detect the live DotNS ABI profile by probing POP_RULES (and, for the
+   * v0.6.0-vs-v0.5.8-rc1 split, DOTNS_POP_CONTROLLER) — never by trusting
+   * configured addresses, since CREATE3 keeps them identical across
+   * generations. Dry-run read only: no transactions, no state writes.
+   * Caches nothing itself — connect() calls this once per instance and
+   * stores the result on _protocolVersion/_adapter.
    *
    * All classification — including the three-valued handling of
    * hasContractCode's own true/false/null result (see its doc comment: null
    * means the runtime doesn't expose the storage map, or the query itself
    * threw, and callers must not treat it as "no code") — lives in
-   * classifyProtocolVersion. This method's only job is to gather the three
-   * live inputs and pass them through unflattened; see that function's doc
-   * comment for the full reasoning, including paritytech/bulletin-deploy#1349
-   * (the bug that motivated moving the null-handling here rather than
-   * checking hasCodeResult at this call site).
+   * classifyProtocolVersion. This method's only job is to gather the live
+   * inputs and pass them through unflattened; see that function's doc
+   * comment for the full reasoning.
+   *
+   * A fourth probe (isPopIssued, against DOTNS_POP_CONTROLLER — see
+   * DotnsProtocolProbe.isPopIssuedOk's own comment) runs in the SAME
+   * Promise.all as the other three: pricingVersionOk answering true on
+   * either v0.5.8-rc1 or v0.6.0 is the common case once v0.6.0 is live
+   * everywhere, so gating isPopIssued behind pricingVersionOk resolving
+   * first would cost every such connect() an extra serialized round-trip.
+   * classifyProtocolVersion only actually consults isPopIssuedOk when
+   * pricingVersionOk is true, so running it unconditionally costs nothing
+   * when pricingVersionOk turns out false. The probe is skipped entirely
+   * (resolves to null immediately, no RPC at all) when DOTNS_POP_CONTROLLER
+   * has no configured address for this environment.
    */
   private async detectProtocolVersion(): Promise<void> {
     this.ensureConnected();
     const popRulesAddress = this._contracts.POP_RULES;
+    const popControllerAddress = this._contracts.DOTNS_POP_CONTROLLER;
     const env = this._environmentId ?? "unknown";
-    // All three reads go in one Promise.all: there is no data dependency
+    // All four reads go in one Promise.all: there is no data dependency
     // between them, because "no code" is only ever concluded from
     // hasCodeResult === false (in the classifier) and never from a silent
     // probe. Awaiting the code-presence read first would cost connect() an
     // extra RTT layer on every deploy for nothing.
-    const [hasCodeResult, pricingVersionOk, startingPriceOk] = await Promise.all([
+    const [hasCodeResult, pricingVersionOk, startingPriceOk, isPopIssuedOk] = await Promise.all([
       this.clientWrapper!.hasContractCode(popRulesAddress),
-      this.probeViewFunctionOk(popRulesAddress, getAdapter("v2").popRulesAbi, "pricingVersion", []),
-      this.probeViewFunctionOk(popRulesAddress, getAdapter("v1").popRulesAbi, "startingPrice", []),
+      this.probeViewFunctionOk(popRulesAddress, getAdapter("v0.5.8-rc1").popRulesAbi, "pricingVersion", []),
+      this.probeViewFunctionOk(popRulesAddress, getAdapter("poprules-startingPrice").popRulesAbi, "startingPrice", []),
+      popControllerAddress
+        ? this.probeViewFunctionOk(popControllerAddress, POP_CONTROLLER_PROBE_ABI, "isPopIssued", [PROTOCOL_PROBE_LABEL])
+        : Promise.resolve(null),
     ]);
-    const classification = classifyProtocolVersion({ hasCode: hasCodeResult, pricingVersionOk, startingPriceOk });
-    if (classification.version === null) {
+    const classification = classifyProtocolVersion({ hasCode: hasCodeResult, pricingVersionOk, startingPriceOk, isPopIssuedOk });
+    if (classification.profile === null) {
       // Always name env + the POP_RULES address here: not every caller passes
       // an environmentId (secondary DotNS instances connect without one and
       // log env as "unknown"), and the address is what actually identifies
@@ -3033,11 +3183,18 @@ export class DotNS {
       // entirely from classifyProtocolVersion.
       throw new Error(`${env} (POP_RULES ${popRulesAddress}): ${classification.reason}`);
     }
-    const version = classification.version;
-    this._protocolVersion = version;
-    this._adapter = getAdapter(version);
-    setDeployAttribute("deploy.dotns.protocol_version", version);
-    console.log(`   DotNS protocol ${version} detected on ${env}`);
+    const profile = classification.profile;
+    this._protocolVersion = profile;
+    this._adapter = getAdapter(profile);
+    setDeployAttribute("deploy.dotns.protocol_version", profile);
+    console.log(`   DotNS ABI profile ${profile} detected on ${env}`);
+    // See this method's own doc comment above for why the isPopIssuedOk-null
+    // fallback (no configured DOTNS_POP_CONTROLLER) is safe — v0.5.8-rc1 and
+    // v0.6.0 share an identical registration/ABI adapter, so this only
+    // affects classifyLabelStatus's local advisory label semantics.
+    if (profile === "v0.5.8-rc1" && pricingVersionOk && isPopIssuedOk === null) {
+      console.log(`   NOTE: could not confirm whether ${env} is v0.5.8-rc1 or v0.6.0 — DOTNS_POP_CONTROLLER has no configured address here, so the isPopIssued discriminator probe was never attempted. Defaulting to v0.5.8-rc1 label semantics (registration itself is unaffected: both profiles share an identical ABI/adapter).`);
+    }
   }
 
   async contractCall(contractAddress: string, contractAbi: readonly any[], functionName: string, args: any[] = []): Promise<any> {
@@ -4332,9 +4489,15 @@ export class DotNS {
 
       this.ensureConnected();
       const validated = validateDomainLabel(label);
-      const trailingDigits = countTrailingDigits(validated);
-      const baselength = validated.length - trailingDigits;
-      const classification = classifyDotnsLabel(validated, this._tld);
+      // trailingDigits/baselength must come from the SAME profile-aware
+      // classifier as `classification` below — this used to independently
+      // recompute baselength via the (v0.6.0-wrong) `length -
+      // trailingDigits` formula, so a v0.6.0 preflight's `classification`
+      // could say NoStatus while its sibling `baselength` field still
+      // reported the old, stripped number to library callers reading
+      // DotnsPreflightResult.
+      const { trailingDigits, baseLength: baselength } = classifyLabelStatus(validated, this._protocolVersion);
+      const classification = classifyDotnsLabel(validated, this._tld, this._protocolVersion);
 
       // Issue #1185: Reserved (and the trailing-digit/hyphen-base rules) are
       // NOT a terminal, ownership-blind rejection anymore — a name registered
@@ -4345,7 +4508,7 @@ export class DotNS {
       // validateDomainLabel itself used to throw for Reserved labels first —
       // now that validateDomainLabel is contract-syntax-only, this is where
       // the ownership-aware decision actually happens.
-      const registrability = classifyRegistrability(validated);
+      const registrability = classifyRegistrability(validated, this._protocolVersion);
 
       const baseName = stripTrailingDigits(validated);
       const [userStatus, baseReservation, ownership, isTestnet, signerFreeBalance] = await Promise.all([
@@ -4426,7 +4589,7 @@ export class DotNS {
       // path below (which would give actively misleading NoStatus advice for
       // a governance-reserved name).
       if (!registrability.registrable) {
-        const decision = decideRegistrabilityOutcome({ label: validated, registrability, existingOwner, selfAddress, tld: this._tld });
+        const decision = decideRegistrabilityOutcome({ label: validated, registrability, existingOwner, selfAddress, tld: this._tld, profile: this._protocolVersion });
         if (!decision.canProceed) {
           // existingOwner is always null here (the owned-by-someone-else
           // branch above already returned; owned-by-us takes the
@@ -4669,9 +4832,9 @@ export class DotNS {
       // live here (that check never caught a hyphen-base label at all, and
       // is now provably unreachable — every label it would have caught is
       // also caught by classifyRegistrability, which fires first).
-      const registrability = classifyRegistrability(label);
+      const registrability = classifyRegistrability(label, this._protocolVersion);
       if (!registrability.registrable) {
-        const decision = decideRegistrabilityOutcome({ label, registrability, existingOwner: null, selfAddress: this.evmAddress!.toLowerCase(), tld: this._tld });
+        const decision = decideRegistrabilityOutcome({ label, registrability, existingOwner: null, selfAddress: this.evmAddress!.toLowerCase(), tld: this._tld, profile: this._protocolVersion });
         throw new NonRetryableError(decision.reason!);
       }
 

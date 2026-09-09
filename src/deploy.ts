@@ -25,6 +25,7 @@ import { computeStats, telemetryAttributes, renderSummary } from "./incremental-
 import { keccak256, toBytes } from "viem";
 import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD } from "./dotns.js";
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions } from "./dotns.js";
+import type { DotnsAbiProfile } from "./dotns-protocol.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet } from "./pool.js";
@@ -2799,15 +2800,21 @@ export function formatSubdomainParentError(
   parentOwner: string | null,
   selfAddress: string,
   tld: string = DEFAULT_TLD,
+  // Without this, a v0.6.0 environment would silently fall back to
+  // poprules-startingPrice's (stricter, digit-stripping) label semantics
+  // here — the exact class of bug the profile-aware classifier exists to
+  // close, just at a call site outside src/dotns.ts. Defaults to the old
+  // profile so every existing call/test keeps its exact prior verdict.
+  profile: DotnsAbiProfile = "poprules-startingPrice",
 ): string {
   if (parentOwner !== null) {
     return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${parentOwner}, not by this signer.`;
   }
-  const registrability = classifyRegistrability(parentLabel);
+  const registrability = classifyRegistrability(parentLabel, profile);
   if (registrability.registrable) {
     return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by no one, not by this signer.`;
   }
-  return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld })}`;
+  return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld, profile })}`;
 }
 
 // Publish step. Subdomains are not supported by the Publisher contract (it only
@@ -3322,7 +3329,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             const { owned: parentOwned, owner: parentOwner } = await preflight.checkOwnership(parsed.parentLabel!);
             if (!parentOwned) {
               throw new NonRetryableError(
-                formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "", envTld)
+                formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "", envTld, preflight.protocolVersion)
               );
             }
           }

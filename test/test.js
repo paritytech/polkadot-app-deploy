@@ -4540,18 +4540,18 @@ describe("DotNS.register contract path", () => {
 });
 
 // ---------------------------------------------------------------------------
-// DotNS protocol-version-aware registration (2026-09-01 ABI drift fix)
+// DotNS ABI-profile-aware registration (2026-09-01 ABI drift fix)
 //
-// v1 (preview) and v2 (paseo-next-v2) are live at the same time on
-// mutually-incompatible ABIs — the Registration tuple went from 4 to 6
-// fields (maxPrice, pricingVersion appended) and the NoStatus deposit gate
-// moved from PopRules.startingPrice() to PopRules.price(label). These tests
-// exercise generateCommitment's real (non-stubbed) tuple-building through
-// __setProtocolVersionForTest, and gateOnFeeBalance's adapter-routed deposit
+// poprules-startingPrice (preview) and v0.5.8-rc1 (paseo-next-v2) are live at
+// the same time on mutually-incompatible ABIs — the Registration tuple went
+// from 4 to 6 fields (maxPrice, pricingVersion appended) and the NoStatus
+// deposit gate moved from PopRules.startingPrice() to PopRules.price(label).
+// These tests exercise generateCommitment's real (non-stubbed) tuple-building
+// through __setProtocolVersionForTest, and gateOnFeeBalance's adapter-routed deposit
 // read — the two call sites the drift actually broke.
 // ---------------------------------------------------------------------------
-describe("DotNS protocol-version-aware registration", () => {
-  test("generateCommitment: v1 (default, no override) builds the unchanged 4-field tuple", async () => {
+describe("DotNS ABI-profile-aware registration", () => {
+  test("generateCommitment: poprules-startingPrice (default, no override) builds the unchanged 4-field tuple", async () => {
     const d = new DotNS();
     d.connected = true;
     d.evmAddress = "0xabcd000000000000000000000000000000000001";
@@ -4563,44 +4563,44 @@ describe("DotNS protocol-version-aware registration", () => {
     };
     const { registration } = await d.generateCommitment("protov1registerlabel");
     assert.deepStrictEqual(Object.keys(registration), ["label", "owner", "secret", "reserved"],
-      ">> FAIL: v1-tuple: v1's registration must stay the unchanged 4-field tuple");
-    assert.ok(seenAbiFnCount > 0, ">> FAIL: v1-tuple: makeCommitment must be routed through an adapter ABI");
+      ">> FAIL: poprules-tuple: poprules-startingPrice's registration must stay the unchanged 4-field tuple");
+    assert.ok(seenAbiFnCount > 0, ">> FAIL: poprules-tuple: makeCommitment must be routed through an adapter ABI");
   });
 
-  test("generateCommitment: v2 builds the 6-field tuple with maxPrice then pricingVersion appended, buffered +10%", async () => {
+  test("generateCommitment: v0.5.8-rc1 builds the 6-field tuple with maxPrice then pricingVersion appended, buffered +10%", async () => {
     const d = new DotNS();
     d.connected = true;
     d.evmAddress = "0xabcd000000000000000000000000000000000001";
     d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
-    d.__setProtocolVersionForTest("v2");
+    d.__setProtocolVersionForTest("v0.5.8-rc1");
     d.contractCall = async (_addr, _abi, fn) => {
       if (fn === "makeCommitment") return "0xcommitment";
       throw new Error(`unexpected contractCall in stub: ${fn}`);
     };
     const { registration } = await d.generateCommitment("protov2registerlabel", false, { priceWei: 100n, pricingVersion: 7n });
     assert.deepStrictEqual(Object.keys(registration), ["label", "owner", "secret", "reserved", "maxPrice", "pricingVersion"],
-      ">> FAIL: v2-tuple: v2's registration must carry all 6 fields, maxPrice before pricingVersion");
-    assert.strictEqual(registration.maxPrice, 110n, ">> FAIL: v2-tuple: maxPrice must be priceWei + the same 10% buffer finalizeRegistration applies");
-    assert.strictEqual(registration.pricingVersion, 7n, ">> FAIL: v2-tuple: pricingVersion must be the value read from PopRules.pricingVersion()");
+      ">> FAIL: v0.5.8-rc1-tuple: v0.5.8-rc1's registration must carry all 6 fields, maxPrice before pricingVersion");
+    assert.strictEqual(registration.maxPrice, 110n, ">> FAIL: v0.5.8-rc1-tuple: maxPrice must be priceWei + the same 10% buffer finalizeRegistration applies");
+    assert.strictEqual(registration.pricingVersion, 7n, ">> FAIL: v0.5.8-rc1-tuple: pricingVersion must be the value read from PopRules.pricingVersion()");
   });
 
-  test("generateCommitment: v2 without pricing throws naming pricingVersion, before any chain call", async () => {
+  test("generateCommitment: v0.5.8-rc1 without pricing throws naming pricingVersion, before any chain call", async () => {
     const d = new DotNS();
     d.connected = true;
     d.evmAddress = "0xabcd000000000000000000000000000000000001";
     d._contracts = { DOTNS_REGISTRAR_CONTROLLER: "0xCTRL" };
-    d.__setProtocolVersionForTest("v2");
+    d.__setProtocolVersionForTest("v0.5.8-rc1");
     let chainCalled = false;
     d.contractCall = async () => { chainCalled = true; throw new Error("should not be called"); };
     await assert.rejects(
       () => d.generateCommitment("protov2nopricing"),
       /pricingVersion/,
-      ">> FAIL: v2-missing-pricing: must throw naming pricingVersion when pricing is omitted on v2",
+      ">> FAIL: v0.5.8-rc1-missing-pricing: must throw naming pricingVersion when pricing is omitted on v0.5.8-rc1",
     );
-    assert.strictEqual(chainCalled, false, ">> FAIL: v2-missing-pricing: must fail before any chain call, not after a doomed makeCommitment");
+    assert.strictEqual(chainCalled, false, ">> FAIL: v0.5.8-rc1-missing-pricing: must fail before any chain call, not after a doomed makeCommitment");
   });
 
-  test("gateOnFeeBalance (via preflight): v1 reads startingPrice() with no args for the NoStatus deposit gate", async () => {
+  test("gateOnFeeBalance (via preflight): poprules-startingPrice reads startingPrice() with no args for the NoStatus deposit gate", async () => {
     const d = new DotNS();
     d.connected = true;
     const myAddr = "0xabcd000000000000000000000000000000000001";
@@ -4617,22 +4617,22 @@ describe("DotNS protocol-version-aware registration", () => {
     d.contractCall = async (_contract, _abi, fn, args) => {
       if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
       if (fn === "startingPrice") { calledFn = fn; calledArgs = args; return 10n * 10n ** 18n; }
-      if (fn === "price") throw new Error("v1 must not call price(label) — that is v2-only");
+      if (fn === "price") throw new Error("poprules-startingPrice must not call price(label) — that is v0.5.8-rc1-only");
       throw new Error(`unexpected contractCall in stub: ${fn}`);
     };
     const r = await d.preflight("v1depositgatelabel");
-    assert.strictEqual(r.canProceed, true, `>> FAIL: v1-deposit-gate: expected canProceed=true; reason=${r.reason}`);
-    assert.strictEqual(calledFn, "startingPrice", ">> FAIL: v1-deposit-gate: v1 must call startingPrice for the NoStatus deposit gate");
-    assert.deepStrictEqual(calledArgs, [], ">> FAIL: v1-deposit-gate: startingPrice takes no args");
+    assert.strictEqual(r.canProceed, true, `>> FAIL: poprules-deposit-gate: expected canProceed=true; reason=${r.reason}`);
+    assert.strictEqual(calledFn, "startingPrice", ">> FAIL: poprules-deposit-gate: poprules-startingPrice must call startingPrice for the NoStatus deposit gate");
+    assert.deepStrictEqual(calledArgs, [], ">> FAIL: poprules-deposit-gate: startingPrice takes no args");
   });
 
-  test("gateOnFeeBalance (via preflight): v2 reads price(label) and REJECTS startingPrice for the NoStatus deposit gate", async () => {
+  test("gateOnFeeBalance (via preflight): v0.5.8-rc1 reads price(label) and REJECTS startingPrice for the NoStatus deposit gate", async () => {
     const d = new DotNS();
     d.connected = true;
     const myAddr = "0xabcd000000000000000000000000000000000001";
     d.evmAddress = myAddr;
     d.substrateAddress = "5".padEnd(48, "x");
-    d.__setProtocolVersionForTest("v2");
+    d.__setProtocolVersionForTest("v0.5.8-rc1");
     d.checkOwnership = async () => ({ owned: false, owner: null });
     d.getUserPopStatus = async () => ProofOfPersonhoodStatus.NoStatus;
     d.isTestnet = async () => false;
@@ -4643,14 +4643,14 @@ describe("DotNS protocol-version-aware registration", () => {
     let calledArgs = null;
     d.contractCall = async (_contract, _abi, fn, args) => {
       if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
-      if (fn === "startingPrice") throw new Error("v2 must not call startingPrice() — it was removed upstream and this stub rejects it");
+      if (fn === "startingPrice") throw new Error("v0.5.8-rc1 must not call startingPrice() — it was removed upstream and this stub rejects it");
       if (fn === "price") { calledFn = fn; calledArgs = args; return 10n * 10n ** 18n; }
       throw new Error(`unexpected contractCall in stub: ${fn}`);
     };
     const r = await d.preflight("v2depositgatelabel");
-    assert.strictEqual(r.canProceed, true, `>> FAIL: v2-deposit-gate: expected canProceed=true; reason=${r.reason}`);
-    assert.strictEqual(calledFn, "price", ">> FAIL: v2-deposit-gate: v2 must call price(label), not startingPrice");
-    assert.deepStrictEqual(calledArgs, ["v2depositgatelabel"], ">> FAIL: v2-deposit-gate: price must be called with the label");
+    assert.strictEqual(r.canProceed, true, `>> FAIL: v0.5.8-rc1-deposit-gate: expected canProceed=true; reason=${r.reason}`);
+    assert.strictEqual(calledFn, "price", ">> FAIL: v0.5.8-rc1-deposit-gate: v0.5.8-rc1 must call price(label), not startingPrice");
+    assert.deepStrictEqual(calledArgs, ["v2depositgatelabel"], ">> FAIL: v0.5.8-rc1-deposit-gate: price must be called with the label");
   });
 });
 
@@ -4669,8 +4669,8 @@ describe("DotNS protocol-version-aware registration", () => {
 // ---------------------------------------------------------------------------
 test("detectProtocolVersion passes hasContractCode's result through to classifyProtocolVersion unflattened (null stays null)", async () => {
   const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
-  const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v2").popRulesAbi, functionName: "pricingVersion", args: [] });
-  const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("v1").popRulesAbi, functionName: "startingPrice", args: [] });
+  const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", args: [] });
+  const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("poprules-startingPrice").popRulesAbi, functionName: "startingPrice", args: [] });
   const PROBE_REVERTS = { result: { isOk: false, value: { data: "0x" } } };
 
   const d = new DotNS();
@@ -14250,7 +14250,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       DOTNS_REGISTRAR_CONTROLLER: "0x35f8594c8e68a0ad079bca5f72bf6c9560ac22b0",
       DOTNS_REGISTRY: "0x64e619ea4d8a593c68533c0feaf3e36d3666495b",
       DOTNS_POP_CONTROLLER: "0xb0dd60b3da4a563cdc8aa78ec9d5b169f81046f1",
-      ROOT_GATEWAY_DISPATCHER: "0x2cedd39924d216b4a49f4c532e03fe79d006e89e",
       DOTNS_RESOLVER: "0x5296344ed752c19cdee2bb3e5e5b015ba69982c7",
       DOTNS_CONTENT_RESOLVER: "0xa27c323a30c7ee1f0a7a35f48983d98d18c53445",
       DOTNS_REVERSE_RESOLVER: "0x099b539bf034c741404d393ab95946e4923bc7ab",
@@ -14277,7 +14276,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       DOTNS_REGISTRAR_CONTROLLER: "0xBdaA01bD1bA67d709F2b1fF286Da0d854977EA30",
       DOTNS_REGISTRY: "0xf34054fd76BbF85f216cf9908226D5f0A72E50CA",
       DOTNS_POP_CONTROLLER: "0xCC932348606cc1f3318cADeC5A5Cd2CA447f8a4b",
-      ROOT_GATEWAY_DISPATCHER: "0xa889CCA3Fb4B07b98a11cc54C10f13dDA20bc3db",
       DOTNS_RESOLVER: "0xbd1165E549DF96F083c0A16f61590927bC187009",
       DOTNS_CONTENT_RESOLVER: "0x7F74D7CD50f5a834270E2ad395a01b01891AB37d",
       DOTNS_REVERSE_RESOLVER: "0xee3883d7eB60Ee9BCD7F3bcD8f2f05302A9Cc035",
@@ -17952,6 +17950,21 @@ describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literal
   // DEFAULT_GATEWAY pointing at the WRONG environment's gateway, and
   // resolveEndpoints dropped the env.ipfs field so deploys silently fell back
   // to the hardcoded default.
+  // DotNS v0.6.0 deleted ROOT_GATEWAY_DISPATCHER upstream and nothing on our
+  // side ever read it. Belt-and-suspenders beyond the per-env
+  // deepStrictEqual snapshots elsewhere in this file (which don't cover every
+  // environment): scan every environment's `contracts` for the removed keys.
+  test("no environment declares ROOT_GATEWAY_DISPATCHER, a role-manager, or a popGateway key (#1410)", () => {
+    const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
+    for (const env of envDoc.environments) {
+      const keys = Object.keys(env.contracts ?? {});
+      for (const removed of ["ROOT_GATEWAY_DISPATCHER", "DOTNS_ROLE_MANAGER", "DotnsRoleManager", "popGateway", "POP_GATEWAY"]) {
+        assert.ok(!keys.includes(removed),
+          `>> FAIL: v060-config-cleanup: environment "${env.id}" still declares "${removed}", which upstream deleted — remove it from assets/environments.json.`);
+      }
+    }
+  });
+
   test("no environments.json URL appears as a hardcoded string literal in src/ outside environments.ts", () => {
     const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf8"));
 

@@ -47,12 +47,73 @@ export async function checkProductConfigFilesExist(
   for (const exec of config.executables) {
     const execAbs = path.resolve(configDir, exec.path);
     try {
-      await fs.stat(execAbs); // file or directory
+      const st = await fs.stat(execAbs);
+      if (exec.kind === "app" && "manifest" in exec && !st.isDirectory()) {
+        errors.push(
+          `executables[app].path "${exec.path}" must be a directory for App manifest v2 (${execAbs})`,
+        );
+      }
     } catch {
       errors.push(`executables[${exec.kind}].path "${exec.path}" not found (${execAbs})`);
     }
   }
 
+  return errors;
+}
+
+/**
+ * Materialize each App v2 manifest inside its executable directory before the
+ * directory is content-addressed. The config object is the single source of
+ * truth; the same JSON.stringify bytes are later written to DotNS.
+ */
+export async function writeEmbeddedAppManifests(
+  config: ProductConfig,
+  configDir: string,
+): Promise<string[]> {
+  const errors: string[] = [];
+  for (const exec of config.executables) {
+    if (exec.kind !== "app" || !("manifest" in exec)) continue;
+    const manifestPath = path.join(
+      path.resolve(configDir, exec.path),
+      "manifest.json",
+    );
+    try {
+      await fs.writeFile(manifestPath, JSON.stringify(exec.manifest), "utf8");
+    } catch (error) {
+      errors.push(
+        `cannot write App v2 embedded manifest at ${manifestPath}: ${(error as Error).message}`,
+      );
+    }
+  }
+  return errors;
+}
+
+/** Fail closed if an App v2 artifact no longer contains the configured bytes. */
+export async function verifyEmbeddedAppManifests(
+  config: ProductConfig,
+  configDir: string,
+): Promise<string[]> {
+  const errors: string[] = [];
+  for (const exec of config.executables) {
+    if (exec.kind !== "app" || !("manifest" in exec)) continue;
+    const manifestPath = path.join(
+      path.resolve(configDir, exec.path),
+      "manifest.json",
+    );
+    const expected = Buffer.from(JSON.stringify(exec.manifest), "utf8");
+    try {
+      const actual = await fs.readFile(manifestPath);
+      if (!actual.equals(expected)) {
+        errors.push(
+          `App v2 embedded manifest differs from executable text-record bytes (${manifestPath})`,
+        );
+      }
+    } catch (error) {
+      errors.push(
+        `cannot read App v2 embedded manifest at ${manifestPath}: ${(error as Error).message}`,
+      );
+    }
+  }
   return errors;
 }
 
@@ -80,8 +141,12 @@ export async function preflightProductConfig(
     if (!c.ok) errors.push(`text record "${c.key}" is ${c.bytes} B, over the ${c.budget} B dotNS budget`);
   }
 
-  // Referenced files must exist before we do any upload work.
-  errors.push(...(await checkProductConfigFilesExist(config, path.dirname(sourcePath))));
+  // Referenced files must exist before we materialize generated manifests.
+  const fileErrors = await checkProductConfigFilesExist(config, path.dirname(sourcePath));
+  errors.push(...fileErrors);
+  if (fileErrors.length === 0) {
+    errors.push(...(await writeEmbeddedAppManifests(config, path.dirname(sourcePath))));
+  }
 
   if (errors.length > 0) {
     throw new NonRetryableError(

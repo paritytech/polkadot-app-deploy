@@ -22,8 +22,7 @@ import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./ma
 import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
 import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
-import { keccak256, toBytes } from "viem";
-import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, PublisherNotSupportedError, PUBLISHER_ABI, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD } from "./dotns.js";
+import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD } from "./dotns.js";
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions } from "./dotns.js";
 import type { DotnsAbiProfile } from "./dotns-protocol.js";
 export type { PhoneSignatureStep };
@@ -566,25 +565,6 @@ export function shouldPublishManifest(opts: {
   noManifest: boolean;
 }): boolean {
   return opts.configFound && !opts.noManifest;
-}
-
-/**
- * Reject the contradictory `--no-manifest`/`--content-only` + `--publish`
- * combination up front. `--publish` lists the domain in the on-chain
- * Publisher registry, which reads the manifest's text records (Browse relies
- * on them) — skipping manifest publishing while also asking to list the
- * domain would silently publish a domain with no manifest data. Returns an
- * error message string to print + exit on, or `null` when the combination is
- * fine. Exported for unit testing.
- */
-export function validateNoManifestFlags(opts: {
-  noManifest: boolean;
-  publish: boolean;
-}): string | null {
-  if (opts.noManifest && opts.publish) {
-    return "Error: --no-manifest (--content-only) and --publish are mutually exclusive — --publish requires the manifest records that --no-manifest skips.";
-  }
-  return null;
 }
 
 /** storageSigner > signer > mnemonic > pool precedence for storage routing. Exported for unit testing. */
@@ -2640,18 +2620,6 @@ export interface DeployOptions {
    */
   dumpCar?: string | boolean;
   /**
-   * After a successful deploy, list the label in the on-chain Publisher
-   * registry. Silently skipped on envs that do not have a Publisher contract.
-   */
-  publish?: boolean;
-  /**
-   * When true, a publish failure after a successful deploy fails the run.
-   * Default (false): warning is logged, deploy still exits 0 — the bytes
-   * landed on Bulletin and the contenthash is on chain, the registry is a
-   * discovery courtesy.
-   */
-  failOnPublishError?: boolean;
-  /**
    * Override/supply DotNS contract addresses, shallow-merged OVER the chosen
    * env's `contracts` map (these win). The `custom` env ships no addresses, so
    * this is how they are provided. Keys are the DOTNS_* names used in
@@ -2815,78 +2783,6 @@ export function formatSubdomainParentError(
     return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by no one, not by this signer.`;
   }
   return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld, profile })}`;
-}
-
-// Publish step. Subdomains are not supported by the Publisher contract (it only
-// indexes top-level `.dot` labels) so we skip rather than publish the parent.
-async function publish(
-  dotns: DotNS,
-  parsed: ParsedDomainName,
-  failOnError: boolean | undefined,
-): Promise<void> {
-  console.log("\n" + "=".repeat(60));
-  console.log("Publish");
-  console.log("=".repeat(60));
-  if (parsed.isSubdomain) {
-    console.log(`   Subdomains are not supported by the Publisher registry — skipping.`);
-    return;
-  }
-  try {
-    const result = await dotns.publishLabel(parsed.label);
-    setDeployAttribute("deploy.publish.status", result.status);
-    if (result.txHash) setDeployAttribute("deploy.publish.tx", result.txHash);
-    console.log(`   Status: ${result.status}`);
-  } catch (e: any) {
-    if (e instanceof PublisherNotSupportedError) {
-      console.log(`   Skipped: ${e.message}`);
-      return;
-    }
-    setDeployAttribute("deploy.publish.status", "failed");
-    if (failOnError) throw e;
-    const msg = e?.message ?? String(e);
-    console.log(`   Publish failed: ${msg}`);
-  }
-}
-
-// Entrypoint for `bulletin-deploy --unpublish`. Opens a DotNS connection on
-// the chosen env, calls Publisher.unpublish, and exits. Does not touch
-// Bulletin, IPFS, or the build directory — there is nothing to deploy.
-export async function unpublish(
-  domainName: string,
-  options: { mnemonic?: string; derivationPath?: string; rpc?: string; env?: string } = {},
-): Promise<{ domainName: string; status: "unpublished" | "already-unpublished"; txHash?: string }> {
-  const envId = options.env ?? DEFAULT_ENV_ID;
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, envId);
-  const popSelfServe = getPopSelfServeConfig(doc, envId);
-  const tld = resolved.tld ?? DEFAULT_TLD;
-  const parsed = parseDomainName(domainName, tld);
-  if (parsed.isSubdomain) {
-    throw new Error(`Subdomains are not supported by the Publisher registry. To unpublish ${parsed.parentLabel}.${tld} (which controls ${domainName}), pass that label directly.`);
-  }
-  const label = parsed.label;
-  const dotns = new DotNS();
-  try {
-    // Pass resolved.tld (undefined-preserving), NOT the defaulted `tld` above
-    // — otherwise connect()'s on-chain tld() read never fires for an env that
-    // genuinely configures none (see the envConfiguredTld comment in deploy()).
-    await dotns.connect(resolveDotnsConnectOptions(
-      { mnemonic: options.mnemonic, derivationPath: options.derivationPath },
-      resolved.assetHub,
-      resolved.autoAccountMapping,
-      resolved.contracts,
-      resolved.nativeToEthRatio,
-      envId,
-      popSelfServe,
-      resolved.registerStorageDeposit,
-      resolved.tld,
-    ));
-    const result = await dotns.unpublishLabel(label);
-    // Adopt the authoritative, chain-resolved TLD for the returned domain name.
-    return { domainName: `${label}.${dotns.tld}`, status: result.status, txHash: result.txHash };
-  } finally {
-    try { dotns.disconnect(); } catch {}
-  }
 }
 
 /**
@@ -3281,10 +3177,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
     // existing contenthash / read failed). Decoded from on-chain e3-prefixed
     // bytes to the IPFS CID string.
     let previousContenthashCid: string | null = null;
-    // Hoisted so the phone-signing banner and the publish skip below can both
-    // read the preflight-determined publish state. false = already published or
-    // publish not requested or not supported.
-    let preflightPublishNeeded = false;
     try {
       // Check domain ownership before uploading anything
       console.log("\n" + "=".repeat(60));
@@ -3351,37 +3243,10 @@ export async function deploy(content: DeployContent, domainName: string | null =
         // (classification, ownership, reservation, PoP gate) BEFORE touching
         // Bulletin. Advisory; registerDomain keeps its own internal checks.
         // Issue #100.
-        preflightPublishNeeded = false;
         try {
           dotnsPreflight = await preflight.preflight(name, { transferRecipientH160: options.transferTo });
           previousContenthashCid = await readPreviousContenthashSafe(preflight, name);
           setDeployAttribute("deploy.incremental", previousContenthashCid ? "true" : "false");
-
-          // Check publish state during preflight so tap count is accurate upfront.
-          if (options.publish && parsed && !parsed.isSubdomain) {
-            const publisher = (preflight as any)._contracts?.PUBLISHER;
-            const zeroAddr = "0x0000000000000000000000000000000000000000";
-            if (!publisher || publisher === zeroAddr) {
-              console.log(`   Publish: not supported on this environment — will be skipped`);
-            } else {
-              const labelhash = keccak256(toBytes(name));
-              try {
-                const alreadyPublished = await preflight.contractCall(
-                  publisher,
-                  PUBLISHER_ABI,
-                  "isPublished",
-                  [labelhash],
-                );
-                preflightPublishNeeded = !alreadyPublished;
-                if (!preflightPublishNeeded) {
-                  console.log(`   Publish: already published — will be skipped`);
-                }
-              } catch {
-                // isPublished read failed — conservative: assume publish will be needed
-                preflightPublishNeeded = true;
-              }
-            }
-          }
         } finally {
           preflight.disconnect();
         }
@@ -3422,7 +3287,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       // The CLI bin uses this to print the "Have your phone ready" banner up front;
       // library consumers (playground-cli) ignore it or use their own UI.
       if (phoneSignerActive) {
-        const steps = computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded);
+        const steps = computePhoneSigningSteps(dotnsPreflight);
         options.onPhoneSignaturePlan?.(steps as PhoneSignatureStep[]);
       }
 
@@ -3621,15 +3486,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
             confirmPhoneReady: options.confirmPhoneReady,
             phoneSigner: true, // owner path is always a real phone/session signer
           });
-          const willPublish = !!(options.publish && parsed && preflightPublishNeeded !== false);
           // Wire total so confirmPhoneReady gets the right count.
-          ownerDotns.setPhoneSignatureTotal(willPublish ? 2 : 1);
+          ownerDotns.setPhoneSignatureTotal(1);
           const contenthashHex = `0x${encodeContenthash(cid as string)}`;
           // #885: the owner is the PGAS-funded session account; elect PGAS for the
           // AH fee so a zero-native owner can update content faucet-free.
           await ownerDotns.setContenthash(name, contenthashHex, { feeAsset: "pgas" });
-          // Mirror the main path's publish step — the owner is authorised to publish too.
-          if (willPublish) await publish(ownerDotns, parsed!, options.failOnPublishError);
           return;
         }
 
@@ -3642,7 +3504,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           phoneSigner: phoneSignerActive,
         });
         if (phoneSignerActive) {
-          dotns.setPhoneSignatureTotal(computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded).length);
+          dotns.setPhoneSignatureTotal(computePhoneSigningSteps(dotnsPreflight).length);
         }
 
         // Track whether THIS run freshly registered the name. The transfer-to-
@@ -3677,17 +3539,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const contenthashHex = `0x${encodeContenthash(cid as string)}`;
         await dotns.setContenthash(name, contenthashHex);
 
-        // Publish step. Runs after the durable on-chain state (contenthash)
-        // is in place so a publish revert can never roll back the CID write.
-        // Skipped silently on envs without a Publisher contract — the
-        // mirror-to-paseo-next-v2 run will pick it up when relevant.
-        if (options.publish && parsed) {
-          if (preflightPublishNeeded !== false) {
-            await publish(dotns, parsed, options.failOnPublishError);
-          }
-          // preflightPublishNeeded === false: preflight confirmed already-published — skip silently.
-        }
-
         // Zero-mobile-sig handover: the worker (Alice/--mnemonic) signed the whole
         // deploy above; now hand the finished name to the signed-in account. One
         // ERC-721 transferFrom moves ownership + resolver authorisation. Idempotent.
@@ -3699,7 +3550,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           console.log(`   ${name}.${envTld} already existed — updated content only; ownership unchanged (not transferred to ${options.transferTo}).`);
           // Actionable, because this also fires when a retry re-ran the whole
           // deploy after attempt 1 freshly registered + then flaked on
-          // setContenthash/publish: attempt 2 sees "Already owned", so the
+          // setContenthash: attempt 2 sees "Already owned", so the
           // handover this run owed never happens. transferName is idempotent,
           // so the recovery command is always safe to run.
           console.log(`   If you meant to claim it, run: ${CLI_NAME} transfer ${name} --env ${envId}${options.suri ? ` --mnemonic "<your worker key>"` : ""}`);
@@ -3770,13 +3621,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
 /**
  * Compute the ordered list of step labels that will require a phone tap,
- * given the DotNS preflight result and whether publish is needed.
+ * given the DotNS preflight result.
  * Returns [] when deploy would abort or preflight is null.
  * Exported for unit testing.
  */
 export function computePhoneSigningSteps(
   dotnsPreflight: { plannedAction: string; needsPopUpgrade: boolean } | null,
-  publishNeeded: boolean,
 ): string[] {
   if (!dotnsPreflight || dotnsPreflight.plannedAction === "abort") return [];
   const steps: string[] = [];
@@ -3784,6 +3634,5 @@ export function computePhoneSigningSteps(
     steps.push("Commitment", "Register");
   }
   steps.push("Link content");
-  if (publishNeeded) steps.push("Publish to registry");
   return steps;
 }

@@ -75,6 +75,32 @@ describe("validateRootManifest", () => {
   });
 });
 
+const APP_V2_MANIFEST = {
+  $v: 2,
+  kind: "app",
+  appVersion: [0, 1, 7],
+  runtime: {
+    kind: "polkavm",
+    abiVersion: 1,
+    entrypoint: "app.polkavm",
+  },
+  capabilities: {
+    graphics: {
+      abiVersion: 1,
+      profile: "framebuffer",
+      requiredFeatures: [],
+    },
+    deviceInput: {
+      abiVersion: 1,
+      requiredFeatures: ["pointer", "keyboard"],
+    },
+    audio: {
+      abiVersion: 1,
+      requiredFeatures: [],
+    },
+  },
+};
+
 describe("validateExecutableManifest — app", () => {
   test("accepts a minimal app manifest", () => {
     const result = validateExecutableManifest({ $v: 1, kind: "app", appVersion: [1, 0, 0] });
@@ -97,6 +123,43 @@ describe("validateExecutableManifest — app", () => {
   test("rejects 5-element appVersion", () => {
     const result = validateExecutableManifest({ $v: 1, kind: "app", appVersion: [1, 0, 0, "tag", "extra"] });
     assert.equal(result.ok, false);
+  });
+});
+
+describe("validateExecutableManifest — App v2", () => {
+  test("accepts PolkaVM and web runtime variants", () => {
+    assert.equal(validateExecutableManifest(APP_V2_MANIFEST).ok, true);
+    assert.equal(
+      validateExecutableManifest({
+        $v: 2,
+        kind: "app",
+        appVersion: [1, 0, 0],
+        runtime: { kind: "web", entrypoint: "index.html" },
+      }).ok,
+      true,
+    );
+  });
+
+  test("rejects unknown required features and unsafe entrypoints", () => {
+    const unknownFeature = structuredClone(APP_V2_MANIFEST);
+    unknownFeature.capabilities.deviceInput.requiredFeatures.push("gamepad");
+    const featureResult = validateExecutableManifest(unknownFeature);
+    assert.equal(featureResult.ok, false);
+    assert.ok(featureResult.errors.some((error) => error.includes("gamepad")));
+
+    const unsafeEntrypoint = structuredClone(APP_V2_MANIFEST);
+    unsafeEntrypoint.runtime.entrypoint = "../app.polkavm";
+    const entrypointResult = validateExecutableManifest(unsafeEntrypoint);
+    assert.equal(entrypointResult.ok, false);
+    assert.ok(entrypointResult.errors.some((error) => error.includes("entrypoint")));
+  });
+
+  test("rejects PolkaVM manifests without graphics", () => {
+    const missingGraphics = structuredClone(APP_V2_MANIFEST);
+    delete missingGraphics.capabilities.graphics;
+    const result = validateExecutableManifest(missingGraphics);
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((error) => error.includes("graphics")));
   });
 });
 
@@ -339,6 +402,32 @@ describe("validateProductConfig", () => {
   });
 });
 
+test("validateProductConfig accepts an App v2 manifest as the single version source", () => {
+  const result = validateProductConfig({
+    ...VALID_CONFIG,
+    executables: [
+      { kind: "app", path: "./dist/app", manifest: APP_V2_MANIFEST },
+    ],
+  });
+  assert.equal(result.ok, true, result.ok ? "" : result.errors.join("; "));
+});
+
+test("validateProductConfig rejects duplicate App version sources", () => {
+  const result = validateProductConfig({
+    ...VALID_CONFIG,
+    executables: [
+      {
+        kind: "app",
+        path: "./dist/app",
+        appVersion: [0, 1, 7],
+        manifest: APP_V2_MANIFEST,
+      },
+    ],
+  });
+  assert.equal(result.ok, false);
+  assert.ok(result.errors.some((error) => error.includes("exactly one")));
+});
+
 test("defineConfig returns its input unchanged", () => {
   assert.equal(defineConfig(VALID_CONFIG), VALID_CONFIG);
 });
@@ -434,6 +523,50 @@ describe("preflightProductConfig", () => {
       },
     );
   });
+});
+
+test("preflight writes the exact App v2 text-record bytes into the artifact", async () => {
+  const dir = await mkTmp("pfl-app-v2-");
+  const config = {
+    ...VALID_CONFIG,
+    executables: [
+      { kind: "app", path: "./dist/app", manifest: APP_V2_MANIFEST },
+    ],
+  };
+  const cfgPath = path.join(dir, "product.config.mjs");
+  await fs.writeFile(cfgPath, `export default ${JSON.stringify(config)};`);
+  await fs.writeFile(path.join(dir, "icon.png"), "x");
+  await fs.mkdir(path.join(dir, "dist/app"), { recursive: true });
+
+  await preflightProductConfig({ path: cfgPath });
+
+  const embedded = await fs.readFile(path.join(dir, "dist/app/manifest.json"), "utf8");
+  assert.equal(embedded, JSON.stringify(APP_V2_MANIFEST));
+});
+
+test("publish rejects changed App v2 embedded bytes before network work", async () => {
+  const dir = await mkTmp("publish-app-v2-mismatch-");
+  const config = {
+    ...VALID_CONFIG,
+    executables: [
+      { kind: "app", path: "./dist/app", manifest: APP_V2_MANIFEST },
+    ],
+  };
+  await fs.mkdir(path.join(dir, "dist/app"), { recursive: true });
+  await fs.writeFile(path.join(dir, "dist/app/manifest.json"), "{}");
+
+  await assert.rejects(
+    () =>
+      publishManifest({
+        loaded: { config, sourcePath: path.join(dir, "bulletin-deploy.config.mjs") },
+        domain: config.domain,
+      }),
+    (error) => {
+      assert.match(error.message, /embedded manifest verification failed/);
+      assert.match(error.message, /differs/);
+      return true;
+    },
+  );
 });
 
 describe("assertWithinBudget", () => {

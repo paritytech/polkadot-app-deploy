@@ -27,21 +27,73 @@ export interface RootManifest {
   icon: Icon;
 }
 
-interface CommonExecutableFields {
+interface CommonExecutableFieldsV1 {
   $v: 1;
   appVersion: AppVersion;
 }
 
-export interface AppManifest extends CommonExecutableFields {
+interface CommonAppFieldsV2 {
+  $v: 2;
+  kind: "app";
+  appVersion: AppVersion;
+}
+
+export interface AppManifestV1 extends CommonExecutableFieldsV1 {
   kind: "app";
 }
+
+export interface WebRuntime {
+  kind: "web";
+  entrypoint: string;
+}
+
+export interface PolkaVmRuntime {
+  kind: "polkavm";
+  abiVersion: 1;
+  entrypoint: string;
+}
+
+export interface GraphicsRequirement {
+  abiVersion: 1;
+  profile: "framebuffer" | "tri2d" | "webgpu-raster";
+  requiredFeatures: string[];
+  requiredLimits?: Record<string, number>;
+}
+
+export interface DeviceInputRequirement {
+  abiVersion: 1;
+  requiredFeatures: Array<
+    "pointer" | "keyboard" | "touch" | "wheel" | "text" | "ime" | "focus"
+  >;
+}
+
+export interface AudioRequirement {
+  abiVersion: 1;
+  requiredFeatures: string[];
+}
+
+export interface WebAppManifestV2 extends CommonAppFieldsV2 {
+  runtime: WebRuntime;
+}
+
+export interface PolkaVmAppManifestV2 extends CommonAppFieldsV2 {
+  runtime: PolkaVmRuntime;
+  capabilities: {
+    graphics: GraphicsRequirement;
+    deviceInput?: DeviceInputRequirement;
+    audio?: AudioRequirement;
+  };
+}
+
+export type AppManifestV2 = WebAppManifestV2 | PolkaVmAppManifestV2;
+export type AppManifest = AppManifestV1 | AppManifestV2;
 
 export interface WidgetDimensions {
   height: number[];
   width?: number;
 }
 
-export interface WidgetManifest extends CommonExecutableFields {
+export interface WidgetManifest extends CommonExecutableFieldsV1 {
   kind: "widget";
   description?: string;
   dimensions: WidgetDimensions;
@@ -49,7 +101,7 @@ export interface WidgetManifest extends CommonExecutableFields {
 
 export type FundingMode = "CARD" | "BANK" | "CRYPTO";
 
-export interface FundingManifest extends CommonExecutableFields {
+export interface FundingManifest extends CommonExecutableFieldsV1 {
   kind: "funding";
   modes: FundingMode[];
 }
@@ -59,7 +111,7 @@ export interface WorkerIncludes {
   pocket: boolean;
 }
 
-export interface WorkerManifest extends CommonExecutableFields {
+export interface WorkerManifest extends CommonExecutableFieldsV1 {
   kind: "worker";
   entrypoint: string;
   includes: WorkerIncludes;
@@ -69,11 +121,19 @@ export type ExecutableManifest = AppManifest | WidgetManifest | FundingManifest 
 
 export type ExecutableKind = ExecutableManifest["kind"];
 
-export interface AppExecutableConfig {
+export interface AppExecutableConfigV1 {
   kind: "app";
   path: string;
   appVersion: AppVersion;
 }
+
+export interface AppExecutableConfigV2 {
+  kind: "app";
+  path: string;
+  manifest: AppManifestV2;
+}
+
+export type AppExecutableConfig = AppExecutableConfigV1 | AppExecutableConfigV2;
 
 export interface WidgetExecutableConfig {
   kind: "widget";

@@ -60,11 +60,178 @@ function isNonEmptyString(value: unknown): value is string {
 function isAppVersion(value: unknown): value is AppVersion {
   if (!Array.isArray(value)) return false;
   if (value.length !== 3 && value.length !== 4) return false;
-  if (!value.slice(0, 3).every(n => typeof n === "number" && Number.isFinite(n) && n >= 0)) {
+  if (!value.slice(0, 3).every(n => Number.isSafeInteger(n) && (n as number) >= 0)) {
     return false;
   }
-  if (value.length === 4 && typeof value[3] !== "string") return false;
+  if (value.length === 4 && !isNonEmptyString(value[3])) return false;
   return true;
+}
+
+function rejectUnknownFields(
+  input: Record<string, unknown>,
+  allowed: readonly string[],
+  prefix: string,
+): string[] {
+  return Object.keys(input)
+    .filter((key) => !allowed.includes(key))
+    .map((key) => `${prefix}contains unknown field '${key}'`);
+}
+
+function validateRelativeEntrypoint(
+  value: unknown,
+  suffix: string,
+  prefix: string,
+): string[] {
+  if (!isNonEmptyString(value)) return [`${prefix}entrypoint must be a non-empty string`];
+  if (
+    value.startsWith("/") ||
+    value.includes("\\") ||
+    value.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    return [`${prefix}entrypoint must be a relative path with no empty, '.', or '..' segments`];
+  }
+  if (!value.toLowerCase().endsWith(suffix)) {
+    return [`${prefix}entrypoint must end with ${suffix}`];
+  }
+  return [];
+}
+
+function validateRequiredFeatures(
+  value: unknown,
+  allowed: readonly string[],
+  prefix: string,
+): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.some((feature) => typeof feature !== "string") ||
+    new Set(value).size !== value.length
+  ) {
+    return [`${prefix}requiredFeatures must be an array of unique strings`];
+  }
+  const unknown = value.filter((feature) => !allowed.includes(feature as string));
+  return unknown.map(
+    (feature) => `${prefix}requiredFeatures contains unsupported feature ${JSON.stringify(feature)}`,
+  );
+}
+
+const GRAPHICS_PROFILES = ["framebuffer", "tri2d", "webgpu-raster"] as const;
+const DEVICE_INPUT_FEATURES = [
+  "pointer",
+  "keyboard",
+  "touch",
+  "wheel",
+  "text",
+  "ime",
+  "focus",
+] as const;
+const GPU_LIMIT_CEILINGS: Readonly<Record<string, number>> = {
+  maxTextureDimension2D: 4096,
+  maxBufferSize: 16 * 1024 * 1024,
+  maxBindingsPerBindGroup: 16,
+  maxBindGroups: 4,
+  maxVertexBuffers: 8,
+  maxVertexAttributes: 16,
+  maxColorAttachments: 4,
+};
+
+function validateGraphicsRequirement(value: unknown, prefix: string): string[] {
+  if (!isPlainObject(value)) return [`${prefix}graphics must be an object`];
+  const errors = rejectUnknownFields(
+    value,
+    ["abiVersion", "profile", "requiredFeatures", "requiredLimits"],
+    `${prefix}graphics `,
+  );
+  if (value.abiVersion !== 1) errors.push(`${prefix}graphics.abiVersion must be 1`);
+  if (!GRAPHICS_PROFILES.includes(value.profile as (typeof GRAPHICS_PROFILES)[number])) {
+    errors.push(`${prefix}graphics.profile must be one of ${GRAPHICS_PROFILES.join(", ")}`);
+  }
+  errors.push(...validateRequiredFeatures(value.requiredFeatures, [], `${prefix}graphics.`));
+  if (value.requiredLimits !== undefined) {
+    if (value.profile !== "webgpu-raster" || !isPlainObject(value.requiredLimits)) {
+      errors.push(
+        `${prefix}graphics.requiredLimits requires the webgpu-raster profile and an object value`,
+      );
+    } else {
+      for (const [key, minimum] of Object.entries(value.requiredLimits)) {
+        const ceiling = GPU_LIMIT_CEILINGS[key];
+        if (
+          ceiling === undefined ||
+          !Number.isSafeInteger(minimum) ||
+          (minimum as number) <= 0 ||
+          (minimum as number) > ceiling
+        ) {
+          errors.push(`${prefix}graphics.requiredLimits.${key} is unsupported or outside its profile ceiling`);
+        }
+      }
+    }
+  }
+  return errors;
+}
+
+function validateOptionalCapability(
+  value: unknown,
+  allowedFeatures: readonly string[],
+  prefix: string,
+): string[] {
+  if (!isPlainObject(value)) return [`${prefix}must be an object`];
+  const errors = rejectUnknownFields(value, ["abiVersion", "requiredFeatures"], prefix);
+  if (value.abiVersion !== 1) errors.push(`${prefix}abiVersion must be 1`);
+  errors.push(...validateRequiredFeatures(value.requiredFeatures, allowedFeatures, prefix));
+  return errors;
+}
+
+function validateAppV2(input: Record<string, unknown>, prefix: string): string[] {
+  const runtime = input.runtime;
+  if (!isPlainObject(runtime)) return [`${prefix}runtime must be an object`];
+
+  const commonErrors = isAppVersion(input.appVersion)
+    ? []
+    : [`${prefix}appVersion must be [major, minor, patch] or [major, minor, patch, build]`];
+
+  if (runtime.kind === "web") {
+    return [
+      ...commonErrors,
+      ...rejectUnknownFields(input, ["$v", "kind", "appVersion", "runtime"], prefix),
+      ...rejectUnknownFields(runtime, ["kind", "entrypoint"], `${prefix}runtime `),
+      ...validateRelativeEntrypoint(runtime.entrypoint, ".html", `${prefix}runtime.`),
+    ];
+  }
+
+  if (runtime.kind !== "polkavm") {
+    return [...commonErrors, `${prefix}runtime.kind must be web or polkavm`];
+  }
+
+  const errors = [
+    ...commonErrors,
+    ...rejectUnknownFields(input, ["$v", "kind", "appVersion", "runtime", "capabilities"], prefix),
+    ...rejectUnknownFields(runtime, ["kind", "abiVersion", "entrypoint"], `${prefix}runtime `),
+    ...validateRelativeEntrypoint(runtime.entrypoint, ".polkavm", `${prefix}runtime.`),
+  ];
+  if (runtime.abiVersion !== 1) errors.push(`${prefix}runtime.abiVersion must be 1`);
+  if (!isPlainObject(input.capabilities)) {
+    errors.push(`${prefix}capabilities must be an object`);
+    return errors;
+  }
+  const capabilities = input.capabilities;
+  errors.push(
+    ...rejectUnknownFields(capabilities, ["graphics", "deviceInput", "audio"], `${prefix}capabilities `),
+  );
+  errors.push(...validateGraphicsRequirement(capabilities.graphics, `${prefix}capabilities.`));
+  if (capabilities.deviceInput !== undefined) {
+    errors.push(
+      ...validateOptionalCapability(
+        capabilities.deviceInput,
+        DEVICE_INPUT_FEATURES,
+        `${prefix}capabilities.deviceInput.`,
+      ),
+    );
+  }
+  if (capabilities.audio !== undefined) {
+    errors.push(
+      ...validateOptionalCapability(capabilities.audio, [], `${prefix}capabilities.audio.`),
+    );
+  }
+  return errors;
 }
 
 function validateWidgetFields(input: Record<string, unknown>, p: string): string[] {
@@ -143,22 +310,26 @@ export function validateExecutableManifest(input: unknown): ValidationResult<Exe
   if (!isPlainObject(input)) {
     return { ok: false, errors: ["executable manifest must be an object"] };
   }
-  if (input.$v !== 1) errors.push(`executable manifest $v must be 1 (got ${JSON.stringify(input.$v)})`);
-  if (!isAppVersion(input.appVersion)) {
-    errors.push("executable manifest appVersion must be [major, minor, patch] or [major, minor, patch, build]");
-  }
   const kind = input.kind;
   const p = "executable manifest ";
-  if (kind === KIND_APP) {
-    // App has no kind-specific fields beyond the common ones.
-  } else if (kind === KIND_WIDGET) {
-    errors.push(...validateWidgetFields(input, p));
-  } else if (kind === KIND_FUNDING) {
-    errors.push(...validateFundingFields(input, p));
-  } else if (kind === KIND_WORKER) {
-    errors.push(...validateWorkerFields(input, p));
+  if (kind === KIND_APP && input.$v === 2) {
+    errors.push(...validateAppV2(input, p));
   } else {
-    errors.push(`${p}kind must be one of ${EXECUTABLE_KINDS.join(", ")} (got ${JSON.stringify(kind)})`);
+    if (input.$v !== 1) errors.push(`executable manifest $v must be 1 (got ${JSON.stringify(input.$v)})`);
+    if (!isAppVersion(input.appVersion)) {
+      errors.push("executable manifest appVersion must be [major, minor, patch] or [major, minor, patch, build]");
+    }
+    if (kind === KIND_APP) {
+      errors.push(...rejectUnknownFields(input, ["$v", "kind", "appVersion"], p));
+    } else if (kind === KIND_WIDGET) {
+      errors.push(...validateWidgetFields(input, p));
+    } else if (kind === KIND_FUNDING) {
+      errors.push(...validateFundingFields(input, p));
+    } else if (kind === KIND_WORKER) {
+      errors.push(...validateWorkerFields(input, p));
+    } else {
+      errors.push(`${p}kind must be one of ${EXECUTABLE_KINDS.join(", ")} (got ${JSON.stringify(kind)})`);
+    }
   }
   return errors.length === 0 ? { ok: true, value: input as unknown as ExecutableManifest } : { ok: false, errors };
 }
@@ -202,20 +373,35 @@ function validateExecutableConfig(input: unknown, index: number): string[] {
   if (!isPlainObject(input)) return [`executables[${index}] must be an object`];
   const errors: string[] = [];
   if (!isNonEmptyString(input.path)) errors.push(`${p}path must be a non-empty string`);
-  if (!isAppVersion(input.appVersion)) {
-    errors.push(`${p}appVersion must be [major, minor, patch] or [major, minor, patch, build]`);
-  }
   const kind = input.kind;
   if (kind === KIND_APP) {
-    // App has no kind-specific fields beyond the common ones.
-  } else if (kind === KIND_WIDGET) {
-    errors.push(...validateWidgetFields(input, p));
-  } else if (kind === KIND_FUNDING) {
-    errors.push(...validateFundingFields(input, p));
-  } else if (kind === KIND_WORKER) {
-    errors.push(...validateWorkerFields(input, p));
+    const hasAppVersion = input.appVersion !== undefined;
+    const hasManifest = input.manifest !== undefined;
+    if (hasAppVersion === hasManifest) {
+      errors.push(`${p}must declare exactly one of appVersion (App v1) or manifest (App v2)`);
+    } else if (hasAppVersion && !isAppVersion(input.appVersion)) {
+      errors.push(`${p}appVersion must be [major, minor, patch] or [major, minor, patch, build]`);
+    } else if (hasManifest) {
+      const result = validateExecutableManifest(input.manifest);
+      if (!result.ok) {
+        errors.push(...result.errors.map((error) => `${p}manifest: ${error}`));
+      } else if (result.value.kind !== KIND_APP || result.value.$v !== 2) {
+        errors.push(`${p}manifest must be an App manifest with $v 2`);
+      }
+    }
   } else {
-    errors.push(`${p}kind must be one of ${EXECUTABLE_KINDS.join(", ")} (got ${JSON.stringify(kind)})`);
+    if (!isAppVersion(input.appVersion)) {
+      errors.push(`${p}appVersion must be [major, minor, patch] or [major, minor, patch, build]`);
+    }
+    if (kind === KIND_WIDGET) {
+      errors.push(...validateWidgetFields(input, p));
+    } else if (kind === KIND_FUNDING) {
+      errors.push(...validateFundingFields(input, p));
+    } else if (kind === KIND_WORKER) {
+      errors.push(...validateWorkerFields(input, p));
+    } else {
+      errors.push(`${p}kind must be one of ${EXECUTABLE_KINDS.join(", ")} (got ${JSON.stringify(kind)})`);
+    }
   }
   return errors;
 }

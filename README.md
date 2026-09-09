@@ -81,8 +81,7 @@ Key options:
 | `--no-transfer-to-signedin-user` | When signed in, sign every DotNS tx with your mobile session instead of the default register-as-worker-then-hand-over flow. |
 | `--to <0xH160>` | Recipient address for the `transfer` subcommand. Defaults to the signed-in account; the zero address is refused. |
 | `--js-merkle` | Use pure-JS merkleization (no IPFS Kubo binary required). |
-| `--no-manifest`, `--content-only` | Skip manifest publishing even when a `polkadot-app-deploy.config.*` is discoverable — plain content deploy. Mutually exclusive with `--publish`. |
-| `--publish` | List the domain in the on-chain Publisher registry after deploy. |
+| `--no-manifest`, `--content-only` | Skip manifest publishing even when a `polkadot-app-deploy.config.*` is discoverable — plain content deploy. |
 | `--config <path>` | Explicit path to `polkadot-app-deploy.config.ts` for product deploys. |
 | `--tag "..."` | Label the deploy in telemetry. |
 | `--version` | Print the installed version and exit. |

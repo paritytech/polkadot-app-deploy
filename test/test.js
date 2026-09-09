@@ -18,7 +18,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
-import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, PUBLISHER_ABI, PublisherNotSupportedError, decodePublisherRevert, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -1424,24 +1424,6 @@ describe("classifyErrorKind", () => {
     );
   });
 
-  // Decoded ABI custom-error reverts from src/dotns.ts's Publisher paths
-  // (publishLabel / unpublishLabel) — these have no "Contract reverted" /
-  // flags=N / ContractReverted envelope, so they need their own alternative
-  // on the contract-revert rule.
-  //
-  // Reason deliberately NOT NoPersonhood: the `reverted: NoPersonhood`
-  // rule sits ahead of contract-revert and claims that one for
-  // naming.pop_required (the kind that names the remedy). See the
-  // "naming.pop_required: Publisher.publish NoPersonhood revert reason" test.
-  // Every other decoded Publisher error still lands here.
-  test("contract-revert: Publisher.publish reverted with decoded custom error", () => {
-    assert.strictEqual(classifyErrorKind("Publisher.publish reverted: NotOwner"), "contract-revert");
-  });
-
-  test("contract-revert: Publisher.unpublish reverted with decoded custom error", () => {
-    assert.strictEqual(classifyErrorKind("Publisher.unpublish reverted: CooldownActive"), "contract-revert");
-  });
-
   test("chain-timeout: timed out waiting for block", () => {
     assert.strictEqual(classifyErrorKind("finalize-registration timed out after 90s waiting for block confirmation"), "chain-timeout");
   });
@@ -1875,14 +1857,14 @@ describe("classifyErrorKind", () => {
 
   // naming.pop_required (9 spans) — Revive surfaces the personhood gate as a
   // bare revert reason, not the "requires ProofOfPersonhoodX" prose.
-  test("naming.pop_required: Publisher.publish NoPersonhood revert reason", () => {
-    const msg = "Publisher.publish reverted: NoPersonhood";
+  test("naming.pop_required: NoPersonhood revert reason", () => {
+    const msg = "Contract reverted: NoPersonhood";
     assert.strictEqual(classifyErrorKind(msg), "naming.pop_required",
       `>> FAIL: naming.pop_required: the NoPersonhood revert reason is the same user-actionable cause as the prose variant and must share its kind; got ${classifyErrorKind(msg)}`);
   });
   test("naming.pop_required: a revert without NoPersonhood stays contract-revert", () => {
     assert.strictEqual(
-      classifyErrorKind("Publisher.publish reverted (flags=1) with data: 0x"),
+      classifyErrorKind("Contract reverted (flags=1) with data: 0x"),
       "contract-revert",
       ">> FAIL: naming.pop_required: the NoPersonhood rule is over-broad — it swallowed a generic revert",
     );
@@ -1907,7 +1889,7 @@ describe("classifyErrorKind", () => {
   // naming.contract_unavailable (1 span) — env config carries a zero/absent
   // address, caught before the call rather than as empty return data.
   test("naming.contract_unavailable: invalid configured contract address", () => {
-    const msg = "Invalid contract address for PUBLISHER in environment paseo-next-v2: 0x0000000000000000000000000000000000000000";
+    const msg = "Invalid contract address for DOTNS_RESOLVER in environment paseo-next-v2: 0x0000000000000000000000000000000000000000";
     assert.strictEqual(classifyErrorKind(msg), "naming.contract_unavailable",
       `>> FAIL: naming.contract_unavailable: a zero/absent configured address is the same failure family as an empty contract read; got ${classifyErrorKind(msg)}`);
   });
@@ -3517,6 +3499,10 @@ describe("DotNS initial state", () => {
   // (not through a wrapper like getUserPopStatus) so the env id in the thrown
   // message isn't obscured by an outer "Could not read ..." wrapper.
   const EMPTY_DATA_LABELHASH = "0x" + "11".repeat(32);
+  const SAMPLE_VIEW_ABI = [
+    { inputs: [{ name: "labelhash", type: "bytes32" }], name: "isPublished", outputs: [{ name: "", type: "bool" }], stateMutability: "view", type: "function" },
+  ];
+
   function makeEmptyDataDotNS(hasContractCode) {
     const d = new DotNS();
     d.connected = true;
@@ -3538,7 +3524,7 @@ describe("DotNS initial state", () => {
   test("contractCall empty-data error (no contract code) names the environment", async () => {
     const d = makeEmptyDataDotNS(false);
     await assert.rejects(
-      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      () => d.contractCall("0xSomeContract", SAMPLE_VIEW_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
       (err) => {
         assert.match(err.message, /No contract deployed at/);
         assert.match(err.message, /env=paseo-next-v2/, `expected env id in message, got: ${err.message}`);
@@ -3550,7 +3536,7 @@ describe("DotNS initial state", () => {
   test("contractCall empty-data error (has contract code, unexpected empty) names the environment", async () => {
     const d = makeEmptyDataDotNS(true);
     await assert.rejects(
-      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      () => d.contractCall("0xSomeContract", SAMPLE_VIEW_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
       (err) => {
         assert.match(err.message, /Contract call returned empty data/);
         assert.match(err.message, /env=paseo-next-v2/, `expected env id in message, got: ${err.message}`);
@@ -3563,7 +3549,7 @@ describe("DotNS initial state", () => {
     const d = makeEmptyDataDotNS(false);
     d._environmentId = null;
     await assert.rejects(
-      () => d.contractCall("0xPublisherAddress", PUBLISHER_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
+      () => d.contractCall("0xSomeContract", SAMPLE_VIEW_ABI, "isPublished", [EMPTY_DATA_LABELHASH]),
       (err) => {
         assert.doesNotMatch(err.message, /env=null/, `must not leak literal 'null', got: ${err.message}`);
         assert.match(err.message, /env=/, `expected an env= field even when unset, got: ${err.message}`);
@@ -5747,6 +5733,70 @@ describe("NonRetryableError", () => {
 });
 
 // ---------------------------------------------------------------------------
+// DotNS.setContenthashAndTextRecord
+// ---------------------------------------------------------------------------
+describe("DotNS.setContenthashAndTextRecord", () => {
+  test("submits the CID and executable manifest in one atomic batch", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    let contenthashReads = 0;
+    let textReads = 0;
+    d.getContenthash = async () => (contenthashReads++ === 0 ? "0xold" : "0x1234");
+    d.getTextRecord = async () => (textReads++ === 0 ? "old manifest" : "new manifest");
+
+    let submitted;
+    d.submitBatchedContractCalls = async (calls, _status, label, options) => {
+      submitted = { calls, label, options };
+      return { kind: "hash", hash: "0xbatch" };
+    };
+
+    const result = await d.setContenthashAndTextRecord(
+      "app.example",
+      "0x1234",
+      "executable",
+      "new manifest",
+    );
+
+    assert.strictEqual(submitted.calls.length, 2);
+    assert.deepStrictEqual(
+      submitted.calls.map(({ functionName }) => functionName),
+      ["setText", "setContenthash"],
+    );
+    assert.deepStrictEqual(submitted.calls[0].args.slice(1), ["executable", "new manifest"]);
+    assert.strictEqual(submitted.calls[1].args[1], "0x1234");
+    assert.strictEqual(submitted.label, "Utility.batch_all(setContenthash+setText)");
+    assert.strictEqual(await submitted.options.verifyEffect(), true);
+    assert.deepStrictEqual(result, {
+      node: result.node,
+      contenthashSkipped: false,
+      textSkipped: false,
+      txHash: "0xbatch",
+    });
+  });
+
+  test("skips the batch only when both resolver records already match", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.getContenthash = async () => "0x1234";
+    d.getTextRecord = async () => "manifest";
+    d.submitBatchedContractCalls = async () => {
+      assert.fail("unchanged resolver state must not submit a batch");
+    };
+
+    const result = await d.setContenthashAndTextRecord(
+      "app.example",
+      "0x1234",
+      "executable",
+      "manifest",
+    );
+
+    assert.strictEqual(result.contenthashSkipped, true);
+    assert.strictEqual(result.textSkipped, true);
+    assert.strictEqual(result.txHash, "skipped");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // DotNS.setTextRecord
 // ---------------------------------------------------------------------------
 describe("DotNS.setTextRecord", () => {
@@ -6317,308 +6367,6 @@ describe("registerSubdomain verifyEffect", () => {
       "verifyEffect must return true once checkSubdomainOwnership returns owned:true >> FAIL: registerSubdomain verifyEffect: expected true on ownership confirmed");
     assert.ok(checkCalls >= 1,
       "verifyEffect must call checkSubdomainOwnership at least once >> FAIL: registerSubdomain verifyEffect: checkSubdomainOwnership not called");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 19b-iii. publishLabel/unpublishLabel verifyEffect
-// ---------------------------------------------------------------------------
-describe("publishLabel/unpublishLabel verifyEffect", () => {
-  const PUBLISHER_ADDR = "0xa616254fd98724c7a3d295c98ca393a486096b68";
-
-  function makeDotnsForPublish() {
-    const d = new DotNS();
-    d.connected = true;
-    d.rpc = null;
-    d.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
-    d.evmAddress = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
-    d.signer = {};
-    d["_contracts"] = { PUBLISHER: PUBLISHER_ADDR };
-    d.clientWrapper = {
-      client: {
-        query: {
-          Timestamp: {
-            Now: { getValue: async () => 1_000_000n },
-          },
-        },
-      },
-    };
-    return d;
-  }
-
-  test("publishLabel passes verifyEffect to contractTransaction", async () => {
-    const d = makeDotnsForPublish();
-
-    const capturedOpts = [];
-    // contractCall: first call is the isPublished pre-check (return false so we
-    // proceed to the tx); subsequent calls are the post-tx read-back (return true).
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? false : true;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedOpts.push(opts ?? {});
-      return { kind: "hash", hash: "0xpublishtx" };
-    };
-
-    await d.publishLabel("myappx00");
-
-    assert.strictEqual(capturedOpts.length, 1,
-      "contractTransaction must be called once >> FAIL: publishLabel verifyEffect: contractTransaction not called");
-    assert.strictEqual(typeof capturedOpts[0].verifyEffect, "function",
-      "publishLabel must pass verifyEffect to contractTransaction >> FAIL: publishLabel verifyEffect: verifyEffect not passed — nonce-advance false-positive guard missing");
-  });
-
-  test("publishLabel verifyEffect returns true once isPublished returns true", async () => {
-    const d = makeDotnsForPublish();
-
-    let capturedVerifyEffect = null;
-    // contractCall counter: call 1 = pre-check (false), call 2+ = post-tx read-back (true)
-    // The verifyEffect itself also calls contractCall internally.
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      // pre-check (1st call) → false; everything else → true
-      return contractCallCount === 1 ? false : true;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedVerifyEffect = opts?.verifyEffect ?? null;
-      return { kind: "hash", hash: "0xpublishtx2" };
-    };
-
-    // Wire up clientWrapper so verifyEffect chain-time polling works
-    let tsCall = 0;
-    d.clientWrapper = {
-      client: {
-        query: {
-          Timestamp: {
-            Now: {
-              getValue: async () => {
-                tsCall++;
-                return tsCall === 1 ? 1_000_000n : 1_005_000n;
-              },
-            },
-          },
-        },
-      },
-    };
-
-    await d.publishLabel("myappx00");
-
-    assert.ok(capturedVerifyEffect !== null,
-      "verifyEffect closure must be captured >> FAIL: publishLabel verifyEffect: closure not captured");
-
-    // Reset tsCall so the verifyEffect invocation gets a fresh timeline
-    tsCall = 0;
-    const result = await capturedVerifyEffect();
-    assert.strictEqual(result, true,
-      "verifyEffect must return true once isPublished returns true >> FAIL: publishLabel verifyEffect: expected true when publish confirmed on-chain");
-  });
-
-  test("publishLabel verifyEffect returns false when clientWrapper is null (teardown guard)", async () => {
-    const d = makeDotnsForPublish();
-
-    let capturedVerifyEffect = null;
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? false : true;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedVerifyEffect = opts?.verifyEffect ?? null;
-      return { kind: "hash", hash: "0xpublishteardown" };
-    };
-
-    await d.publishLabel("myappx00");
-
-    // Simulate session torn down before verifyEffect is invoked
-    d.connected = false;
-    d.clientWrapper = null;
-
-    assert.ok(capturedVerifyEffect !== null,
-      "verifyEffect must be captured >> FAIL: publishLabel verifyEffect: closure not captured");
-    const result = await capturedVerifyEffect();
-    assert.strictEqual(result, false,
-      "verifyEffect must return false when session is torn down >> FAIL: publishLabel verifyEffect: teardown guard missing — crash risk on disconnect");
-  });
-
-  test("unpublishLabel passes verifyEffect to contractTransaction", async () => {
-    const d = makeDotnsForPublish();
-
-    const capturedOpts = [];
-    // contractCall: call 1 = isPublished pre-check (return true so we proceed);
-    // call 2+ = post-tx read-back (return false = successfully unpublished).
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? true : false;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedOpts.push(opts ?? {});
-      return { kind: "hash", hash: "0xunpublishtx" };
-    };
-
-    await d.unpublishLabel("myappx00");
-
-    assert.strictEqual(capturedOpts.length, 1,
-      "contractTransaction must be called once >> FAIL: unpublishLabel verifyEffect: contractTransaction not called");
-    assert.strictEqual(typeof capturedOpts[0].verifyEffect, "function",
-      "unpublishLabel must pass verifyEffect to contractTransaction >> FAIL: unpublishLabel verifyEffect: verifyEffect not passed — nonce-advance false-positive guard missing");
-  });
-
-  test("unpublishLabel verifyEffect returns true once isPublished returns false", async () => {
-    const d = makeDotnsForPublish();
-
-    let capturedVerifyEffect = null;
-    // contractCall counter: call 1 = pre-check (true), call 2+ → false (removed)
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? true : false;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedVerifyEffect = opts?.verifyEffect ?? null;
-      return { kind: "hash", hash: "0xunpublishtx2" };
-    };
-
-    let tsCall = 0;
-    d.clientWrapper = {
-      client: {
-        query: {
-          Timestamp: {
-            Now: {
-              getValue: async () => {
-                tsCall++;
-                return tsCall === 1 ? 1_000_000n : 1_005_000n;
-              },
-            },
-          },
-        },
-      },
-    };
-
-    await d.unpublishLabel("myappx00");
-
-    assert.ok(capturedVerifyEffect !== null,
-      "verifyEffect closure must be captured >> FAIL: unpublishLabel verifyEffect: closure not captured");
-
-    tsCall = 0;
-    const result = await capturedVerifyEffect();
-    assert.strictEqual(result, true,
-      "verifyEffect must return true once isPublished returns false >> FAIL: unpublishLabel verifyEffect: expected true when unpublish confirmed on-chain");
-  });
-
-  test("unpublishLabel verifyEffect returns false when clientWrapper is null (teardown guard)", async () => {
-    const d = makeDotnsForPublish();
-
-    let capturedVerifyEffect = null;
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return contractCallCount === 1 ? true : false;
-    };
-    d.contractTransaction = async (_addr, _value, _abi, _fn, _args, _cb, opts) => {
-      capturedVerifyEffect = opts?.verifyEffect ?? null;
-      return { kind: "hash", hash: "0xunpublishteardown" };
-    };
-
-    await d.unpublishLabel("myappx00");
-
-    d.connected = false;
-    d.clientWrapper = null;
-
-    assert.ok(capturedVerifyEffect !== null,
-      "verifyEffect must be captured >> FAIL: unpublishLabel verifyEffect: closure not captured");
-    const result = await capturedVerifyEffect();
-    assert.strictEqual(result, false,
-      "verifyEffect must return false when session is torn down >> FAIL: unpublishLabel verifyEffect: teardown guard missing — crash risk on disconnect");
-  });
-
-  test("publishLabel throws when post-tx read-back shows still-unpublished (nonce-advance phantom-success)", async () => {
-    const d = makeDotnsForPublish();
-    // contractCall: call 1 = pre-check (false → proceed to tx); call 2 = post-tx
-    // read-back (false → the publish tx silently did NOT land). The stubbed
-    // contractTransaction resolves without invoking verifyEffect, modelling a
-    // nonce-advance resolution that never actually mutated the registry.
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return false;
-    };
-    d.contractTransaction = async () => ({ kind: "nonce-advanced" });
-
-    await assert.rejects(
-      () => d.publishLabel("myappx00"),
-      /Post-publish verification failed/,
-      ">> FAIL: publishLabel read-back: phantom-success not caught — must throw when isPublished is still false after the publish tx",
-    );
-    assert.ok(contractCallCount >= 2,
-      "post-tx read-back must run after the tx >> FAIL: publishLabel read-back: isPublished not re-read after contractTransaction");
-  });
-
-  test("unpublishLabel throws when post-tx read-back shows still-published (nonce-advance phantom-success)", async () => {
-    const d = makeDotnsForPublish();
-    // contractCall: call 1 = pre-check (true → currently published, proceed to tx);
-    // call 2 = post-tx read-back (true → the unpublish tx silently did NOT land).
-    let contractCallCount = 0;
-    d.contractCall = async () => {
-      contractCallCount++;
-      return true;
-    };
-    d.contractTransaction = async () => ({ kind: "nonce-advanced" });
-
-    await assert.rejects(
-      () => d.unpublishLabel("myappx00"),
-      /Post-unpublish verification failed/,
-      ">> FAIL: unpublishLabel read-back: phantom-success not caught — must throw when isPublished is still true after the unpublish tx",
-    );
-    assert.ok(contractCallCount >= 2,
-      "post-tx read-back must run after the tx >> FAIL: unpublishLabel read-back: isPublished not re-read after contractTransaction");
-  });
-});
-
-// ---------------------------------------------------------------------------
-// 19c. PUBLISHER_ABI + decodePublisherRevert + PublisherNotSupportedError
-// ---------------------------------------------------------------------------
-describe("Publisher: ABI + revert decoding", () => {
-  test("PUBLISHER_ABI exposes publish/unpublish/isPublished + the 4 errors", () => {
-    const fnNames = PUBLISHER_ABI.filter((e) => e.type === "function").map((e) => e.name).sort();
-    const errNames = PUBLISHER_ABI.filter((e) => e.type === "error").map((e) => e.name).sort();
-    assert.deepStrictEqual(fnNames, ["isPublished", "publish", "unpublish"]);
-    assert.deepStrictEqual(errNames, ["CooldownActive", "EmptyLabel", "NoPersonhood", "NotOwner"]);
-  });
-
-  test("decodePublisherRevert identifies the 4 known errors from raw hex data", () => {
-    const cases = [
-      { errorName: "EmptyLabel", args: [] },
-      { errorName: "NoPersonhood", args: [] },
-      { errorName: "CooldownActive", args: [1700000000n] },
-      { errorName: "NotOwner", args: ["0x35cdb23ff7fc86e8dccd577ca309bfea9c978d20", 42n] },
-    ];
-    for (const c of cases) {
-      const data = encodeErrorResult({ abi: PUBLISHER_ABI, errorName: c.errorName, args: c.args });
-      // Both the raw hex form and the structured-error form must work.
-      assert.strictEqual(decodePublisherRevert(data)?.name, c.errorName);
-      assert.strictEqual(decodePublisherRevert({ revertData: data })?.name, c.errorName);
-    }
-  });
-
-  test("decodePublisherRevert returns null for nullish / empty / unknown inputs", () => {
-    assert.strictEqual(decodePublisherRevert(null), null);
-    assert.strictEqual(decodePublisherRevert(undefined), null);
-    assert.strictEqual(decodePublisherRevert({}), null);
-    assert.strictEqual(decodePublisherRevert("0x"), null);
-    // 0xdeadbeef is not a Publisher error selector.
-    assert.strictEqual(decodePublisherRevert("0xdeadbeef"), null);
-  });
-
-  test("PublisherNotSupportedError carries env name and identifies via instanceof", () => {
-    const e = new PublisherNotSupportedError("paseo-next");
-    assert.ok(e instanceof PublisherNotSupportedError);
-    assert.ok(e instanceof Error);
-    assert.match(e.message, /paseo-next/);
-    assert.match(e.message, /Publisher contract is not configured/);
   });
 });
 
@@ -7621,13 +7369,6 @@ describe("buildCliFlagsSummary", () => {
 
   test("empty when no flags set", () => {
     assert.strictEqual(buildCliFlagsSummary({}), "");
-  });
-
-  test("reports --publish / --unpublish / --fail-on-publish-error presence", () => {
-    const s = buildCliFlagsSummary({ publish: true, unpublish: true, failOnPublishError: true });
-    assert.ok(s.includes("--publish"));
-    assert.ok(s.includes("--unpublish"));
-    assert.ok(s.includes("--fail-on-publish-error"));
   });
 });
 
@@ -17954,11 +17695,11 @@ describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literal
   // side ever read it. Belt-and-suspenders beyond the per-env
   // deepStrictEqual snapshots elsewhere in this file (which don't cover every
   // environment): scan every environment's `contracts` for the removed keys.
-  test("no environment declares ROOT_GATEWAY_DISPATCHER, a role-manager, or a popGateway key (#1410)", () => {
+  test("no environment declares ROOT_GATEWAY_DISPATCHER, a role-manager, a popGateway, or PUBLISHER (#1410, #1310)", () => {
     const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
     for (const env of envDoc.environments) {
       const keys = Object.keys(env.contracts ?? {});
-      for (const removed of ["ROOT_GATEWAY_DISPATCHER", "DOTNS_ROLE_MANAGER", "DotnsRoleManager", "popGateway", "POP_GATEWAY"]) {
+      for (const removed of ["ROOT_GATEWAY_DISPATCHER", "DOTNS_ROLE_MANAGER", "DotnsRoleManager", "popGateway", "POP_GATEWAY", "PUBLISHER"]) {
         assert.ok(!keys.includes(removed),
           `>> FAIL: v060-config-cleanup: environment "${env.id}" still declares "${removed}", which upstream deleted — remove it from assets/environments.json.`);
       }
@@ -21199,42 +20940,22 @@ describe("computePhoneSigningSteps", () => {
   }
 
   test("new domain: 3 taps (commitment · register · link)", () => {
-    const steps = computePhoneSigningSteps(pf("register"), false);
+    const steps = computePhoneSigningSteps(pf("register"));
     assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content"]);
   });
 
   test("already owned: 1 tap (link only)", () => {
-    const steps = computePhoneSigningSteps(pf("already-owned-by-us"), false);
-    assert.deepStrictEqual(steps, ["Link content"]);
-  });
-
-  test("new domain + publish needed: 4 taps", () => {
-    const steps = computePhoneSigningSteps(pf("register"), true);
-    assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content", "Publish to registry"]);
-  });
-
-  test("already owned + publish needed: 2 taps", () => {
-    const steps = computePhoneSigningSteps(pf("already-owned-by-us"), true);
-    assert.deepStrictEqual(steps, ["Link content", "Publish to registry"]);
-  });
-
-  test("new domain + publish not needed: 3 taps (same as base register)", () => {
-    const steps = computePhoneSigningSteps(pf("register"), false);
-    assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content"]);
-  });
-
-  test("already owned + publish not needed: 1 tap", () => {
-    const steps = computePhoneSigningSteps(pf("already-owned-by-us"), false);
+    const steps = computePhoneSigningSteps(pf("already-owned-by-us"));
     assert.deepStrictEqual(steps, ["Link content"]);
   });
 
   test("abort action: 0 taps", () => {
-    const steps = computePhoneSigningSteps(pf("abort"), false);
+    const steps = computePhoneSigningSteps(pf("abort"));
     assert.deepStrictEqual(steps, []);
   });
 
   test("null preflight: 0 taps", () => {
-    const steps = computePhoneSigningSteps(null, false);
+    const steps = computePhoneSigningSteps(null);
     assert.deepStrictEqual(steps, []);
   });
 });
@@ -21415,8 +21136,7 @@ describe("human-first phone signing", () => {
     const handler = (steps) => plans.push(steps.slice());
     // Simulate what deploy() does at preflight.
     const dotnsPreflight = { plannedAction: "register", needsPopUpgrade: false };
-    const preflightPublishNeeded = false;
-    const steps = computePhoneSigningSteps(dotnsPreflight, preflightPublishNeeded);
+    const steps = computePhoneSigningSteps(dotnsPreflight);
     handler(steps);
     assert.deepStrictEqual(plans[0], ["Commitment", "Register", "Link content"],
       "new-name plan must be [Commitment, Register, Link content] >> FAIL: human-first phone signing: wrong step plan for new-name");
@@ -21425,16 +21145,10 @@ describe("human-first phone signing", () => {
   test("onPhoneSignaturePlan fires before storage with correct step counts: owned-name (link)", () => {
     const plans = [];
     const dotnsPreflight = { plannedAction: "already-owned-by-us", needsPopUpgrade: false };
-    const steps = computePhoneSigningSteps(dotnsPreflight, false);
+    const steps = computePhoneSigningSteps(dotnsPreflight);
     plans.push(steps.slice());
     assert.deepStrictEqual(plans[0], ["Link content"],
       "owned-name plan must be [Link content] >> FAIL: human-first phone signing: wrong step plan for owned-name");
-  });
-
-  test("onPhoneSignaturePlan fires before storage with correct step counts: new-name + publish (commit·register·link·publish)", () => {
-    const steps = computePhoneSigningSteps({ plannedAction: "register", needsPopUpgrade: false }, true);
-    assert.deepStrictEqual(steps, ["Commitment", "Register", "Link content", "Publish to registry"],
-      "new-name+publish plan must include Publish to registry >> FAIL: human-first phone signing: publish step missing from plan");
   });
 
   test("core src/dotns.ts and src/deploy.ts contain no readline or process.stdin reference", () => {
@@ -22143,7 +21857,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -22474,7 +22188,7 @@ describe("resolveEnvId env/flag precedence (#1165)", () => {
   });
 });
 
-describe("shouldPublishManifest / validateNoManifestFlags — --no-manifest / --content-only (#1163)", () => {
+describe("shouldPublishManifest — --no-manifest / --content-only (#1163)", () => {
   test("config present + noManifest → false (skip manifest publish even though a config was discovered)", () => {
     const result = shouldPublishManifest({ configFound: true, noManifest: true });
     assert.strictEqual(result, false,
@@ -22492,24 +22206,6 @@ describe("shouldPublishManifest / validateNoManifestFlags — --no-manifest / --
       ">> FAIL: shouldPublishManifest: with no config discovered, manifest publishing must stay skipped (legacy contenthash-only path)");
     assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: true }), false,
       ">> FAIL: shouldPublishManifest: with no config discovered AND --no-manifest set, manifest publishing must stay skipped");
-  });
-
-  test("--no-manifest + --publish → rejected as a contradiction", () => {
-    const err = validateNoManifestFlags({ noManifest: true, publish: true });
-    assert.match(err, /--no-manifest.*--publish are mutually exclusive/,
-      ">> FAIL: validateNoManifestFlags: --no-manifest + --publish must be rejected — Publisher listing (--publish) depends on the manifest records --no-manifest skips");
-  });
-
-  test("--no-manifest without --publish → not rejected", () => {
-    const err = validateNoManifestFlags({ noManifest: true, publish: false });
-    assert.strictEqual(err, null,
-      ">> FAIL: validateNoManifestFlags: --no-manifest alone (no --publish) must be accepted — it's the normal content-only use case");
-  });
-
-  test("--publish without --no-manifest → not rejected", () => {
-    const err = validateNoManifestFlags({ noManifest: false, publish: true });
-    assert.strictEqual(err, null,
-      ">> FAIL: validateNoManifestFlags: --publish alone (no --no-manifest) must be accepted — unaffected by #1163");
   });
 });
 

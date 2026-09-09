@@ -103,7 +103,9 @@ function composePlaceholderExecutable(
   exec: ProductConfig["executables"][number],
 ): ExecutableManifest {
   if (exec.kind === "app") {
-    return { $v: 1, kind: "app", appVersion: exec.appVersion };
+    return "manifest" in exec
+      ? exec.manifest
+      : { $v: 1, kind: "app", appVersion: exec.appVersion };
   }
   if (exec.kind === "widget") {
     return {

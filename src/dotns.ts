@@ -10,7 +10,6 @@ import { Binary } from "polkadot-api";
 import {
   encodeFunctionData,
   decodeFunctionResult,
-  decodeErrorResult,
   keccak256,
   toBytes,
   formatEther,
@@ -33,7 +32,7 @@ import { classifyProtocolVersion, getAdapter, POP_CONTROLLER_PROBE_ABI, PROTOCOL
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
 
 /** One step in the phone-signature plan fired at preflight. */
-export type PhoneSignatureStep = "Commitment" | "Register" | "Link content" | "Publish to registry";
+export type PhoneSignatureStep = "Commitment" | "Register" | "Link content";
 
 // ---------------------------------------------------------------------------
 // Exported constants and types
@@ -970,26 +969,6 @@ const DOTNS_TEXT_RESOLVER_ABI = [
   { inputs: [{ name: "node", type: "bytes32" }, { name: "key", type: "string" }], name: "text", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
 ] as const;
 
-export const PUBLISHER_ABI = [
-  { inputs: [{ name: "label", type: "string" }], name: "publish", outputs: [], stateMutability: "nonpayable", type: "function" },
-  { inputs: [{ name: "label", type: "string" }], name: "unpublish", outputs: [], stateMutability: "nonpayable", type: "function" },
-  { inputs: [{ name: "labelhash", type: "bytes32" }], name: "isPublished", outputs: [{ name: "", type: "bool" }], stateMutability: "view", type: "function" },
-  { inputs: [], name: "EmptyLabel", type: "error" },
-  { inputs: [], name: "NoPersonhood", type: "error" },
-  { inputs: [{ name: "nextAllowedAt", type: "uint64" }], name: "CooldownActive", type: "error" },
-  { inputs: [{ name: "caller", type: "address" }, { name: "tokenId", type: "uint256" }], name: "NotOwner", type: "error" },
-] as const;
-
-// Thrown when --publish/--unpublish runs against an env that does not have a
-// Publisher contract deployed. Caller decides whether to swallow (warn + skip)
-// or surface as a fatal error.
-export class PublisherNotSupportedError extends Error {
-  constructor(envName: string) {
-    super(`Publisher contract is not configured for environment '${envName}'. Use an env that has a deployed Publisher (currently: devnet).`);
-    this.name = "PublisherNotSupportedError";
-  }
-}
-
 // Thrown by dryRunReviveCall when the contract would revert. Carries the raw
 // revert data so callers can decode it against a specific ABI without parsing
 // the human-readable message produced by formatContractDryRunFailure.
@@ -1001,21 +980,6 @@ export class ContractDryRunRevertError extends Error {
     this.name = "ContractDryRunRevertError";
     this.revertData = revertData;
     this.revertFlags = revertFlags;
-  }
-}
-
-// Decodes a Publisher revert. Accepts either a structured ContractDryRunRevertError
-// (the happy path — dry-run failed and threw with revertData attached) or a raw
-// 0x-prefixed hex string for direct decoding (tests, manual inspection).
-// Returns null when the input does not match a known Publisher selector.
-export function decodePublisherRevert(source: { revertData?: `0x${string}` } | `0x${string}` | undefined | null): { name: string; args?: readonly unknown[] } | null {
-  const data = typeof source === "string" ? source : source?.revertData;
-  if (!data || data.length < 10) return null;
-  try {
-    const decoded = decodeErrorResult({ abi: PUBLISHER_ABI, data });
-    return { name: decoded.errorName, args: decoded.args };
-  } catch {
-    return null;
   }
 }
 
@@ -2486,7 +2450,7 @@ export class DotNS {
   /** True only when the signer is a real phone/session signer that needs `_awaitPhoneReady`. */
   private _isPhoneSigner = false;
   private _localMnemonic: string | null = null;
-  private _contracts: typeof CONTRACTS & { PUBLISHER?: string; DOTNS_PROTOCOL_REGISTRY?: string; DOTNS_POP_CONTROLLER?: string } = CONTRACTS;
+  private _contracts: typeof CONTRACTS & { DOTNS_PROTOCOL_REGISTRY?: string; DOTNS_POP_CONTROLLER?: string } = CONTRACTS;
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
   private _environmentId: string | null = null;
   private _popSelfServe: PopSelfServeConfig | null = null;
@@ -2637,7 +2601,7 @@ export class DotNS {
       // Validate early — before any chain calls — so a stale environments.json
       // surfaces a clear error rather than a confusing RPC revert.
       validateContractAddresses(options.contracts, options.environmentId ?? "unknown");
-      this._contracts = { ...CONTRACTS, ...options.contracts } as typeof CONTRACTS & { PUBLISHER?: string; DOTNS_PROTOCOL_REGISTRY?: string };
+      this._contracts = { ...CONTRACTS, ...options.contracts } as typeof CONTRACTS & { DOTNS_PROTOCOL_REGISTRY?: string };
     }
     if (options.environmentId) {
       this._environmentId = options.environmentId;
@@ -3690,6 +3654,110 @@ export class DotNS {
     );
   }
 
+  /**
+   * Atomically update an executable's content CID and manifest text record.
+   *
+   * Hosts must never observe a new archive with the previous execution
+   * contract (or the inverse). Both resolver calls therefore share one
+   * `Utility.batch_all` transaction and roll back together on any failure.
+   */
+  async setContenthashAndTextRecord(
+    domainName: string,
+    contenthashHex: string,
+    key: string,
+    value: string,
+  ): Promise<{
+    node: string;
+    contenthashSkipped: boolean;
+    textSkipped: boolean;
+    txHash: string;
+  }> {
+    return withSpan(
+      "deploy.dotns.set-contenthash-and-text",
+      "2b. set-contenthash + text",
+      {},
+      async () => {
+        this.ensureConnected();
+        const node = namehash(`${domainName}.${this._tld}`);
+        const expectedContenthash = contenthashHex.toLowerCase();
+
+        let contenthashSkipped = false;
+        let textSkipped = false;
+        try {
+          const [currentContenthash, currentText] = await Promise.all([
+            this.getContenthash(domainName),
+            this.getTextRecord(domainName, key),
+          ]);
+          contenthashSkipped = (currentContenthash || "0x").toLowerCase() === expectedContenthash;
+          textSkipped = shouldSkipTextWrite(currentText, value);
+        } catch {
+          // A failed pre-check must not suppress either half of the atomic write.
+        }
+        setDeployAttribute("deploy.dotns.contenthash_unchanged", String(contenthashSkipped));
+        setDeployAttribute("deploy.dotns.text_unchanged", String(textSkipped));
+
+        if (contenthashSkipped && textSkipped) {
+          console.log(`   Contenthash and text[${key}] already set — skipping tx`);
+          return {
+            node,
+            contenthashSkipped,
+            textSkipped,
+            txHash: TX_KIND_SKIPPED,
+          };
+        }
+
+        const stateMatches = async (): Promise<boolean> => {
+          try {
+            const [currentContenthash, currentText] = await Promise.all([
+              this.getContenthash(domainName),
+              this.getTextRecord(domainName, key),
+            ]);
+            return (
+              (currentContenthash || "0x").toLowerCase() === expectedContenthash && currentText === value
+            );
+          } catch {
+            return false;
+          }
+        };
+
+        console.log(`   Atomically setting contenthash and text[${key}] on ${domainName}.${this._tld}…`);
+        const txResolution = await this.submitBatchedContractCalls(
+          [
+            {
+              contractAddress: this._contracts.DOTNS_CONTENT_RESOLVER,
+              abi: DOTNS_TEXT_RESOLVER_ABI,
+              functionName: "setText",
+              args: [node, key, value],
+            },
+            {
+              contractAddress: this._contracts.DOTNS_CONTENT_RESOLVER,
+              abi: DOTNS_CONTENT_RESOLVER_ABI,
+              functionName: "setContenthash",
+              args: [node, contenthashHex],
+            },
+          ],
+          (status) => console.log(`      ${status}`),
+          "Utility.batch_all(setContenthash+setText)",
+          { verifyEffect: stateMatches },
+        );
+        logTxResolution(txResolution);
+
+        if (!(await stateMatches())) {
+          throw new Error(
+            `Post-batch verification failed for ${domainName}.${this._tld}: contenthash and text[${key}] do not match the values submitted atomically.`,
+          );
+        }
+
+        return {
+          node,
+          contenthashSkipped,
+          textSkipped,
+          txHash: txResolution.kind === TX_KIND_HASH ? txResolution.hash : TX_KIND_NONCE_ADVANCED,
+        };
+      },
+    );
+  }
+
   async setContenthash(domainName: string, contenthashHex: string, opts: { feeAsset?: "pgas" } = {}): Promise<{ node: string }> {
     return withSpan("deploy.dotns.set-contenthash", "2b. set-contenthash", {}, async () => {
       this.ensureConnected();
@@ -4047,162 +4115,6 @@ export class DotNS {
         console.log(`   Verified text[${v.key}]: ${v.onChain}`);
       }
       return { txHash, batched: true };
-    });
-  }
-
-  // Adds `<label>.dot` to the on-chain Publisher registry. Pre-checks
-  // isPublished and returns "already-published" instead of resubmitting,
-  // which is both cheaper and avoids waking the Lite cooldown. A
-  // CooldownActive revert is treated as success-equivalent — the registry
-  // is already in the desired state from a recent prior publish.
-  async publishLabel(label: string): Promise<{ status: "published" | "already-published" | "cooldown-skipped"; txHash?: string }> {
-    return withSpan("deploy.publish", `3. publish ${label}.${this._tld}`, { "deploy.publish.label": label }, async () => {
-      this.ensureConnected();
-      const publisher = this._contracts.PUBLISHER;
-      if (!publisher || publisher === zeroAddress) {
-        throw new PublisherNotSupportedError(this.rpc ?? "unknown");
-      }
-      const labelhash = keccak256(toBytes(label));
-      const already = await withTimeout(
-        this.contractCall(publisher, PUBLISHER_ABI, "isPublished", [labelhash]),
-        30000,
-        "isPublished",
-      );
-      if (already === true) {
-        console.log(`   Already published — skipping`);
-        return { status: "already-published" as const };
-      }
-
-      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
-      const PUBLISH_POLL_INTERVAL_MS = 2_000;
-      const verifyEffect = async (): Promise<boolean> => {
-        // Capture wrapper once; bail if session torn down (same guard as
-        // setContenthash — prevents orphaned rejections on disconnect, #515).
-        const wrapper = this.clientWrapper;
-        if (!this.connected || !wrapper) return false;
-        const startChainMs = Number(await wrapper.client.query.Timestamp.Now.getValue());
-        let lastPrintedElapsed = -1;
-        while (true) {
-          const liveWrapper = this.clientWrapper;
-          if (!this.connected || !liveWrapper) return false;
-          const [published, nowChainMs] = await Promise.all([
-            this.contractCall(publisher, PUBLISHER_ABI, "isPublished", [labelhash]),
-            liveWrapper.client.query.Timestamp.Now.getValue().then(Number),
-          ]);
-          if (published === true) return true;
-          const chainElapsed = (nowChainMs - startChainMs) / 1000;
-          if (chainElapsed >= MAX_VERIFY_CHAIN_SECONDS) return false;
-          const floored = Math.floor(chainElapsed);
-          if (floored > lastPrintedElapsed) {
-            console.log(`   Awaiting publish finalization [verifyEffect] (chain time +${floored}s / ${MAX_VERIFY_CHAIN_SECONDS}s)...`);
-            lastPrintedElapsed = floored;
-          }
-          await new Promise((r) => setTimeout(r, PUBLISH_POLL_INTERVAL_MS));
-        }
-      };
-
-      try {
-        const txRes = await this.contractTransaction(publisher, 0n, PUBLISHER_ABI, "publish", [label], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect, phoneLabel: "Publish to registry" });
-        // Final read-back catches a rare post-finality reorg or nonce-advance false-positive.
-        const finalPublished = await withTimeout(
-          this.contractCall(publisher, PUBLISHER_ABI, "isPublished", [labelhash]),
-          30000,
-          "isPublished",
-        );
-        if (finalPublished !== true) {
-          throw new Error(
-            `Post-publish verification failed for ${label}.${this._tld}: isPublished returned ${finalPublished} after the publish tx. ` +
-            `The publish tx may have silently failed via nonce-advance, or another party removed the label. Re-run to retry.`,
-          );
-        }
-        logTxResolution(txRes);
-        const txHash = txRes.kind === TX_KIND_HASH ? txRes.hash : TX_KIND_NONCE_ADVANCED;
-        return { status: "published" as const, txHash };
-      } catch (e: any) {
-        const decoded = decodePublisherRevert(e);
-        if (decoded?.name === "CooldownActive") {
-          const nextAllowed = decoded.args?.[0];
-          console.log(`   Cooldown active (next allowed at ${nextAllowed}) — treating as already published`);
-          return { status: "cooldown-skipped" as const };
-        }
-        if (decoded?.name) throw new Error(`Publisher.publish reverted: ${decoded.name}${decoded.args ? `(${decoded.args.join(", ")})` : ""}`);
-        throw e;
-      }
-    });
-  }
-
-  // Removes `<label>.dot` from the on-chain Publisher registry. Pre-checks
-  // isPublished and returns "already-unpublished" instead of resubmitting,
-  // which both saves gas and avoids emitting a spurious Unpublished event
-  // for a label that was never in the set.
-  async unpublishLabel(label: string): Promise<{ status: "unpublished" | "already-unpublished"; txHash?: string }> {
-    return withSpan("deploy.unpublish", `unpublish ${label}.${this._tld}`, { "deploy.unpublish.label": label }, async () => {
-      this.ensureConnected();
-      const publisher = this._contracts.PUBLISHER;
-      if (!publisher || publisher === zeroAddress) {
-        throw new PublisherNotSupportedError(this.rpc ?? "unknown");
-      }
-      const labelhash = keccak256(toBytes(label));
-      const isPub = await withTimeout(
-        this.contractCall(publisher, PUBLISHER_ABI, "isPublished", [labelhash]),
-        30000,
-        "isPublished",
-      );
-      if (isPub !== true) {
-        console.log(`   Not currently published — skipping`);
-        return { status: "already-unpublished" as const };
-      }
-
-      const MAX_VERIFY_CHAIN_SECONDS = VERIFY_EFFECT_CHAIN_SECONDS;
-      const UNPUBLISH_POLL_INTERVAL_MS = 2_000;
-      const verifyEffect = async (): Promise<boolean> => {
-        // Capture wrapper once; bail if session torn down (same guard as
-        // setContenthash — prevents orphaned rejections on disconnect, #515).
-        const wrapper = this.clientWrapper;
-        if (!this.connected || !wrapper) return false;
-        const startChainMs = Number(await wrapper.client.query.Timestamp.Now.getValue());
-        let lastPrintedElapsed = -1;
-        while (true) {
-          const liveWrapper = this.clientWrapper;
-          if (!this.connected || !liveWrapper) return false;
-          const [published, nowChainMs] = await Promise.all([
-            this.contractCall(publisher, PUBLISHER_ABI, "isPublished", [labelhash]),
-            liveWrapper.client.query.Timestamp.Now.getValue().then(Number),
-          ]);
-          if (published !== true) return true;
-          const chainElapsed = (nowChainMs - startChainMs) / 1000;
-          if (chainElapsed >= MAX_VERIFY_CHAIN_SECONDS) return false;
-          const floored = Math.floor(chainElapsed);
-          if (floored > lastPrintedElapsed) {
-            console.log(`   Awaiting unpublish finalization [verifyEffect] (chain time +${floored}s / ${MAX_VERIFY_CHAIN_SECONDS}s)...`);
-            lastPrintedElapsed = floored;
-          }
-          await new Promise((r) => setTimeout(r, UNPUBLISH_POLL_INTERVAL_MS));
-        }
-      };
-
-      try {
-        const txRes = await this.contractTransaction(publisher, 0n, PUBLISHER_ABI, "unpublish", [label], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect });
-        // Final read-back catches a rare post-finality reorg or nonce-advance false-positive.
-        const finalPublished = await withTimeout(
-          this.contractCall(publisher, PUBLISHER_ABI, "isPublished", [labelhash]),
-          30000,
-          "isPublished",
-        );
-        if (finalPublished === true) {
-          throw new Error(
-            `Post-unpublish verification failed for ${label}.${this._tld}: isPublished still returned true after the unpublish tx. ` +
-            `The unpublish tx may have silently failed via nonce-advance, or another party re-published the label. Re-run to retry.`,
-          );
-        }
-        logTxResolution(txRes);
-        const txHash = txRes.kind === TX_KIND_HASH ? txRes.hash : TX_KIND_NONCE_ADVANCED;
-        return { status: "unpublished" as const, txHash };
-      } catch (e: any) {
-        const decoded = decodePublisherRevert(e);
-        if (decoded?.name) throw new Error(`Publisher.unpublish reverted: ${decoded.name}${decoded.args ? `(${decoded.args.join(", ")})` : ""}`);
-        throw e;
-      }
     });
   }
 

@@ -42,19 +42,30 @@ export * from "./run-state.js";
 export { defineConfig } from "./manifest/types.js";
 export type {
   AppExecutableConfig,
+  AppExecutableConfigV1,
+  AppExecutableConfigV2,
   AppManifest,
+  AppManifestV1,
+  AppManifestV2,
   AppVersion,
+  AudioRequirement,
+  DeviceInputRequirement,
   ExecutableConfig,
   ExecutableKind,
   ExecutableManifest,
   FundingExecutableConfig,
   FundingManifest,
   FundingMode,
+  GraphicsRequirement,
   Icon,
   IconConfig,
   IconFormat,
+  PolkaVmAppManifestV2,
+  PolkaVmRuntime,
   ProductConfig,
   RootManifest,
+  WebAppManifestV2,
+  WebRuntime,
   WidgetDimensions,
   WidgetExecutableConfig,
   WidgetManifest,
@@ -78,6 +89,11 @@ export {
 export type { BudgetCheck, PessimisticSizeReport } from "./manifest/byte-budget.js";
 export { loadProductConfig, tryLoadProductConfig, formatConfigLoadError } from "./manifest/config-load.js";
 export type { LoadProductConfigOptions, LoadedProductConfig } from "./manifest/config-load.js";
-export { preflightProductConfig, checkProductConfigFilesExist } from "./manifest/product-preflight.js";
+export {
+  preflightProductConfig,
+  checkProductConfigFilesExist,
+  writeEmbeddedAppManifests,
+  verifyEmbeddedAppManifests,
+} from "./manifest/product-preflight.js";
 export { publishManifest } from "./manifest/publish.js";
 export type { PublishManifestOptions, PublishManifestResult } from "./manifest/publish.js";

@@ -419,7 +419,7 @@ export type DeployErrorCategory = 'user' | 'environment' | 'internal' | 'unknown
 
 export function classifyDeployError(msg: string): DeployErrorCategory {
   if (isExpectedError(msg)) return 'user';
-  if (/chunk.*failed after.*retr|tx dropped from best chain|timed out after \d+s waiting for block|Contract reverted|Contract execution would revert|dotns register failed|All promises were rejected|"type"\s*:\s*"Invalid"|Commitment still too new|not finalised after \d+s|chain may have (dropped|evicted)|ReviveApi.*timed out|ReviveApi.*returned empty result|\b(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|publish|unpublish|Revive\.call|Utility\.batch_all) timed out after \d+ms|transaction watcher silent for/i.test(msg)) return 'environment';
+  if (/chunk.*failed after.*retr|tx dropped from best chain|timed out after \d+s waiting for block|Contract reverted|Contract execution would revert|dotns register failed|All promises were rejected|"type"\s*:\s*"Invalid"|Commitment still too new|not finalised after \d+s|chain may have (dropped|evicted)|ReviveApi.*timed out|ReviveApi.*returned empty result|\b(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|Revive\.call|Utility\.batch_all) timed out after \d+ms|transaction watcher silent for/i.test(msg)) return 'environment';
   if (/javascript heap out of memory|allocation failed.*heap|External signer mode is not supported with dotns-cli/i.test(msg)) return 'internal';
   return 'unknown';
 }
@@ -468,7 +468,7 @@ export function computeDeployOutcome(
 //   network.recovery_exhausted     — retry budget exhausted after too many recovery attempts
 //   account.mapping_pending        — EVM account auto-mapping submitted but not yet reflected on-chain
 //   chain.api_timeout              — ReviveApi call timed out (EVM address resolution)
-//   chain.tx_timeout               — outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / publish / unpublish / Revive.call / Utility.batch_all)
+//   chain.tx_timeout               — outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / Revive.call / Utility.batch_all)
 //   chain.tx_silent                — signSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
 //   chain.extrinsic_expired        — tx rejected because the mortality window passed (AncientBirthBlock)
 //   chain.quota_exhausted          — Bulletin chain storage quota exhausted
@@ -499,7 +499,7 @@ export type DeployErrorKind =
   | 'network.recovery_exhausted'
   | 'account.mapping_pending'
   | 'chain.api_timeout'
-  // outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / publish / unpublish / Revive.call / Utility.batch_all)
+  // outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / Revive.call / Utility.batch_all)
   | 'chain.tx_timeout'
   // signSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
   | 'chain.tx_silent'
@@ -532,9 +532,8 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // Revive surfaces the personhood gate as a bare revert reason rather than the
   // "requires ProofOfPersonhoodX, but this signer is NoStatus" prose matched
   // further down — same user-actionable cause, so it shares that kind. Ordered
-  // ahead of contract-revert, which would otherwise claim it: both the
-  // "(flags=N)" shape and the decoded `Publisher.publish reverted:` shape are
-  // contract-revert alternatives, and NoPersonhood arrives as the latter. The
+  // ahead of contract-revert, which would otherwise claim it: the "(flags=N)"
+  // shape is a contract-revert alternative that NoPersonhood arrives as. The
   // specific kind names the remedy, so it wins.
   [/reverted:\s*NoPersonhood\b/i, 'naming.pop_required'],
   // Operator interrupt (Ctrl-C). Its own kind so dashboards can exclude it from
@@ -546,9 +545,7 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // shows up in the data later, widening this is a one-line change with evidence
   // behind it; over-matching now would be invisible.
   [/^aborted by user\b/i, 'user.aborted'],
-  // `Publisher\.(?:un)?publish reverted:` — decoded ABI custom-error reverts
-  // from src/dotns.ts's publishLabel/unpublishLabel Publisher call paths.
-  [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"|Publisher\.(?:un)?publish reverted:/i, 'contract-revert'],
+  [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"/i, 'contract-revert'],
   [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within|Commitment still too new after \d+s/i, 'chain-timeout'],
   [/\bstale\b.*nonce|nonce.*\bstale\b|"type"\s*:\s*"(?:Future|Stale)"|Invalid::Future|tx rejected by pool/i, 'nonce-stale'],
   // Invalid::BadProof: the extrinsic's signature didn't verify (wrong genesis
@@ -588,7 +585,7 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   [/ReviveApi\.\w+ timed out after \d+ms/i, 'chain.api_timeout'],
   [/ReviveApi\.\w+ returned empty result/i, 'chain.api_timeout'],
   [/transaction watcher silent for \d+s/i, 'chain.tx_silent'],
-  [/(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|publish|unpublish|Revive\.call|Utility\.batch_all) timed out after \d+ms/i, 'chain.tx_timeout'],
+  [/(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|Revive\.call|Utility\.batch_all) timed out after \d+ms/i, 'chain.tx_timeout'],
   // Prefix, not the full `AncientBirthBlock` variant name: at 17 chars it is
   // long enough to be cut in half by the 100-char truncation both src/deploy.ts
   // producer sites apply to the inner chain error, which sent a live span to

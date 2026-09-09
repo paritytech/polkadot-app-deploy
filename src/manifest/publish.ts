@@ -3,11 +3,11 @@
  *
  * Wires [`storeFile`](../deploy.ts) and [`storeDirectory`](../deploy.ts) for
  * Bulletin uploads with [`DotNS`](../dotns.ts) for the on-chain text-record
- * writes. Phase 4/5 atomicity work (`Utility.batchAll`, snapshot/rollback,
- * Step 8 round-trip verify) is deliberately deferred. Sequential
- * best-effort writes keep this module small while the broader plan in
- * `docs-internal/superpowers/plans/2026-05-20-product-manifest-support.md`
- * tracks the follow-ups.
+ * writes. Each executable's contenthash and execution manifest are committed
+ * atomically with `Utility.batch_all`, because either record without its
+ * matching peer is not a valid launch contract. Root metadata and independent
+ * executable kinds remain separate transactions; snapshot/rollback and the
+ * Step 8 round-trip verification remain tracked follow-ups.
  */
 
 import * as fs from "node:fs/promises";
@@ -34,6 +34,7 @@ import {
 } from "../environments.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
 import type { LoadedProductConfig } from "./config-load.js";
+import { verifyEmbeddedAppManifests } from "./product-preflight.js";
 import type {
   AppManifest,
   ExecutableConfig,
@@ -92,7 +93,12 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
         `Either update the config or pass the matching <domain> argument.`,
     );
   }
-
+  const embeddedErrors = await verifyEmbeddedAppManifests(config, path.dirname(sourcePath));
+  if (embeddedErrors.length > 0) {
+    throw new NonRetryableError(
+      `App v2 embedded manifest verification failed:\n  - ${embeddedErrors.join("\n  - ")}`,
+    );
+  }
   const sizeReport = pessimisticSizePreflight(config);
   if (!sizeReport.ok) {
     const failing = sizeReport.checks.filter(c => !c.ok).map(c => `${c.key}: ${c.bytes}/${c.budget} B`).join(", ");
@@ -164,13 +170,10 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
       await registerOrEnsureResolver(dotns, ownership, exec.kind, baseLabel, config.domain);
 
       const subContenthash = `0x${encodeContenthash(cid)}`;
-      console.log(`  Setting contenthash on ${exec.kind}.${config.domain} → ${cid}…`);
-      await dotns.setContenthash(`${exec.kind}.${baseLabel}`, subContenthash);
-
       const execManifest = composeExecutable(exec);
       const execJson = JSON.stringify(execManifest);
-      console.log(`  Writing executable manifest on ${exec.kind}.${config.domain} (${Buffer.byteLength(execJson, "utf8")} B)…`);
-      await dotns.setTextRecord(`${exec.kind}.${baseLabel}`, "executable", execJson);
+      console.log(`  Atomically writing contenthash and executable manifest on ${exec.kind}.${config.domain} → ${cid} (${Buffer.byteLength(execJson, "utf8")} B)…`);
+      await dotns.setContenthashAndTextRecord(`${exec.kind}.${baseLabel}`, subContenthash, "executable", execJson);
       textRecordsWritten++;
     }
 
@@ -267,7 +270,9 @@ function composeRoot(config: ProductConfig, iconCid: string): RootManifest {
 
 function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
   if (exec.kind === "app") {
-    return { $v: 1, kind: "app", appVersion: exec.appVersion } as AppManifest;
+    return "manifest" in exec
+      ? exec.manifest
+      : ({ $v: 1, kind: "app", appVersion: exec.appVersion } as AppManifest);
   }
   if (exec.kind === "widget") {
     return {

@@ -320,23 +320,6 @@ describe("bundled snapshot", () => {
     assert.ok(wssArr.length > 0 && wssArr[0].startsWith("wss://"));
   });
 
-  test("devnet env carries a valid Publisher contract so --publish is not silently skipped (issue #130)", async () => {
-    // The Browse Publisher IS deployed on the devnet Asset Hub, but the env
-    // shipped without contracts.PUBLISHER, so the publish gate in deploy.ts
-    // took the "not supported on this environment — will be skipped" branch
-    // and apps could never be listed in Browse from a devnet deploy. Guard the
-    // devnet-family env (id contains "devnet": "devnet" here / "PCF-devnet" in
-    // the bulletin-deploy twin) so a future edit can't drop the address again.
-    const bundled = JSON.parse(await fs.readFile(defaultBundledPath(), "utf8"));
-    const devnet = bundled.environments.find(e => /devnet/i.test(e.id));
-    assert.ok(devnet, ">> FAIL: devnet-publisher: bundled snapshot must include a devnet-family env");
-    const publisher = devnet.contracts?.PUBLISHER;
-    assert.ok(
-      isValidContractAddress(publisher),
-      `>> FAIL: devnet-publisher: env '${devnet.id}' must define a valid PUBLISHER contract (Browse Publisher is deployed on the devnet Asset Hub); got ${JSON.stringify(publisher)}. Without it, 'pad --publish --env ${devnet.id}' silently skips (issue #130).`,
-    );
-  });
-
   test("devnet env carries webGateway=dev-dot.li so the post-deploy link resolves the right network (issue #142)", async () => {
     // dot.li (the default gateway) resolves DotNS names against paseo-next-v2/mainnet.
     // devnet names are only resolvable via the dev-dot.li gateway. Without this field,

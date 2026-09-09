@@ -6,7 +6,7 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, unpublish, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, validateNoManifestFlags } from "../dist/deploy.js";
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
@@ -62,9 +62,6 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i].startsWith("--reproducible=")) { flags.reproducibleSource = args[i].slice("--reproducible=".length); }
   else if (args[i] === "--dump-car") { flags.dumpCar = true; }
   else if (args[i].startsWith("--dump-car=")) { flags.dumpCar = args[i].slice("--dump-car=".length); }
-  else if (args[i] === "--publish") { flags.publish = true; }
-  else if (args[i] === "--unpublish") { flags.unpublish = true; }
-  else if (args[i] === "--fail-on-publish-error") { flags.failOnPublishError = true; }
   else if (args[i] === "--suri") { flags.suri = args[++i]; }
   else if (args[i] === "--no-transfer-to-signedin-user") { flags.noTransferToSignedinUser = true; }
   else if (args[i] === "--to") { flags.to = args[++i]; }
@@ -73,24 +70,9 @@ for (let i = 0; i < args.length; i++) {
   else { positional.push(args[i]); }
 }
 
-if (flags.publish && flags.unpublish) {
-  console.error("Error: --publish and --unpublish are mutually exclusive.");
-  process.exit(1);
-}
-
-// --no-manifest (--content-only) skips manifest publishing even when a
-// polkadot-app-deploy.config.* is discoverable; --publish depends on those
-// manifest records (Publisher listing -> Browse), so the combination is
-// rejected up front rather than silently publishing a domain with no manifest.
-const noManifestErr = validateNoManifestFlags({ noManifest: !!flags.noManifest, publish: !!flags.publish });
-if (noManifestErr) {
-  console.error(noManifestErr);
-  process.exit(1);
-}
-
 // The mnemonic actually used to sign — --mnemonic flag > MNEMONIC env var >
-// DOTNS_MNEMONIC env var. Used everywhere deploy/publish/unpublish need a
-// signer identity (existence guards below intentionally keep checking
+// DOTNS_MNEMONIC env var. Used everywhere a deploy needs a signer identity
+// (existence guards below intentionally keep checking
 // flags.mnemonic / process.env.MNEMONIC directly — only the VALUE forwarded
 // to options.mnemonic changes here).
 const effectiveMnemonic = resolveEffectiveMnemonic({
@@ -130,32 +112,6 @@ if (flags.listEnvironments) {
     process.exit(0);
   } catch (e) {
     console.error(`Error: failed to load environments: ${e?.message ?? e}`);
-    process.exit(1);
-  }
-}
-
-if (flags.unpublish) {
-  if (!flags.mnemonic && !process.env.MNEMONIC) {
-    console.error("Error: --unpublish requires --mnemonic (or MNEMONIC env var).");
-    process.exit(1);
-  }
-  const [domain] = positional;
-  if (!domain) {
-    console.error("Error: --unpublish requires a domain (e.g. my-app.dot)");
-    process.exit(1);
-  }
-  try {
-    const result = await unpublish(domain, {
-      mnemonic: effectiveMnemonic,
-      derivationPath: flags.derivationPath,
-      rpc: flags.rpc,
-      env: effectiveEnvId,
-    });
-    console.log(`Domain: ${result.domainName}`);
-    console.log(`Status: ${result.status}`);
-    process.exit(0);
-  } catch (e) {
-    console.error(`Unpublish failed:`, e?.message ?? e);
     process.exit(1);
   }
 }
@@ -245,11 +201,6 @@ if (positional[0] === "product") {
   process.exit(2);
 }
 
-if (flags.publish && !flags.mnemonic && !process.env.MNEMONIC) {
-  console.error("Error: --publish requires --mnemonic (or MNEMONIC env var).");
-  process.exit(1);
-}
-
 if (flags.help || positional.length === 0) {
   console.log(`polkadot-app-deploy v${VERSION}
 
@@ -311,18 +262,7 @@ Options:
                       Skip manifest publishing entirely, even when a
                       polkadot-app-deploy.config.* is discoverable — plain
                       content deploy (storage + root contenthash), same as
-                      having no config at all. Mutually exclusive with --publish.
-  --publish           After deploy, list <domain> in the on-chain Publisher
-                      registry (Publisher.publish). Only takes effect on envs
-                      with a deployed Publisher (currently: devnet).
-                      Requires --mnemonic (the signer must own the label).
-  --unpublish         Standalone mode: removes <domain> from the Publisher
-                      registry (Publisher.unpublish). Skips the deploy.
-                      Usage: polkadot-app-deploy --unpublish <domain.dot>
-                      Requires --mnemonic. Mutually exclusive with --publish.
-  --fail-on-publish-error
-                      Exit non-zero if --publish fails after a successful deploy.
-                      Default: non-fatal (warning logged, exit 0).
+                      having no config at all.
   --version           Show version
   --help              Show this help`);
   process.exit(0);
@@ -529,8 +469,6 @@ try {
     allowLargeDeploy: flags.allowLargeDeploy,
     reproducibleSource: flags.reproducibleSource,
     dumpCar: flags.dumpCar,
-    publish: flags.publish,
-    failOnPublishError: flags.failOnPublishError,
     transferToSignedInUser: !flags.noTransferToSignedinUser,
     // Human-first phone signing hooks (spec: 2026-06-13-human-first-phone-signing-design).
     onPhoneSignaturePlan: (steps) => {

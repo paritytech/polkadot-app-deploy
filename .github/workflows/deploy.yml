@@ -76,14 +76,6 @@ on:
         description: 'Sticky-comment header used to identify this workflow''s prior PR comment so it can be replaced on re-runs (marocchino/sticky-pull-request-comment). Override when multiple deploy workflows in the same repo each post their own comment.'
         type: string
         default: 'polkadot-app-deploy'
-      publish:
-        description: 'After a successful deploy, list <dotns-domain> in the on-chain Publisher registry (Publisher.publish / --publish). Takes effect on any env whose environments.json config has a non-zero PUBLISHER contract (currently devnet); a non-fatal skip on envs without one (e.g. paseo-next-v2, whose Publisher was not redeployed with the 2026-08-12 DotNS contracts). The DotNS owner mnemonic (secrets.mnemonic) signs it — no direct-signer required. Subdomains are skipped by the registry.'
-        type: boolean
-        default: false
-      fail-on-publish-error:
-        description: 'If true, a publish failure after a successful content deploy fails the run (--fail-on-publish-error). Default false: publish errors are logged as a non-fatal warning and the deploy still succeeds. Ignored unless publish is true.'
-        type: boolean
-        default: false
     secrets:
       mnemonic:
         description: 'Mnemonic (DotNS domain owner)'
@@ -280,10 +272,6 @@ jobs:
             if [ -n "${{ inputs.rpc }}" ]; then FLAGS+=(--rpc "${{ inputs.rpc }}"); fi
             if [ -n "${{ inputs.env }}" ]; then FLAGS+=(--env "${{ inputs.env }}"); fi
             if [ "${{ inputs.pool-size }}" != "0" ]; then FLAGS+=(--pool-size "${{ inputs.pool-size }}"); fi
-            # --publish needs a mnemonic; the MNEMONIC env exported above satisfies
-            # the CLI's signer guard, so this works in pool mode without direct-signer.
-            if [ "${{ inputs.publish }}" = "true" ]; then FLAGS+=(--publish); fi
-            if [ "${{ inputs.fail-on-publish-error }}" = "true" ]; then FLAGS+=(--fail-on-publish-error); fi
             # Only use the wrapper when retry is actually configured (max-retries > 1).
             # Default callers (max-retries: 1) run the deploy directly so there
             # are no wrapper stderr-capture or exit-75 classification side-effects.

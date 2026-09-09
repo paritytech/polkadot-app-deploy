@@ -107,9 +107,6 @@ export function scrubSecrets(text: string): string {
 export function buildCliFlagsSummary(flags: Record<string, unknown>): string {
   const parts: string[] = [];
   if (flags.jsMerkle) parts.push("--js-merkle");
-  if (flags.publish) parts.push("--publish");
-  if (flags.unpublish) parts.push("--unpublish");
-  if (flags.failOnPublishError) parts.push("--fail-on-publish-error");
   if (flags.poolSize != null) parts.push(`--pool-size ${String(flags.poolSize)}`);
   if (typeof flags.tag === "string" && flags.tag) parts.push(`--tag ${flags.tag}`);
   if (flags.mnemonic) parts.push("--mnemonic <set>");

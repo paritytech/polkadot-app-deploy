@@ -71,42 +71,6 @@ function runCliExpectFail(relPath, ...args) {
   }
 }
 
-describe("--publish / --unpublish parsing", () => {
-  test("help documents --publish, --unpublish, --fail-on-publish-error", () => {
-    const help = runCli("bin/polkadot-app-deploy", "--help");
-    assert.match(help, /--publish\b/);
-    assert.match(help, /--unpublish\b/);
-    assert.match(help, /--fail-on-publish-error\b/);
-  });
-
-  test("--publish and --unpublish together exit 1", () => {
-    // Pass a bogus mnemonic so we don't trip the mnemonic-required check first.
-    const r = runCliExpectFail("bin/polkadot-app-deploy", "--publish", "--unpublish", "--mnemonic", "x x x", "foo.dot");
-    assert.strictEqual(r.code, 1);
-    assert.match(r.stderr, /mutually exclusive/i);
-  });
-
-  test("--publish without mnemonic (and no MNEMONIC env) exits 1", () => {
-    // Provide positional args so help-mode doesn't fire — we want to hit
-    // the mnemonic-required guard specifically.
-    const r = runCliExpectFail("bin/polkadot-app-deploy", "--publish", "./.no-such-dir", "foo.dot");
-    assert.strictEqual(r.code, 1);
-    assert.match(r.stderr, /--publish requires --mnemonic/);
-  });
-
-  test("--unpublish without mnemonic exits 1", () => {
-    const r = runCliExpectFail("bin/polkadot-app-deploy", "--unpublish", "foo.dot");
-    assert.strictEqual(r.code, 1);
-    assert.match(r.stderr, /--unpublish requires --mnemonic/);
-  });
-
-  test("--unpublish without a domain exits 1", () => {
-    const r = runCliExpectFail("bin/polkadot-app-deploy", "--unpublish", "--mnemonic", "x x x");
-    assert.strictEqual(r.code, 1);
-    assert.match(r.stderr, /requires a domain/);
-  });
-});
-
 describe("no 'wallet' wording in CLI", () => {
   test("--help output contains no 'wallet' text", () => {
     const help = runCli("bin/polkadot-app-deploy", "--help");

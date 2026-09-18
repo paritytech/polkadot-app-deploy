@@ -336,8 +336,9 @@ export const POP_CONTROLLER_PROBE_ABI = [
  */
 export const PROTOCOL_PROBE_LABEL = "probelabel";
 
-/** finalizeRegistration's existing +10% payment buffer — maxPrice must agree with the amount actually sent, so they share this exact formula. */
-function withTenPercentBuffer(priceWei: bigint): bigint {
+/** The committed `maxPrice` and the amount actually sent must be the same
+ *  number, so every site that needs the buffer takes it from here. */
+export function withTenPercentBuffer(priceWei: bigint): bigint {
   return (priceWei * 110n) / 100n;
 }
 

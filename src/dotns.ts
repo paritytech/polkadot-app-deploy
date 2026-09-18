@@ -28,7 +28,7 @@ import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
-import { classifyProtocolVersion, getAdapter, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
+import { classifyProtocolVersion, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
 
 /** One step in the phone-signature plan fired at preflight. */
@@ -232,7 +232,7 @@ export function registerDepositWei(userStatus: number, startingPriceWei: bigint)
 }
 // Apply finalizeRegistration's +10% payment buffer, then convert wei→native.
 export function bufferedWeiToNative(weiValue: bigint, nativeToEthRatio: bigint): bigint {
-  return weiToNative((weiValue * 110n) / 100n, nativeToEthRatio);
+  return weiToNative(withTenPercentBuffer(weiValue), nativeToEthRatio);
 }
 
 // Convert an EVM wei fee to native (planck) units for contractTransaction's
@@ -917,7 +917,8 @@ const POP_RULES_ABI = [
   { inputs: [{ name: "name", type: "string" }, { name: "userAddress", type: "address" }], name: "priceWithoutCheck", outputs: [{ name: "metadata", type: "tuple", components: [{ name: "price", type: "uint256" }, { name: "status", type: "uint8" }, { name: "userStatus", type: "uint8" }, { name: "message", type: "string" }] }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "name", type: "string" }], name: "isBaseNameReserved", outputs: [{ name: "isReserved", type: "bool" }, { name: "reservationOwner", type: "address" }, { name: "expiryTimestamp", type: "uint64" }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "name", type: "string" }, { name: "from", type: "address" }, { name: "to", type: "address" }], name: "transferFloor", outputs: [{ name: "", type: "uint256" }], stateMutability: "view", type: "function" },
-  { inputs: [], name: "startingPrice", outputs: [{ name: "", type: "uint256" }], stateMutability: "view", type: "function" },
+  // No startingPrice here: it exists only on the poprules-startingPrice
+  // generation, so it belongs to that profile's OLD_POP_RULES_ABI.
 ] as const;
 
 const PERSONHOOD_ABI = [
@@ -3063,11 +3064,8 @@ export class DotNS {
     if (!this.clientWrapper) throw new Error(`DotNS registry read (${functionName}): polkadot-api client not available`);
     const registryAddress = this._contracts.DOTNS_PROTOCOL_REGISTRY;
     if (!registryAddress) return { ok: false };
-    const encodedCallData = encodeFunctionData({ abi: DOTNS_PROTOCOL_REGISTRY_ABI, functionName, args: [] });
-    const callResult = await this.clientWrapper.performDryRunCall(this.substrateAddress!, registryAddress, 0n, encodedCallData);
-    if (!callResult.result.isOk) return { ok: false };
-    const rawData: string = callResult.result.value.data ?? "0x";
-    if (rawData.length <= 2) return { ok: false };
+    const { ok, rawData } = await this.performViewDryRun(registryAddress, DOTNS_PROTOCOL_REGISTRY_ABI, functionName, []);
+    if (!ok) return { ok: false };
     const value = decodeFunctionResult({ abi: DOTNS_PROTOCOL_REGISTRY_ABI, functionName, data: rawData as `0x${string}` }) as string;
     return { ok: true, value };
   }
@@ -3084,11 +3082,18 @@ export class DotNS {
   private async probeViewFunctionOk(contractAddress: string, abi: readonly any[], functionName: string, args: unknown[] = []): Promise<boolean> {
     this.ensureConnected();
     if (!this.clientWrapper) throw new Error(`DotNS protocol probe (${functionName}): polkadot-api client not available`);
+    const { ok } = await this.performViewDryRun(contractAddress, abi, functionName, args);
+    return ok;
+  }
+
+  /** A revert or empty `0x` is `ok: false`; an RPC failure throws. Callers need
+   *  those two apart, which contractCall collapses into a single throw. */
+  private async performViewDryRun(contractAddress: string, abi: readonly any[], functionName: string, args: unknown[]): Promise<{ ok: boolean; rawData: string }> {
     const encodedCallData = encodeFunctionData({ abi, functionName, args });
-    const callResult = await this.clientWrapper.performDryRunCall(this.substrateAddress!, contractAddress, 0n, encodedCallData);
-    if (!callResult.result.isOk) return false;
+    const callResult = await this.clientWrapper!.performDryRunCall(this.substrateAddress!, contractAddress, 0n, encodedCallData);
+    if (!callResult.result.isOk) return { ok: false, rawData: "0x" };
     const rawData: string = callResult.result.value.data ?? "0x";
-    return rawData.length > 2;
+    return { ok: rawData.length > 2, rawData };
   }
 
   /**
@@ -3145,7 +3150,7 @@ export class DotNS {
       // which deployment failed to classify. The reason text itself —
       // including which case it is and any code-presence caveat — comes
       // entirely from classifyProtocolVersion.
-      throw new Error(`${env} (POP_RULES ${popRulesAddress}): ${classification.reason}`);
+      throw new Error(`${env} (${dotnsContractName(popRulesAddress, this._contracts)} ${popRulesAddress}): ${classification.reason}`);
     }
     const profile = classification.profile;
     this._protocolVersion = profile;
@@ -4337,7 +4342,7 @@ export class DotNS {
     // could spuriously throw "Payment conversion underflow" for a tiny but
     // genuinely payable priceWei (floors to 0 native units where the correct
     // rounded-up payment is 1 unit).
-    const bufferedPaymentWei = (priceWei * 110n) / 100n;
+    const bufferedPaymentWei = withTenPercentBuffer(priceWei);
     // Invariant: bufferedWeiToNative (via weiToNative) rounds any nonzero
     // remainder UP, so a positive priceWei can never convert to 0 native
     // units — a "payment conversion underflow" guard here is unreachable

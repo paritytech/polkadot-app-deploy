@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import fsSync from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { classifyDeployError } from "../dist/telemetry.js";
 
 import {
   loadEnvironments,
@@ -749,7 +750,8 @@ describe("describeContractSources", () => {
   });
 
   test("names the operator's file, with its path, for --environment-file", () => {
-    const r = describeContractSources(env, undefined, "file", "/home/ops/envs.json", "gamingnet");
+    // An env absent from the shipped config declares all of its own contracts.
+    const r = describeContractSources(env, undefined, "file", "/home/ops/envs.json", "gamingnet", Object.keys(env));
     assert.equal(r.POP_RULES, "/home/ops/envs.json (environment gamingnet)",
       ">> FAIL: an environment that never appears in assets/environments.json must be attributed to the file that declared it");
   });
@@ -758,6 +760,25 @@ describe("describeContractSources", () => {
     const r = describeContractSources(env, { POP_RULES: "0x" + "9".repeat(40) }, "bundled", undefined, "custom");
     assert.match(r.POP_RULES, /--contract flag or contracts option \(POP_RULES=0x9+\)/);
     assert.match(r.DOTNS_REGISTRY, /assets\/environments\.json/, "keys not overridden keep the environment's source");
+  });
+
+  // A user file overriding one address keeps the rest from the shipped config,
+  // so attributing the whole merged map to the file sends an operator to a file
+  // that never mentions the address they are chasing.
+  test("only the keys the user file declared are attributed to it", () => {
+    const r = describeContractSources(env, undefined, "file", "./mine.json", "paseo-next-v2", ["POP_RULES"]);
+    assert.equal(r.POP_RULES, "./mine.json (environment paseo-next-v2)",
+      ">> FAIL: a key the user file DID declare was not attributed to that file");
+    assert.match(r.DOTNS_REGISTRY, /assets\/environments\.json shipped with polkadot-app-deploy/,
+      ">> FAIL: a key the user file never declared was blamed on that file");
+  });
+
+  test("a user file that declares no contracts for the env claims none of them", () => {
+    const r = describeContractSources(env, undefined, "file", "./mine.json", "paseo-next-v2", []);
+    assert.match(r.POP_RULES, /assets\/environments\.json/,
+      ">> FAIL: a file declaring no contracts for this env was still credited with them");
+    assert.match(r.DOTNS_REGISTRY, /assets\/environments\.json/,
+      ">> FAIL: a file declaring no contracts for this env was still credited with them");
   });
 
   test("names the hardcoded fallback when no environments file loaded at all", () => {
@@ -769,5 +790,42 @@ describe("describeContractSources", () => {
       () => validateContractAddresses({ POP_RULES: "0xdeadbeef" }, "gamingnet", { POP_RULES: "/home/ops/envs.json (environment gamingnet)" }),
       /This address came from \/home\/ops\/envs\.json/,
     );
+  });
+});
+
+// Keying userFileContractKeys by the wrong field, or reading the wrong object,
+// restores the bug with every unit test still green, so this drives the real
+// loader. It also feeds the real message to the classifier: the origin wording
+// lives in one place and both halves must keep agreeing on it.
+describe("loadEnvironments reports which contracts the user file declared", () => {
+  test("a partial override file is blamed only for the keys it declares", async () => {
+    const dir = await tmpDir("env1507-");
+    try {
+      const file = path.join(dir, "mine.json");
+      await fs.writeFile(file, JSON.stringify({
+        environments: [{ id: "paseo-next-v2", contracts: { POP_RULES: "0x" + "9".repeat(40) } }],
+      }));
+      const { doc, source, userFilePath, userFileContractKeys } = await loadEnvironments({ userFilePath: file, warn: () => {} });
+      assert.equal(source, "file",
+        ">> FAIL: partial override file: loadEnvironments did not report the file as the source");
+      assert.deepEqual(userFileContractKeys?.["paseo-next-v2"], ["POP_RULES"],
+        ">> FAIL: partial override file: the declared-key list was not reported, so every address gets blamed on that file");
+
+      const merged = doc.environments.find((e) => e.id === "paseo-next-v2").contracts;
+      const sources = describeContractSources(merged, undefined, source, userFilePath, "paseo-next-v2", userFileContractKeys?.["paseo-next-v2"]);
+      assert.equal(sources.POP_RULES, `${file} (environment paseo-next-v2)`,
+        ">> FAIL: partial override file: the key the file declared was not attributed to the file");
+      assert.match(sources.DOTNS_REGISTRAR, /assets\/environments\.json shipped with polkadot-app-deploy/,
+        ">> FAIL: partial override file: an address from the shipped config was blamed on the operator's file");
+
+      // The classifier reads this exact string. If the origin wording changes
+      // and only one side follows, a stale shipped address turns into the
+      // operator's mistake and leaves the health dashboards.
+      const failure = `No contract deployed at 0xabc (DOTNS_REGISTRAR) env=paseo-next-v2. This address came from ${sources.DOTNS_REGISTRAR}.`;
+      assert.equal(classifyDeployError(failure), "unknown",
+        ">> FAIL: partial override file: a bad address in the config we ship classified as user error, which hides a fleet-wide failure from the dashboards");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

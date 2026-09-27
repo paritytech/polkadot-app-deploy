@@ -2185,6 +2185,53 @@ describe("withSpan error attribute propagation", () => {
   });
 });
 
+// A wrong contract address is the operator's mistake only when it came from
+// their config. A stale address in the config we ship is a fleet-wide tool
+// failure and must stay on the health dashboards.
+describe("a missing contract is classified by WHOSE config is wrong", () => {
+  const body = (env) => `No contract deployed at 0xabc (POP_RULES) env=${env} — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code.`;
+  const from = (origin) => ` This address came from ${origin}.`;
+
+  test("an address from the operator's own file is user error, not a sad deploy", () => {
+    const msg = body("gamingnet") + from("/home/ops/envs.json (environment gamingnet)");
+    assert.equal(classifyDeployError(msg), "user",
+      ">> FAIL: an operator's own wrong address counted against tool health");
+  });
+
+  test("an address from the config we ship stays visible as a tool failure", () => {
+    const msg = body("paseo-next-v2") + from("assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2)");
+    assert.equal(classifyDeployError(msg), "unknown",
+      ">> FAIL: a stale address in our own shipped config was blamed on the operator and filtered off the dashboards");
+    assert.equal(isExpectedError(msg), false,
+      ">> FAIL: a stale shipped address was marked expected, hiding it from every widget filtering NOT deploy.expected:true");
+  });
+
+  test("an address from the built-in fallback also stays visible", () => {
+    const msg = body("paseo-next-v2") + from("the built-in fallback for paseo-next-v2");
+    assert.equal(classifyDeployError(msg), "unknown",
+      ">> FAIL: a bad fallback address was blamed on the operator");
+  });
+
+  test("no stated origin stays visible rather than assumed to be the operator's", () => {
+    assert.equal(classifyDeployError(body("gamingnet")), "unknown",
+      ">> FAIL: an address with no known origin was assumed to be the operator's mistake");
+  });
+
+  test("an unverifiable address follows the same rule", () => {
+    const unverifiable = "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.";
+    assert.equal(classifyDeployError(unverifiable + from("/home/ops/envs.json (environment paseo-next-v2)")), "user",
+      ">> FAIL: unverifiable address: an operator's own wrong address counted against tool health");
+    assert.equal(classifyDeployError(unverifiable + from("assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2)")), "unknown",
+      ">> FAIL: unverifiable address: an address from the config we ship was blamed on the operator");
+  });
+
+  test("an unrecognised DotNS generation is environment, not unknown", () => {
+    const msg = "Could not determine the DotNS ABI profile: contract code is present at POP_RULES, but neither pricingVersion() (v0.5.8-rc1) nor startingPrice() (poprules-startingPrice) answered.";
+    assert.equal(classifyDeployError(msg), "environment",
+      ">> FAIL: an unsupported chain generation counted as a tool failure");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 9. isExpectedError classification
 // ---------------------------------------------------------------------------

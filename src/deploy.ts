@@ -2958,6 +2958,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   let envAssetHub: string[] | undefined;
   let envSource: string | undefined;
   let envUserFilePath: string | undefined;
+  let envUserFileKeys: string[] | undefined;
   let envNetwork: string | undefined;
   let envName: string | undefined;
   let envIpfs: string | undefined;
@@ -2983,12 +2984,13 @@ export async function deploy(content: DeployContent, domainName: string | null =
     envAssetHub = options.assetHubEndpoints;
   } else {
     try {
-      const { doc, source, userFilePath } = await loadEnvironments();
+      const { doc, source, userFilePath, userFileContractKeys } = await loadEnvironments();
       const resolved = resolveEndpoints(doc, envId);
       envBulletin = resolved.bulletin;
       envAssetHub = options.assetHubEndpoints ?? resolved.assetHub;
       envSource = source;
       envUserFilePath = userFilePath;
+      envUserFileKeys = userFileContractKeys?.[envId];
       envNetwork = resolved.network;
       envName = resolved.envName;
       envIpfs = resolved.ipfs;
@@ -3008,7 +3010,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   }
   // CLI/library-supplied contract addresses win over the env's map. The `custom`
   // env intentionally ships no addresses, so they must be provided this way.
-  const contractSources = describeContractSources(envContracts, options.contracts, envSource, envUserFilePath, envId);
+  const contractSources = describeContractSources(envContracts, options.contracts, envSource, envUserFilePath, envId, envUserFileKeys);
   if (options.contracts && Object.keys(options.contracts).length > 0) {
     envContracts = { ...envContracts, ...options.contracts };
   }

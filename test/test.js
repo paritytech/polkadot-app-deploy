@@ -11523,6 +11523,14 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       "npm error syscall stat",
       "npm error path /home/runner/.npm/_cacache/content-v2/sha512/66/5e/21ff482cc3",
     ].join("\n");
+    // CORRUPTION_LOG above matches through "seems to be corrupted" (or
+    // _cacache); on its own it can't prove the EINTEGRITY alternative is
+    // still doing anything. This scenario has neither of those and no
+    // _cacache path, so it only passes if EINTEGRITY alone fires the clean.
+    const EINTEGRITY_ONLY_LOG = [
+      "npm error code EINTEGRITY",
+      "npm error integrity checksum failed when using sha512: wanted sha512-abc123 but got sha512-def456",
+    ].join("\n");
     const UNRELATED_LOG = "npm error code ECONNRESET\nnpm error network request to https://registry... failed";
 
     // nick-fields/retry's on_retry_command runs via Node's execSync with no
@@ -11555,6 +11563,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         `>> FAIL: ${label}: a corrupted-cache signature in the captured log did not trigger npm cache clean --force before the next attempt`);
       assert.ok(ranCacheClean(onRetryScript, ENOENT_ONLY_LOG),
         `>> FAIL: ${label}: an ENOENT-under-_cacache log with no "seems to be corrupted" line did not trigger npm cache clean --force (the corruption signature spans multiple lines in real npm output, so a same-line-anchored pattern silently never fires)`);
+      assert.ok(ranCacheClean(onRetryScript, EINTEGRITY_ONLY_LOG),
+        `>> FAIL: ${label}: an EINTEGRITY-only log (no "seems to be corrupted", no _cacache path) did not trigger npm cache clean --force`);
       assert.ok(!ranCacheClean(onRetryScript, UNRELATED_LOG),
         `>> FAIL: ${label}: an unrelated failure (ECONNRESET) triggered npm cache clean --force, which should only fire on a corrupted-cache signature`);
     }

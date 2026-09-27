@@ -3185,8 +3185,15 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: npm ci
+      # Step-level safety net (#1595): every RPC call in the test is already
+      # bounded by its own timeout (30s connect / 20s request), but
+      # --test-timeout is a second line of defense in case some future call
+      # slips through unbounded. Its own timeout-minutes stays below the
+      # job's 10 so a runaway step is caught here, not by the job cancelling
+      # the whole run.
       - name: Assert every extrinsic encodes against the live chain
-        run: E2E=1 node --test test/e2e-chain-calls.test.js
+        timeout-minutes: 5
+        run: E2E=1 node --test --test-timeout=60000 test/e2e-chain-calls.test.js
 
   # Authoritative daily drift detector: are the DotNS contract addresses in
   # assets/environments.json still in sync with paritytech/dotns DEPLOYMENTS.md?

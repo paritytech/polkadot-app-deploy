@@ -11685,7 +11685,10 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     test("chain-call-encoding keeps its E2E=1 live-chain assertion after gating", () => {
       const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
       const block = jobBlock(wf, "chain-call-encoding");
-      assert.match(block, /E2E=1 node --test test\/e2e-chain-calls\.test\.js/,
+      // Allows an optional --test-timeout=<ms> safety net (#1595) between
+      // `--test` and the target file, without tolerating the E2E=1 gate or
+      // the target file itself being weakened or dropped.
+      assert.match(block, /E2E=1 node --test(?: --test-timeout=\d+)? test\/e2e-chain-calls\.test\.js/,
         ">> FAIL: deps-discriminator: chain-call-encoding must still run with E2E=1 — cause: the live-chain assertion step was weakened or dropped while adding the gate");
     });
 

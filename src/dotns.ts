@@ -1963,6 +1963,38 @@ export function storageDepositLimitFor(
   return buffered < floor ? floor : buffered;
 }
 
+/**
+ * The weight ceiling to declare on a Revive call, given the dry run's
+ * measured gasRequired. weight_limit used to be declared at exactly the
+ * dry-run estimate, with no margin — unlike storage_deposit_limit
+ * (storageDepositLimitFor, above), buffered 20% since bulletin-deploy
+ * #1518. A dry run measures the chain as it was; a write elsewhere between
+ * the estimate and inclusion (proof_size moves on ANY write to the same
+ * trie, not just this call's own) can push the real requirement above the
+ * declared limit and trap the call (bulletin-deploy #1522).
+ *
+ * Same 20% factor as storageDepositLimitFor, applied to BOTH components:
+ * ref_time and proof_size can drift independently, and buffering only one
+ * is not enough to clear a replay under load.
+ *
+ * Deliberately NO floor, unlike storageDepositLimitFor: the single-call
+ * path (dryRunReviveCall) always measures the exact call about to be
+ * submitted — no commit()-stands-in-for-register()-reveal substitution gap
+ * to floor against there. (submitBatchedContractCalls only dry-runs the
+ * HEAD call and reuses that estimate for every sibling in the batch —
+ * pre-existing behavior this doesn't change.) Over-buffering also isn't
+ * free insurance the way storage headroom is — pallet-revive declares a
+ * Revive.call's pre-dispatch weight from the declared gas_limit, so a large
+ * enough weight_limit gets the tx rejected outright with
+ * `Invalid/ExhaustsResources` before it reaches a block.
+ */
+export function weightLimitFor(gasRequired: { referenceTime: bigint; proofSize: bigint }): { ref_time: bigint; proof_size: bigint } {
+  return {
+    ref_time: (gasRequired.referenceTime * 120n) / 100n,
+    proof_size: (gasRequired.proofSize * 120n) / 100n,
+  };
+}
+
 export class ReviveClientWrapper {
   static DRY_RUN_STORAGE_LIMIT: bigint = 18446744073709551615n;
   static DRY_RUN_WEIGHT_LIMIT: { ref_time: bigint; proof_size: bigint } = { ref_time: 18446744073709551615n, proof_size: 18446744073709551615n };
@@ -2321,7 +2353,7 @@ export class ReviveClientWrapper {
       throw new ContractDryRunRevertError(msg, (gasEstimate.revertData ?? "0x") as `0x${string}`, gasEstimate.revertFlags ?? 0n);
     }
     return {
-      weight_limit: { ref_time: gasEstimate.gasRequired.referenceTime, proof_size: gasEstimate.gasRequired.proofSize },
+      weight_limit: weightLimitFor(gasEstimate.gasRequired),
       storage_deposit_limit: storageDepositLimitFor(gasEstimate.storageDeposit, this._storageDepositFloor),
     };
   }
@@ -4104,20 +4136,16 @@ export class DotNS {
       }));
     }
 
-    const weight_limit = {
-      proof_size: headEstimate.gasRequired.proofSize,
-      ref_time: headEstimate.gasRequired.referenceTime,
-    };
-    // Route through the same storageDepositLimitFor() helper
+    // Route through the same storageDepositLimitFor()/weightLimitFor() helpers
     // ReviveClientWrapper.dryRunReviveCall uses, instead of recomputing the
-    // 20%-buffer-floored-at-floor formula inline — the two had drifted
-    // into separate copies of the same arithmetic (issue: storage_deposit_limit
-    // buffer formula duplicated past its own helper). this._registerStorageDeposit
-    // is the same per-env floor threaded into ReviveClientWrapper via
-    // setStorageDepositFloor (bulletin-deploy #1491/#1518) — this call site
-    // builds its own Revive.call extrinsics directly rather than going
-    // through the wrapper's dryRunReviveCall, so it must be passed explicitly
-    // here too.
+    // buffer formulas inline — the two had drifted into separate copies of the
+    // same arithmetic (issue: storage_deposit_limit buffer formula duplicated
+    // past its own helper). this._registerStorageDeposit is the same per-env
+    // floor threaded into ReviveClientWrapper via setStorageDepositFloor
+    // (bulletin-deploy #1491/#1518) — this call site builds its own
+    // Revive.call extrinsics directly rather than going through the wrapper's
+    // dryRunReviveCall, so it must be passed explicitly here too.
+    const weight_limit = weightLimitFor(headEstimate.gasRequired);
     const storage_deposit_limit = storageDepositLimitFor(headEstimate.storageDeposit, this._registerStorageDeposit);
 
     const client = this.clientWrapper.client;

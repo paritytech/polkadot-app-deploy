@@ -11706,8 +11706,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     assert.ok(job, "nightly-pr-coverage job must exist");
     assert.match(job, /^ {4}runs-on:\s*ubuntu-latest$/m,
       "nightly-pr-coverage runs on ubuntu-latest");
-    // 16 matrix legs covering 14 distinct scenario names (s1 and s-inc each appear twice).
-    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env", "s-manifest-pvm", "s-transfer", "s-transfer-subname"]) {
+    // 17 matrix legs covering 15 distinct scenario names (s1 and s-inc each appear twice).
+    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env", "s-product-manifest", "s-manifest-pvm", "s-transfer", "s-transfer-subname"]) {
       assert.match(job, new RegExp(`scenario:\\s*${sc.replace(/-/g, "-")}\\b`),
         `nightly-pr-coverage matrix must include scenario ${sc}`);
     }

@@ -2246,6 +2246,60 @@ describe("e2e", { skip: !ENABLED }, () => {
   // end-to-end behavior a unit test (which mocks the network) cannot: the
   // icon actually lands on, and is fetchable from, the resolved env's own
   // gateway.
+  // setResolver is owner-only, so every DotNS write must come from the account
+  // --product-name derives. deploy() and publishManifest() resolve it separately.
+  //
+  // The label is fixed: the product account must already own it, since a fresh
+  // register costs ~211 PAS and testnet auto-top-up targets a fraction of that.
+  describe("S-PRODUCT-MANIFEST — --product-name publishes the manifest as the account that owns the name", { skip: SCENARIO !== "s-product-manifest" }, () => {
+    test(`deploy with --product-name and a manifest signs every DotNS write as the product account`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      const label = "e2eprodman00";
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld });
+      try {
+        // Built here, not via buildArgs: that adds --derivation-path for a pinned
+        // pool leg, which --product-name refuses (it derives its own signer).
+        const args = [
+          fixtureDir, `${label}.${tld}`,
+          "--tag", process.env.DEPLOY_TAG,
+          "--js-merkle",
+          "--env", E2E_ENV_ID,
+          "--mnemonic", ALICE_MNEMONIC,
+          "--product-name", "e2eproduct",
+          "--config", configPath,
+        ];
+        const { code, stdout, stderr } = await runBulletinDeploy({ args, timeoutMs: DEPLOY_TIMEOUT_MS });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-PRODUCT-MANIFEST" });
+
+        // The deploy and the manifest step open separate DotNS sessions. Each one
+        // that applies --product-name logs this line; a session that missed the
+        // flag stays silent and signs as the bare mnemonic account.
+        const deployers = [...stdout.matchAll(/Product deployer:\s+(\S+)/g)].map((m) => m[1]);
+        assert.ok(deployers.length >= 2,
+          `>> FAIL: S-PRODUCT-MANIFEST: expected a "Product deployer:" line from both the deploy and the manifest step, saw ${deployers.length}. publishManifest resolves its own signer; without productName it connects as the bare mnemonic account and setResolver reverts NotAuthorised.`);
+        assert.equal(new Set(deployers).size, 1,
+          `>> FAIL: S-PRODUCT-MANIFEST: every DotNS write must be signed by one account, saw ${[...new Set(deployers)].join(" and ")} — the registry refuses setResolver from anyone but the name's owner`);
+
+        // #1495: the same account must also STORE the manifest's bytes. --product-name is the
+        // case where the two can silently diverge: deploy() swaps in the product signer before
+        // selecting storage, so a manifest step that resolved storage from the raw mnemonic
+        // would upload from the root account instead — needing a second Bulletin grant.
+        const { manifest } = assertManifestStorageMatchesContent(stdout, { scenario: "S-PRODUCT-MANIFEST" });
+        assert.equal(manifest.address, deployers[0],
+          `>> FAIL: S-PRODUCT-MANIFEST: the manifest's icon and executables were stored by ${manifest.address}, not by the product account ${deployers[0]} that signs its records and paid for the content.`);
+
+        const deployedCid = parseDeployedCid(stdout, "S-PRODUCT-MANIFEST");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-PRODUCT-MANIFEST", label });
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("S-MANIFEST-ENV — manifest publish honors --env for icon Bulletin storage on a non-default env (#1094)", { skip: SCENARIO !== "s-manifest-env" }, () => {
     test(`deploy ${SIGNER}/${MERKLE} with a manifest lands the icon on the resolved env's Bulletin chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
       // The regression this guards is publishManifest ignoring --env and

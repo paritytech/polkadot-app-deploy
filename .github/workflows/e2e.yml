@@ -374,7 +374,7 @@ jobs:
       (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 6
     permissions:
       contents: read
     outputs:
@@ -394,7 +394,10 @@ jobs:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - id: select
         env:
           PRIMARY_ENV: ${{ inputs.primary-env || 'paseo-next-v2' }}
@@ -491,8 +494,14 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - run: npm ci
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - name: Restore Kubo from cache
         if: matrix.merkle == 'kubo'
         uses: actions/cache@v5
@@ -689,8 +698,14 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - run: npm ci
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - name: Resolve test-version and deploy-tag from trigger
         id: version
         env:
@@ -868,8 +883,14 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - run: npm ci
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - run: npm run build
       - name: Ensure E2E signer accounts are authorized + funded
         env:
@@ -948,7 +969,10 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Restore Kubo from cache
         if: matrix.merkle == 'kubo'
         uses: actions/cache@v5
@@ -970,7 +994,10 @@ jobs:
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo'
         run: ipfs init
-      - run: npm ci
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - name: Run scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1170,12 +1197,17 @@ jobs:
       PAD_ENV: ${{ matrix.env }}
       S3_LABEL: e2eownedns03
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1188,22 +1220,24 @@ jobs:
           ref: ${{ env.BULLETIN_DEPLOY_REF }}
           path: polkadot-app-deploy-src
       - name: Install polkadot-app-deploy
-        run: |
-          if [ -n "$BULLETIN_DEPLOY_REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
-            cd polkadot-app-deploy-src
-            npm ci
-            cd ..
-            echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
-          elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          fi
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            if [ -n "$BULLETIN_DEPLOY_REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
+              cd polkadot-app-deploy-src
+              npm ci
+              cd ..
+              echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
+            elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            fi
       - name: Deploy to Bob's domain — expect rejection
         timeout-minutes: 10
         env:
@@ -1268,12 +1302,17 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       PAD_ENV: ${{ matrix.env }}
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1286,22 +1325,24 @@ jobs:
           ref: ${{ env.BULLETIN_DEPLOY_REF }}
           path: polkadot-app-deploy-src
       - name: Install polkadot-app-deploy
-        run: |
-          if [ -n "$BULLETIN_DEPLOY_REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
-            cd polkadot-app-deploy-src
-            npm ci
-            cd ..
-            echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
-          elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          fi
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            if [ -n "$BULLETIN_DEPLOY_REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
+              cd polkadot-app-deploy-src
+              npm ci
+              cd ..
+              echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
+            elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            fi
       - name: Deploy with DOTNS_COMMITMENT_BUFFER=0 — expect retry escalation
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1385,12 +1426,17 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       PAD_ENV: ${{ matrix.env }}
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1403,22 +1449,24 @@ jobs:
           ref: ${{ env.BULLETIN_DEPLOY_REF }}
           path: polkadot-app-deploy-src
       - name: Install polkadot-app-deploy
-        run: |
-          if [ -n "$BULLETIN_DEPLOY_REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
-            cd polkadot-app-deploy-src
-            npm ci
-            cd ..
-            echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
-          elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          fi
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            if [ -n "$BULLETIN_DEPLOY_REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
+              cd polkadot-app-deploy-src
+              npm ci
+              cd ..
+              echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
+            elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            fi
       - name: Deploy with unroutable primary RPC — expect failover to default
         timeout-minutes: 12
         env:
@@ -1481,7 +1529,10 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - uses: actions/download-artifact@v8
         with:
           name: e2e-fixture-nightly
@@ -1494,22 +1545,24 @@ jobs:
           ref: ${{ env.BULLETIN_DEPLOY_REF }}
           path: polkadot-app-deploy-src
       - name: Install polkadot-app-deploy
-        run: |
-          if [ -n "$BULLETIN_DEPLOY_REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
-            cd polkadot-app-deploy-src
-            npm ci
-            cd ..
-            echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
-          elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-          fi
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            if [ -n "$BULLETIN_DEPLOY_REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $BULLETIN_DEPLOY_REF"
+              cd polkadot-app-deploy-src
+              npm ci
+              cd ..
+              echo "PAD_BIN=$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy" >> "$GITHUB_ENV"
+            elif [ -n "$BULLETIN_DEPLOY_VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "PAD_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+            fi
       - name: Run S7 SIGINT scenario
         timeout-minutes: 10
         env:
@@ -1560,20 +1613,26 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          # ws is a devDep needed by test/helpers/ws-fault-proxy.mjs; not in the published package
-          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
-          # e2e.test.js resolves imports from ../dist — symlink the installed dist so
-          # relative imports work on the npm-install path (no local build on this path).
-          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            # ws is a devDep needed by test/helpers/ws-fault-proxy.mjs; not in the published package
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            # e2e.test.js resolves imports from ../dist — symlink the installed dist so
+            # relative imports work on the npm-install path (no local build on this path).
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S8 WS fault-injection scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1630,17 +1689,23 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S9 parallel nonce-collision scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1691,17 +1756,23 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S-GRANDPA-REUPLOAD scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1753,17 +1824,23 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
-          ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run S-MORTALITY chunk expiry retry scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1818,10 +1895,14 @@ jobs:
           cache: npm
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Build polkadot-app-deploy from source
-        run: |
-          SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
       - name: Run S-REPROVE auto-reprove scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1862,12 +1943,17 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       NODE_OPTIONS: --max-old-space-size=8192
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
 
       # ---- source-build path (schedule / dispatch without version) ----------
       - name: Checkout polkadot-app-deploy source
@@ -1879,7 +1965,9 @@ jobs:
           path: polkadot-app-deploy-src
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: cd polkadot-app-deploy-src && npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: cd polkadot-app-deploy-src && npm ci
       - name: Run S-CAR --input-car scenario (source-build path, one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
@@ -1905,12 +1993,14 @@ jobs:
       # placed in the same dir to resolve transitive deps.
       - name: Install polkadot-app-deploy from npm (S-CAR)
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-car"
-          mkdir -p /tmp/bd-s-car
-          echo '{"type":"module"}' > /tmp/bd-s-car/package.json
-          cd /tmp/bd-s-car && npm install "@parity/polkadot-app-deploy@${V}"
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-car"
+            mkdir -p /tmp/bd-s-car
+            echo '{"type":"module"}' > /tmp/bd-s-car/package.json
+            cd /tmp/bd-s-car && npm install "@parity/polkadot-app-deploy@${V}"
       - name: Write S-CAR inline test script
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
@@ -2047,12 +2137,17 @@ jobs:
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
       NODE_OPTIONS: --max-old-space-size=8192
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - name: Checkout polkadot-app-deploy source
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: actions/checkout@v6
@@ -2062,7 +2157,9 @@ jobs:
           path: polkadot-app-deploy-src
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: cd polkadot-app-deploy-src && npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: cd polkadot-app-deploy-src && npm ci
       - name: Run S-INC scenario (one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
@@ -2108,12 +2205,17 @@ jobs:
       BULLETIN_DEPLOY_REF: ${{ needs.build-nightly.outputs.polkadot-app-deploy-ref }}
       SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
     steps:
+      # npm-retry is a local action, so this repo must be at the workspace root.
+      - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
 
       # ---- source-build path (schedule / dispatch without version) ----------
       - name: Checkout polkadot-app-deploy source
@@ -2125,7 +2227,9 @@ jobs:
           path: polkadot-app-deploy-src
       - name: Build polkadot-app-deploy from source
         if: env.BULLETIN_DEPLOY_REF != ''
-        run: cd polkadot-app-deploy-src && npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: cd polkadot-app-deploy-src && npm ci
       - name: Run external signer test (source build, one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
@@ -2151,24 +2255,26 @@ jobs:
       # where the test script can resolve them.
       - name: Install polkadot-app-deploy from npm with polkadot deps
         if: env.BULLETIN_DEPLOY_REF == ''
-        run: |
-          V="${BULLETIN_DEPLOY_VERSION:-latest}"
-          echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-ext"
-          mkdir -p /tmp/bd-s-ext
-          echo '{"type":"module"}' > /tmp/bd-s-ext/package.json
-          # Install the product FIRST, then pin polkadot-api to whatever version it
-          # actually resolved. A bare `polkadot-api` here takes the registry's latest,
-          # which drifted ahead of our dependency range the moment polkadot-api 3.0.0
-          # shipped (2026-08-18) and DROPPED the `./signer` subpath — so this scenario's
-          # `import { getPolkadotSigner } from "polkadot-api/signer"` dies with
-          # ERR_PACKAGE_PATH_NOT_EXPORTED against papi 3 while the product itself is fine
-          # on its nested 2.x. Pinning to the resolved version also makes the test honest:
-          # an "external PolkadotSigner" must come from the SAME papi instance the product
-          # uses, not a different major.
-          cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring
-          PAPI=$(node -p "require('/tmp/bd-s-ext/node_modules/polkadot-api/package.json').version")
-          echo "@parity/polkadot-app-deploy@${V} resolved polkadot-api ${PAPI} — pinning the scenario to it"
-          cd /tmp/bd-s-ext && npm install "polkadot-api@${PAPI}"
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            echo "Installing @parity/polkadot-app-deploy@$V into /tmp/bd-s-ext"
+            mkdir -p /tmp/bd-s-ext
+            echo '{"type":"module"}' > /tmp/bd-s-ext/package.json
+            # Install the product FIRST, then pin polkadot-api to whatever version it
+            # actually resolved. A bare `polkadot-api` here takes the registry's latest,
+            # which drifted ahead of our dependency range the moment polkadot-api 3.0.0
+            # shipped (2026-08-18) and DROPPED the `./signer` subpath — so this scenario's
+            # `import { getPolkadotSigner } from "polkadot-api/signer"` dies with
+            # ERR_PACKAGE_PATH_NOT_EXPORTED against papi 3 while the product itself is fine
+            # on its nested 2.x. Pinning to the resolved version also makes the test honest:
+            # an "external PolkadotSigner" must come from the SAME papi instance the product
+            # uses, not a different major.
+            cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring
+            PAPI=$(node -p "require('/tmp/bd-s-ext/node_modules/polkadot-api/package.json').version")
+            echo "@parity/polkadot-app-deploy@${V} resolved polkadot-api ${PAPI} — pinning the scenario to it"
+            cd /tmp/bd-s-ext && npm install "polkadot-api@${PAPI}"
       - name: Write external signer test script
         if: env.BULLETIN_DEPLOY_REF == ''
         run: |
@@ -2836,8 +2942,14 @@ jobs:
           node-version: 22
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
-      - run: npm ci
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - name: Assert every extrinsic encodes against the live chain
         run: E2E=1 node --test test/e2e-chain-calls.test.js
 
@@ -2864,7 +2976,10 @@ jobs:
           node-version: 22
       # Node 22 bundles npm 10, which cannot install this repo's npm 11
       # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       # paritytech/dotns is a private repo — GITHUB_TOKEN can't read it. With the
       # DOTNS_REPO_READ_TOKEN PAT this is the real drift check; without it the
       # tool soft-skips on the fetch failure rather than false-failing.

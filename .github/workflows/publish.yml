@@ -28,9 +28,21 @@ jobs:
       # tests.yml, e2e.yml and deploy.yml already pin npm 11 for exactly this;
       # publish.yml was the one workflow left unpinned, so v0.16.0-rc.1 failed
       # to publish and its gating E2E then timed out waiting for the artifact.
-      - run: npm install -g npm@11
+      # A local composite action rather than a hand-rolled shell loop: unlike
+      # bulletin-deploy's publish job (which holds id-token: write for OIDC
+      # trusted publishing and deliberately avoids any action beyond actions/*
+      # in that job), this job never publishes directly — it builds, packs,
+      # and dispatches to npm_publish_automation via `gh api`, and holds no
+      # elevated token here. The local-action trust-boundary rationale
+      # doesn't apply, so this uses the same ./.github/actions/npm-retry
+      # every other same-repo job does.
+      - uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11
 
-      - run: npm ci
+      - uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
 
       # Full offline suite (test/test.js etc.) — builds internally
       # (npm test → npm run build → node --test). The public package ships with

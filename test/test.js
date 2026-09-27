@@ -9811,6 +9811,81 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     return [...pathsMatch[1].matchAll(/^ {6}- (.+)$/gm)].map(match => match[1].trim().replace(/^['"](.*)['"]$/, "$1"));
   }
 
+  // Port of bulletin #1427/#1392: a registry ECONNRESET during an install
+  // reds a leg before any product code runs. Every npm install/ci step in
+  // this repo's workflows must go through the pinned retry mechanism.
+  // Two accepted shapes here: the local composite action
+  // (.github/actions/npm-retry) for jobs that run in THIS repo's own
+  // checkout, or the pinned nick-fields/retry action directly for
+  // deploy.yml, a reusable workflow consumed by other repos — a local
+  // action reference there resolves against the CALLER's checkout, which
+  // does not have this repo's .github/actions/ directory. Unlike bulletin,
+  // this repo's publish.yml does NOT hold id-token: write (it dispatches to
+  // npm_publish_automation instead of publishing directly), so it uses the
+  // composite action like every other same-repo job rather than a
+  // hand-rolled shell loop.
+  test("workflow npm installs are retried, and the local action is resolvable", () => {
+    const PIN = "nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60";
+    const LOCAL = "./.github/actions/npm-retry";
+    const action = fs.readFileSync(".github/actions/npm-retry/action.yml", "utf8");
+    assert.match(action, new RegExp(`uses: ${PIN}`),
+      ">> FAIL: npm-retry action: must pin the same retry action the workflows pin");
+
+    // Matches the single-line `- run: npm ci` form as well as a block script.
+    const installRe = /(?:^|\n)\s*(?:- run: )?(?:[A-Z_]+=\S+\s+)?(?:cd \S+ && )?npm\s+(?:ci|install|i)\b/;
+    const workflows = fs.readdirSync(".github/workflows").filter((f) => /\.ya?ml$/.test(f));
+    assert.ok(workflows.length >= 4,
+      `>> FAIL: workflow lint: expected to scan several workflows, found ${workflows.length}`);
+    let jobsScanned = 0;
+    for (const name of workflows) {
+      const file = `.github/workflows/${name}`;
+      const wf = fs.readFileSync(file, "utf8");
+      if (file.endsWith("deploy.yml")) continue; // asserted separately below
+      const unretried = wf.split(/\n(?= {6}- )/).filter((step) => {
+        const code = step.replace(/^\s*#.*$/gm, "");
+        if (!installRe.test(code)) return false;
+        if (code.includes(LOCAL)) return false;
+        return installRe.test(code);
+      });
+      assert.deepStrictEqual(unretried.map((step) => step.trim().split("\n").slice(0, 2).join(" ")), [],
+        `>> FAIL: ${file}: every npm install step must use ${LOCAL}`);
+
+      // The local action is read from the workspace root, so a job using it must
+      // check this repo out there.
+      const jobsAt = wf.search(/^jobs:\s*$/m);
+      assert.notEqual(jobsAt, -1, `>> FAIL: ${file}: no jobs: block found, so the checkout check would examine nothing`);
+      const jobs = wf.slice(jobsAt).split(/\n(?= {2}[\w-]+:\s*$)/m);
+      assert.ok(jobs.length >= 2, `>> FAIL: ${file}: parsed ${jobs.length} jobs, so the checkout check would examine nothing`);
+      for (const job of jobs) {
+        jobsScanned++;
+        const use = job.indexOf(`uses: ${LOCAL}`);
+        if (use === -1) continue;
+        const jobName = job.trim().split("\n")[0];
+        // Whole step blocks, so an `if:` written before `uses:` is seen too.
+        // A checkout puts the action on disk when it lands at the workspace root
+        // (no path:) and is either this repo implicitly or named explicitly.
+        const otherRepo = /^ {8,}repository: (?!paritytech\/polkadot-app-deploy\s*$)/m;
+        const rootCheckout = job.split(/\n(?= {6}- )/).find((step) =>
+          /uses: actions\/checkout@/.test(step)
+          && !/^ {8,}path:/m.test(step)
+          && !otherRepo.test(step)
+          && !/^ {6,8}(?:- )?if:/m.test(step));
+        assert.ok(rootCheckout && job.indexOf(rootCheckout) < use,
+          `>> FAIL: ${file}: job "${jobName}" uses ${LOCAL} without an unconditional checkout of this repo at the workspace root first, so the action cannot resolve`);
+      }
+    }
+    assert.ok(jobsScanned > 20, `>> FAIL: workflow lint: only ${jobsScanned} jobs scanned, the parse is not finding them`);
+
+    // deploy.yml runs in the caller's checkout, where a local action of ours
+    // does not exist and a private-repo reference is unreadable.
+    const deploy = fs.readFileSync(".github/workflows/deploy.yml", "utf8");
+    assert.ok(!deploy.includes(LOCAL),
+      ">> FAIL: deploy.yml: must not reference our local action — it runs in the caller's checkout");
+    const install = deploy.split(/\n(?= {6}- )/).find((step) => /- name: Install polkadot-app-deploy$/m.test(step));
+    assert.ok(install && install.includes(`uses: ${PIN}`),
+      ">> FAIL: deploy.yml: the Install polkadot-app-deploy step must run under the pinned retry action");
+  });
+
   for (const file of [".github/workflows/e2e.yml", ".github/workflows/deploy.yml"]) {
     test(`${file}: every directly-runnable job declares timeout-minutes`, () => {
       const jobs = parseJobs(fs.readFileSync(file, "utf-8"));

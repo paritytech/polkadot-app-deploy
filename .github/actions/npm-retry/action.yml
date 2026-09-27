@@ -1,0 +1,30 @@
+name: npm with retry
+description: Run an npm install command and retry a transient registry failure. The command must be safe to repeat.
+inputs:
+  run:
+    description: Shell command(s) to run
+    required: true
+  max_attempts:
+    description: Attempts before giving up
+    default: '2'
+  retry_wait_seconds:
+    description: Seconds between attempts
+    default: '10'
+  timeout_minutes:
+    # Worst case is attempts x this + waits, and it must fit the tightest job cap
+    # that uses this action. A real install takes 26 to 36 s.
+    description: Per-attempt timeout
+    default: '2'
+runs:
+  using: composite
+  steps:
+    - uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+      with:
+        timeout_minutes: ${{ inputs.timeout_minutes }}
+        max_attempts: ${{ inputs.max_attempts }}
+        retry_wait_seconds: ${{ inputs.retry_wait_seconds }}
+        # Explicit rather than relying on the default (see bulletin-deploy #1417).
+        retry_on: any
+        command: |
+          set -e
+          ${{ inputs.run }}

@@ -181,34 +181,48 @@ jobs:
 
       - name: Install polkadot-app-deploy
         if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          REF='${{ inputs.polkadot-app-deploy-ref }}'
-          VERSION='${{ inputs.polkadot-app-deploy-version }}'
-          if [ -n "$REF" ]; then
-            echo "Building polkadot-app-deploy from source ref: $REF"
-            cd polkadot-app-deploy-src
-            # This installs polkadot-app-deploy's OWN npm 11 lockfile, not the
-            # caller's. Scoped to this source-build branch so a consumer that
-            # never source-builds keeps its own npm untouched.
-            npm install -g npm@11.17.0
-            npm ci
-            cd ..
-            BIN="$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy"
-            WRAPPER="$(pwd)/polkadot-app-deploy-src/tools/release-retry-wrapper.mjs"
-            echo "BULLETIN_DEPLOY_BIN=$BIN" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$WRAPPER" >> "$GITHUB_ENV"
-            echo "::notice::Using source-built polkadot-app-deploy from ref $REF"
-          elif [ -n "$VERSION" ]; then
-            echo "Installing @parity/polkadot-app-deploy@$VERSION"
-            npm install -g "@parity/polkadot-app-deploy@$VERSION"
-            echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
-          else
-            echo "Installing @parity/polkadot-app-deploy (latest stable)"
-            npm install -g @parity/polkadot-app-deploy
-            echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
-            echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
-          fi
+        # A direct retry action rather than a local composite action: this is
+        # a reusable workflow, consumed by other repos via
+        # `uses: paritytech/polkadot-app-deploy/.github/workflows/deploy.yml@...`.
+        # A "./" local-action reference resolves against the CALLER's
+        # checkout, which does not have this repo's own action directory, so
+        # a composite action defined here would fail to resolve there.
+        # nick-fields/retry is a regular (non-local) action, so it works the
+        # same for every caller.
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: |
+            set -e
+            REF='${{ inputs.polkadot-app-deploy-ref }}'
+            VERSION='${{ inputs.polkadot-app-deploy-version }}'
+            if [ -n "$REF" ]; then
+              echo "Building polkadot-app-deploy from source ref: $REF"
+              cd polkadot-app-deploy-src
+              # This installs polkadot-app-deploy's OWN npm 11 lockfile, not the
+              # caller's. Scoped to this source-build branch so a consumer that
+              # never source-builds keeps its own npm untouched.
+              npm install -g npm@11.17.0
+              npm ci
+              cd ..
+              BIN="$(pwd)/polkadot-app-deploy-src/bin/polkadot-app-deploy"
+              WRAPPER="$(pwd)/polkadot-app-deploy-src/tools/release-retry-wrapper.mjs"
+              echo "BULLETIN_DEPLOY_BIN=$BIN" >> "$GITHUB_ENV"
+              echo "RELEASE_RETRY_WRAPPER=$WRAPPER" >> "$GITHUB_ENV"
+              echo "::notice::Using source-built polkadot-app-deploy from ref $REF"
+            elif [ -n "$VERSION" ]; then
+              echo "Installing @parity/polkadot-app-deploy@$VERSION"
+              npm install -g "@parity/polkadot-app-deploy@$VERSION"
+              echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+              echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            else
+              echo "Installing @parity/polkadot-app-deploy (latest stable)"
+              npm install -g @parity/polkadot-app-deploy
+              echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
+              echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            fi
 
       - name: Verify minimum polkadot-app-deploy version
         if: steps.cache.outputs.cache-hit != 'true' && inputs.polkadot-app-deploy-ref == ''

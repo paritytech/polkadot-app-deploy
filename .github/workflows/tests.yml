@@ -52,9 +52,13 @@ jobs:
       # every such PR was failing at `npm ci` before this pin. npm 11 installs
       # both its own and npm 10's lockfiles, so pinning it here is strictly
       # more permissive. Keep in sync with packageManager in package.json.
-      - run: npm install -g npm@11.17.0
+      - uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
       - run: npm --version
-      - run: npm ci
+      - uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
       - run: npm test
 
       # Static-check the workflows themselves. `yaml.safe_load` only proves a

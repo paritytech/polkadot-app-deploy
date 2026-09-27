@@ -20,6 +20,18 @@ test("classifyForRetry: flake-class patterns return exit 75", () => {
   }
 });
 
+test("classifyForRetry: unverifiable code presence is retry-eligible, a missing contract is not", () => {
+  // null = the code-presence query failed (retry). false = a verdict (no retry).
+  assert.strictEqual(
+    classifyForRetry("paseo-next-v2 (POP_RULES 0xabc): Could not determine the DotNS ABI profile: neither pricingVersion() (v0.5.8-rc1) nor startingPrice() (poprules-startingPrice) answered. Code presence at this address could not be verified either (the runtime code-presence query failed), so a wrong/undeployed POP_RULES address is also possible."),
+    75,
+  );
+  assert.strictEqual(
+    classifyForRetry("paseo-next-v2 (POP_RULES 0xabc): No contract deployed at this address — could not detect the DotNS ABI profile because no contract code was found here."),
+    1,
+  );
+});
+
 test("classifyForRetry: a harness-guard failure is never retried, even alongside flake wording", () => {
   // S8 and S-GRANDPA-REUPLOAD log "Connection lost" while passing, so without
   // this a deterministic leak would rerun the whole scenario (#1393).

@@ -48,6 +48,10 @@ const FLAKE_PATTERNS = [
   // assertion that never emits this string, so retrying cannot mask a real
   // integrity regression.
   "roundtrip budget exhausted",
+  // hasContractCode returned null: the runtime code-presence query itself
+  // failed. A contract that is genuinely absent answers false and produces a
+  // different message, so retrying this cannot mask a missing contract.
+  "Code presence at this address could not be verified",
 ];
 
 // output: combined stdout+stderr text from the child. Any flake pattern

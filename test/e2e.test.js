@@ -1050,7 +1050,6 @@ describe("e2e", { skip: !ENABLED }, () => {
   // Assertions:
   //   - First deploy uploads the full ~9.6 MB (probe finds 0 of N chunks on chain)
   //   - Second deploy uploads ≤ 1.5 MB (rotated bundle + section-2 overhead)
-  //   - Chunk-skip rate ≥ 85 % on second deploy
   describe("S-INC-ASSET-ROTATION — realistic Vite rebuild", { skip: SCENARIO !== "s-inc-asset-rotation" }, () => {
     test(`bundle filename rotation re-uploads only the changed file`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
       const label = pickRotLabel();
@@ -1094,6 +1093,21 @@ describe("e2e", { skip: !ENABLED }, () => {
         // Live observation: ~700 KB uploaded. 1.5 MB ceiling = ~2× headroom for
         // chunk-packing variability (sibling small files in the same chunk as the
         // rotated bundle may also re-upload).
+        //
+        // #1355: root cause was CONTENT_HASH_RE (src/manifest.ts) only
+        // admitting [A-Za-z0-9] in the hash segment, so Vite/Rollup bundle
+        // names whose base64url hash suffix contains "_" or "-" (e.g.
+        // errors-CHrKVge_.js) fell through to "volatile" and were fully
+        // re-uploaded on every deploy despite their CID never changing.
+        // Fixed by widening CONTENT_HASH_RE's class to admit the full
+        // base64url alphabet — a pure name-based classification with no
+        // history-dependence. (An earlier attempt fixed this via a
+        // prevManifest CID-match in the CAR-section classifier instead; that
+        // broke S-INC-PORTABILITY by letting content-identical,
+        // name-unclassified files like index.html migrate into section 1's
+        // tail between deploys — reverted.) Ceiling stays at 1.5 MB — a
+        // future regression here means the dedup broke again, not that the
+        // budget is stale.
         const bytesUploaded = parseBytesUploadedFromOutput(r2.stdout);
         if (bytesUploaded > 1_500_000) {
           failWith({

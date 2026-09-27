@@ -547,7 +547,7 @@ export async function rebuildOrderedCarFromBytes(
 export async function merkleizeWithStableOrder(
   directoryPath: string,
   prevStableOrder?: string[],
-  options?: { useKubo?: boolean; classifyFn?: (filePath: string) => "stable" | "volatile"; phase?: string }
+  options?: { useKubo?: boolean; classifyFn?: (filePath: string, fileCid?: string) => "stable" | "volatile"; phase?: string }
 ): Promise<MerkleizeStableResult> {
   const useKubo = options?.useKubo ?? false;
   const phase = options?.phase;

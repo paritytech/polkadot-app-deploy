@@ -53,7 +53,22 @@ const STABLE_EXTENSIONS = new Set([
 // Bundler content-hash patterns: -<6+ hex>, -<6+ alnum>, .<6+ hex>.<ext>.
 // Examples: main-AbcDef12.js, vendor.a1b2c3d4.css, runtime-Xyz789.wasm.
 // {6,16} relaxed from v2's {8,} per PR #11 measurements (Vite hashes can be 6).
-const CONTENT_HASH_RE = /[-.](?:[a-f0-9]{6,16}|[A-Za-z0-9]{6,16})\.[a-zA-Z0-9]+$/;
+//
+// #1355: the alnum class alone (`[A-Za-z0-9]`) missed Vite/Rollup's actual
+// hash alphabet, which is base64url (`A-Za-z0-9_-`) — e.g. errors-CHrKVge_.js,
+// index-B_NQy5Da.js, descriptors-7XDUQZP4-Q_l81UXa.js. Those hash-suffixed
+// bundles fell through to "volatile" on every deploy despite being
+// byte-identical between deploys, forcing a full re-upload each time. Widened
+// to `[A-Za-z0-9_-]` so the whole base64url alphabet — including a "-"
+// separator inside a multi-segment hash — is recognised as part of the hash,
+// not just the class boundary. Classification here is name-only: it never
+// looks at file history, so — unlike a CID-match-against-prevManifest
+// approach — it cannot make a file's section membership depend on the
+// previous deploy's manifest (that dependency is what breaks the invariant
+// that chunking is a pure function of content). Measured against
+// test/fixtures/realistic-vite/v1/assets/ (59 files): 14 failed the old
+// alnum-only class, 0 fail this one.
+const CONTENT_HASH_RE = /[-.](?:[a-f0-9]{6,16}|[A-Za-z0-9_-]{6,16})\.[a-zA-Z0-9]+$/;
 
 export function isVolatilePath(p: string): boolean {
   return p.startsWith(`${MANIFEST_DIR}/`) || p === MANIFEST_DIR;

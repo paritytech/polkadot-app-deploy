@@ -11054,6 +11054,72 @@ describe("manifest (incremental-upload-v2)", () => {
       assert.equal(classifyFile("data.json"), "volatile");
       assert.equal(classifyFile("notes.txt"), "volatile");
     });
+
+    // #1355 root cause: CONTENT_HASH_RE's hash-segment character class was
+    // `[A-Za-z0-9]` — it excluded the "_" and "-" that Vite/Rollup's
+    // base64url-alphabet hashes actually contain, so bundle files whose hash
+    // suffix happened to include either character fell through to
+    // "volatile" and were fully re-uploaded on every deploy despite an
+    // unchanged CID. Widened to `[A-Za-z0-9_-]`. These are real filenames
+    // from test/fixtures/realistic-vite/v1/assets/ that failed under the
+    // old class — see the full-fixture sweep below for all 14.
+    test("treats real Vite/Rollup base64url hash suffixes (with _ or -) as stable (#1355)", () => {
+      const names = [
+        "assets/_md-BChABl-9.js",
+        "assets/index-B_NQy5Da.js",
+        "assets/errors-CHrKVge_.js",
+        "assets/bulletin_metadata-ZWUBSZT2-BukF-JIi.js",
+        "assets/substrate-client-w5-JehSV.js",
+        "assets/get-sync-provider-euY2_EAo.js",
+        "assets/descriptors-7XDUQZP4-Q_l81UXa.js",
+        "assets/metadataTypes-25EYWYSO-DB9fHAu_.js",
+        "assets/passet_metadata-7H7LGTAU-BnXlGKH_.js",
+        "assets/sm-provider-B_oHyEGq.js",
+      ];
+      for (const n of names) {
+        assert.equal(classifyFile(n), "stable", `expected ${n} to classify stable`);
+      }
+    });
+
+    // Full-fixture sweep: pin the exact counts from the PR description.
+    // 59 real Vite-emitted filenames; 14 failed the pre-#1355 alnum-only
+    // class, 0 fail the widened [A-Za-z0-9_-] class.
+    test("classifies every file in the realistic-vite v1 assets fixture as stable", () => {
+      const dir = path.resolve("test/fixtures/realistic-vite/v1/assets");
+      const names = fs.readdirSync(dir).map((f) => `assets/${f}`);
+      assert.equal(names.length, 59, "fixture file count changed — update the pinned expectation");
+      const failing = names.filter((n) => classifyFile(n) !== "stable");
+      assert.deepEqual(failing, [], `expected 0 misclassified; got ${failing.length}: ${failing.join(", ")}`);
+    });
+
+    // Negative side: the widened class must not start treating plainly
+    // non-hashed filenames as content-hashed. The dangerous direction for
+    // this heuristic is guessing "stable" for content that actually changes
+    // between deploys (mutable content silently lands in the cached
+    // section). These have no bundler-hash-shaped segment at all.
+    test("still treats plain, non-hashed filenames as volatile (negative)", () => {
+      assert.equal(classifyFile("index.html"), "volatile");
+      assert.equal(classifyFile("about/index.html"), "volatile");
+      assert.equal(classifyFile("notes.txt"), "volatile");
+      assert.equal(classifyFile("data.json"), "volatile");
+      assert.equal(classifyFile("styles.css"), "volatile");
+      assert.equal(classifyFile("readme.md"), "volatile");
+      assert.equal(classifyFile("robots.txt"), "volatile");
+    });
+
+    // Known, accepted trade-off (pre-existing for the alnum-only class too —
+    // e.g. "vendor-bundle.js" already matched "bundle" as a 6-char pseudo-hash
+    // before this change): any dash-delimited segment of 6-16 characters
+    // drawn from [A-Za-z0-9_-] looks like a hash to this heuristic, whether
+    // or not it actually is one. Widening the class to include "-" extends
+    // that same pre-existing weakness to segments that span an internal "-",
+    // e.g. a date-stamped export name. Documented here, not silently
+    // widened away — a stricter heuristic would need real hash-entropy
+    // detection, out of scope for a name-based fix.
+    test("documents the accepted false-positive surface from widening the hash class", () => {
+      assert.equal(classifyFile("vendor-bundle.js"), "stable"); // pre-existing, not new
+      assert.equal(classifyFile("report-2026-09-04.json"), "stable"); // new surface: multi-hyphen numeric run now bridges via "-"
+    });
   });
 
   describe("parseManifest", () => {
@@ -13299,6 +13365,57 @@ describe("incremental-v2 scenarios (mocked storage)", () => {
     assert.ok(a.section1.size > 0);
     assert.ok(b.section1.size > 0);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1383 regression guard: CAR-section classification must be a pure function
+// of the current directory's content — never of a previous deploy's
+// manifest. An earlier attempt at fixing #1355 threaded a prevManifest-aware
+// classifyFn (CID-match only, ignoring the recorded `type`) into
+// buildOrderedCar. Because index.html is deliberately heuristic-volatile (no
+// content hash in its name) but is often byte-identical between two
+// consecutive deploys, that CID-match flipped it to "stable" on the second
+// deploy, migrating it into section 1's tail and forcing a
+// never-before-uploaded chunk — confirmed on real chain via S-INC-PORTABILITY
+// ("Probed 10 → 9 on chain, 1 absent"). This test exercises buildOrderedCar
+// exactly as deploy.ts calls it: no classifyFn override, so the bare default
+// `(p) => classifyFile(p)` applies — which never even receives a
+// prevManifest — across two back-to-back, byte-identical deploys of the same
+// directory.
+// ---------------------------------------------------------------------------
+describe("portability: CAR-section classification independent of deploy history (#1383 regression guard)", () => {
+  test("section-1 membership is identical across two byte-identical deploys; index.html never migrates in", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-port-"));
+    try {
+      fs.writeFileSync(path.join(dir, "vendor-9f8e7d6c.js"), Buffer.alloc(80_000, 0x42));
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      // Deploy 1: no prevStableOrder, no classifyFn override.
+      const out1 = await merkleizeJSBackend(dir);
+      const car1 = await buildOrderedCar({ output: out1 });
+
+      // Deploy 2: identical directory content (index.html byte-for-byte the
+      // same), fed deploy 1's own stableOrder as prevStableOrder — matching
+      // what deploy.ts actually passes to merkleizeWithStableOrder.
+      const out2 = await merkleizeJSBackend(dir);
+      const car2 = await buildOrderedCar({ output: out2, prevStableOrder: car1.stableOrder });
+
+      // Sanity: confirm this genuinely is the byte-identical scenario.
+      assert.equal(out1.fileCids.get("index.html"), out2.fileCids.get("index.html"));
+      assert.ok(car1.stableOrder.length > 0, "vendor bundle must land in section 1 for this test to be meaningful");
+
+      // Portability property: exact set equality, not mere overlap — a
+      // migrated file would inflate car2.stableOrder beyond car1.stableOrder
+      // while every original member still "overlaps".
+      assert.deepEqual([...car2.stableOrder].sort(), [...car1.stableOrder].sort());
+
+      const htmlCid = out2.fileCids.get("index.html");
+      assert.ok(!car2.stableOrder.includes(htmlCid),
+        "index.html must never enter the stable section — it has no content hash in its name");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

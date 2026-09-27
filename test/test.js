@@ -9843,24 +9843,22 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       if (file.endsWith("deploy.yml")) continue; // asserted separately below
       const unretried = wf.split(/\n(?= {6}- )/).filter((step) => {
         const code = step.replace(/^\s*#.*$/gm, "");
-        if (!installRe.test(code)) return false;
-        if (code.includes(LOCAL)) return false;
-        return installRe.test(code);
+        return installRe.test(code) && !code.includes(LOCAL);
       });
       assert.deepStrictEqual(unretried.map((step) => step.trim().split("\n").slice(0, 2).join(" ")), [],
         `>> FAIL: ${file}: every npm install step must use ${LOCAL}`);
 
       // The local action is read from the workspace root, so a job using it must
-      // check this repo out there.
-      const jobsAt = wf.search(/^jobs:\s*$/m);
-      assert.notEqual(jobsAt, -1, `>> FAIL: ${file}: no jobs: block found, so the checkout check would examine nothing`);
-      const jobs = wf.slice(jobsAt).split(/\n(?= {2}[\w-]+:\s*$)/m);
-      assert.ok(jobs.length >= 2, `>> FAIL: ${file}: parsed ${jobs.length} jobs, so the checkout check would examine nothing`);
-      for (const job of jobs) {
+      // check this repo out there. Reuses the shared parser (also used by
+      // jobBlock() above and scripts/e2e-ensure-authorized.mjs) rather than a
+      // second hand-rolled job-splitting regex — see workflow-jobs.mjs's own
+      // header on why a second copy of this parser is a drift hazard.
+      const blocks = extractJobBlocks(wf);
+      assert.ok(blocks.size >= 1, `>> FAIL: ${file}: parsed ${blocks.size} jobs, so the checkout check would examine nothing`);
+      for (const [jobName, job] of blocks) {
         jobsScanned++;
         const use = job.indexOf(`uses: ${LOCAL}`);
         if (use === -1) continue;
-        const jobName = job.trim().split("\n")[0];
         // Whole step blocks, so an `if:` written before `uses:` is seen too.
         // A checkout puts the action on disk when it lands at the workspace root
         // (no path:) and is either this repo implicitly or named explicitly.

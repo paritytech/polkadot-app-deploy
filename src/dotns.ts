@@ -943,11 +943,39 @@ const PERSONHOOD_ABI = [
   },
 ] as const;
 
+// bulletin-deploy #1435: DotNS v0.7 added a 5th field (`persist: bool`) to
+// the on-chain `SubnodeRecord` tuple `setSubnodeOwner` takes. That changes
+// the function selector, so the legacy 4-field encoding below now matches no
+// function on a v0.7+ chain and bare-reverts (flags=1, empty `0x` data) —
+// which reads like a permissions or pricing failure and is neither. There is
+// no read-only capability probe that tells the two apart ahead of time (v0.7
+// ships zero new functions/contracts), so detection instead probes the
+// WRITE's own accepted shape at the first subname operation per connection —
+// see resolveSubnodeOwnerShape/buildSetSubnodeOwnerCall below, which dry-run
+// the 5-field shape first and fall back to this legacy 4-field ABI only on a
+// bare selector-not-found revert (a revert WITH data is a real rejection and
+// propagates — see isBareRevertResult).
 const DOTNS_REGISTRY_ABI = [
   { inputs: [{ name: "record", type: "tuple", components: [{ name: "parentNode", type: "bytes32" }, { name: "subLabel", type: "string" }, { name: "parentLabel", type: "string" }, { name: "owner", type: "address" }] }], name: "setSubnodeOwner", outputs: [{ name: "subnode", type: "bytes32" }], stateMutability: "nonpayable", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }, { name: "newResolver", type: "address" }], name: "setResolver", outputs: [], stateMutability: "nonpayable", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }], name: "owner", outputs: [{ name: "", type: "address" }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }], name: "resolver", outputs: [{ name: "", type: "address" }], stateMutability: "view", type: "function" },
+] as const;
+
+// v0.7+ `setSubnodeOwner` — same 4 fields plus a trailing `persist: bool`.
+// Kept as its own ABI array (rather than a second same-named entry alongside
+// DOTNS_REGISTRY_ABI's) so encodeFunctionData never has to disambiguate two
+// same-name tuple overloads by shape — callers pick the array explicitly via
+// buildSetSubnodeOwnerCall instead. `persist` gates ONLY the LabelStore
+// write, which indexes the subname under its owner so off-chain consumers
+// can enumerate it. bulletin-deploy #1453: DotNS v0.8.0 gates that deferred
+// write to registered controllers (`if (!record.persist)
+// _onlyRegistrarController()`), and a mnemonic-signed account is never one,
+// so callers always pass `persist: true` — it is accepted on v0.7 too (the
+// registry itself performs the write and is an admitted store writer), so
+// this needs no version gate.
+const DOTNS_REGISTRY_SET_SUBNODE_OWNER_ABI_V07 = [
+  { inputs: [{ name: "record", type: "tuple", components: [{ name: "parentNode", type: "bytes32" }, { name: "subLabel", type: "string" }, { name: "parentLabel", type: "string" }, { name: "owner", type: "address" }, { name: "persist", type: "bool" }] }], name: "setSubnodeOwner", outputs: [{ name: "subnode", type: "bytes32" }], stateMutability: "nonpayable", type: "function" },
 ] as const;
 
 const DOTNS_CONTENT_RESOLVER_ABI = [
@@ -1058,6 +1086,18 @@ function formatWeight(weight: { referenceTime: bigint; proofSize: bigint } | und
 
 const BARE_REVERT_DIAGNOSTIC_FUNCTIONS = new Set(["register", "commit", "setContenthash", "setSubnodeOwner", "setResolver"]);
 
+// A "bare revert" — empty (or absent) revert data plus flags=1 — means the
+// dry-run found no matching function selector at all (e.g. a v0.7+ chain
+// rejecting the legacy 4-field setSubnodeOwner encoding, or vice versa). Any
+// revert WITH data means the function exists and rejected the call for a
+// real reason (permissions, bad parent, etc.) — that distinction is exactly
+// what resolveSubnodeOwnerShape's shape probe depends on (bulletin-deploy
+// #1435), so it shares this exact check with formatContractDryRunFailure's
+// own bare-revert diagnostic rather than re-deriving it.
+function isBareRevertResult(revertData: string | undefined, revertFlags: bigint | undefined): boolean {
+  return (revertData === undefined || revertData.trim() === "0x") && revertFlags === 1n;
+}
+
 // Fee election (#885): route Asset-Hub tx fees through ChargeAssetTxPayment → PGAS.
 // Passed to signSubmitAndWatch when the signer is a PGAS-funded session account
 // (e.g. the owner-signs update path), so a zero-native account can pay fees in PGAS.
@@ -1104,8 +1144,7 @@ function formatContractDryRunFailure(
   // Emit inline diagnostic when a bare revert (empty 0x data + flags=1) occurs on a known
   // DotNS write function. Surfaces the most likely causes without requiring the user to
   // run tools/dotns-dry-run.mjs manually.
-  const revertData = gasEstimate.revertData;
-  const isBareRevert = (revertData === undefined || revertData.trim() === "0x") && gasEstimate.revertFlags === 1n;
+  const isBareRevert = isBareRevertResult(gasEstimate.revertData, gasEstimate.revertFlags);
   if (isBareRevert && BARE_REVERT_DIAGNOSTIC_FUNCTIONS.has(functionName)) {
     if (functionName === "register") {
       lines.push(
@@ -2470,6 +2509,22 @@ export class DotNS {
   // this into a throw-if-unset without re-checking both of those.
   private _protocolVersion: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE;
   private _adapter: DotnsProtocolAdapter = getAdapter(DEFAULT_DOTNS_PROFILE);
+  // bulletin-deploy #1435: which setSubnodeOwner tuple shape this
+  // connection's chain accepts — "legacy" (4-field, pre-v0.7) or "v07"
+  // (5-field + persist). `null` means "not yet probed"; resolveSubnodeOwnerShape
+  // resolves it lazily on the FIRST subname write per connection (register or
+  // transfer, whichever runs first) and caches the verdict here for the rest
+  // of that connection's life. Defaults to "legacy" (not null) for the same
+  // reason `_protocolVersion` defaults to DEFAULT_DOTNS_PROFILE above: every
+  // existing test/library caller that constructs a DotNS instance and stubs
+  // contractTransaction/submitBatchedContractCalls directly WITHOUT ever
+  // calling connect() must keep pre-#1435 4-field behaviour, with no probe
+  // attempted at all (there is no clientWrapper to probe against in that
+  // case). connect() resets this to null so a real connection always
+  // re-probes on its first subname write rather than trusting this default
+  // or a previous connection's stale verdict — see the reset next to
+  // detectProtocolVersion() in connect().
+  private _subnodeOwnerShape: "legacy" | "v07" | null = "legacy";
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
   private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>) | undefined = undefined;
   /** Total phone-signature count for this DotNS session (drives the `total` field passed to confirmPhoneReady). */
@@ -2519,6 +2574,11 @@ export class DotNS {
   get protocolVersion(): DotnsAbiProfile { return this._protocolVersion; }
 
   /** Test-only: bypass connect()'s live probe and pin the adapter directly, for unit tests that stub chain calls without going through connect(). */
+  /** bulletin-deploy #1435 test-only: pin the setSubnodeOwner shape cache directly ("legacy", "v07", or null to force resolveSubnodeOwnerShape to re-probe), bypassing the live dry-run probe — for unit tests that stub the probe or exercise the fallback/caching logic itself. */
+  __setSubnodeOwnerShapeForTest(shape: "legacy" | "v07" | null): void {
+    this._subnodeOwnerShape = shape;
+  }
+
   __setProtocolVersionForTest(profile: DotnsAbiProfile): void {
     this._protocolVersion = profile;
     this._adapter = getAdapter(profile);
@@ -2709,6 +2769,13 @@ export class DotNS {
       // drift guardrail never caught this). See detectProtocolVersion's doc
       // comment for the three-valued classification this relies on.
       await this.detectProtocolVersion();
+      // bulletin-deploy #1435: reset the setSubnodeOwner shape cache on
+      // every (re)connect — it is resolved lazily by
+      // resolveSubnodeOwnerShape on the first subname write of THIS
+      // connection, and a stale "legacy"/"v07" verdict carried over from a
+      // previous connect() (possibly to a different chain) must never be
+      // reused.
+      this._subnodeOwnerShape = null;
       // Optional pin (e.g. environments.json's per-env `dotnsProtocol`):
       // ASSERTED against the live probe, never obeyed over it. A pin that
       // silently overrode the probe would recreate exactly the failure this
@@ -3406,6 +3473,98 @@ export class DotNS {
    *  exactly the derivation-site bug class #1240/#1244 fixed elsewhere in this
    *  file (see computeDomainTokenId's doc comment). Fixed here the same way:
    *  derive every node from `this._tld`, resolved by connect(), not a literal. */
+  /**
+   * bulletin-deploy #1435/#1453: resolve — once per connection — which
+   * `setSubnodeOwner` tuple shape this chain's DOTNS_REGISTRY accepts, and
+   * cache the verdict on `_subnodeOwnerShape` for the rest of this
+   * connection's life. Called by buildSetSubnodeOwnerCall on the first
+   * subname write (register or transfer, whichever runs first); every
+   * subsequent subname write in the same connection reuses the cached shape
+   * with no further chain I/O.
+   *
+   * There is no read-only capability probe for this (v0.7 adds no new
+   * function/contract to probe), so this probes the WRITE itself: dry-run
+   * the v0.7+ (5-field, `persist: true`) encoding against `sampleRecord`
+   * first (a dry run commits no state, so this never spends a fee or
+   * mutates the registry). Three outcomes:
+   *
+   *   - The dry run succeeds → this chain is on v0.7+; cache "v07".
+   *   - The dry run bare-reverts (empty `0x` data, flags=1 — i.e. no
+   *     function matches this selector at all) → this chain predates v0.7;
+   *     cache "legacy" and fall back to the 4-field encoding.
+   *   - The dry run reverts WITH data → the 5-field function EXISTS and
+   *     rejected the call for a real reason (bad parent, not authorised,
+   *     etc.) — that is a genuine failure of the caller's actual write, not
+   *     a shape mismatch, so it propagates immediately rather than being
+   *     swallowed into a fallback attempt.
+   *
+   * `sampleRecord` is the actual record the caller is about to write (not a
+   * throwaway probe payload) — probing with real args means a chain that
+   * genuinely rejects this specific write (e.g. the signer doesn't own the
+   * parent) reports that real reason here, on the first (probe) dry run.
+   *
+   * `persist: true` on the probe matches what buildSetSubnodeOwnerCall
+   * submits (#1453: `persist: false` reverts NotAuthorised from a
+   * non-controller on DotNS v0.8.0), so a stale `false` here would revert
+   * during the probe before the real write got a chance.
+   */
+  private async resolveSubnodeOwnerShape(sampleRecord: { parentNode: string; subLabel: string; parentLabel: string; owner: string }): Promise<"legacy" | "v07"> {
+    if (this._subnodeOwnerShape !== null) return this._subnodeOwnerShape;
+    this.ensureConnected();
+    if (!this.clientWrapper) throw new Error("resolveSubnodeOwnerShape: polkadot-api client not available");
+    const contractAddress = this._contracts.DOTNS_REGISTRY;
+    const v07Abi: readonly any[] = DOTNS_REGISTRY_SET_SUBNODE_OWNER_ABI_V07;
+    const v07Args: any[] = [{ ...sampleRecord, persist: true }];
+    const encodedCallData = encodeFunctionData({ abi: v07Abi, functionName: "setSubnodeOwner", args: v07Args });
+    const callResult = await this.clientWrapper.performDryRunCall(this.substrateAddress!, contractAddress, 0n, encodedCallData);
+    if (callResult.result.isOk) {
+      this._subnodeOwnerShape = "v07";
+      return "v07";
+    }
+    const errorData = callResult.result.value;
+    const revertData: string | undefined = errorData?.data;
+    const revertFlags: bigint | undefined = errorData?.flags;
+    if (!isBareRevertResult(revertData, revertFlags)) {
+      // A real rejection of the v0.7+ shape — this chain accepts a selector
+      // this doesn't bare-revert on, and the actual write is invalid for a
+      // real reason. Propagate rather than falling back to the legacy shape.
+      throw new Error(formatContractDryRunFailure({
+        revertData,
+        revertFlags,
+        gasConsumed: callResult.gasConsumed,
+        gasRequired: callResult.gasRequired,
+        storageDeposit: callResult.storageDeposit?.value,
+      }, {
+        contractAddress,
+        functionName: "setSubnodeOwner",
+        signerSubstrateAddress: this.substrateAddress!,
+        signerEvmAddress: this.evmAddress ?? undefined,
+        value: 0n,
+        encodedData: encodedCallData,
+        args: v07Args,
+        contracts: this._contracts,
+      }));
+    }
+    // Bare revert on the v0.7+ shape (selector not found) → this chain
+    // predates v0.7; fall back to the legacy 4-field encoding.
+    this._subnodeOwnerShape = "legacy";
+    return "legacy";
+  }
+
+  /**
+   * Build the `{ abi, args }` pair a setSubnodeOwner call site should submit,
+   * after resolving (and caching) this connection's accepted tuple shape —
+   * see resolveSubnodeOwnerShape. `record` carries the 4 fields common to
+   * both shapes; the v0.7+ shape appends `persist: true` (bulletin-deploy
+   * #1453), which has the registry index the subname into its owner's
+   * LabelStore.
+   */
+  private async buildSetSubnodeOwnerCall(record: { parentNode: string; subLabel: string; parentLabel: string; owner: string }): Promise<{ abi: readonly any[]; args: any[] }> {
+    const shape = await this.resolveSubnodeOwnerShape(record);
+    if (shape === "v07") return { abi: DOTNS_REGISTRY_SET_SUBNODE_OWNER_ABI_V07, args: [{ ...record, persist: true }] };
+    return { abi: DOTNS_REGISTRY_ABI, args: [record] };
+  }
+
   async transferSubname(
     sublabel: string,
     parentLabel: string,
@@ -3451,9 +3610,13 @@ export class DotNS {
     // trailing setResolver would revert. The recipient sets the resolver/content
     // on their next deploy.
     const subnodeRecord = { parentNode, subLabel: sublabel, parentLabel, owner: toH160 };
+    // bulletin-deploy #1435: resolve (and cache) whether this connection's
+    // chain accepts the legacy 4-field or v0.7+ 5-field setSubnodeOwner
+    // shape — see buildSetSubnodeOwnerCall.
+    const { abi: setSubnodeOwnerAbi, args: setSubnodeOwnerArgs } = await this.buildSetSubnodeOwnerCall(subnodeRecord);
     const txRes = await this.contractTransaction(
-      this._contracts.DOTNS_REGISTRY, 0n, DOTNS_REGISTRY_ABI, "setSubnodeOwner",
-      [subnodeRecord], statusCallback,
+      this._contracts.DOTNS_REGISTRY, 0n, setSubnodeOwnerAbi, "setSubnodeOwner",
+      setSubnodeOwnerArgs, statusCallback,
     );
     const after = (await withTimeout(
       this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [subnode]),
@@ -3547,6 +3710,12 @@ export class DotNS {
         }
       };
 
+      // bulletin-deploy #1435: resolve (and cache) whether this connection's
+      // chain accepts the legacy 4-field or v0.7+ 5-field setSubnodeOwner
+      // shape — see buildSetSubnodeOwnerCall. setResolver's shape is
+      // unaffected by v0.7, so it keeps using DOTNS_REGISTRY_ABI directly.
+      const { abi: setSubnodeOwnerAbi, args: setSubnodeOwnerArgs } = await this.buildSetSubnodeOwnerCall(subnodeRecord);
+
       // setSubnodeOwner and setResolver are committed atomically via
       // Utility.batch_all so the runtime sees them as one transaction.
       // Submitting separately raced: setResolver's dry-run ran against
@@ -3554,7 +3723,7 @@ export class DotNS {
       // flags=1 data=0x1648fd01 (caller is not the node owner).
       const txResolution = await this.submitBatchedContractCalls(
         [
-          { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setSubnodeOwner", args: [subnodeRecord] },
+          { contractAddress: this._contracts.DOTNS_REGISTRY, abi: setSubnodeOwnerAbi, functionName: "setSubnodeOwner", args: setSubnodeOwnerArgs },
           { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setResolver", args: [subnodeNode, this._contracts.DOTNS_CONTENT_RESOLVER] },
         ],
         (s: string) => console.log(`      ${s}`),

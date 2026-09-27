@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient } from "../dist/dotns.js";
-import { namehash, zeroAddress } from "viem";
+import { namehash, zeroAddress, decodeFunctionData } from "viem";
 
 test("weiToNative: zero stays zero", () => {
   assert.equal(weiToNative(0n, 100000000n), 0n);
@@ -269,4 +269,289 @@ test("subname dispatch: a sublabel classifyRegistrability would refuse as a top-
     : await d.transferName(parsed.label, "0xRECIP");
   assert.equal(r.status, "ok", ">> FAIL: subname dispatch: transferSubname must complete normally, not be refused as a non-compliant label");
   assert.equal(r.txHash, "0xsub", ">> FAIL: subname dispatch: expected the transferSubname tx path (txHash 0xsub), not transferName's (0xabc) — confirms the correct method was actually invoked");
+});
+
+// ---------------------------------------------------------------------------
+// bulletin-deploy #1435/#1453: setSubnodeOwner v0.7+ call-shape probe.
+//
+// DotNS v0.7 added a 5th field (`persist: bool`) to the on-chain
+// SubnodeRecord tuple setSubnodeOwner takes, changing the function selector
+// — the legacy 4-field encoding now bare-reverts (flags=1, empty `0x` data)
+// on a v0.7+ chain. resolveSubnodeOwnerShape/buildSetSubnodeOwnerCall
+// (src/dotns.ts) dry-run-probe the WRITE itself: try the v0.7+ 5-field shape
+// (persist:true — #1453: persist:false reverts NotAuthorised from a
+// non-controller on v0.8.0) first, fall back to the legacy 4-field shape on
+// a bare revert, and propagate a revert WITH data (a real rejection, not a
+// shape mismatch) rather than falling back. The result is cached on the
+// DotNS instance (`_subnodeOwnerShape`) for the life of the connection.
+
+// Canonical raw shapes ReviveClientWrapper.performDryRunCall resolves to —
+// mirrors the { result: { isOk, value: { data, flags } } } shape every other
+// dry-run stub in this suite already returns from that method.
+function bareRevertProbeResult() {
+  return {
+    gasConsumed: { referenceTime: 0n, proofSize: 0n },
+    gasRequired: { referenceTime: 0n, proofSize: 0n },
+    storageDeposit: { value: 0n },
+    result: { isOk: false, isErr: true, value: { data: "0x", flags: 1n } },
+  };
+}
+function revertWithDataProbeResult(data = "0x1648fd01") {
+  return {
+    gasConsumed: { referenceTime: 0n, proofSize: 0n },
+    gasRequired: { referenceTime: 0n, proofSize: 0n },
+    storageDeposit: { value: 0n },
+    result: { isOk: false, isErr: true, value: { data, flags: 1n } },
+  };
+}
+function okProbeResult() {
+  return {
+    gasConsumed: { referenceTime: 0n, proofSize: 0n },
+    gasRequired: { referenceTime: 0n, proofSize: 0n },
+    storageDeposit: { value: 0n },
+    result: { isOk: true, isErr: false, value: { data: "0x" + "00".repeat(32), flags: 0n } },
+  };
+}
+
+// A transferSubname stub whose subname ownership is STATEFUL — the post-tx
+// owner() read reflects whatever contractTransaction's setSubnodeOwner call
+// actually wrote — so the same `d` can be driven through transferSubname
+// more than once in the same test (needed for the caching test below, where
+// a second real-looking write must reuse rather than re-probe the shape).
+function stubSubnameForShapeProbe({
+  parentOwner = "0xOWNER",
+  evmAddress = "0xOWNER",
+  initialSubOwner = "0xOLD",
+  tld = "dot",
+  sublabel = "app",
+  parentLabel = "foo",
+  probeDryRunCall,
+} = {}) {
+  const d = Object.create(DotNS.prototype);
+  d.connected = true;
+  d.evmAddress = evmAddress;
+  d.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  d._tld = tld;
+  d._contracts = { DOTNS_REGISTRY: "0xRegistry" };
+  d.ensureConnected = () => {};
+  // The constructor defaults this to "legacy" precisely so a caller that
+  // never connect()s keeps pre-#1435 behaviour with zero probing (see the
+  // field's own comment in src/dotns.ts) — force it back to "unresolved" so
+  // this test's probe stub actually runs.
+  d.__setSubnodeOwnerShapeForTest(null);
+
+  let probeCalls = 0;
+  d.clientWrapper = {
+    performDryRunCall: async (_origin, _addr, _value, encodedData) => {
+      probeCalls += 1;
+      return probeDryRunCall(encodedData);
+    },
+  };
+
+  const parentNode = namehash(`${parentLabel}.${tld}`);
+  const subnode = namehash(`${sublabel}.${parentLabel}.${tld}`);
+  let currentSubOwner = initialSubOwner;
+  d.contractCallNullable = async (_addr, _abi, fn, args) => {
+    if (fn !== "owner") throw new Error("unexpected call " + fn);
+    const node = args[0];
+    if (node === parentNode) return parentOwner;
+    if (node === subnode) return currentSubOwner;
+    throw new Error(`stubSubnameForShapeProbe: owner() called with unrecognised node ${node}`);
+  };
+  const submittedCalls = [];
+  d.contractTransaction = async (_addr, _value, abi, fn, args) => {
+    if (fn !== "setSubnodeOwner") throw new Error("unexpected tx " + fn);
+    submittedCalls.push({ abi, args });
+    currentSubOwner = args[0].owner; // simulate the write landing, for the post-tx re-read
+    return { kind: "hash", hash: "0xsub" };
+  };
+
+  return { d, getProbeCalls: () => probeCalls, getSubmittedCalls: () => submittedCalls };
+}
+
+test("transferSubname: setSubnodeOwner shape probe falls back to the legacy 4-field tuple on a bare (selector-not-found) revert", async () => {
+  const { d, getProbeCalls, getSubmittedCalls } = stubSubnameForShapeProbe({
+    probeDryRunCall: bareRevertProbeResult,
+  });
+  const r = await d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111");
+  assert.equal(r.status, "ok", `>> FAIL: setSubnodeOwner shape probe legacy fallback: expected status "ok", got "${r.status}"`);
+  assert.equal(getProbeCalls(), 1, ">> FAIL: setSubnodeOwner shape probe legacy fallback: expected exactly one probe dry-run call");
+  const [{ abi, args }] = getSubmittedCalls();
+  assert.equal(
+    abi[0].inputs[0].components.length, 4,
+    `>> FAIL: setSubnodeOwner shape probe legacy fallback: expected the submitted record tuple to have 4 components (no persist field) on a bare-revert probe, got ${abi[0].inputs[0].components.length}`,
+  );
+  assert.ok(
+    !("persist" in args[0]),
+    ">> FAIL: setSubnodeOwner shape probe legacy fallback: submitted args must not carry a persist field on the legacy 4-field shape",
+  );
+});
+
+test("transferSubname: setSubnodeOwner shape probe uses the v0.7+ 5-field tuple with persist:true when the dry-run accepts it", async () => {
+  const { d, getSubmittedCalls } = stubSubnameForShapeProbe({
+    probeDryRunCall: okProbeResult,
+  });
+  const r = await d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111");
+  assert.equal(r.status, "ok", `>> FAIL: setSubnodeOwner shape probe v0.7+: expected status "ok", got "${r.status}"`);
+  const [{ abi, args }] = getSubmittedCalls();
+  assert.equal(
+    abi[0].inputs[0].components.length, 5,
+    `>> FAIL: setSubnodeOwner shape probe v0.7+: expected the submitted record tuple to have 5 components (incl. persist) when the v0.7+ dry-run succeeds, got ${abi[0].inputs[0].components.length}`,
+  );
+  assert.equal(
+    args[0].persist, true,
+    ">> FAIL: setSubnodeOwner shape probe v0.7+: persist must be true — dotns#305 restricts persist:false to registered controllers, so a mnemonic-signed account reverts NotAuthorised on DotNS v0.8.0",
+  );
+});
+
+// The shape probe dry-runs the write it is about to make, so its persist value
+// has to match the submitted one. dotns#305 rejects persist:false from a
+// non-controller, and the probe classifies a revert-with-data as a real
+// rejection, so a stale false here would fail during the probe rather than
+// the write (bulletin-deploy #1453).
+test("transferSubname: the shape probe dry-runs persist:true, matching what it submits (dotns#305)", async () => {
+  let probedData = null;
+  const { d } = stubSubnameForShapeProbe({
+    probeDryRunCall: (encodedData) => { probedData ??= encodedData; return okProbeResult(); },
+  });
+  await d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111");
+  assert.ok(probedData, ">> FAIL: shape probe never issued a dry run, so this test asserts nothing");
+  const V07_ABI = [{ inputs: [{ name: "record", type: "tuple", components: [{ name: "parentNode", type: "bytes32" }, { name: "subLabel", type: "string" }, { name: "parentLabel", type: "string" }, { name: "owner", type: "address" }, { name: "persist", type: "bool" }] }], name: "setSubnodeOwner", outputs: [{ name: "subnode", type: "bytes32" }], stateMutability: "nonpayable", type: "function" }];
+  const { args } = decodeFunctionData({ abi: V07_ABI, data: probedData });
+  assert.equal(
+    args[0].persist, true,
+    ">> FAIL: the shape probe must dry-run persist:true. A false here reverts NotAuthorised on DotNS v0.8.0, and resolveSubnodeOwnerShape propagates a revert-with-data, so the probe fails before the write is ever attempted",
+  );
+});
+
+test("transferSubname: setSubnodeOwner shape probe propagates a revert WITH data instead of falling back to the legacy shape", async () => {
+  const { d, getSubmittedCalls } = stubSubnameForShapeProbe({
+    probeDryRunCall: () => revertWithDataProbeResult("0x1648fd01"),
+  });
+  await assert.rejects(
+    () => d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111"),
+    /Contract execution would revert/,
+    ">> FAIL: setSubnodeOwner shape probe real-revert: a revert WITH data on the v0.7+ probe is a real rejection (permissions, bad parent, etc.) and must propagate, not be swallowed into a shape-fallback attempt",
+  );
+  assert.equal(
+    getSubmittedCalls().length, 0,
+    ">> FAIL: setSubnodeOwner shape probe real-revert: setSubnodeOwner must never be submitted when the shape probe itself reverted with data",
+  );
+});
+
+test("setSubnodeOwner shape is cached per connection: a second subname write does not re-probe", async () => {
+  const { d, getProbeCalls, getSubmittedCalls } = stubSubnameForShapeProbe({
+    probeDryRunCall: bareRevertProbeResult,
+  });
+  await d.transferSubname("app", "foo", "0x2222222222222222222222222222222222222222");
+  assert.equal(getProbeCalls(), 1, ">> FAIL: setSubnodeOwner shape cache: expected the first subname write to probe exactly once");
+  await d.transferSubname("app", "foo", "0x3333333333333333333333333333333333333333");
+  assert.equal(
+    getProbeCalls(), 1,
+    ">> FAIL: setSubnodeOwner shape cache: a second subname write in the same connection re-probed instead of reusing the cached shape",
+  );
+  assert.equal(getSubmittedCalls().length, 2, ">> FAIL: setSubnodeOwner shape cache: expected both writes to actually submit a setSubnodeOwner transaction");
+  for (const { abi } of getSubmittedCalls()) {
+    assert.equal(abi[0].inputs[0].components.length, 4, ">> FAIL: setSubnodeOwner shape cache: both writes must use the same (cached) legacy shape");
+  }
+});
+
+// registerSubdomain's batched setSubnodeOwner + setResolver call (the other
+// #1435 call site) must go through the same shape probe/cache.
+function stubRegisterSubdomainForShapeProbe({
+  evmAddress = "0x4444444444444444444444444444444444444444",
+  tld = "dot",
+  probeDryRunCall,
+} = {}) {
+  const d = Object.create(DotNS.prototype);
+  d.connected = true;
+  d.evmAddress = evmAddress;
+  d.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  d._tld = tld;
+  d._contracts = { DOTNS_REGISTRY: "0xRegistry", DOTNS_CONTENT_RESOLVER: "0xResolver" };
+  d.ensureConnected = () => {};
+  d.__setSubnodeOwnerShapeForTest(null);
+
+  let probeCalls = 0;
+  d.clientWrapper = {
+    client: { query: { Timestamp: { Now: { getValue: async () => 1_000_000n } } } },
+    performDryRunCall: async () => {
+      probeCalls += 1;
+      return probeDryRunCall();
+    },
+  };
+  let submittedCalls = null;
+  d.submitBatchedContractCalls = async (calls) => {
+    submittedCalls = calls;
+    return { kind: "hash", hash: "0xsubdomaintx" };
+  };
+  return { d, getProbeCalls: () => probeCalls, getSubmittedCalls: () => submittedCalls };
+}
+
+test("registerSubdomain: batched setSubnodeOwner call also goes through the shape probe (v0.7+ 5-field + persist:true)", async () => {
+  const { d, getSubmittedCalls } = stubRegisterSubdomainForShapeProbe({ probeDryRunCall: okProbeResult });
+  await d.registerSubdomain("mywallet", "myapp");
+  const calls = getSubmittedCalls();
+  const setSubnodeOwnerCall = calls.find((c) => c.functionName === "setSubnodeOwner");
+  assert.ok(setSubnodeOwnerCall, ">> FAIL: registerSubdomain setSubnodeOwner shape: expected a setSubnodeOwner call in the batched submission");
+  assert.equal(
+    setSubnodeOwnerCall.abi[0].inputs[0].components.length, 5,
+    ">> FAIL: registerSubdomain setSubnodeOwner shape: expected the v0.7+ 5-field tuple when the probe accepts it",
+  );
+  assert.equal(setSubnodeOwnerCall.args[0].persist, true, ">> FAIL: registerSubdomain setSubnodeOwner shape: persist must be true on the v0.7+ path (dotns#305 gates persist:false to registered controllers)");
+  const setResolverCall = calls.find((c) => c.functionName === "setResolver");
+  assert.ok(setResolverCall, ">> FAIL: registerSubdomain setSubnodeOwner shape: setResolver call missing from the batch — setResolver's own shape is unaffected by v0.7 and must still be submitted alongside it");
+});
+
+test("setSubnodeOwner shape cache is shared across call sites: registerSubdomain reuses a shape transferSubname already resolved", async () => {
+  const tld = "dot";
+  const d = Object.create(DotNS.prototype);
+  d.connected = true;
+  d.evmAddress = "0x4444444444444444444444444444444444444444";
+  d.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  d._tld = tld;
+  d._contracts = { DOTNS_REGISTRY: "0xRegistry", DOTNS_CONTENT_RESOLVER: "0xResolver" };
+  d.ensureConnected = () => {};
+  d.__setSubnodeOwnerShapeForTest(null);
+
+  let probeCalls = 0;
+  d.clientWrapper = {
+    client: { query: { Timestamp: { Now: { getValue: async () => 1_000_000n } } } },
+    performDryRunCall: async () => {
+      probeCalls += 1;
+      return bareRevertProbeResult();
+    },
+  };
+
+  // --- leg 1: transferSubname resolves + caches "legacy" ---
+  const xferParentNode = namehash("foo.dot");
+  const xferSubnode = namehash("app.foo.dot");
+  let xferSubnodeCalls = 0;
+  d.contractCallNullable = async (_addr, _abi, fn, args) => {
+    if (fn !== "owner") throw new Error("unexpected call " + fn);
+    const node = args[0];
+    if (node === xferParentNode) return "0x4444444444444444444444444444444444444444";
+    if (node === xferSubnode) { xferSubnodeCalls += 1; return xferSubnodeCalls === 1 ? "0x5555555555555555555555555555555555555555" : "0x1111111111111111111111111111111111111111"; }
+    throw new Error("unrecognised node " + node);
+  };
+  d.contractTransaction = async (_addr, _value, _abi, fn) => {
+    if (fn !== "setSubnodeOwner") throw new Error("unexpected tx " + fn);
+    return { kind: "hash", hash: "0xsub" };
+  };
+  await d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111");
+  assert.equal(probeCalls, 1, ">> FAIL: setSubnodeOwner shape cache (cross-call-site): expected transferSubname to probe exactly once");
+
+  // --- leg 2: registerSubdomain must reuse the cached shape, no new probe ---
+  let submittedCalls = null;
+  d.submitBatchedContractCalls = async (calls) => { submittedCalls = calls; return { kind: "hash", hash: "0xreg" }; };
+  await d.registerSubdomain("mywallet", "myapp");
+  assert.equal(
+    probeCalls, 1,
+    ">> FAIL: setSubnodeOwner shape cache (cross-call-site): registerSubdomain re-probed even though transferSubname already resolved the shape earlier on this same connection",
+  );
+  const setSubnodeOwnerCall = submittedCalls.find((c) => c.functionName === "setSubnodeOwner");
+  assert.equal(
+    setSubnodeOwnerCall.abi[0].inputs[0].components.length, 4,
+    ">> FAIL: setSubnodeOwner shape cache (cross-call-site): expected registerSubdomain to reuse the cached legacy shape",
+  );
 });

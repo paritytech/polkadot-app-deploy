@@ -40,7 +40,7 @@ import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLoca
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
 import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
-import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e2e.test.js";
+import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked } from "./e2e.test.js";
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
@@ -606,6 +606,89 @@ describe("pickFreshRunLabel (test/e2e.test.js) — sanitization-stable fresh lab
       pickFreshRunLabel("e2esubcheck"),
       noStatusRunLabel("e2esubcheck"),
       ">> FAIL: pickFreshRunLabel-fix: NoStatus branch (signerPopStatus < 2) must be unaffected by the buildFreshLabelFromTag fix",
+    );
+  });
+});
+
+describe("registerOrConverge (test/e2e.test.js) — S-TRANSFER* retry-idempotency helper (bulletin #1364/#1334)", () => {
+  test("fresh label: calls register() once and returns null", async () => {
+    const calls = [];
+    const reg = { register: async (label) => { calls.push(label); } };
+    const result = await registerOrConverge(reg, "e2exferabc");
+    assert.equal(result, null, ">> FAIL: registerOrConverge: a successful register() must report null (freshly registered), not an existing owner");
+    assert.deepEqual(calls, ["e2exferabc"], ">> FAIL: registerOrConverge: must call reg.register(label) exactly once with the given label");
+  });
+
+  test("already owned by the expected signer (retry after a failure between register and transfer): returns the owner, does not throw", async () => {
+    const reg = { register: async () => { throw new Error("Domain e2exferabc.dot already owned by 0x1234567890abcdef1234567890abcdef12345678"); } };
+    const result = await registerOrConverge(reg, "e2exferabc");
+    assert.equal(
+      result?.toLowerCase(), "0x1234567890abcdef1234567890abcdef12345678",
+      ">> FAIL: registerOrConverge: an 'already owned by <addr>' register() failure must converge by returning <addr>, not throw or return the wrong address",
+    );
+  });
+
+  test("already owned by the recipient (retry after a fully-completed prior attempt): returns the recipient's address", async () => {
+    const reg = { register: async () => { throw new Error("Domain e2exferabc.dot already owned by 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01"); } };
+    const result = await registerOrConverge(reg, "e2exferabc");
+    assert.equal(
+      result?.toLowerCase(), "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01",
+      ">> FAIL: registerOrConverge: must surface whichever address the on-chain 'already owned by' error names, so the caller can distinguish a same-signer retry from a fully-completed handover",
+    );
+  });
+
+  test("a non-ownership register() failure propagates unchanged, not swallowed as a convergence signal", async () => {
+    const boom = new Error("ChainHead disjointed");
+    const reg = { register: async () => { throw boom; } };
+    await assert.rejects(
+      () => registerOrConverge(reg, "e2exferabc"),
+      (err) => err === boom,
+      ">> FAIL: registerOrConverge: a register() failure that is NOT an 'already owned by' message must propagate as-is (e.g. a real RPC/chain flake), never get misread as an ownership convergence",
+    );
+  });
+
+  test("a non-Error throw (string/object) without 'already owned by' also propagates unchanged", async () => {
+    const reg = { register: async () => { throw "connection reset"; } };
+    await assert.rejects(
+      () => registerOrConverge(reg, "e2exferabc"),
+      (err) => err === "connection reset",
+      ">> FAIL: registerOrConverge: a non-Error throw must still be message-matched via String(err) and propagate unchanged when it isn't an ownership conflict",
+    );
+  });
+});
+
+describe("registerOrConvergeChecked (test/e2e.test.js) — allowed-owner guard shared by S-TRANSFER and S-TRANSFER-SUBNAME (bulletin #1364/#1334)", () => {
+  test("fresh label: delegates to registerOrConverge and returns null without asserting", async () => {
+    const reg = { register: async () => {} };
+    const result = await registerOrConvergeChecked(reg, "e2exferabc", ["0xAAAA"], "TEST");
+    assert.equal(result, null, ">> FAIL: registerOrConvergeChecked: a fresh registration must return null");
+  });
+
+  test("owned by an allowed address: returns that address without throwing", async () => {
+    const reg = { register: async () => { throw new Error("Domain e2exferabc.dot already owned by 0xAAAA"); } };
+    const result = await registerOrConvergeChecked(reg, "e2exferabc", ["0xBBBB", "0xAAAA"], "TEST");
+    assert.equal(
+      result?.toLowerCase(), "0xaaaa",
+      ">> FAIL: registerOrConvergeChecked: an owner present in allowedOwners must be returned, not rejected",
+    );
+  });
+
+  test("owned by an unlisted third party: throws instead of silently converging", async () => {
+    const reg = { register: async () => { throw new Error("Domain e2exferabc.dot already owned by 0xCCCC"); } };
+    await assert.rejects(
+      () => registerOrConvergeChecked(reg, "e2exferabc", ["0xAAAA", "0xBBBB"], "TEST"),
+      /unexpected third party 0xCCCC/i,
+      ">> FAIL: registerOrConvergeChecked: an owner NOT in allowedOwners must fail loudly (fixture drifted to a real third party), never converge silently",
+    );
+  });
+
+  test("a non-ownership register() failure still propagates unchanged through the assertion layer", async () => {
+    const boom = new Error("ChainHead disjointed");
+    const reg = { register: async () => { throw boom; } };
+    await assert.rejects(
+      () => registerOrConvergeChecked(reg, "e2exferabc", ["0xAAAA"], "TEST"),
+      (err) => err === boom,
+      ">> FAIL: registerOrConvergeChecked: a non-'already owned by' failure must propagate as-is, same as the underlying registerOrConverge",
     );
   });
 });

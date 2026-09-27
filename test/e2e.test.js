@@ -260,6 +260,60 @@ export function pickFreshRunLabel(prefix) {
   return buildFreshLabelFromTag(prefix, RUN_TAG);
 }
 
+// Idempotency helper for the S-TRANSFER* scenarios (bulletin #1364/#1334). The
+// release retry wrapper (tools/release-retry-wrapper.mjs) re-runs this whole
+// test file on a transient failure, and RUN_TAG (`${GITHUB_RUN_ID}-${sha7}`) /
+// RUN_TOKEN are fixed for the run, so a retry reuses the SAME label the first
+// attempt used — and DotNS ownership persists on chain across that retry.
+// DotNS.register() is NOT idempotent: ensureNotRegistered throws "Domain X
+// already owned by Y" for ANY existing owner, including the same signer that
+// registered it moments ago. So a retry that got far enough to register (or
+// further) would hard-fail here instead of converging.
+//
+// Deliberately NOT a pre-read via DotNS.checkOwnership: that helper ends in
+// `catch { return { owned: false, owner: null } }` — a flaked ownerOf read
+// (the documented paseo-next-v2 timeout flake under E2E matrix load) would be
+// swallowed into "unregistered", we'd call register() anyway, and walk
+// straight into the exact "already owned by" failure this fix exists to
+// avoid. Instead, attempt register() and only treat ITS "already owned by
+// <addr>" failure — which ensureNotRegistered only ever throws after a real
+// successful non-zero ownerOf read, never on a swallowed RPC error — as a
+// converge-to-<addr> signal. Any other failure propagates unchanged. No
+// wasted on-chain writes either way: ensureNotRegistered runs (in parallel
+// with classifyName) before the commit-reveal transaction, so a thrown
+// "already owned" never got that far.
+//
+// Exported (with `reg` as an injectable param exposing only `.register`) so
+// this is unit-testable in test/test.js without a live chain.
+export async function registerOrConverge(reg, label) {
+  try {
+    await reg.register(label);
+    return null; // freshly registered by the connected signer
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const m = msg.match(/already owned by (0x[0-9a-fA-F]+)/i);
+    if (!m) throw err;
+    return m[1];
+  }
+}
+
+// Shared by S-TRANSFER and S-TRANSFER-SUBNAME's setup: registerOrConverge a
+// label, then assert its existing owner (if any) is one of the accounts this
+// scenario expects — anything else means the fixture drifted to a genuine
+// third party, and converging past that silently would hide a real problem.
+// Returns the existing owner (or null for a fresh registration) so callers
+// that need to branch on WHICH allowed account it was (S-TRANSFER: Alice vs.
+// Bob) still can.
+export async function registerOrConvergeChecked(reg, label, allowedOwners, failContext) {
+  const existingOwner = await registerOrConverge(reg, label);
+  if (existingOwner === null) return null;
+  assert.ok(
+    allowedOwners.some((addr) => addr.toLowerCase() === existingOwner.toLowerCase()),
+    `>> FAIL: ${failContext}: ${label} is owned by an unexpected third party ${existingOwner} — cannot converge as either a fresh registration or a retry of this run`,
+  );
+  return existingOwner;
+}
+
 // Burst-heavy re-upload scenarios get a DEDICATED derived signer so they don't
 // contend on Alice's shared nonce stream (the documented Invalid::Stale failure
 // mode — see the MANIFEST_SCENARIOS note below). These accounts are provisioned
@@ -450,6 +504,12 @@ describe("e2e", { skip: !ENABLED }, () => {
 
       // 1. Register a fresh name owned by Alice (in-process — no storage upload,
       //    keeping the flake surface to the DotNS commit-reveal path only).
+      //    Retry-safe: if a prior, transiently-failed attempt within this same
+      //    run already carried this label all the way to the recipient (Bob),
+      //    there is nothing left for Alice to register or transfer — record
+      //    that so step 2 expects the CLI's idempotent no-op output instead of
+      //    a fresh "Transferred" (see registerOrConverge above for why
+      //    register() itself can't just be re-run unconditionally).
       const reg = new DotNS();
       await reg.connect({ mnemonic: DEFAULT_MNEMONIC, ...connectOpts });
       const aliceH160 = reg.evmAddress;
@@ -457,8 +517,12 @@ describe("e2e", { skip: !ENABLED }, () => {
         aliceH160.toLowerCase(), BOB_H160.toLowerCase(),
         ">> FAIL: S-TRANSFER: worker must differ from the recipient or the transfer is a no-op",
       );
+      let preOwnedByRecipient = false;
       try {
-        await reg.register(label);
+        const existingOwner = await registerOrConvergeChecked(reg, label, [aliceH160, BOB_H160], "S-TRANSFER");
+        if (existingOwner !== null) {
+          preOwnedByRecipient = existingOwner.toLowerCase() === BOB_H160.toLowerCase();
+        }
       } finally {
         reg.disconnect();
       }
@@ -466,7 +530,10 @@ describe("e2e", { skip: !ENABLED }, () => {
       // 2. Hand over via the `transfer` CLI command (exercises commands/transfer.ts
       //    + DotNS.transferName + the live transferFloor quote). transferName
       //    asserts ownerOf == recipient before returning, so exit 0 IS the
-      //    on-chain proof the transfer landed.
+      //    on-chain proof the transfer landed. On a genuinely fresh run this
+      //    must still be a real "Transferred" — preOwnedByRecipient only
+      //    relaxes the expectation when the on-chain state already proved
+      //    (above) that a prior attempt completed the handover.
       const t1 = await runBulletinDeploy({
         args: ["transfer", label, "--to", BOB_H160, ...envArgs],
         timeoutMs: DEPLOY_TIMEOUT_MS,
@@ -476,8 +543,11 @@ describe("e2e", { skip: !ENABLED }, () => {
         `>> FAIL: S-TRANSFER: transfer command exited ${t1.code}: ${(t1.stderr || t1.stdout).split("\n").slice(-3).join(" ")}`,
       );
       assert.match(
-        t1.stdout, /Transferred .* to 0x41dccbd4/i,
-        ">> FAIL: S-TRANSFER: transfer command did not report a successful handover to the recipient",
+        t1.stdout,
+        preOwnedByRecipient ? /already owned by/i : /Transferred .* to 0x41dccbd4/i,
+        preOwnedByRecipient
+          ? ">> FAIL: S-TRANSFER: retry of an already-completed handover should report the recipient already owns it, not attempt a fresh transfer"
+          : ">> FAIL: S-TRANSFER: transfer command did not report a successful handover to the recipient",
       );
 
       // 3. Re-run: idempotent no-op (recipient already owns it).
@@ -524,15 +594,26 @@ describe("e2e", { skip: !ENABLED }, () => {
       const connectOpts = await resolveDotnsEnvConnectOptions();
       const reg = new DotNS();
       await reg.connect({ mnemonic: DEFAULT_MNEMONIC, ...connectOpts });
+      const aliceH160 = reg.evmAddress;
       try {
         // freshParent: registered AND given an "app" subname, both owned by
         // Alice — the handover leg transfers app.<freshParent> to the recipient.
-        await reg.register(freshParent);
+        // Retry-safe: base-domain ownership of freshParent/otherParent is never
+        // moved by this scenario (only the "app" subname is), so on a retry
+        // within the same run Alice still owns both — registerOrConverge skips
+        // the doomed re-register instead of hitting "already owned by <Alice>".
+        // registerSubdomain itself needs no such guard: setSubnodeOwner (and,
+        // batched atomically with it, setResolver) are parent-owner-authorised,
+        // not subnode-owner-authorised, so re-running it unconditionally simply
+        // reasserts Alice as the subnode owner even if a prior attempt already
+        // handed app.<freshParent> to the recipient — converging the fixture
+        // back to the state the handover test below expects to start from.
+        await registerOrConvergeChecked(reg, freshParent, [aliceH160], "S-TRANSFER-SUBNAME setup");
         await reg.registerSubdomain("app", freshParent);
         // otherParent: registered by Alice only. No subname needed — the
         // not-parent-owner leg must fail at the parent-ownership check
         // before transferSubname ever reads the subnode.
-        await reg.register(otherParent);
+        await registerOrConvergeChecked(reg, otherParent, [aliceH160], "S-TRANSFER-SUBNAME setup");
       } finally {
         reg.disconnect();
       }

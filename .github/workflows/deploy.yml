@@ -233,8 +233,12 @@ jobs:
           timeout_minutes: 10
           max_attempts: 3
           retry_wait_seconds: 30
+          # pipefail + tee so a failure inside the group surfaces as the
+          # pipeline's exit code (not tee's, which always succeeds), and the
+          # captured log is what on_retry_command below inspects (#214).
           command: |
-            set -e
+            set -eo pipefail
+            {
             REF='${{ inputs.polkadot-app-deploy-ref }}'
             VERSION='${{ inputs.polkadot-app-deploy-version }}'
             if [ -n "$REF" ]; then
@@ -261,6 +265,17 @@ jobs:
               npm install -g @parity/polkadot-app-deploy
               echo "BULLETIN_DEPLOY_BIN=polkadot-app-deploy" >> "$GITHUB_ENV"
               echo "RELEASE_RETRY_WRAPPER=$(npm root -g)/@parity/polkadot-app-deploy/tools/release-retry-wrapper.mjs" >> "$GITHUB_ENV"
+            fi
+            } 2>&1 | tee "${RUNNER_TEMP}/npm-retry-output.log"
+          # #214: same corrupted-cache-survives-a-hit exposure as the local
+          # npm-retry action — see that action.yml for the full rationale.
+          # Grep-gated so a non-corruption failure (e.g. a registry timeout)
+          # doesn't pay for an unnecessary cache clean.
+          on_retry_command: |
+            LOG="${RUNNER_TEMP}/npm-retry-output.log"
+            if [ -f "$LOG" ] && grep -Eiq 'EINTEGRITY|seems to be corrupted|_cacache|tarball data .* corrupted' "$LOG"; then
+              echo "::warning::npm cache looks corrupted; running npm cache clean --force before the next attempt"
+              npm cache clean --force || true
             fi
 
       - name: Verify minimum polkadot-app-deploy version

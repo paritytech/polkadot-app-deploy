@@ -73,6 +73,23 @@ function jobBlock(text, jobName) {
   return getJobBlock(text, jobName);
 }
 
+// Pulls a single `key: |` block-scalar body (e.g. `command`, `on_retry_command`)
+// out of an arbitrary slice of workflow/action YAML treated as text, dedenting
+// it the same way getJobBlock's own step parsing does.
+function extractBlockScalar(text, key) {
+  const at = text.search(new RegExp(`^\\s*${key}: \\|\\s*$`, "m"));
+  if (at === -1) return null;
+  const lines = text.slice(at).split("\n").slice(1);
+  const indent = (lines.find((l) => l.trim() !== "") ?? "").match(/^ */)[0].length;
+  const body = [];
+  for (const line of lines) {
+    if (line.trim() === "") { body.push(""); continue; }
+    if (line.match(/^ */)[0].length < indent) break;
+    body.push(line.slice(indent));
+  }
+  return body.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Test fixture: PopSelfServeConfig shapes used across helper tests
 // ---------------------------------------------------------------------------
@@ -11457,6 +11474,104 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     const install = deploy.split(/\n(?= {6}- )/).find((step) => /- name: Install polkadot-app-deploy$/m.test(step));
     assert.ok(install && install.includes(`uses: ${PIN}`),
       ">> FAIL: deploy.yml: the Install polkadot-app-deploy step must run under the pinned retry action");
+  });
+
+  // #214: a restored actions/setup-node npm cache can already contain a
+  // corrupted tarball (cache HIT, not a fresh-download truncation), so npm
+  // ci fails with EINTEGRITY / "seems to be corrupted" / ENOENT stat'ing its
+  // own _cacache content file. A bare nick-fields/retry attempt re-reads the
+  // same poisoned entry and fails identically. Both the local composite
+  // action and deploy.yml's direct nick-fields/retry usage must clear the
+  // npm cache via on_retry_command — but only when the failed attempt's
+  // output actually looks like corruption, never on an unrelated failure.
+  test("npm-retry clears a corrupted npm cache before retrying, and only then (#214)", () => {
+    const action = fs.readFileSync(".github/actions/npm-retry/action.yml", "utf8");
+    const actionCommand = extractBlockScalar(action, "command");
+    const actionOnRetry = extractBlockScalar(action, "on_retry_command");
+    assert.ok(actionCommand && /pipefail/.test(actionCommand) && /tee "\$\{RUNNER_TEMP\}/.test(actionCommand),
+      ">> FAIL: npm-retry action: command must capture attempt output (pipefail + tee) for on_retry_command to inspect");
+    assert.ok(actionOnRetry && /npm cache clean --force/.test(actionOnRetry),
+      ">> FAIL: npm-retry action: on_retry_command must clean the npm cache on a corrupted-cache signature");
+
+    const deploy = fs.readFileSync(".github/workflows/deploy.yml", "utf8");
+    const install = deploy.split(/\n(?= {6}- )/).find((step) => /- name: Install polkadot-app-deploy$/m.test(step));
+    assert.ok(install, ">> FAIL: deploy.yml: Install polkadot-app-deploy step not found");
+    const deployCommand = extractBlockScalar(install, "command");
+    const deployOnRetry = extractBlockScalar(install, "on_retry_command");
+    assert.ok(deployCommand && /pipefail/.test(deployCommand) && /tee "\$\{RUNNER_TEMP\}/.test(deployCommand),
+      ">> FAIL: deploy.yml: Install polkadot-app-deploy's command must capture output the same way as the local action (#214)");
+    assert.ok(deployOnRetry && /npm cache clean --force/.test(deployOnRetry),
+      ">> FAIL: deploy.yml: Install polkadot-app-deploy's on_retry_command must clean the npm cache the same way as the local action (#214)");
+
+    // Exercise the actual on_retry_command scripts (not a reimplementation of
+    // their logic) against a real corrupted-cache log and a real unrelated-
+    // failure log, proving the grep gate fires only when it should.
+    const CORRUPTION_LOG = [
+      "npm warn tarball tarball data for smoldot@3.3.2.tgz (sha512-Zl4h/0gs...) seems to be corrupted. Trying again.",
+      "npm warn tar zlib: unexpected end of file",
+      "npm error code ENOENT",
+      "npm error syscall stat",
+      "npm error path /home/runner/.npm/_cacache/content-v2/sha512/66/5e/21ff482cc3",
+    ].join("\n");
+    // ENOENT and _cacache land on separate lines in real npm output (as
+    // above), so a naive `ENOENT.*_cacache` grep never matches across a line
+    // break. This scenario omits the "seems to be corrupted" line entirely,
+    // so it only passes if the `_cacache` alternative alone is doing real
+    // work — pinning the exact bug a same-line-anchored pattern would hide.
+    const ENOENT_ONLY_LOG = [
+      "npm error code ENOENT",
+      "npm error syscall stat",
+      "npm error path /home/runner/.npm/_cacache/content-v2/sha512/66/5e/21ff482cc3",
+    ].join("\n");
+    const UNRELATED_LOG = "npm error code ECONNRESET\nnpm error network request to https://registry... failed";
+
+    // nick-fields/retry's on_retry_command runs via Node's execSync with no
+    // `shell` option (verified against the pinned SHA's dist/index.js), which
+    // defaults to /bin/sh — dash on the Ubuntu runners these workflows use,
+    // NOT bash. A bash function export (`npm() { ...; }; export -f npm`)
+    // only works in bash, so it would validate a script that could silently
+    // break under the real interpreter. Stub npm as an executable on PATH and
+    // run the script through `sh` instead, matching production exactly.
+    function ranCacheClean(onRetryScript, logContents) {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "npm-retry-"));
+      fs.writeFileSync(path.join(tmp, "npm-retry-output.log"), logContents);
+      const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "npm-retry-bin-"));
+      const npmStub = "#!/bin/sh\n"
+        + `if [ "$1" = "cache" ] && [ "$2" = "clean" ]; then echo CLEANED > "${tmp}/cleaned"; exit 0; fi\n`
+        + "exit 0\n";
+      const npmPath = path.join(binDir, "npm");
+      fs.writeFileSync(npmPath, npmStub);
+      fs.chmodSync(npmPath, 0o755);
+      spawnSync("sh", ["-c", onRetryScript], {
+        encoding: "utf8",
+        timeout: 10_000,
+        env: { ...process.env, PATH: `${binDir}:${process.env.PATH}`, RUNNER_TEMP: tmp },
+      });
+      return fs.existsSync(path.join(tmp, "cleaned"));
+    }
+
+    for (const [label, onRetryScript] of [["npm-retry action", actionOnRetry], ["deploy.yml Install step", deployOnRetry]]) {
+      assert.ok(ranCacheClean(onRetryScript, CORRUPTION_LOG),
+        `>> FAIL: ${label}: a corrupted-cache signature in the captured log did not trigger npm cache clean --force before the next attempt`);
+      assert.ok(ranCacheClean(onRetryScript, ENOENT_ONLY_LOG),
+        `>> FAIL: ${label}: an ENOENT-under-_cacache log with no "seems to be corrupted" line did not trigger npm cache clean --force (the corruption signature spans multiple lines in real npm output, so a same-line-anchored pattern silently never fires)`);
+      assert.ok(!ranCacheClean(onRetryScript, UNRELATED_LOG),
+        `>> FAIL: ${label}: an unrelated failure (ECONNRESET) triggered npm cache clean --force, which should only fire on a corrupted-cache signature`);
+    }
+
+    // Exercise the actual `command` block too: pipefail must propagate a
+    // failure through the tee, or a corrupted npm ci would report success.
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "npm-retry-cmd-"));
+    const runInterpolated = actionCommand.replace("${{ inputs.run }}", "npm ci");
+    const failingScript = [
+      `RUNNER_TEMP="${tmp}"`,
+      `npm() { echo "npm error code ENOENT"; return 254; }`,
+      "export -f npm",
+      runInterpolated,
+    ].join("\n");
+    const result = spawnSync("bash", ["-c", failingScript], { encoding: "utf8", timeout: 10_000 });
+    assert.notEqual(result.status, 0,
+      ">> FAIL: npm-retry action: command block reports success even though the piped npm ci failed — pipefail is not propagating the exit code through tee");
   });
 
   for (const file of [".github/workflows/e2e.yml", ".github/workflows/deploy.yml"]) {

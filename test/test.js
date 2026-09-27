@@ -16048,7 +16048,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
                            "nightly-s3", "nightly-s5", "nightly-s6", "nightly-s7",
                            "nightly-s8", "nightly-s9", "nightly-s-grandpa-reupload",
                            "nightly-s-mortality", "nightly-s-reprove", "nightly-s-car",
-                           "nightly-s-ext-signer"]) {
+                           "nightly-s-ext-signer", "nightly-s-reserved-invariant"]) {
       const block = workflowJobBlock(wf, jobName);
       assert.match(
         block,
@@ -16174,6 +16174,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       "nightly-s-car",
       "nightly-s-inc",
       "nightly-s-ext-signer",
+      "nightly-s-reserved-invariant",
     ];
     for (const jobName of nightlyJobs) {
       const block = workflowJobBlock(wf, jobName);
@@ -16215,6 +16216,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       "nightly-s-car",
       "nightly-s-inc",
       "nightly-s-ext-signer",
+      "nightly-s-reserved-invariant",
     ];
     for (const jobName of nightlyJobs) {
       const block = workflowJobBlock(wf, jobName);
@@ -24440,7 +24442,7 @@ describe("e2e.yml: prerequisites job wiring (ensure-e2e-authorized)", () => {
     "nightly-pr-coverage", "nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh",
     "nightly-s3", "nightly-s5", "nightly-s6", "nightly-s7", "nightly-s8", "nightly-s9",
     "nightly-s-grandpa-reupload", "nightly-s-mortality", "nightly-s-reprove",
-    "nightly-s-car", "nightly-s-inc", "nightly-s-ext-signer",
+    "nightly-s-car", "nightly-s-inc", "nightly-s-ext-signer", "nightly-s-reserved-invariant",
   ];
 
   test("e2e.yml defines the ensure-e2e-authorized prerequisites job", () => {

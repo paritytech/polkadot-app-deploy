@@ -33,12 +33,12 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
 import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingTransactions, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
-import { classifyFile, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
+import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
 import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest, classifyFinalityGap, probeFinalityGap, getBestBlockNumber } from "../dist/chunk-probe.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
-import { buildFilesMap, detectFramework, applyManifestFetchAttributes } from "../dist/deploy.js";
+import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
 import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e2e.test.js";
 import * as nodeCrypto from "node:crypto";
@@ -11054,6 +11054,265 @@ describe("manifest (incremental-upload-v2)", () => {
       assert.equal(classifyFile("data.json"), "volatile");
       assert.equal(classifyFile("notes.txt"), "volatile");
     });
+
+    // #1355 root cause: CONTENT_HASH_RE's hash-segment character class was
+    // `[A-Za-z0-9]` — it excluded the "_" and "-" that Vite/Rollup's
+    // base64url-alphabet hashes actually contain, so bundle files whose hash
+    // suffix happened to include either character fell through to
+    // "volatile" and were fully re-uploaded on every deploy despite an
+    // unchanged CID. Widened to `[A-Za-z0-9_-]`. These are real filenames
+    // from test/fixtures/realistic-vite/v1/assets/ that failed under the
+    // old class — see the full-fixture sweep below for all 14.
+    test("treats real Vite/Rollup base64url hash suffixes (with _ or -) as stable (#1355)", () => {
+      const names = [
+        "assets/_md-BChABl-9.js",
+        "assets/index-B_NQy5Da.js",
+        "assets/errors-CHrKVge_.js",
+        "assets/bulletin_metadata-ZWUBSZT2-BukF-JIi.js",
+        "assets/substrate-client-w5-JehSV.js",
+        "assets/get-sync-provider-euY2_EAo.js",
+        "assets/descriptors-7XDUQZP4-Q_l81UXa.js",
+        "assets/metadataTypes-25EYWYSO-DB9fHAu_.js",
+        "assets/passet_metadata-7H7LGTAU-BnXlGKH_.js",
+        "assets/sm-provider-B_oHyEGq.js",
+      ];
+      for (const n of names) {
+        assert.equal(classifyFile(n), "stable", `expected ${n} to classify stable`);
+      }
+    });
+
+    // Full-fixture sweep: pin the exact counts from the PR description.
+    // 59 real Vite-emitted filenames; 14 failed the pre-#1355 alnum-only
+    // class, 0 fail the widened [A-Za-z0-9_-] class.
+    test("classifies every file in the realistic-vite v1 assets fixture as stable", () => {
+      const dir = path.resolve("test/fixtures/realistic-vite/v1/assets");
+      const names = fs.readdirSync(dir).map((f) => `assets/${f}`);
+      assert.equal(names.length, 59, "fixture file count changed — update the pinned expectation");
+      const failing = names.filter((n) => classifyFile(n) !== "stable");
+      assert.deepEqual(failing, [], `expected 0 misclassified; got ${failing.length}: ${failing.join(", ")}`);
+    });
+
+    // Negative side: the widened class must not start treating plainly
+    // non-hashed filenames as content-hashed. The dangerous direction for
+    // this heuristic is guessing "stable" for content that actually changes
+    // between deploys (mutable content silently lands in the cached
+    // section). These have no bundler-hash-shaped segment at all.
+    test("still treats plain, non-hashed filenames as volatile (negative)", () => {
+      assert.equal(classifyFile("index.html"), "volatile");
+      assert.equal(classifyFile("about/index.html"), "volatile");
+      assert.equal(classifyFile("notes.txt"), "volatile");
+      assert.equal(classifyFile("data.json"), "volatile");
+      assert.equal(classifyFile("styles.css"), "volatile");
+      assert.equal(classifyFile("readme.md"), "volatile");
+      assert.equal(classifyFile("robots.txt"), "volatile");
+    });
+
+    // Known, accepted trade-off (pre-existing for the alnum-only class too —
+    // e.g. "vendor-bundle.js" already matched "bundle" as a 6-char pseudo-hash
+    // before this change): any dash-delimited segment of 6-16 characters
+    // drawn from [A-Za-z0-9_-] looks like a hash to this heuristic, whether
+    // or not it actually is one. Widening the class to include "-" extends
+    // that same pre-existing weakness to segments that span an internal "-",
+    // e.g. a date-stamped export name. Documented here, not silently
+    // widened away — a stricter heuristic would need real hash-entropy
+    // detection, out of scope for a name-based fix.
+    test("documents the accepted false-positive surface from widening the hash class", () => {
+      assert.equal(classifyFile("vendor-bundle.js"), "stable"); // pre-existing, not new
+      assert.equal(classifyFile("report-2026-09-04.json"), "stable"); // new surface: multi-hyphen numeric run now bridges via "-"
+    });
+
+    // #1390: CONTENT_HASH_RE's hash-segment length was capped at {6,16}.
+    // webpack's `output.hashDigestLength` defaults to 20, and md5-style
+    // digests are 32 hex characters — both longer than the old cap, so a
+    // stock webpack build had every content-hashed JS/CSS asset
+    // misclassified "volatile" and re-uploaded on every deploy despite
+    // being byte-identical. Cap raised from 16 to 32: exactly covers
+    // md5-length (32 hex) digests, the longest hash shape actually in use
+    // by mainstream bundlers, while still refusing an unbounded segment
+    // (see the "one char over the new cap" case below). Table reproduced
+    // verbatim from the issue body, confirmed failing under the pre-fix
+    // regex before this change.
+    test("treats webpack-default (20-char) and md5-style (32-char) hash suffixes as stable (#1390)", () => {
+      assert.equal(classifyFile("index-a1b2c3d4.js"), "stable", ">> FAIL: vite/rollup 8-char base64url hash: expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8.js"), "stable", ">> FAIL: 16 hex (old cap boundary): expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b81.js"), "stable", ">> FAIL: 17 hex (one over the old cap): expected stable after raising the bound");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8c9d0.js"), "stable", ">> FAIL: 20 hex (webpack output.hashDigestLength default): expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.js"), "stable", ">> FAIL: 32 hex (md5-style digest): expected stable");
+      assert.equal(classifyFile("app.abcdefghijklmnopqrst.css"), "stable", ">> FAIL: 20 alnum: expected stable");
+    });
+
+    // Negative: each branch's cap must still be finite and independent —
+    // one character past either bound must stay volatile. Proves the fix
+    // raised each ceiling rather than removing it (the issue explicitly
+    // warns against widening "so far that a normal word-with-digits
+    // filename becomes stable").
+    test("still treats a segment one character over either branch's cap as volatile (#1390)", () => {
+      assert.equal(
+        classifyFile("main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e.js"),
+        "volatile",
+        ">> FAIL: 33 hex (one over the hex branch's new cap): expected volatile, cap must stay finite"
+      );
+      assert.equal(
+        classifyFile("app.abcdefghijklmnopqrstu.css"),
+        "volatile",
+        ">> FAIL: 21 non-hex alnum (one over the alnum branch's cap): expected volatile, cap must stay finite"
+      );
+    });
+
+    // Negative: the alnum/base64url branch is capped at 20 (webpack's
+    // hashDigestLength default), not reused from the hex branch's 32 —
+    // deliberately narrower, since that branch already accepts ordinary
+    // words and "-" (per #1355 above). A 21-32 char ordinary,
+    // descriptive-looking filename segment must stay volatile: raising
+    // the hex cap for real md5 digests must not also make a longer plain
+    // word look like a hash.
+    test("still treats a long ordinary (non-hash) filename segment as volatile, even within the raised hex cap's range (#1390)", () => {
+      assert.equal(
+        classifyFile("data-longdescriptivefilename.json"),
+        "volatile",
+        ">> FAIL: 23-char ordinary word segment (non-hex, within 20<len<=32): expected volatile — alnum branch capped at 20, not 32"
+      );
+    });
+
+    // A word ending in digits is the shape most likely to be mistaken for a
+    // hash once the caps go up. index.html / data.json / styles.css are
+    // already covered by the "plain, non-hashed filenames" negative above,
+    // so only the new shape is asserted here.
+    test("still treats a word-with-trailing-digits filename as volatile after raising the caps (#1390)", () => {
+      assert.equal(classifyFile("changelog2026.md"), "volatile", ">> FAIL: word+digits, no delimiter before it: expected volatile");
+    });
+
+    // The vite branch of classifyFileHeuristic used to re-test CONTENT_HASH_RE
+    // on a string the function had already rejected one line earlier, against
+    // the same non-global regex — it could never return "stable", so it went.
+    // An assets/ path is classified on its filename alone, exactly as any
+    // other path is.
+    test("classifies an unhashed vite assets/ path on its name alone, with or without the framework hint (#1390)", () => {
+      assert.equal(classifyFileHeuristic("assets/logo.png", "vite"), "stable", ">> FAIL: assets/logo.png: .png is in STABLE_EXTENSIONS, so it is stable with or without the hint");
+      assert.equal(classifyFileHeuristic("assets/data.json", "vite"), "volatile", ">> FAIL: unhashed assets/data.json under vite: expected volatile, same as without the hint");
+      for (const path of ["assets/data.json", "assets/logo.png", "assets/index-a1b2c3d4.js", "assets/style.css"]) {
+        assert.equal(
+          classifyFileHeuristic(path, "vite"),
+          classifyFileHeuristic(path, null),
+          `>> FAIL: ${path}: the vite hint must not change classification — its branch only ever re-tested a regex that had already failed`
+        );
+      }
+    });
+  });
+
+  // Per-framework rule table (#1527/#1528 Phase 1). Replaces the one global
+  // regex with narrow, framework-scoped rules that run BEFORE the global
+  // fallback. C2: each rule set narrows (scopes a claim to a path prefix the
+  // bundler owns) rather than widens a pattern that applies everywhere. Each
+  // exclusion below is a file with a STABLE PATH but MUTABLE CONTENT — the
+  // expensive C2 error a wrong "stable" classification causes.
+  describe("classifyFileHeuristic: per-framework rule table (#1527/#1528 Phase 1)", () => {
+    test("next: _next/static/ is stable, the same basename outside the prefix is not", () => {
+      assert.equal(classifyFileHeuristic("_next/static/chunks/x.js", "next"), "stable",
+        ">> FAIL: next stablePrefix: _next/static/chunks/x.js expected stable");
+      assert.equal(classifyFileHeuristic("_next/server/x.js", "next"), "volatile",
+        ">> FAIL: next stablePrefix: _next/server/x.js is outside _next/static/, expected volatile (no content hash in name)");
+    });
+
+    test("next: _buildManifest.js and _ssgManifest.js stay volatile even under _next/static/", () => {
+      assert.equal(
+        classifyFileHeuristic("_next/static/AbCdEf123456/_buildManifest.js", "next"),
+        "volatile",
+        ">> FAIL: _buildManifest.js has no hash in its own name and its path is only unique while the build id is — must stay volatile even inside the stable prefix"
+      );
+      assert.equal(
+        classifyFileHeuristic("_next/static/AbCdEf123456/_ssgManifest.js", "next"),
+        "volatile",
+        ">> FAIL: _ssgManifest.js: same reasoning as _buildManifest.js"
+      );
+    });
+
+    test("nuxt: separator-less hash-shaped basenames under _nuxt/ are stable", () => {
+      assert.equal(classifyFileHeuristic("_nuxt/CJPnFZM_2.js", "nuxt"), "stable",
+        ">> FAIL: nuxt scopedHashRe: _nuxt/CJPnFZM_2.js expected stable (#1527)");
+    });
+
+    test("nuxt: _nuxt/builds/latest.json stays volatile — fixed filename, re-read to detect a new deployment", () => {
+      assert.equal(
+        classifyFileHeuristic("_nuxt/builds/latest.json", "nuxt"),
+        "volatile",
+        ">> FAIL: _nuxt/builds/latest.json: 'latest' is ordinary word-shaped, not hash-shaped — a blanket _nuxt/ stablePrefix would wrongly cache this mutable file, which is the C2 expensive error this design exists to avoid"
+      );
+    });
+
+    test("nuxt: _nuxt/builds/meta/<buildId>.json is stable — unique per build, so its content never changes under that name", () => {
+      assert.equal(classifyFileHeuristic("_nuxt/builds/meta/2f8a9c1d3e.json", "nuxt"), "stable",
+        ">> FAIL: nuxt build-id-named meta file expected stable (hash-shaped basename)");
+    });
+
+    test("polkavm-app: game/ and LICENSES/ are stable, app.polkavm and manifest.json stay volatile", () => {
+      assert.equal(classifyFileHeuristic("game/freedoom1.wad", "polkavm-app"), "stable",
+        ">> FAIL: polkavm-app stablePrefix game/: freedoom1.wad expected stable (never changes)");
+      assert.equal(classifyFileHeuristic("LICENSES/gpl-2.0.txt", "polkavm-app"), "stable",
+        ">> FAIL: polkavm-app stablePrefix LICENSES/: gpl-2.0.txt expected stable (never changes)");
+      assert.equal(
+        classifyFileHeuristic("app.polkavm", "polkavm-app"),
+        "volatile",
+        ">> FAIL: app.polkavm is the executable — changes every release, has no content hash in its name, must stay volatile"
+      );
+      assert.equal(
+        classifyFileHeuristic("manifest.json", "polkavm-app"),
+        "volatile",
+        ">> FAIL: manifest.json is version metadata — changes every release, must stay volatile"
+      );
+    });
+
+    test("determinism: classifyFileHeuristic(p, f) depends only on (p, f)", () => {
+      const cases = [
+        ["_next/static/chunks/x.js", "next"],
+        ["_next/static/AbCdEf123456/_buildManifest.js", "next"],
+        ["_nuxt/CJPnFZM_2.js", "nuxt"],
+        ["_nuxt/builds/latest.json", "nuxt"],
+        ["game/freedoom1.wad", "polkavm-app"],
+        ["app.polkavm", "polkavm-app"],
+        ["index.html", null],
+      ];
+      // Interleaved, not back-to-back: two adjacent calls with identical
+      // arguments cannot diverge for a pure string function, so repeating
+      // them proves nothing. Classifying every other case in between is what
+      // would catch a per-instance cache or a regex carrying lastIndex state.
+      const first = cases.map(([p, f]) => classifyFileHeuristic(p, f));
+      for (let i = 0; i < cases.length; i++) {
+        const [p, f] = cases[i];
+        assert.equal(
+          classifyFileHeuristic(p, f),
+          first[i],
+          `>> FAIL: classifyFileHeuristic(${p}, ${f}) changed after classifying every other case in between — it is carrying state across calls, so classification is not a pure function of (path, framework)`,
+        );
+      }
+    });
+
+    // Fallback: an unknown framework must classify EXACTLY as `null` does —
+    // the global fallback stays untouched for the majority (unknown) case.
+    // Corpus spans the #1390 table plus the #1355 realistic-vite fixture, plus
+    // each framework's own path shapes WITHOUT the matching hint (must not
+    // accidentally trip a rule that shouldn't apply).
+    test("unknown framework classifies exactly as no framework hint, across the #1390 table + realistic-vite fixture", () => {
+      const names = [
+        "index.html", "about/index.html", "notes.txt", "data.json", "styles.css", "readme.md", "robots.txt",
+        "index-a1b2c3d4.js", "main.a1b2c3d4e5f6a7b8.js", "main.a1b2c3d4e5f6a7b81.js",
+        "main.a1b2c3d4e5f6a7b8c9d0.js", "main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.js",
+        "app.abcdefghijklmnopqrst.css", "vendor-bundle.js", "report-2026-09-04.json",
+        "changelog2026.md", "data-longdescriptivefilename.json",
+        "_next/static/chunks/x.js", "_next/static/AbCdEf123456/_buildManifest.js",
+        "_nuxt/CJPnFZM_2.js", "_nuxt/builds/latest.json",
+        "game/freedoom1.wad", "app.polkavm", "manifest.json",
+      ];
+      const dir = path.resolve("test/fixtures/realistic-vite/v1/assets");
+      const fixtureNames = fs.readdirSync(dir).map((f) => `assets/${f}`);
+      for (const n of [...names, ...fixtureNames]) {
+        assert.equal(
+          classifyFileHeuristic(n, "some-unrecognised-bundler"),
+          classifyFileHeuristic(n, null),
+          `>> FAIL: ${n}: an unknown framework must classify identically to no framework hint — the global fallback must stay untouched`
+        );
+      }
+    });
   });
 
   describe("parseManifest", () => {
@@ -12662,28 +12921,166 @@ describe("buildFilesMap with fileCids (incremental-upload-v2)", () => {
     assert.ok("index.html" in map);
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  // #1528 Phase 1 wiring: buildFilesMap must thread a framework value into
+  // classifyFile so the per-framework rule table actually reaches the
+  // manifest's `files` map (previously the framework value reached nothing).
+  test("threads the framework param into classifyFile", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-bfm-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static", "chunks"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "_next", "static", "chunks", "x.js"), "x");
+    const fileCids = new Map([["_next/static/chunks/x.js", "bafabc"]]);
+    const withoutFramework = buildFilesMap(dir, fileCids);
+    const withFramework = buildFilesMap(dir, fileCids, "next");
+    assert.equal(withoutFramework["_next/static/chunks/x.js"].type, "volatile",
+      ">> FAIL: without a framework hint, an unhashed _next/static/ path stays volatile (global fallback unchanged)");
+    assert.equal(withFramework["_next/static/chunks/x.js"].type, "stable",
+      ">> FAIL: buildFilesMap must thread its framework param into classifyFile so the next stablePrefix rule applies");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });
 
+// Detection hardening (#1527/#1528/#1529 Phase 1): markers evaluated against
+// the deployed directory only (C1), returning null on ambiguity rather than
+// guessing (C3).
 describe("detectFramework", () => {
-  test("returns 'next' when _next/ exists", () => {
+  test("returns 'polkavm-app' when root manifest.json has runtime.kind:'polkavm' alongside app.polkavm", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
-    fs.mkdirSync(path.join(dir, "_next"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "polkavm" }, version: "1.0.0" }));
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(16, 0x00));
+    assert.equal(detectFramework(dir), "polkavm-app");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when app.polkavm is missing (manifest.json alone is not evidence)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "polkavm" } }));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when manifest.json's runtime.kind is not 'polkavm'", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "web" } }));
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(4));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when manifest.json is malformed JSON (fails closed, not a crash)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), "{not valid json");
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(4));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'next' when _next/static/ exists", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static"), { recursive: true });
     assert.equal(detectFramework(dir), "next");
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("returns 'vite' when assets/ exists", () => {
+  test("does NOT return 'next' for a bare _next/ with no static/ subdir", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next"));
+    fs.writeFileSync(path.join(dir, "_next", "server-manifest.json"), "{}");
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'nuxt' when _nuxt/ exists", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_nuxt"));
+    assert.equal(detectFramework(dir), "nuxt");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'vite' when assets/ contains at least one hash-shaped entry", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
     fs.mkdirSync(path.join(dir, "assets"));
+    fs.writeFileSync(path.join(dir, "assets", "main-Abc12345.js"), "x");
     assert.equal(detectFramework(dir), "vite");
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("returns null when neither _next nor assets exists", () => {
+  // C3: an assets/ dir with no hashed entry must return null, not "vite" — a
+  // bare directory-name guess is what let detection flip between UNKNOWN and
+  // vite for vite-plugin-singlefile's inlined-HTML output.
+  test("returns null (not 'vite') when assets/ exists but no entry is hash-shaped", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "assets"));
+    fs.writeFileSync(path.join(dir, "assets", "data.json"), "{}");
+    fs.writeFileSync(path.join(dir, "assets", "logo.png"), "x"); // stable-extension, but not hash-shaped
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns null when no marker exists", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
     fs.writeFileSync(path.join(dir, "index.html"), "<html/>");
     assert.equal(detectFramework(dir), null);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // C3: more than one marker present -> null, never a guess.
+  test("returns null when more than one marker is present (ambiguous — never guesses)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "_nuxt"));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // C1: detection is a pure function of the deployed directory only — no
+  // second parameter through which a prevManifest could ever be threaded in.
+  test("detectFramework takes only a directory path", () => {
+    assert.equal(detectFramework.length, 1,
+      ">> FAIL: detectFramework must stay a pure function of the deployed directory only (C1) — a second parameter would invite reading prevManifest here, which C1 forbids");
+  });
+});
+
+// Bulletin #1550/#1566: a mainnet deploy should upload full content and
+// stop — no incremental (chunk-dedup) upload, no embedded
+// .bulletin-deploy/manifest.json cache manifest. Retention makes the cache
+// stale on arrival at mainnet's low deploy cadence, and a production name
+// should not carry build-cache artifacts. Exact `=== "mainnet"` check on
+// purpose: an env-less deploy or one whose resolved env declares no network
+// keeps the historical incremental behaviour.
+//
+// Ported as a standalone pure predicate only — not yet wired into
+// storeDirectoryV2 or deploy() — the twin has no mainnet env configured
+// today, so there is nothing to gate on yet.
+describe("usesIncrementalCache", () => {
+  test("mainnet network disables incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "mainnet" }), false,
+      ">> FAIL: usesIncrementalCache: mainnet must disable the incremental cache");
+  });
+
+  test("testnet network keeps incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "testnet" }), true,
+      ">> FAIL: usesIncrementalCache: testnet must keep the incremental cache");
+  });
+
+  test("undefined network keeps incremental cache (bare --rpc deploy)", () => {
+    assert.equal(usesIncrementalCache({}), true,
+      ">> FAIL: usesIncrementalCache: an env-less deploy must keep the incremental cache");
+  });
+
+  test("unknown network (env resolved, no declared network) keeps incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "unknown" }), true,
+      ">> FAIL: usesIncrementalCache: an 'unknown' sentinel is not mainnet and must keep the cache");
+  });
+
+  test("password disables incremental cache regardless of network", () => {
+    assert.equal(usesIncrementalCache({ network: "testnet", password: "secret" }), false,
+      ">> FAIL: usesIncrementalCache: an encrypted deploy must disable the incremental cache even off mainnet");
+  });
+
+  test("mainnet + password together still disables incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "mainnet", password: "secret" }), false,
+      ">> FAIL: usesIncrementalCache: mainnet+password combined must not re-enable the cache");
   });
 });
 
@@ -13299,6 +13696,375 @@ describe("incremental-v2 scenarios (mocked storage)", () => {
     assert.ok(a.section1.size > 0);
     assert.ok(b.section1.size > 0);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1383 regression guard: CAR-section classification must be a pure function
+// of the current directory's content — never of a previous deploy's
+// manifest. An earlier attempt at fixing #1355 threaded a prevManifest-aware
+// classifyFn (CID-match only, ignoring the recorded `type`) into
+// buildOrderedCar. Because index.html is deliberately heuristic-volatile (no
+// content hash in its name) but is often byte-identical between two
+// consecutive deploys, that CID-match flipped it to "stable" on the second
+// deploy, migrating it into section 1's tail and forcing a
+// never-before-uploaded chunk — confirmed on real chain via S-INC-PORTABILITY
+// ("Probed 10 → 9 on chain, 1 absent"). This test exercises buildOrderedCar
+// exactly as deploy.ts calls it: no classifyFn override, so the bare default
+// `(p) => classifyFile(p)` applies — which never even receives a
+// prevManifest — across two back-to-back, byte-identical deploys of the same
+// directory.
+// ---------------------------------------------------------------------------
+describe("portability: CAR-section classification independent of deploy history (#1383 regression guard)", () => {
+  test("section-1 membership is identical across two byte-identical deploys; index.html never migrates in", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-port-"));
+    try {
+      fs.writeFileSync(path.join(dir, "vendor-9f8e7d6c.js"), Buffer.alloc(80_000, 0x42));
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      // Deploy 1: no prevStableOrder, no classifyFn override.
+      const out1 = await merkleizeJSBackend(dir);
+      const car1 = await buildOrderedCar({ output: out1 });
+
+      // Deploy 2: identical directory content (index.html byte-for-byte the
+      // same), fed deploy 1's own stableOrder as prevStableOrder — matching
+      // what deploy.ts actually passes to merkleizeWithStableOrder.
+      const out2 = await merkleizeJSBackend(dir);
+      const car2 = await buildOrderedCar({ output: out2, prevStableOrder: car1.stableOrder });
+
+      // Sanity: confirm this genuinely is the byte-identical scenario.
+      assert.equal(out1.fileCids.get("index.html"), out2.fileCids.get("index.html"));
+      assert.ok(car1.stableOrder.length > 0, "vendor bundle must land in section 1 for this test to be meaningful");
+
+      // Portability property: exact set equality, not mere overlap — a
+      // migrated file would inflate car2.stableOrder beyond car1.stableOrder
+      // while every original member still "overlaps".
+      assert.deepEqual([...car2.stableOrder].sort(), [...car1.stableOrder].sort());
+
+      const htmlCid = out2.fileCids.get("index.html");
+      assert.ok(!car2.stableOrder.includes(htmlCid),
+        "index.html must never enter the stable section — it has no content hash in its name");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1527/#1528 Phase 1: the framework-aware classifyFn threaded through
+// buildOrderedCar must preserve the same C1 invariant the describe block
+// above guards. The naive version of this test — build once with a
+// prevManifest and once without — passes even under a reverted classifier,
+// so it proves nothing. This mirrors the actual shape instead: classify tree
+// T with the new framework-aware classifyFn, capture its stableBlockOrder,
+// then run the CAR build again for the SAME T with that order fed back as
+// prevStableOrder, and assert section membership AND chunk boundaries (the
+// full ordered chunkCids array, not just the stable-order set) are
+// identical. That is what would have caught #1383: any classifyFn that lets
+// a file's classification depend on something other than (path, framework)
+// shifts chunk boundaries here.
+// ---------------------------------------------------------------------------
+describe("portability: per-framework classifyFn preserves the C1 invariant (#1527/#1528 Phase 1)", () => {
+  test("next-shaped tree: section membership and full chunk-boundary array identical across two identical builds", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-port-"));
+    try {
+      fs.mkdirSync(path.join(dir, "_next", "static", "chunks", "abc123"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "_next", "static", "chunks", "abc123", "main.js"), Buffer.alloc(40_000, 0x41));
+      fs.mkdirSync(path.join(dir, "_next", "static", "abc123"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "_next", "static", "abc123", "_buildManifest.js"), "self.__BUILD_MANIFEST=1;");
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const framework = detectFramework(dir);
+      assert.equal(framework, "next", ">> FAIL: fixture setup: expected this tree to detect as 'next' for the test to be meaningful");
+      const classifyFn = (p) => classifyFile(p, { framework });
+
+      const out1 = await merkleizeJSBackend(dir);
+      const car1 = await buildOrderedCar({ output: out1, classifyFn });
+
+      const out2 = await merkleizeJSBackend(dir);
+      const car2 = await buildOrderedCar({ output: out2, classifyFn, prevStableOrder: car1.stableOrder });
+
+      // Section membership: exact set equality.
+      assert.deepEqual([...car2.stableOrder].sort(), [...car1.stableOrder].sort(),
+        ">> FAIL: next-shaped tree: section-1 (stable) file membership changed between two identical builds");
+
+      // Chunk boundaries: the FULL ordered chunk-CID array, not just the
+      // stable-order set — this is the #1389 assertion target ("chunk index
+      // 9 disappeared").
+      assert.deepEqual(car2.chunkCids, car1.chunkCids,
+        ">> FAIL: next-shaped tree: ordered chunk-CID array changed between two identical builds — chunk boundaries are not a pure function of (path, framework)");
+      assert.deepEqual(car2.sectionChunkCounts, car1.sectionChunkCounts,
+        ">> FAIL: next-shaped tree: section chunk counts changed between two identical builds");
+
+      // The excluded file must never migrate into section 1, on either pass.
+      const buildManifestCid = out2.fileCids.get("_next/static/abc123/_buildManifest.js");
+      assert.ok(!car1.stableOrder.includes(buildManifestCid) && !car2.stableOrder.includes(buildManifestCid),
+        ">> FAIL: _buildManifest.js (stable path, mutable content) must never enter section 1");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase A / Phase B chunk-subset invariant — permanent regression guard.
+// ---------------------------------------------------------------------------
+// A prior design proposal considered removing the two-merkleization Phase
+// A/B split because Phase A can, in theory, upload a chunk the final CAR
+// (Phase B) never references — paid for and orphaned. #1459 fixed one
+// concrete cause of exactly that (a duplicate-CID file double-counted in
+// section 1's packing between phases).
+//
+// This is NOT a bug fix. This is a discriminating experiment: a failing case
+// here would justify redesigning the two-phase split; a clean pass across
+// the shapes that historically diverged is evidence the divergence class is
+// closed post-#1459, and this guard is what keeps it closed.
+//
+// Mirrors real deploy.ts sequencing:
+//   1. writeEmbeddedManifestPlaceholder — a small placeholder manifest,
+//      written BEFORE Phase A's merkleize.
+//   2. Phase A merkleize + buildOrderedCar, anchored on the PRIOR deploy's
+//      stableOrder (or unanchored, for a first deploy). Phase A uploads its
+//      section-1 chunk set — `phaseA.section1ChunkCids`.
+//   3. finaliseEmbeddedManifest — the real, much larger manifest — written
+//      BEFORE Phase B's re-merkleize. This is the size delta that
+//      historically moved chunk boundaries.
+//   4. Phase B merkleize + buildOrderedCar, anchored on Phase A's OWN
+//      stableOrder. Phase B's `chunkCids` is what the deploy actually
+//      uploads/references for sections 0+1+2.
+//
+// buildOrderedCar `continue`s past MANIFEST_PATH before file classification,
+// so the manifest is always confined to section 0 — this harness DOES reach
+// the placeholder→finalised transition at unit level. The `finalisedBytes >
+// placeholderBytes` checks below are fixture sanity (confirming the
+// transition actually happened), not a standalone proof that section 1 is
+// independent of it — that independence falls out of buildOrderedCar's
+// structure (section 0 is packed separately and never merged into section
+// 1's byte stream), which the subset assertion exercises indirectly.
+//
+// Structural note, so a future reader doesn't mistake this for 4 independent
+// discriminators: Phase B always anchors on Phase A's OWN stableOrder, over
+// the same tree (deploy.ts's real sequencing, mirrored here). Given that,
+// buildOrderedCar's anchored-placement loop forces Phase B's section-1 order
+// to replay Phase A's exactly, so packSection (deterministic) must reproduce
+// Phase A's chunks byte-for-byte UNLESS the two phases' dedup-by-fileCid
+// disagrees — exactly the #1459 mechanism. That makes "duplicate-CID files"
+// the one case that can structurally fail; "unhashed index.html", "asset
+// rotation", and "control" regression-guard their own named issues (a file
+// never migrating into section 1, membership tracking a rotated anchor
+// correctly, exact byte-identity on a no-op redeploy) and validate the
+// subset property holds under those specific mutations too, rather than
+// stress the packing algorithm itself. The first test below is a synthetic
+// mutation case that proves `assertPhaseASubset` actually fires — the other
+// four passing green is otherwise ambiguous between "divergence class closed"
+// and "guard doesn't discriminate".
+describe("portability: Phase A upload set is a subset of Phase B's final CAR (#1517 discriminating experiment)", { concurrency: true }, () => {
+  // Fixture helpers shared by every case below.
+  function writeAsset(dir, relPath, sizeBytes, fillByte) {
+    fs.mkdirSync(path.join(dir, path.dirname(relPath)), { recursive: true });
+    fs.writeFileSync(path.join(dir, relPath), Buffer.alloc(sizeBytes, fillByte));
+  }
+
+  async function withTmpDir(prefix, fn) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    try {
+      return await fn(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // The "anchoring deploy" (deploy N-1): a plain, unanchored buildOrderedCar
+  // pass whose stableOrder feeds Phase A's prevStableOrder — the same role
+  // fetchPreviousManifest's stableBlockOrder plays in deploy.ts.
+  async function buildAnchoringDeploy(dir) {
+    const classifyFn = (p) => classifyFile(p, { framework: null });
+    const out = await merkleizeJSBackend(dir);
+    const build = await buildOrderedCar({ output: out, classifyFn });
+    return { out, build };
+  }
+
+  async function runPhaseAThenPhaseB(dir, { framework = null, phaseAPrevStableOrder = [] } = {}) {
+    const classifyFn = (p) => classifyFile(p, { framework });
+
+    writeEmbeddedManifestPlaceholder(dir, {
+      version: MANIFEST_VERSION,
+      previousContenthash: null,
+      deployedAt: "2026-01-01T00:00:00.000Z",
+      framework: null,
+    });
+    const placeholderBytes = fs.statSync(path.join(dir, MANIFEST_PATH)).size;
+    const outA = await merkleizeJSBackend(dir);
+    const phaseA = await buildOrderedCar({ output: outA, classifyFn, prevStableOrder: phaseAPrevStableOrder, phase: "Phase A" });
+
+    // The real finalised manifest: full file list + chunk map, materially
+    // larger than the placeholder — this is the byte-size transition that
+    // historically moved chunk boundaries. buildFilesMap is the exact
+    // function deploy.ts calls at this point, so this mirrors production
+    // classification instead of re-deriving it.
+    const files = buildFilesMap(dir, outA.fileCids, framework);
+    const chunks = {};
+    for (const cid of phaseA.chunkCids) chunks[cid] = { size: 1000, deployed_at: "2026-01-01T00:00:00.000Z" };
+    finaliseEmbeddedManifest(dir, {
+      version: MANIFEST_VERSION,
+      previousContenthash: null,
+      deployedAt: "2026-01-01T00:00:01.000Z",
+      framework,
+      files,
+      stableBlockOrder: phaseA.stableOrder,
+      blocks: phaseA.blockOrder,
+      chunks,
+    });
+    const finalisedBytes = fs.statSync(path.join(dir, MANIFEST_PATH)).size;
+    const outB = await merkleizeJSBackend(dir);
+    const phaseB = await buildOrderedCar({ output: outB, classifyFn, prevStableOrder: phaseA.stableOrder, phase: "Phase B" });
+
+    return { phaseA, phaseB, outA, outB, placeholderBytes, finalisedBytes };
+  }
+
+  function assertPhaseASubset(phaseA, phaseB, label) {
+    const phaseBSet = new Set(phaseB.chunkCids);
+    const orphaned = phaseA.section1ChunkCids.filter((c) => !phaseBSet.has(c));
+    assert.deepEqual(
+      orphaned,
+      [],
+      `>> FAIL: ${label}: Phase A uploaded ${orphaned.length} section-1 chunk(s) that Phase B's final CAR does not reference — ` +
+      `orphaned CIDs: [${orphaned.join(", ")}] ` +
+      `(phaseA s1=${phaseA.sectionSizes.section1}B/${phaseA.sectionChunkCounts.section1}chunks, ` +
+      `phaseB s0=${phaseB.sectionSizes.section0}B s1=${phaseB.sectionSizes.section1}B/${phaseB.sectionChunkCounts.section1}chunks s2=${phaseB.sectionSizes.section2}B)`
+    );
+  }
+
+  // Multi-chunk fixture sanity, shared by every case: enough stable bytes to
+  // force >=N section-1 chunks, so the subset check exercises a real chunk
+  // boundary rather than trivially holding for a single chunk.
+  function assertMultiChunkFixture(phaseA, minChunks = 2) {
+    assert.ok(phaseA.sectionChunkCounts.section1 >= minChunks,
+      `>> FAIL: fixture setup: expected >=${minChunks} section-1 chunks, got ${phaseA.sectionChunkCounts.section1} — fixture too small to exercise a chunk boundary`);
+  }
+
+  // Meta-test: prove assertPhaseASubset actually fires, on a synthetic
+  // divergence, before trusting the four real-fixture cases below to be
+  // meaningful rather than vacuous. Without this, five greens are ambiguous
+  // between "the divergence class is closed" and "this guard never catches
+  // anything."
+  test("assertPhaseASubset fires when Phase A's section-1 CIDs are not a subset of Phase B's chunkCids (synthetic)", () => {
+    const phaseA = {
+      section1ChunkCids: ["bafkOrphan1", "bafkShared1"],
+      sectionSizes: { section1: 2_000_000 },
+      sectionChunkCounts: { section1: 2 },
+    };
+    const phaseB = {
+      chunkCids: ["bafkHeader", "bafkShared1", "bafkRootDir"], // missing bafkOrphan1
+      sectionSizes: { section0: 100, section1: 1_000_000, section2: 200 },
+      sectionChunkCounts: { section1: 1 },
+    };
+    assert.throws(
+      () => assertPhaseASubset(phaseA, phaseB, "synthetic divergence"),
+      (err) => {
+        assert.match(err.message, /synthetic divergence/, "error must name the case");
+        // Exactly the orphaned CID, not the shared one that IS in phaseB.chunkCids.
+        assert.match(err.message, /orphaned CIDs: \[bafkOrphan1\]/, "error must list exactly the one orphaned CID, excluding the shared one");
+        return true;
+      },
+      ">> FAIL: assertPhaseASubset meta-test: helper did not throw on a genuine Phase-A/Phase-B divergence"
+    );
+  });
+
+  test("duplicate-CID files (#1459): byte-identical stable files at two paths stay deduped across Phase A and Phase B", async () => {
+    await withTmpDir("bd-phaseab-dup-", async (dir) => {
+      writeAsset(dir, "assets/logo-a.png", 600_000, 0x41);
+      writeAsset(dir, "assets/logo-b.png", 600_000, 0x41); // same bytes -> same CID, different path
+      writeAsset(dir, "assets/banner.png", 600_000, 0x42);
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const { phaseA, phaseB, outA, finalisedBytes, placeholderBytes } = await runPhaseAThenPhaseB(dir);
+
+      // Fixture sanity: confirm the duplicate really collapsed to ONE section-1
+      // entry (fileCid-keyed), not two — otherwise this case tests nothing.
+      const logoACid = outA.fileCids.get("assets/logo-a.png");
+      const logoBCid = outA.fileCids.get("assets/logo-b.png");
+      assert.equal(logoACid, logoBCid, ">> FAIL: fixture setup: logo-a.png and logo-b.png must produce the same CID for this to be a duplicate-CID case");
+      const occurrences = phaseA.stableOrder.filter((cid) => cid === logoACid).length;
+      assert.equal(occurrences, 1, `>> FAIL: duplicate-CID files: the duplicate CID appears ${occurrences} times in Phase A's stableOrder, expected exactly 1 (dedup should collapse it)`);
+      assert.ok(finalisedBytes > placeholderBytes, ">> FAIL: fixture setup: finalised manifest must be larger than the placeholder to exercise the size transition");
+      assertMultiChunkFixture(phaseA);
+
+      assertPhaseASubset(phaseA, phaseB, "duplicate-CID files (#1459)");
+    });
+  });
+
+  test("unhashed index.html, byte-identical across builds (#1383/#1389): stays volatile in both phases, never enters section 1", async () => {
+    await withTmpDir("bd-phaseab-idx-", async (dir) => {
+      writeAsset(dir, "assets/app.png", 700_000, 0x41);
+      writeAsset(dir, "assets/vendor.png", 700_000, 0x42);
+      // No content hash in the filename, and content is identical across
+      // Phase A and Phase B by construction (nothing rewrites it) — this is
+      // the exact "heuristically volatile but unchanged" shape #1383/#1389
+      // describe. classifyFn here never threads prevManifest (matches
+      // deploy.ts's actual classifyFn wrapper), so this stays a heuristic
+      // classification, not a CID-match one.
+      fs.writeFileSync(path.join(dir, "index.html"), "<html><body>same every deploy</body></html>");
+
+      const { phaseA, phaseB, outA, outB } = await runPhaseAThenPhaseB(dir);
+
+      const indexCidA = outA.fileCids.get("index.html");
+      const indexCidB = outB.fileCids.get("index.html");
+      assert.equal(indexCidA, indexCidB, ">> FAIL: fixture setup: index.html must be byte-identical (same CID) across Phase A and Phase B for this to be the #1383/#1389 shape");
+      assert.ok(!phaseA.stableOrder.includes(indexCidA), ">> FAIL: unhashed index.html: must not enter Phase A's section 1 (stable) despite being byte-identical");
+      assert.ok(!phaseB.stableOrder.includes(indexCidB), ">> FAIL: unhashed index.html: must not enter Phase B's section 1 (stable) despite being byte-identical");
+      assertMultiChunkFixture(phaseA);
+
+      assertPhaseASubset(phaseA, phaseB, "unhashed index.html, byte-identical (#1383/#1389)");
+    });
+  });
+
+  test("asset rotation (S-INC-ASSET-ROTATION): section-1 membership changes between the anchoring deploy and this one", async () => {
+    await withTmpDir("bd-phaseab-rot-old-", async (dirOld) => {
+      await withTmpDir("bd-phaseab-rot-new-", async (dirNew) => {
+        // Deploy N-1: assetA + assetB stable, unanchored (its own first build).
+        writeAsset(dirOld, "assets/assetA.png", 650_000, 0x41);
+        writeAsset(dirOld, "assets/assetB.png", 650_000, 0x42);
+        fs.writeFileSync(path.join(dirOld, "index.html"), "<html>old</html>");
+        const { out: outOld, build: buildOld } = await buildAnchoringDeploy(dirOld);
+
+        // Deploy N: assetA removed, assetB unchanged (byte-identical), assetC
+        // newly added — section-1 membership genuinely changes.
+        writeAsset(dirNew, "assets/assetB.png", 650_000, 0x42);
+        writeAsset(dirNew, "assets/assetC.png", 650_000, 0x43);
+        fs.writeFileSync(path.join(dirNew, "index.html"), "<html>new</html>");
+
+        const { phaseA, phaseB, outA } = await runPhaseAThenPhaseB(dirNew, { phaseAPrevStableOrder: buildOld.stableOrder });
+
+        // Fixture sanity: membership actually rotated.
+        const assetACid = outOld.fileCids.get("assets/assetA.png");
+        const assetCCid = outA.fileCids.get("assets/assetC.png");
+        assert.ok(!phaseA.stableOrder.includes(assetACid), ">> FAIL: fixture setup: removed assetA must not appear in Phase A's stableOrder");
+        assert.ok(phaseA.stableOrder.includes(assetCCid), ">> FAIL: fixture setup: newly-added assetC must appear in Phase A's stableOrder");
+        assert.ok(phaseA.sectionChunkCounts.section1 >= 1, ">> FAIL: fixture setup: expected at least 1 section-1 chunk");
+
+        assertPhaseASubset(phaseA, phaseB, "asset rotation (S-INC-ASSET-ROTATION)");
+      });
+    });
+  });
+
+  test("control: plain unchanged redeploy — identical tree across the anchoring build, Phase A, and Phase B", async () => {
+    await withTmpDir("bd-phaseab-ctl-", async (dir) => {
+      writeAsset(dir, "assets/asset1.png", 650_000, 0x41);
+      writeAsset(dir, "assets/asset2.png", 650_000, 0x42);
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const { build: buildOld } = await buildAnchoringDeploy(dir); // deploy N-1, unanchored
+      const { phaseA, phaseB } = await runPhaseAThenPhaseB(dir, { phaseAPrevStableOrder: buildOld.stableOrder });
+
+      assertMultiChunkFixture(phaseA);
+      // Stronger than subset: nothing changed, so section-1 membership must be
+      // byte-identical between Phase A and Phase B, not merely a subset.
+      assert.deepEqual([...phaseB.stableOrder].sort(), [...phaseA.stableOrder].sort(),
+        ">> FAIL: control unchanged redeploy: section-1 membership differs between Phase A and Phase B despite no content change");
+
+      assertPhaseASubset(phaseA, phaseB, "control: plain unchanged redeploy");
+    });
   });
 });
 

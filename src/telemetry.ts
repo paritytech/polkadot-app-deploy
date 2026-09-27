@@ -462,6 +462,7 @@ export function computeDeployOutcome(
 //   dotns.abi_decode_empty          — raw ABI decode of zero/empty ("0x") data outside the DotNS-guard wrapper path
 //   naming.already_owned           — domain is already owned by a different EVM address
 //   naming.governance_reserved     — label DotNS naming rules forbid registering (Reserved/trailing-digit/hyphen-base), decided by ownership in preflight (#1185)
+//   naming.short_names_closed      short base refused because PopRules.shortNamesEnabled is off. Not a personhood problem; only the PopRules owner can open the band
 //   naming.subdomain_orphan        — subdomain parent is owned by a different address
 //   verify.contenthash_mismatch    — post-deploy on-chain contenthash differs from what was written
 //   verify.dagpb_not_finalised     — DAG-PB root not finalised; chain may have dropped the extrinsic
@@ -493,6 +494,7 @@ export type DeployErrorKind =
   | 'dotns.abi_decode_empty'
   | 'naming.already_owned'
   | 'naming.governance_reserved'
+  | 'naming.short_names_closed'
   | 'naming.subdomain_orphan'
   | 'verify.contenthash_mismatch'
   | 'verify.dagpb_not_finalised'
@@ -554,6 +556,10 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // src/deploy.ts truncate the inner chain error at 100 chars.
   [/BadProof/i, 'chain.bad_proof'],
   [/heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i, 'connection'],
+  // Our preflight wording and the chain's own revert. Kept separate from
+  // pop_required: grouping them would hide a config change behind a label the
+  // user can act on.
+  [/short names are not on sale on|Short names are not for sale/i, 'naming.short_names_closed'],
   [/requires ProofOfPersonhood(?:Full|Lite|Light),\s*but this signer is NoStatus/i, 'naming.pop_required'],
   [/requires NoStatus,\s*but this signer is ProofOfPersonhood/i, 'naming.nostatus_required'],
   [/Cannot decode zero data.*with ABI parameters/i, 'dotns.abi_decode_empty'],

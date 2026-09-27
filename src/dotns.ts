@@ -938,6 +938,10 @@ const POP_RULES_ABI = [
   { inputs: [{ name: "name", type: "string" }, { name: "userAddress", type: "address" }], name: "priceWithoutCheck", outputs: [{ name: "metadata", type: "tuple", components: [{ name: "price", type: "uint256" }, { name: "status", type: "uint8" }, { name: "userStatus", type: "uint8" }, { name: "message", type: "string" }] }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "name", type: "string" }], name: "isBaseNameReserved", outputs: [{ name: "isReserved", type: "bool" }, { name: "reservationOwner", type: "address" }, { name: "expiryTimestamp", type: "uint64" }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "name", type: "string" }, { name: "from", type: "address" }, { name: "to", type: "address" }], name: "transferFloor", outputs: [{ name: "", type: "uint256" }], stateMutability: "view", type: "function" },
+  // Auto-getter for PopRules' `bool public shortNamesEnabled`. Older deployments
+  // predate it and revert on this call, which readShortNamesEnabled reports as
+  // unknown rather than off.
+  { inputs: [], name: "shortNamesEnabled", outputs: [{ name: "", type: "bool" }], stateMutability: "view", type: "function" },
   // No startingPrice here: it exists only on the poprules-startingPrice
   // generation, so it belongs to that profile's OLD_POP_RULES_ABI.
 ] as const;
@@ -1422,18 +1426,11 @@ function classifyLabelStatus(label: string, profile: DotnsAbiProfile = DEFAULT_D
       // rule and telemetry both read it), just no longer used to DECIDE
       // status here.
       //
-      // NOT modelled here (out of scope for this classifier): `_requireShortNamesOpen`
-      // additionally gates the 6-8 band on an owner-settable `shortNamesEnabled`
-      // flag — `require(shortNamesEnabled || baseLength >= 9, "Short names
-      // are not for sale")`. A signer holding PopFull/PopLite is therefore
-      // NOT guaranteed to register a 6-8 char name; this preflight only
-      // reports the personhood-tier requirement, not whether short names are
-      // currently on sale at all. Reading that flag would need a new
-      // on-chain call this classifier doesn't make. Two things a reader must
-      // not assume: that the flag is off (or on) anywhere in particular —
-      // run tools/probe-dotns-v060.mjs, do not trust a date in a comment —
-      // and that a failed read means `false`; on older deployments the
-      // accessor reverts outright, which is "unknown", not "off".
+      // `_requireShortNamesOpen` gates base lengths below nine on an
+      // owner-settable `shortNamesEnabled`, independently of personhood, so a
+      // PopFull/PopLite signer is still not guaranteed a short name. This
+      // function answers the personhood tier only; the flag is read where a
+      // connection exists, in preflight and register.
       const lite = LITE_USERNAME_RE.exec(label);
       const baseLength = lite ? lite[1].length : label.length;
       return { status: classifyByLadder(baseLength, lite !== null), trailingDigits, baseLength };
@@ -1801,6 +1798,22 @@ export function canRegister(requiredStatus: number, userStatus: number): boolean
 function exampleNoStatusLabel(label: string, tld: string = DEFAULT_TLD): string {
   const base = stripTrailingDigits(label).replace(/[^a-z0-9-]/g, "x");
   return `${noStatusFallbackBase(base)}.${tld}`;
+}
+
+// A read that never completed, as opposed to one that completed and said no.
+// Preflight's chain reads rethrow on these rather than falling back to a
+// default: network noise is not evidence about the chain's state.
+const READ_NEVER_COMPLETED_RE = /timed out after \d+ms|heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i;
+
+// PopRules closes every base length below nine unless shortNamesEnabled is on.
+// Below six is already Reserved and refused earlier, so six to eight is the only
+// range this gate decides.
+function isShortNameBand(baseLength: number): boolean {
+  return baseLength >= 6 && baseLength <= 8;
+}
+
+export function shortNamesClosedReason(label: string, baseLength: number, tld: string, environmentId: string | null | undefined): string {
+  return `${label}.${tld} has a ${baseLength}-character base and short names are not on sale on ${environmentId ?? "this environment"}. PopRules.shortNamesEnabled is off, which closes the 6 to 8 character band to every signer, whatever their personhood status. Use a base of 9 characters or more, for example ${exampleNoStatusLabel(label, tld)}.`;
 }
 
 // #paseo-tld: `tld` selects which suffix is THIS environment's own — it must
@@ -2601,6 +2614,8 @@ export class DotNS {
   // or a previous connection's stale verdict — see the reset next to
   // detectProtocolVersion() in connect().
   private _subnodeOwnerShape: "legacy" | "v07" | null = "legacy";
+  // null is unread; "unknown" is a completed read with no usable answer.
+  private _shortNamesEnabled: boolean | "unknown" | null = null;
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
   private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>) | undefined = undefined;
   /** Total phone-signature count for this DotNS session (drives the `total` field passed to confirmPhoneReady). */
@@ -2653,6 +2668,11 @@ export class DotNS {
   /** bulletin-deploy #1435 test-only: pin the setSubnodeOwner shape cache directly ("legacy", "v07", or null to force resolveSubnodeOwnerShape to re-probe), bypassing the live dry-run probe — for unit tests that stub the probe or exercise the fallback/caching logic itself. */
   __setSubnodeOwnerShapeForTest(shape: "legacy" | "v07" | null): void {
     this._subnodeOwnerShape = shape;
+  }
+
+  /** Test-only: pin the cached PopRules.shortNamesEnabled value so a scenario can reach the personhood branch for a 6-8 char label on a chain where the band is closed. */
+  __setShortNamesEnabledForTest(value: boolean | "unknown" | null): void {
+    this._shortNamesEnabled = value;
   }
 
   __setProtocolVersionForTest(profile: DotnsAbiProfile): void {
@@ -2852,6 +2872,7 @@ export class DotNS {
       // previous connect() (possibly to a different chain) must never be
       // reused.
       this._subnodeOwnerShape = null;
+      this._shortNamesEnabled = null;
       // Optional pin (e.g. environments.json's per-env `dotnsProtocol`):
       // ASSERTED against the live probe, never obeyed over it. A pin that
       // silently overrode the probe would recreate exactly the failure this
@@ -3570,6 +3591,34 @@ export class DotNS {
     // isAuthorised absent on this registry deployment — fall back to the
     // pre-existing ownership-equality check rather than refusing outright.
     return { authorised: owner !== null && owner.toLowerCase() === account.toLowerCase(), owner };
+  }
+
+  /**
+   * PopRules gates short names with `require(shortNamesEnabled || baseLength >= 9)`,
+   * independently of personhood.
+   *
+   * `null` means no usable answer and must never be read as "off". Only a decoded
+   * `false` closes the band; refusing a name the chain would accept is worse than
+   * letting the chain refuse it.
+   */
+  private async readShortNamesEnabled(): Promise<boolean | null> {
+    if (this._shortNamesEnabled === null) {
+      try {
+        const value = await withTimeout(
+          this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "shortNamesEnabled", []),
+          30000,
+          "shortNamesEnabled",
+        );
+        this._shortNamesEnabled = typeof value === "boolean" ? value : "unknown";
+      } catch (e: any) {
+        if (READ_NEVER_COMPLETED_RE.test(e?.message ?? String(e))) throw e;
+        // Completed and gave nothing decodable: a fixed property of this
+        // deployment, so cache it rather than re-fetch per label.
+        this._shortNamesEnabled = "unknown";
+      }
+    }
+    setDeployAttribute("deploy.dotns.short_names_enabled", String(this._shortNamesEnabled));
+    return this._shortNamesEnabled === "unknown" ? null : this._shortNamesEnabled;
   }
 
   /** Live transfer-fee quote. transferFloor is a pure PopRules view — it
@@ -4778,7 +4827,7 @@ export class DotNS {
             return await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "isBaseNameReserved", [baseName]), 30000, "isBaseNameReserved") as [boolean, string, bigint];
           } catch (e: any) {
             const msg = e?.message ?? String(e);
-            if (/timed out after \d+ms|heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i.test(msg)) {
+            if (READ_NEVER_COMPLETED_RE.test(msg)) {
               throw e;
             }
             return [false, zeroAddress, 0n];
@@ -4882,6 +4931,18 @@ export class DotNS {
       }
 
       const targetPopStatus = userStatus;
+
+      // Before the personhood check: a shut band is not a personhood problem, and
+      // that branch would tell the caller to get verified, which cannot help.
+      if (isShortNameBand(baselength) && (await this.readShortNamesEnabled()) === false) {
+        return {
+          label: validated, classification, userStatus, trailingDigits, baselength,
+          isAvailable: true, existingOwner: null, isBaseNameReserved: isReserved, reservationOwner,
+          isTestnet, canProceed: false,
+          reason: shortNamesClosedReason(validated, baselength, this._tld, this._environmentId),
+          plannedAction: "abort", needsPopUpgrade: false, targetPopStatus, signerFreeBalance,
+        };
+      }
 
       if (!canRegister(classification.status, userStatus)) {
         // When the signer has NoStatus and the env supports the personhood bootstrap
@@ -5078,6 +5139,12 @@ export class DotNS {
       if (!registrability.registrable) {
         const decision = decideRegistrabilityOutcome({ label, registrability, existingOwner: null, selfAddress: this.evmAddress!.toLowerCase(), tld: this._tld, profile: this._protocolVersion });
         throw new NonRetryableError(decision.reason!);
+      }
+
+      // Same gate as preflight, for library callers that skip it.
+      const registerBaseLength = classifyLabelStatus(label, this._protocolVersion).baseLength;
+      if (isShortNameBand(registerBaseLength) && (await this.readShortNamesEnabled()) === false) {
+        throw new NonRetryableError(shortNamesClosedReason(label, registerBaseLength, this._tld, this._environmentId));
       }
 
       const isTestnet = await this.isTestnet();

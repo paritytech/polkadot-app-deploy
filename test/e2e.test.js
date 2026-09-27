@@ -2726,6 +2726,21 @@ describe("e2e", { skip: !ENABLED }, () => {
       const tld = await resolveE2eTld();
       const label = "web3";
       const { fixtureDir } = await mutateFixture(RUN_TAG);
+
+      // #1588 (port of bulletin-deploy): this scenario must cost nothing at
+      // all — not just skip the DotNS registration/storage it directly
+      // guards, but also never trigger an account-mapping or top-up
+      // transaction, which DotNS.connect() can submit
+      // (ensureMappedAccountReady) BEFORE the Reserved-classification check
+      // even runs. That only holds if the signer connect() uses is already
+      // mapped and funded; on the previously-unpinned default signer (bare
+      // Alice), an environment where that account is unmapped/underfunded
+      // would silently defeat the "never writes" invariant this test exists
+      // to prove. The CI job now pins BULLETIN_POOL_ACCOUNT_INDEX to pool
+      // account 0 — see the comment on that env var in e2e.yml for why
+      // sharing an already-provisioned, concurrently-written index is safe
+      // for a scenario that (per the log-line assertions below) never signs
+      // anything itself.
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           args: buildArgs(fixtureDir, `${label}.${tld}`),
@@ -2763,6 +2778,37 @@ describe("e2e", { skip: !ENABLED }, () => {
           assert.ok(
             !combined.includes(marker),
             `>> FAIL: S-RESERVED-INVARIANT: output contains "${marker}" — a registration/storage step must never run for a governance-reserved label (this scenario must cost nothing).`,
+          );
+        }
+
+        // #1588: connect()'s account-mapping check (which runs BEFORE the
+        // Reserved refusal above) must never need to submit — or attempt to
+        // submit — a real transaction. Cover both ensureMappedAccountReady
+        // code paths (src/dotns.ts): the manual-mapping branch logs "Mapping
+        // account on Asset Hub Revive..." right before ensureAccountMapped();
+        // the auto-mapping branch (every env in assets/environments.json
+        // today) logs "is NOT mapped on Revive" as soon as it finds the
+        // account unmapped, then "Mapping requires submitting a
+        // transaction..." and "Topped up ... for auto-map" if it has to
+        // fund and submit the Revive.call auto-map trigger. None of these
+        // must appear for an already-mapped, already-funded pinned signer.
+        //
+        // This IS the proof that sharing pool index 0 with a concurrent
+        // writer leg (see e2e.yml's BULLETIN_POOL_ACCOUNT_INDEX comment) is
+        // safe: this list must stay exhaustive over every write path
+        // connect() can take. If a future change adds a new write path here
+        // that doesn't log through one of these markers, reinstate a
+        // dedicated pool index (or a nonce check) for this scenario instead
+        // of extending this list blind.
+        for (const marker of [
+          "Mapping account on Asset Hub Revive",
+          "is NOT mapped on Revive",
+          "Mapping requires submitting a transaction",
+          "Topped up",
+        ]) {
+          assert.ok(
+            !combined.includes(marker),
+            `>> FAIL: S-RESERVED-INVARIANT: output contains "${marker}" — connect()'s account-mapping check must never need to submit (or attempt) a real transaction; this scenario's signer must already be mapped and funded.`,
           );
         }
       } finally {

@@ -45,6 +45,16 @@ export const STALE_SESSION_MESSAGE =
     `Run "${CLI_NAME} logout", then "${CLI_NAME} login" to pair again.`;
 
 /**
+ * Deploy-specific variant of STALE_SESSION_MESSAGE. See src/deploy-actors.ts's
+ * resolveDeployActors for the full rationale (issue #234) — in short, `deploy`
+ * has a remedy `whoami` doesn't: an explicit `--mnemonic` / `MNEMONIC` signer,
+ * which wins even when the persisted session can't be read. Naming it here
+ * means the fail-fast error doesn't just point at re-pairing.
+ */
+export const STALE_SESSION_DEPLOY_MESSAGE =
+    `${STALE_SESSION_MESSAGE} Or pass --mnemonic explicitly to sign with a different key.`;
+
+/**
  * Returns true if there is a persisted SSO session file on disk.
  * Does NOT load the SSO stack — uses only node fs/os/path.
  * Safe to call from headless/pool paths.

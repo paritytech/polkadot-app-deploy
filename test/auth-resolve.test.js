@@ -2,6 +2,11 @@
 // and stale-session message emit path in deploy.ts.
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
+import { setupStaleSessionHome } from "./helpers/stale-session-home.js";
 
 describe("chooseSignerInput", async () => {
     const { chooseSignerInput } = await import("../dist/deploy.js");
@@ -314,4 +319,84 @@ describe("selectStorageReconnect fallback message", async () => {
         assert.ok(msg.includes("expired at block 99"), ">> FAIL: fallback: expired reason must include expiration block in message");
         assert.ok(msg.includes("polkadot-app-deploy logout && polkadot-app-deploy login"), ">> FAIL: fallback: expired message must include logout+login command");
     });
+});
+
+// issue #234: a persisted login session that exists but can't be read/decoded
+// must fail the deploy fast (NonRetryableError, before any chain write), not
+// silently fall through to the default dev signer (the public dev phrase)
+// with no transfer target — see src/deploy-actors.ts's resolveDeployActors
+// for the full rationale. Uses the same real stale v0.7 session fixture
+// whoami.test.js drives (genuinely undecoded by the V2 codec, not a mock) so
+// this exercises the actual failure mode, not a stand-in for it.
+describe("deploy CLI: unreadable persisted session must fail fast, not fall back to the default dev key (#234)", async () => {
+  const { DOT_DAPP_ID } = await import("../dist/auth-config.js");
+  const { EXIT_CODE_NO_RETRY } = await import("../dist/deploy.js");
+  const repoRoot = path.resolve(import.meta.dirname, "..");
+
+  // Shared scaffold for both tests below: a fresh corrupt-session HOME + a
+  // throwaway build dir, spawn the built CLI against them, clean up either way.
+  async function runDeployAgainstCorruptSession(domainLabel, extraArgs, extraEnv) {
+    const fakeHome = await setupStaleSessionHome(DOT_DAPP_ID, "pad-234-");
+    const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "pad-234-build-"));
+    fs.writeFileSync(path.join(buildDir, "index.html"), "<html></html>");
+    try {
+      return spawnSync(process.execPath, [path.join(repoRoot, "bin/polkadot-app-deploy"), buildDir, domainLabel, "--no-manifest", ...extraArgs], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        timeout: 8000,
+        killSignal: "SIGKILL",
+        env: {
+          ...process.env,
+          HOME: fakeHome,
+          USERPROFILE: fakeHome,
+          // Unreachable on purpose — should never be dialled in the no-mnemonic
+          // case (abort happens first); in the --mnemonic case the deploy is
+          // expected to fail here, AFTER signer selection is what's under test.
+          DOTNS_RPC: "ws://127.0.0.1:1",
+          PAD_UPDATE_CHECK: "0",
+          ...extraEnv,
+        },
+      });
+    } finally {
+      fs.rmSync(buildDir, { recursive: true, force: true });
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  }
+
+  test("no --mnemonic + unreadable session on disk: deploy exits non-zero (NonRetryableError) BEFORE any signer plan or phone gate is printed", async () => {
+    const result = await runDeployAgainstCorruptSession("authfailfast234x", [], { MNEMONIC: "", DOTNS_MNEMONIC: "" });
+
+    assert.equal(
+      result.status, EXIT_CODE_NO_RETRY,
+      `>> FAIL: #234: an unreadable session must exit EXIT_CODE_NO_RETRY (${EXIT_CODE_NO_RETRY}), not fall through — got status ${result.status}, stderr: ${result.stderr}, stdout: ${result.stdout}`,
+    );
+    assert.match(result.stderr, /Stored login session could not be read/,
+      ">> FAIL: #234: stderr must name the problem (stale/unreadable session)");
+    assert.match(result.stderr, /logout/, ">> FAIL: #234: stderr must name the logout remedy");
+    assert.match(result.stderr, /login/, ">> FAIL: #234: stderr must name the login remedy");
+    assert.match(result.stderr, /--mnemonic/,
+      ">> FAIL: #234: stderr must also name the --mnemonic remedy (deploy, unlike whoami, has this alternative)");
+    assert.doesNotMatch(result.stdout, /Press Y when ready/,
+      ">> FAIL: #234: the phone gate must never print when there is no usable phone session");
+    assert.doesNotMatch(result.stdout, /Using .*signer:/,
+      ">> FAIL: #234: no signer plan should print — the deploy must abort before resolving/announcing any signer");
+  });
+
+  test("--mnemonic + the SAME unreadable session on disk: proceeds past signer selection using the mnemonic, with a notice that the session was ignored", async () => {
+    const { Keyring } = await import("@polkadot/keyring");
+    const { cryptoWaitReady } = await import("@polkadot/util-crypto");
+    await cryptoWaitReady();
+    const keyring = new Keyring({ type: "sr25519" });
+    const MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+    const address = keyring.addFromMnemonic(MNEMONIC).address;
+
+    const result = await runDeployAgainstCorruptSession("authfailfast234y", ["--mnemonic", MNEMONIC], {});
+
+    assert.match(result.stderr, /the persisted login session will be ignored/,
+      ">> FAIL: #234: an explicit --mnemonic must print a one-line notice that the unreadable session was ignored");
+    assert.doesNotMatch(result.stderr, /Stored login session could not be read/,
+      ">> FAIL: #234: --mnemonic must win outright — the fail-fast stale-session error must NOT fire");
+    assert.match(result.stdout, new RegExp(`SS58 Address: ${address}`),
+      `>> FAIL: #234: --mnemonic must proceed past signer selection and print the mnemonic-derived address (${address}) — got stdout:\n${result.stdout}, stderr:\n${result.stderr}`);
+  });
 });

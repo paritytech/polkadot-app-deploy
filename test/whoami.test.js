@@ -1,14 +1,7 @@
 // test/whoami.test.js — unit tests for src/commands/whoami.ts (formatWhoami + runWhoami)
 import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, copyFile } from "node:fs/promises";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
-import { fileURLToPath } from "node:url";
-
-const FIXTURE_SESSION = fileURLToPath(
-    new URL("./fixtures/v07-session/dot-cli_SsoSessions.json", import.meta.url),
-);
+import { setupStaleSessionHome } from "./helpers/stale-session-home.js";
 
 // Top-level imports (module scope — not inside describe/async describe)
 const { formatWhoami, runWhoami } = await import("../dist/commands/whoami.js");
@@ -50,10 +43,7 @@ describe("runWhoami — stale v0.7 session detection", () => {
 
     beforeEach(async () => {
         // Set up a fake HOME containing the v0.7 session fixture.
-        const fakeHome = await mkdtemp(join(tmpdir(), "bd-whoami-stale-"));
-        const appsDir = join(fakeHome, ".polkadot-apps");
-        await mkdir(appsDir, { recursive: true });
-        await copyFile(FIXTURE_SESSION, join(appsDir, `${DOT_DAPP_ID}_SsoSessions.json`));
+        const fakeHome = await setupStaleSessionHome(DOT_DAPP_ID, "bd-whoami-stale-");
         process.env.HOME = fakeHome;
 
         errOutput = "";

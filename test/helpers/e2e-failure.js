@@ -17,7 +17,7 @@
  * Patterns mirror the production telemetry classifier in src/telemetry.ts and
  * tools/release-retry-wrapper.mjs (when that file lands via #534).
  */
-const FLAKE_PATTERNS = [
+export const FLAKE_PATTERNS = [
   { needle: "requires Node.js >=22", class: "node_version_drift", summary: "Runner has Node v18 in PATH — setup-node@v6 didn't take. parity-default runner env regression; rerun on a fresh runner." },
   { needle: "received a shutdown signal", class: "runner_shutdown", summary: "Runner process killed mid-job. Pure CI infra flake; rerun." },
   { needle: "Invalid: Stale", class: "nonce_stale", summary: "Asset Hub tx Invalid (Stale) — nonce race on shared signer account; usually clears on retry." },

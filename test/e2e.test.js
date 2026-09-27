@@ -1739,7 +1739,9 @@ describe("e2e", { skip: !ENABLED }, () => {
         if (!(cleanSuccess || cleanBail)) {
           failWith({
             scenario: "S8",
-            message: `deploy must either survive cleanly or bail with budget/reconnect-exhausted error or ChainHead disjointed; got exit ${code}. Drops injected: ${proxy.stats.dropsInjected}`,
+            // Wording avoids the wrapper's flake needles on purpose: this
+            // message prints on failure and the wrapper scans our own output.
+            message: `deploy must either survive cleanly or bail with a retry-budget, reconnect-exhausted or chain-head error; got exit ${code}. Drops injected: ${proxy.stats.dropsInjected}`,
             context: stderr,
             keywords: ["Error", "Stale", "Connection"],
             hint: "an uncaught crash (exit 2) means #278's suppression broke.",

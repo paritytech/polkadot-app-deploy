@@ -6349,6 +6349,238 @@ describe("DotNS.setContenthashAndTextRecord", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #1164: DotNS.ensureResolverAndSetTextRecord — the skip/single-write/batch
+// trichotomy, tested via the same instance-stubbing pattern as the sibling
+// DotNS.setContenthashAndTextRecord block above (no live chain needed:
+// contractCallNullable/getTextRecord/ensureContentResolver/setTextRecord/
+// submitBatchedContractCalls are all plain instance methods, stubbable
+// directly).
+// ---------------------------------------------------------------------------
+describe("DotNS.ensureResolverAndSetTextRecord", () => {
+  const RESOLVER = "0xBBBB000000000000000000000000000000BBBB";
+
+  function baseInstance() {
+    const d = new DotNS();
+    d.connected = true;
+    d._contracts = { DOTNS_REGISTRY: "0xAAAA000000000000000000000000000000AAAA", DOTNS_CONTENT_RESOLVER: RESOLVER };
+    return d;
+  }
+
+  test("neither stale: skips entirely, no chain write of any kind", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => RESOLVER;
+    d.getTextRecord = async () => "manifest json";
+    d.ensureContentResolver = async () => assert.fail("resolver already matches — must not write");
+    d.setTextRecord = async () => assert.fail("text already matches — must not write");
+    d.submitBatchedContractCalls = async () => assert.fail("neither field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "manifest json");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: false, textWritten: false },
+      ">> FAIL: ensureResolverAndSetTextRecord both-unchanged: expected a pure skip, 0 writes");
+  });
+
+  test("only the resolver is stale: delegates to ensureContentResolver, never batches", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => "0xSomeOtherResolver000000000000000000000";
+    d.getTextRecord = async () => "manifest json";
+    let ensureContentResolverCalls = 0;
+    d.ensureContentResolver = async (domainName) => { ensureContentResolverCalls++; assert.strictEqual(domainName, "app.example"); return { changed: true }; };
+    d.setTextRecord = async () => assert.fail("text already matches — must not write");
+    d.submitBatchedContractCalls = async () => assert.fail("only one field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "manifest json");
+    assert.strictEqual(ensureContentResolverCalls, 1,
+      ">> FAIL: ensureResolverAndSetTextRecord resolver-only: ensureContentResolver must be called exactly once");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: true, textWritten: false },
+      ">> FAIL: ensureResolverAndSetTextRecord resolver-only: expected resolverWritten:true, textWritten:false");
+  });
+
+  test("only the text is stale: delegates to setTextRecord, never batches", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => RESOLVER;
+    d.getTextRecord = async () => "old manifest json";
+    d.ensureContentResolver = async () => assert.fail("resolver already matches — must not write");
+    let setTextRecordCalls = 0;
+    d.setTextRecord = async (domainName, key, value) => {
+      setTextRecordCalls++;
+      assert.strictEqual(domainName, "app.example");
+      assert.strictEqual(key, "manifest");
+      assert.strictEqual(value, "new manifest json");
+      return { value, txHash: "0xtexttx" };
+    };
+    d.submitBatchedContractCalls = async () => assert.fail("only one field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "new manifest json");
+    assert.strictEqual(setTextRecordCalls, 1,
+      ">> FAIL: ensureResolverAndSetTextRecord text-only: setTextRecord must be called exactly once");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: false, textWritten: true },
+      ">> FAIL: ensureResolverAndSetTextRecord text-only: expected resolverWritten:false, textWritten:true");
+  });
+
+  test("both stale: batches setResolver+setText in ONE Utility.batch_all, in that order", async () => {
+    const d = baseInstance();
+    let resolverReads = 0;
+    d.contractCallNullable = async () => (resolverReads++ === 0 ? "0xSomeOtherResolver000000000000000000000" : RESOLVER);
+    let textReads = 0;
+    d.getTextRecord = async () => (textReads++ === 0 ? "old manifest json" : "new manifest json");
+    d.ensureContentResolver = async () => assert.fail("both fields stale — must batch, not delegate to ensureContentResolver alone");
+    d.setTextRecord = async () => assert.fail("both fields stale — must batch, not delegate to setTextRecord alone");
+    let submitted;
+    d.submitBatchedContractCalls = async (calls, _status, label, options) => {
+      submitted = { calls, label, options };
+      return { kind: "hash", hash: "0xbatch" };
+    };
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "new manifest json");
+    assert.strictEqual(submitted.calls.length, 2,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: must submit exactly 2 inner calls");
+    assert.deepStrictEqual(submitted.calls.map(({ functionName }) => functionName), ["setResolver", "setText"],
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: inner call order must be [setResolver, setText]");
+    assert.strictEqual(submitted.calls[0].args[1], RESOLVER,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setResolver's target arg must be the content resolver address");
+    assert.strictEqual(submitted.calls[1].args[1], "manifest",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's key arg must be the text-record key");
+    assert.strictEqual(submitted.calls[1].args[2], "new manifest json",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's value arg must be the new value");
+    assert.strictEqual(submitted.label, "Utility.batch_all(setResolver+setText[manifest])",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: unexpected batch label");
+    assert.strictEqual(submitted.options.independentCalls, true,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: must pass independentCalls: true — setResolver and setText have no on-chain data dependency on each other");
+    assert.strictEqual(await submitted.options.verifyEffect(), true,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: verifyEffect must re-read both values and confirm the write");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: true, textWritten: true },
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: expected resolverWritten:true, textWritten:true");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1164: DotNS.submitBatchedContractCalls — independentCalls opt-in and the
+// multi-dry-run/max-selection it enables. Drives the private method directly
+// with a fake clientWrapper and captures what actually gets passed to
+// client.tx.Revive.call — the literal args the submitted extrinsic is built
+// from, not an intermediate.
+// ---------------------------------------------------------------------------
+describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#1164)", () => {
+  test("without independentCalls, dry-runs ONLY the head call (default, dependent-calls-safe behavior)", async () => {
+    // #1164 regression guard: registerSubdomain's batch (setSubnodeOwner then
+    // setResolver, both DOTNS_REGISTRY) has a genuine on-chain data dependency —
+    // setResolver's authorization check only passes once setSubnodeOwner has
+    // actually applied. Dry-running setResolver on its own (against
+    // pre-setSubnodeOwner state) reverts with flags=1 data=0x1648fd01 — verified
+    // live against paseo-next-v2 while developing #1164's independentCalls
+    // option. Without `independentCalls: true`, submitBatchedContractCalls MUST
+    // dry-run only the head call, never the second — this pins that default.
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    let estimateCalls = 0;
+    d.clientWrapper = {
+      ensureAccountMapped: async () => {},
+      estimateGasForCall: async () => {
+        estimateCalls++;
+        return { success: true, gasRequired: { referenceTime: 1_000_000_000n, proofSize: 50_000n }, storageDeposit: 0n };
+      },
+      client: {
+        tx: {
+          Revive: { call: () => ({ decodedCall: {} }) },
+          Utility: { batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }) },
+        },
+      },
+      signAndSubmitWithRetry: async (buildBatch) => { buildBatch(); return { kind: "hash", hash: "0xbatch" }; },
+    };
+
+    const abiOne = [{ type: "function", name: "setSubnodeOwner", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const abiTwo = [{ type: "function", name: "setResolver", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    await d["submitBatchedContractCalls"](
+      [
+        { contractAddress: "0xAAAA000000000000000000000000000000AAAA", abi: abiOne, functionName: "setSubnodeOwner", args: [] },
+        { contractAddress: "0xBBBB000000000000000000000000000000BBBB", abi: abiTwo, functionName: "setResolver", args: [] },
+      ],
+      () => {},
+      "test batch",
+      // no independentCalls — the default, dependent-calls-safe path.
+    );
+
+    assert.strictEqual(estimateCalls, 1,
+      ">> FAIL: submitBatchedContractCalls default dry-run scope: without independentCalls, exactly ONE call (the head) must be dry-run — dry-running the second call independently would see pre-first-call on-chain state and could revert a call that will actually succeed once batched (registerSubdomain's setResolver dependency, #1164)");
+  });
+
+  // ensureResolverAndSetTextRecord's batched branch is this codebase's first
+  // CROSS-contract batch (a small setResolver head call ahead of a
+  // potentially much larger setText tail call). A head-only dry-run estimate
+  // could under-provision the tail call. This pins the fix: with
+  // independentCalls:true, submitBatchedContractCalls dry-runs EVERY inner
+  // call and declares the component-wise MAX across all of them — proven
+  // here with per-call estimates that deliberately differ (a small head, a
+  // large tail), so a regression back to "head estimate only" would
+  // under-declare and this test would catch it.
+  //
+  // Both weight_limit and storage_deposit_limit are routed through their
+  // respective buffer helpers (weightLimitFor / storageDepositLimitFor,
+  // bulletin #1522/#1491/#1518) applied to the MAX estimate computed here —
+  // so both expected values below are the 20%-buffered max, not the raw one.
+  test("declares the LARGER of two differing per-call estimates, not just the head call's", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    const capturedCalls = [];
+    // storageDeposit values deliberately both exceed computeStorageDepositLimit's
+    // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT floor (2e12) so the floor can't mask
+    // which estimate actually won the max-selection.
+    const estimates = [
+      { success: true, gasRequired: { referenceTime: 1_000_000_000n, proofSize: 50_000n }, storageDeposit: 2_000_000_000_000n },
+      { success: true, gasRequired: { referenceTime: 9_000_000_000n, proofSize: 900_000n }, storageDeposit: 20_000_000_000_000n },
+    ];
+    let estimateCallIndex = 0;
+    d.clientWrapper = {
+      ensureAccountMapped: async () => {},
+      estimateGasForCall: async () => estimates[estimateCallIndex++],
+      client: {
+        tx: {
+          Revive: {
+            call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
+          },
+          Utility: {
+            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+          },
+        },
+      },
+      signAndSubmitWithRetry: async (buildBatch) => {
+        buildBatch();
+        return { kind: "hash", hash: "0xbatch" };
+      },
+    };
+
+    const abiHead = [{ type: "function", name: "setResolver", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const abiTail = [{ type: "function", name: "setText", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    await d["submitBatchedContractCalls"](
+      [
+        { contractAddress: "0xAAAA000000000000000000000000000000AAAA", abi: abiHead, functionName: "setResolver", args: [] },
+        { contractAddress: "0xBBBB000000000000000000000000000000BBBB", abi: abiTail, functionName: "setText", args: [] },
+      ],
+      () => {},
+      "test batch",
+      // independentCalls: true — only the caller can assert its inner calls have
+      // no on-chain data dependency on each other (see ensureResolverAndSetTextRecord).
+      { independentCalls: true },
+    );
+
+    assert.strictEqual(estimateCallIndex, 2,
+      ">> FAIL: submitBatchedContractCalls estimate count: every inner call must be dry-run individually, not just the head call");
+    assert.strictEqual(capturedCalls.length, 2,
+      ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
+    for (const call of capturedCalls) {
+      assert.deepStrictEqual(call.weight_limit, { ref_time: (9_000_000_000n * 120n) / 100n, proof_size: (900_000n * 120n) / 100n },
+        ">> FAIL: submitBatchedContractCalls max-estimate weight_limit: must declare the LARGER (tail-call) buffered estimate, not the head call's smaller one — a head-only estimate would under-provision the tail call");
+      assert.strictEqual(call.storage_deposit_limit, (20_000_000_000_000n * 120n) / 100n,
+        ">> FAIL: submitBatchedContractCalls max-estimate storage_deposit_limit: must declare the LARGER (tail-call) buffered storage deposit, not the head call's smaller one");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // DotNS.setTextRecord
 // ---------------------------------------------------------------------------
 describe("DotNS.setTextRecord", () => {
@@ -18460,7 +18692,12 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
 
   test("dotns.ts: submitBatchedContractCalls threads this._registerStorageDeposit, not a bare default call", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
-    assert.match(dotnsSrc, /storageDepositLimitFor\(headEstimate\.storageDeposit,\s*this\._registerStorageDeposit\)/,
+    // #1164: the estimate submitBatchedContractCalls buffers is the component-wise
+    // max across every dry-run'd inner call (maxStorageDeposit), not just the head
+    // call's own estimate (headEstimate.storageDeposit, the pre-#1164 shape) — see
+    // the independentCalls/multi-dry-run block above this call site. The floor
+    // argument itself is unaffected by that change.
+    assert.match(dotnsSrc, /storageDepositLimitFor\(maxStorageDeposit,\s*this\._registerStorageDeposit\)/,
       ">> FAIL: submitBatchedContractCalls must pass this._registerStorageDeposit as the floor — the per-env config, " +
       "otherwise it silently falls back to the generic 200 PAS default regardless of environments.json");
   });
@@ -22989,13 +23226,17 @@ describe("DeployResult.browserUrl (#1157)", () => {
   });
 
   test("deploy()'s return site reuses ONE browserUrlFor(...) call — no second URL mechanism", () => {
-    // Checked directly rather than via a fixed-size preceding-text window: a
-    // byte-distance window is brittle to unrelated edits between the `const
-    // browserUrl = ...` assignment and the return statement shifting the
-    // assignment out of the window and failing the test for a reason
-    // unrelated to the invariant.
+    // #1164: the "Check it out here" console lines moved out of this call
+    // site and into printDeploymentCompleteBanner (deferred until after a
+    // pending manifest publish succeeds, so a manifest failure never leaves
+    // a false completion banner on screen) — they no longer appear
+    // immediately after this assignment. The invariant this test protects
+    // (one resolution, reused everywhere) still holds and is asserted
+    // directly: browserUrlFor is called exactly once in this file, and the
+    // banner call passes the SAME `browserUrl` variable rather than
+    // resolving a second time.
     const src = fs.readFileSync("src/deploy.ts", "utf-8");
-    const returnStatement = "return { domainName: name, fullDomain: `${name}.${envTld}`, cid: cid as string, ipfsCid, browserUrl }";
+    const returnStatement = "domainName: name,\n        fullDomain: `${name}.${envTld}`,\n        cid: cid as string,\n        ipfsCid,\n        browserUrl,";
     assert.ok(src.includes(returnStatement), ">> FAIL: browserUrl-single-resolution: deploy()'s DeployResult return must include a `browserUrl` field");
     assert.ok(
       !returnStatement.includes("browserUrlFor("),
@@ -23003,8 +23244,23 @@ describe("DeployResult.browserUrl (#1157)", () => {
     );
     assert.match(
       src,
-      /const browserUrl = browserUrlFor\(name, envId, envWebGateway\);\s*\n\s*console\.log\("\\nCheck it out here:"\);\s*\n\s*console\.log\(`   \$\{browserUrl\}`\);/,
-      ">> FAIL: browserUrl-single-resolution: expected `const browserUrl = browserUrlFor(name, envId, envWebGateway)` assigned once, immediately followed by the console.log lines that print it — the SAME value must feed both the console output and the returned browserUrl field"
+      /const browserUrl = browserUrlFor\(name, envId, envWebGateway\);/,
+      ">> FAIL: browserUrl-single-resolution: expected `const browserUrl = browserUrlFor(name, envId, envWebGateway)` assigned once in deploy()"
+    );
+    // Matches only the CALL shape (name, envId, envWebGateway args) — not the
+    // `export function browserUrlFor(...)` definition or its doc-comment
+    // mention, either of which would false-positive a naive `browserUrlFor(`
+    // occurrence count.
+    const browserUrlForCallCount = (src.match(/browserUrlFor\(name, envId, envWebGateway\)/g) || []).length;
+    assert.equal(
+      browserUrlForCallCount,
+      1,
+      ">> FAIL: browserUrl-single-resolution: browserUrlFor(name, envId, envWebGateway) must be called exactly once in src/deploy.ts — a second call site would be the exact drift this test guards against"
+    );
+    assert.match(
+      src,
+      /printDeploymentCompleteBanner\(`\$\{name\}\.\$\{envTld\}`, browserUrl\)/,
+      ">> FAIL: browserUrl-single-resolution: the completion banner must reuse the SAME browserUrl variable via printDeploymentCompleteBanner(..., browserUrl), not a second resolution"
     );
   });
 
@@ -24170,7 +24426,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -24612,6 +24868,39 @@ describe("shouldPublishManifest — --no-manifest / --content-only (#1163)", () 
       ">> FAIL: shouldPublishManifest: with no config discovered, manifest publishing must stay skipped (legacy contenthash-only path)");
     assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: true }), false,
       ">> FAIL: shouldPublishManifest: with no config discovered AND --no-manifest set, manifest publishing must stay skipped");
+  });
+});
+
+describe("pickPostDeployBannerText (#1164)", () => {
+  test("manifestPending true → interim banner, not DEPLOYMENT COMPLETE", () => {
+    assert.strictEqual(pickPostDeployBannerText(true), "CONTENT DEPLOYED — publishing product manifest…",
+      ">> FAIL: pickPostDeployBannerText: manifestPending:true must defer the completion banner (#1164)");
+  });
+
+  test("manifestPending false → DEPLOYMENT COMPLETE (unchanged default)", () => {
+    assert.strictEqual(pickPostDeployBannerText(false), "DEPLOYMENT COMPLETE!",
+      ">> FAIL: pickPostDeployBannerText: manifestPending:false must keep today's banner");
+  });
+
+  test("manifestPending undefined (every existing library caller) → DEPLOYMENT COMPLETE (default unchanged)", () => {
+    assert.strictEqual(pickPostDeployBannerText(undefined), "DEPLOYMENT COMPLETE!",
+      ">> FAIL: pickPostDeployBannerText: an unset flag (e.g. playground-cli, which never sets manifestPending) must keep today's banner — the change is opt-in, not a behavior change for existing callers");
+  });
+});
+
+describe("bin/polkadot-app-deploy manifestPending + deferred banner wiring (#1164, source wiring)", () => {
+  const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+
+  test("passes manifestPending to deploy() derived from shouldPublishManifest", () => {
+    assert.match(bin, /manifestPending:\s*manifestWillPublish/,
+      ">> FAIL: bin/polkadot-app-deploy must pass manifestPending: manifestWillPublish (derived from shouldPublishManifest) into deploy()'s options — the banner defers only when a manifest publish will actually follow");
+  });
+
+  test("prints the real completion banner AFTER publishManifest succeeds, not before", () => {
+    const publishIdx = bin.indexOf("await publishManifest(");
+    const bannerIdx = bin.indexOf("printDeploymentCompleteBanner(");
+    assert.ok(publishIdx > -1 && bannerIdx > -1 && bannerIdx > publishIdx,
+      ">> FAIL: bin/polkadot-app-deploy: printDeploymentCompleteBanner must be called AFTER await publishManifest(...) resolves, inside the same try block, so a manifest publish failure never prints a false completion banner");
   });
 });
 

@@ -4094,16 +4094,31 @@ export class DotNS {
    *
    * Each call is encoded as a `pallet-revive::call(...)` extrinsic and
    * batched into one outer dispatch. The runtime executes them in
-   * sequence and rolls back the entire batch on any inner revert. Only
-   * the leading call is dry-run for gas — its weight is reused as the
-   * budget for every subsequent call, on the assumption sibling
-   * registry/resolver writes are similarly sized.
+   * sequence and rolls back the entire batch on any inner revert.
+   *
+   * By default, only the HEAD call is dry-run and its estimate is reused
+   * for every sibling — required whenever a later call's validity depends
+   * on an EARLIER call's on-chain effect within the same batch
+   * (registerSubdomain: setResolver's authorization check only passes once
+   * setSubnodeOwner has actually applied; dry-running setResolver on its
+   * own sees pre-setSubnodeOwner state and reverts with flags=1
+   * data=0x1648fd01 — verified live, #1164). Pass `independentCalls: true`
+   * when the caller can guarantee no such dependency exists (each call's
+   * dry-run validity does not depend on any sibling call's on-chain
+   * effect) — then EVERY inner call is dry-run and the declared
+   * weight_limit/storage_deposit_limit is the component-wise max across
+   * all of them, rather than a head-only estimate that could
+   * under-provision a much larger sibling (ensureResolverAndSetTextRecord's
+   * batched branch: a small setResolver head call ahead of a potentially
+   * large setText tail call, on two DIFFERENT contracts — this codebase's
+   * first cross-contract batch). One extra dry-run RPC call per additional
+   * inner call; only ever raises the declared limits, never lowers them.
    */
   private async submitBatchedContractCalls(
     calls: { contractAddress: string; abi: readonly any[]; functionName: string; args: any[]; value?: bigint }[],
     statusCallback: (status: string) => void,
     label: string,
-    { verifyEffect }: { verifyEffect?: () => Promise<boolean> } = {},
+    { verifyEffect, independentCalls }: { verifyEffect?: () => Promise<boolean>; independentCalls?: boolean } = {},
   ): Promise<TxResolution> {
     this.ensureConnected();
     if (!this.clientWrapper) throw new Error(`${label}: polkadot-api client not available`);
@@ -4117,24 +4132,36 @@ export class DotNS {
       data: encodeFunctionData({ abi: c.abi, functionName: c.functionName, args: c.args }),
     }));
 
-    const headEstimate = await this.clientWrapper.estimateGasForCall(
-      this.substrateAddress!,
-      encoded[0].contractAddress,
-      encoded[0].value,
-      encoded[0].data,
+    const toEstimate = independentCalls ? encoded : [encoded[0]];
+    const estimates = await Promise.all(
+      toEstimate.map(e => this.clientWrapper!.estimateGasForCall(this.substrateAddress!, e.contractAddress, e.value, e.data)),
     );
-    if (!headEstimate.success) {
-      throw new Error(formatContractDryRunFailure(headEstimate, {
-        contractAddress: encoded[0].contractAddress,
-        functionName: calls[0].functionName,
+    const failedIndex = estimates.findIndex((e: any) => !e.success);
+    if (failedIndex !== -1) {
+      const failedEncoded = toEstimate[failedIndex];
+      throw new Error(formatContractDryRunFailure(estimates[failedIndex], {
+        contractAddress: failedEncoded.contractAddress,
+        functionName: calls[failedIndex].functionName,
         signerSubstrateAddress: this.substrateAddress!,
         signerEvmAddress: this.evmAddress!,
-        value: encoded[0].value,
-        encodedData: encoded[0].data,
-        args: calls[0].args,
+        value: failedEncoded.value,
+        encodedData: failedEncoded.data,
+        args: calls[failedIndex].args,
         contracts: this._contracts,
       }));
     }
+
+    // #1164: component-wise max across every dry-run estimate collected above
+    // (either just the head call, or all of them when independentCalls is
+    // set — see toEstimate above), not just the head call's own estimate.
+    const maxGasRequired = estimates.reduce(
+      (acc: { referenceTime: bigint; proofSize: bigint }, e: any) => ({
+        referenceTime: e.gasRequired.referenceTime > acc.referenceTime ? e.gasRequired.referenceTime : acc.referenceTime,
+        proofSize: e.gasRequired.proofSize > acc.proofSize ? e.gasRequired.proofSize : acc.proofSize,
+      }),
+      { referenceTime: 0n, proofSize: 0n },
+    );
+    const maxStorageDeposit = estimates.reduce((max: bigint, e: any) => (e.storageDeposit > max ? e.storageDeposit : max), 0n);
 
     // Route through the same storageDepositLimitFor()/weightLimitFor() helpers
     // ReviveClientWrapper.dryRunReviveCall uses, instead of recomputing the
@@ -4145,8 +4172,8 @@ export class DotNS {
     // (bulletin-deploy #1491/#1518) — this call site builds its own
     // Revive.call extrinsics directly rather than going through the wrapper's
     // dryRunReviveCall, so it must be passed explicitly here too.
-    const weight_limit = weightLimitFor(headEstimate.gasRequired);
-    const storage_deposit_limit = storageDepositLimitFor(headEstimate.storageDeposit, this._registerStorageDeposit);
+    const weight_limit = weightLimitFor(maxGasRequired);
+    const storage_deposit_limit = storageDepositLimitFor(maxStorageDeposit, this._registerStorageDeposit);
 
     const client = this.clientWrapper.client;
     const buildBatch = () => {
@@ -4562,6 +4589,108 @@ export class DotNS {
       const txHashStr = textTxRes.kind === TX_KIND_HASH ? textTxRes.hash : TX_KIND_NONCE_ADVANCED;
       return { value, txHash: txHashStr };
     });
+  }
+
+  /**
+   * Ensure a name's registered resolver points at `DOTNS_CONTENT_RESOLVER` AND
+   * its `key` text record holds `value` — batching whichever of the two is
+   * actually stale into ONE `Utility.batch_all` transaction (#1164).
+   *
+   * Delegates to `ensureContentResolver` / `setTextRecord` unchanged when only
+   * one of the two needs writing (so the common single-write case keeps
+   * today's exact behavior, including their own verify/poll ceremony), and
+   * only reaches for `submitBatchedContractCalls` when both are stale —
+   * mirrors `setContenthashAndTextRecord`'s existing atomic-pair pattern.
+   */
+  async ensureResolverAndSetTextRecord(
+    domainName: string,
+    key: string,
+    value: string,
+  ): Promise<{ node: string; resolverWritten: boolean; textWritten: boolean }> {
+    return withSpan(
+      "deploy.dotns.ensure-resolver-and-set-text",
+      `2b/2c. resolver + text[${key}]`,
+      {},
+      async () => {
+        this.ensureConnected();
+        const node = computeDomainNode(domainName, this._tld);
+        const target = this._contracts.DOTNS_CONTENT_RESOLVER;
+        const resolverPointsAtTarget = (candidate: unknown): boolean =>
+          typeof candidate === "string" && candidate.toLowerCase() === target.toLowerCase();
+
+        // The resolver read and the text read are independent RPC round-trips —
+        // run them concurrently rather than paying their latency sequentially.
+        // Each keeps its own try/catch: a failed pre-check must not suppress
+        // either half of the write (mirrors setContenthashAndTextRecord).
+        const [currentResolver, currentText] = await Promise.all([
+          // #1060: resolver(node) legitimately returns empty for a name with
+          // no resolver registered yet — mirrors ensureContentResolver's own
+          // pre-check.
+          this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "resolver", [node]).catch(() => null),
+          this.getTextRecord(domainName, key).catch(() => ""),
+        ]);
+        const resolverNeeded = !resolverPointsAtTarget(currentResolver);
+        const textNeeded = !shouldSkipTextWrite(currentText, value);
+
+        setDeployAttribute("deploy.dotns.resolver_unchanged", String(!resolverNeeded));
+        setDeployAttribute("deploy.dotns.text_unchanged", String(!textNeeded));
+
+        if (!resolverNeeded && !textNeeded) {
+          console.log(`   Resolver and text[${key}] already set on ${domainName}.${this._tld} — skipping tx`);
+          return { node, resolverWritten: false, textWritten: false };
+        }
+
+        if (resolverNeeded && !textNeeded) {
+          const { changed } = await this.ensureContentResolver(domainName);
+          return { node, resolverWritten: changed, textWritten: false };
+        }
+
+        if (!resolverNeeded && textNeeded) {
+          const { txHash } = await this.setTextRecord(domainName, key, value);
+          return { node, resolverWritten: false, textWritten: txHash !== TX_KIND_SKIPPED };
+        }
+
+        // Both stale: batch the resolver redirect and the text write into one
+        // Utility.batch_all so a crash between them can never leave the root
+        // resolver pointed at the content resolver with a stale/missing
+        // manifest text record, or vice versa.
+        console.log(`   Atomically setting resolver and text[${key}] on ${domainName}.${this._tld}…`);
+        const verifyBoth = async (): Promise<boolean> => {
+          try {
+            const [r, t] = await Promise.all([
+              this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "resolver", [node]),
+              this.getTextRecord(domainName, key),
+            ]);
+            return resolverPointsAtTarget(r) && t === value;
+          } catch {
+            return false;
+          }
+        };
+        const txResolution = await this.submitBatchedContractCalls(
+          [
+            { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setResolver", args: [node, target] },
+            { contractAddress: this._contracts.DOTNS_CONTENT_RESOLVER, abi: DOTNS_TEXT_RESOLVER_ABI, functionName: "setText", args: [node, key, value] },
+          ],
+          (status) => console.log(`      ${status}`),
+          `Utility.batch_all(setResolver+setText[${key}])`,
+          // #1164: independentCalls is safe here — setResolver (registry
+          // pointer) and setText (content-resolver storage keyed by node)
+          // are independent writes with no on-chain data dependency between
+          // them (unlike registerSubdomain's setSubnodeOwner+setResolver,
+          // where setResolver's authorization depends on setSubnodeOwner
+          // having already applied). Verified live against paseo-next-v2:
+          // the batch succeeds and both values land atomically.
+          { verifyEffect: verifyBoth, independentCalls: true },
+        );
+        logTxResolution(txResolution);
+        if (!(await verifyBoth())) {
+          throw new Error(
+            `Post-batch verification failed for ${domainName}.${this._tld}: resolver and text[${key}] do not match the values submitted atomically.`,
+          );
+        }
+        return { node, resolverWritten: true, textWritten: true };
+      },
+    );
   }
 
   // Atomicity boundary: setContenthash and publish stay outside this batch

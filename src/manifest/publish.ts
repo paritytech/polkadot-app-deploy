@@ -183,12 +183,12 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   try {
     const baseLabel = stripDotSuffix(config.domain, envTld);
 
-    await dotns.ensureContentResolver(baseLabel);
-
     const rootManifest = composeRoot(config, iconCid);
     const rootJson = JSON.stringify(rootManifest);
-    console.log(`  Writing root manifest text record on ${config.domain} (${Buffer.byteLength(rootJson, "utf8")} B)…`);
-    await dotns.setTextRecord(baseLabel, "manifest", rootJson);
+    console.log(
+      `  Ensuring resolver + writing root manifest text record on ${config.domain} (${Buffer.byteLength(rootJson, "utf8")} B)…`,
+    );
+    await dotns.ensureResolverAndSetTextRecord(baseLabel, "manifest", rootJson);
 
     let textRecordsWritten = 1;
     for (const exec of config.executables) {

@@ -6,7 +6,7 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError } from "../dist/deploy.js";
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion, isInteractive } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
@@ -441,6 +441,12 @@ try {
   // --no-manifest (--content-only) skips this entirely — the deploy is
   // content-only regardless of any discoverable config, so there's nothing to
   // preflight.
+  //
+  // #1164: hoisted so the SAME loaded config (one filesystem walk-up + parse)
+  // can drive both the manifestPending banner decision below and the actual
+  // publishManifest() call further down — previously each of those call sites
+  // reloaded the config independently.
+  let preflightedConfig = null;
   if (!flags.noManifest) {
     try {
       const { preflightProductConfig, reconcileManifestDomain } = await import("../dist/index.js");
@@ -456,6 +462,7 @@ try {
         ),
         loadEnvironments({ userFilePath: flags.environmentFile ?? process.env.PAD_ENV_FILE }),
       ]);
+      preflightedConfig = loadedConfig;
       // Reconcile the config's domain against the ACTUAL deploy target
       // BEFORE deploy() runs at all — this is the real "nothing uploaded
       // yet" gate; src/manifest/publish.ts's own call to the same helper
@@ -475,10 +482,17 @@ try {
     }
   }
 
+  // #1164: determine up front whether a manifest publish will follow, so
+  // deploy() can defer the "DEPLOYMENT COMPLETE" banner until publishManifest
+  // actually succeeds. Reuses the SAME preflightedConfig loaded just above —
+  // no second config load.
+  const manifestWillPublish = shouldPublishManifest({ configFound: !!preflightedConfig, noManifest: !!flags.noManifest });
+
   const result = await deploy(buildDir, domain, {
     mnemonic: effectiveMnemonic,
     derivationPath: flags.derivationPath,
     suri: flags.suri,
+    manifestPending: manifestWillPublish,
     rpc: flags.rpc,
     env: effectiveEnvId,
     poolSize: flags.poolSize,
@@ -575,16 +589,15 @@ try {
   //
   // --no-manifest (--content-only) skips manifest publishing even when a
   // config is present. shouldPublishManifest() is the single source of truth
-  // for that decision (config discovery still runs either way, so the
-  // "config found but --no-manifest set" case is exercised for real, not just
-  // in unit tests).
+  // for that decision.
+  //
+  // #1164: reuses `preflightedConfig` (loaded once, above) instead of a
+  // second independent tryLoadProductConfig call.
   {
-    const { tryLoadProductConfig, publishManifest } = await import("../dist/index.js");
+    const { publishManifest } = await import("../dist/index.js");
     const path = await import("node:path");
     const buildDirAbs = path.resolve(buildDir);
-    const loaded = await tryLoadProductConfig(
-      flags.config ? { path: flags.config } : { cwd: buildDirAbs, walkUp: true },
-    );
+    const loaded = preflightedConfig;
     if (shouldPublishManifest({ configFound: !!loaded, noManifest: !!flags.noManifest })) {
       try {
         await publishManifest({
@@ -596,6 +609,11 @@ try {
           mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,
         });
+        // #1164: deploy() deferred the real completion banner (manifestPending
+        // was set above) — print it now that the manifest phase actually
+        // succeeded, so a manifest publish failure never leaves a false
+        // "DEPLOYMENT COMPLETE!" on screen.
+        printDeploymentCompleteBanner(result.fullDomain, result.browserUrl);
       } catch (err) {
         console.error(`Manifest publish failed: ${err?.message ?? err}`);
         process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);

@@ -577,6 +577,31 @@ export function shouldPublishManifest(opts: {
 }
 
 /**
+ * Choose the post-deploy banner text (#1164). Pure and unit-testable without
+ * a live deploy. `manifestPending` is opt-in on `DeployOptions` — every
+ * existing library caller (e.g. playground-cli) leaves it unset and keeps
+ * today's "DEPLOYMENT COMPLETE!" banner.
+ */
+export function pickPostDeployBannerText(manifestPending: boolean | undefined): string {
+  return manifestPending ? "CONTENT DEPLOYED — publishing product manifest…" : "DEPLOYMENT COMPLETE!";
+}
+
+/**
+ * Print the real completion banner + browser URL. Called by `deploy()` itself
+ * when `manifestPending` is unset/false, and by `bin/polkadot-app-deploy` once
+ * its own subsequent `publishManifest()` call succeeds when it is set.
+ */
+export function printDeploymentCompleteBanner(fullDomain: string, browserUrl: string): void {
+  console.log("\n" + "=".repeat(60));
+  console.log("DEPLOYMENT COMPLETE!");
+  console.log("=".repeat(60));
+  console.log("\nCheck it out here:");
+  console.log(`   ${browserUrl}`);
+  console.log(`   ${fullDomain}  (in a Polkadot app: mobile or desktop)`);
+  console.log("\n" + "=".repeat(60) + "\n");
+}
+
+/**
  * storageSigner > signer (unless session-backed with no slot, bulletin #1452) > mnemonic > pool
  * precedence for storage routing. `selectStorageReconnect` delegates to this so the two
  * never drift apart. Exported for unit testing.
@@ -2857,6 +2882,17 @@ export interface DeployOptions {
    * case (undefined/"resign").
    */
   confirmPhoneReady?: (ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>;
+  /**
+   * #1164: when set, the post-deploy console banner prints "CONTENT DEPLOYED
+   * — publishing product manifest…" instead of "DEPLOYMENT COMPLETE!", and
+   * the "Check it out here" browser-URL block is suppressed. The caller
+   * (bin/polkadot-app-deploy) is then responsible for printing the real
+   * completion banner itself, via `printDeploymentCompleteBanner`, once its
+   * own subsequent `publishManifest()` call succeeds. Opt-in: every existing
+   * library caller (e.g. playground-cli) leaves this unset and keeps today's
+   * single-banner output.
+   */
+  manifestPending?: boolean;
 }
 
 // Resolve the DeployOptions that affect DotNS authentication into the shape
@@ -3911,15 +3947,25 @@ export async function deploy(content: DeployContent, domainName: string | null =
         }
       });
 
-      console.log("\n" + "=".repeat(60));
-      console.log("DEPLOYMENT COMPLETE!");
-      console.log("=".repeat(60));
       const browserUrl = browserUrlFor(name, envId, envWebGateway);
-      console.log("\nCheck it out here:");
-      console.log(`   ${browserUrl}`);
-      console.log(`   ${name}.${envTld}  (in a Polkadot app: mobile or desktop)`);
-      console.log("\n" + "=".repeat(60) + "\n");
-      return { domainName: name, fullDomain: `${name}.${envTld}`, cid: cid as string, ipfsCid, browserUrl };
+      // #1164: a manifest publish immediately follows in bin/polkadot-app-deploy
+      // when manifestPending is set — defer the real completion banner (and
+      // its browser URL) until that phase actually succeeds, so a manifest
+      // failure never leaves a false "DEPLOYMENT COMPLETE!" on screen.
+      if (options.manifestPending) {
+        console.log("\n" + "=".repeat(60));
+        console.log(pickPostDeployBannerText(true));
+        console.log("=".repeat(60) + "\n");
+      } else {
+        printDeploymentCompleteBanner(`${name}.${envTld}`, browserUrl);
+      }
+      return {
+        domainName: name,
+        fullDomain: `${name}.${envTld}`,
+        cid: cid as string,
+        ipfsCid,
+        browserUrl,
+      };
     } finally {
       // Flush the module-level failover flag in case onStatusChanged fired after
       // the deploy span attribute was already written. Idempotent if already set.

@@ -8,6 +8,19 @@
 //   3. Bulletin gateway (HTTP) — fetch the env's `ipfs` URL; any HTTP status
 //      means the gateway server is up (404 at "/" is fine — the gateway
 //      doesn't serve a root index but proves it's reachable).
+//   4. DotNS contract presence (issue #1329 in bulletin-deploy) — a chain can
+//      be RPC-live with zero deployable DotNS contracts. DotNS deploys
+//      through a CREATE3 factory, so contract addresses are IDENTICAL across
+//      every env and stable across a chain reset — a configured address can
+//      point at empty space on a freshly reset chain. Code presence (not
+//      address presence) is the only real signal, checked via a raw
+//      state_getStorage read on pallet-revive's AccountInfoOf map for the
+//      env's POP_RULES and DOTNS_REGISTRAR_CONTROLLER addresses. Deliberately
+//      does NOT probe the DotNS protocol generation (startingPrice/
+//      pricingVersion) — envs legitimately run different contract
+//      generations and src/dotns-protocol.ts already owns that distinction;
+//      probing a version-specific function here would wrongly fail a
+//      healthy env.
 // Read-only — no extrinsics submitted. Designed to be invoked from
 // .github/workflows/e2e.yml's `select-env` job.
 //
@@ -20,6 +33,13 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// The two DotNS contracts a deploy cannot proceed without: POP_RULES gates
+// name classification/pricing, DOTNS_REGISTRAR_CONTROLLER handles
+// commit/register. Both must have code on chain, not just a configured
+// address (see the CREATE3 note above).
+const DOTNS_CHECK_KEYS = ["POP_RULES", "DOTNS_REGISTRAR_CONTROLLER"];
 
 // Alice (//Alice derivation) — 32-byte SS58 pubkey hex.
 // Substrate address: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
@@ -47,7 +67,23 @@ function fail(kind, message, durationMs) {
   process.exit(1);
 }
 
-function loadEnv(envId) {
+// #1538 (bulletin-deploy) looked at replacing this hand-parse with the real
+// src/environments.ts resolveEndpoints()/loadEnvironments() (which the
+// comment below used to say it was manually matching). Deliberately NOT
+// done: this function is invoked directly by .github/workflows/e2e.yml's
+// `select-env` job (`node tools/probe-env-health.mjs --env "$env"`), which
+// runs no `npm ci` and no `npm run build` before that call — a hard
+// "zero npm deps, no build step" constraint documented in this file's own
+// header. `dist/` (where resolveEndpoints lives once built) is gitignored
+// and does not exist in that job's checkout. Importing it here would make
+// `select-env` crash with "dist/environments.js not found" — no env would
+// get selected, and the whole E2E pipeline goes dark. Do NOT "fix" this
+// hand-parse without first adding a build step to `select-env` or otherwise
+// removing the zero-build constraint.
+// A drift-guard test (test/probe-env-health.test.js) runs under `npm test`,
+// where `dist/` does exist, and will catch this hand-parse silently
+// diverging from resolveEndpoints() for any e2eEligible env.
+export function loadEnv(envId) {
   let doc;
   try {
     doc = JSON.parse(fs.readFileSync(path.resolve("assets/environments.json"), "utf-8"));
@@ -68,7 +104,9 @@ function loadEnv(envId) {
   // therefore ReviveApi.address); the Bulletin chain hosts content storage.
   // A healthy E2E env needs both reachable. Match how
   // src/environments.ts::resolveEndpoints reads it (chains is an array of
-  // chain objects, each with an `id` and an `endpoints` map keyed by env id).
+  // chain objects, each with an `id` and an `endpoints` map keyed by env id) —
+  // see the module-level comment above for why this stays a hand-parse
+  // instead of importing resolveEndpoints itself.
   const pickWss = (chainId) => {
     const chain = (doc.chains || []).find((c) => c.id === chainId);
     const wss = chain?.endpoints?.[envId]?.wss;
@@ -92,6 +130,25 @@ function loadEnv(envId) {
 // Probe a single chain over WebSocket. Returns { ok: true, result } on success
 // or { ok: false, kind, message } on failure. Does not exit the process —
 // caller composes results from multiple chain probes.
+// Storage key prefix for pallet-revive's `AccountInfoOf` map:
+//   twox128("Revive") ++ twox128("AccountInfoOf")
+// Hardcoded because this probe must stay dependency-free — no npm ci / npm
+// run build precedes it in select-env's job. Node has no twox128, so the
+// prefix is precomputed rather than derived at runtime. To re-derive:
+//   xxhashAsU8a("Revive", 128) ++ xxhashAsU8a("AccountInfoOf", 128)
+// from @polkadot/util-crypto. `test/probe-env-health.test.js` pins this value.
+//
+// The map uses the **Identity** hasher for its H160 key (verified against a
+// live chain: contract addresses return data, EOAs and unused addresses
+// return null), so the full key is simply PREFIX ++ <20-byte H160> — no
+// per-key hashing, hence no crypto dependency.
+const REVIVE_ACCOUNT_INFO_PREFIX =
+  "735f040a5d490f1107ad9c56f5ca00d2ae37ff0591fdbbcd9c2406df7147a9dc";
+
+function reviveAccountInfoKey(h160) {
+  return "0x" + REVIVE_ACCOUNT_INFO_PREFIX + h160.replace(/^0x/, "").toLowerCase();
+}
+
 async function probeChain({ url, calls, timeoutMs }) {
   return new Promise((resolve) => {
     let ws;
@@ -130,13 +187,15 @@ async function probeChain({ url, calls, timeoutMs }) {
         });
 
       const results = {};
-      for (const { id, method, params, errorKind, validate } of calls) {
+      for (const { id, method, params, errorKind, validateKind, validate } of calls) {
         const resp = await sendRpc(id, method, params);
         if (settled) return; // timed out mid-flight
         if (resp.error) return fail(errorKind, `${method}: ${resp.error.message}`);
         if (validate) {
           const err = validate(resp.result);
-          if (err) return fail(errorKind, `${method}: ${err}`);
+          // validateKind separates "the RPC itself failed" (errorKind) from
+          // "the RPC answered and the answer proves the env is unusable".
+          if (err) return fail(validateKind || errorKind, `${method}: ${err}`);
         }
         results[method] = resp.result;
       }
@@ -144,6 +203,40 @@ async function probeChain({ url, calls, timeoutMs }) {
       settle({ ok: true, result: results });
     };
   });
+}
+
+// Config half of the DotNS readiness check (bulletin-deploy issue #1329): the
+// env must declare the contracts a deploy needs. The on-chain half runs as
+// extra `state_call`s on the SAME Asset Hub probe below (dotnsStorageCalls) —
+// same connection, same timeout, no extra dependency.
+function checkDotnsConfigured(contracts) {
+  if (!contracts || Object.keys(contracts).length === 0) {
+    return { ok: false, kind: "dotns_not_configured", message: "env has no contracts block — cannot support a DotNS deploy" };
+  }
+  const missingKeys = DOTNS_CHECK_KEYS.filter((k) => !contracts[k]);
+  if (missingKeys.length > 0) {
+    return { ok: false, kind: "dotns_not_configured", message: `env contracts block missing ${missingKeys.join(", ")}` };
+  }
+  return { ok: true };
+}
+
+// One state_getStorage per checked contract. A configured address proves
+// nothing on its own: DotNS deploys through a CREATE3 factory, so addresses
+// are identical across chains and stable across resets — a configured
+// address can point at empty space on a freshly reset chain. `null` means no
+// code at that address.
+function dotnsStorageCalls(contracts, startId) {
+  return DOTNS_CHECK_KEYS.map((key, i) => ({
+    id: startId + i,
+    method: "state_getStorage",
+    params: [reviveAccountInfoKey(contracts[key])],
+    errorKind: "dotns_probe_error",
+    validateKind: "dotns_contract_missing",
+    validate: (r) =>
+      r === null || r === undefined
+        ? `no contract code at ${contracts[key]} (${key}) — chain may have been reset`
+        : null,
+  }));
 }
 
 async function probe({ env, timeoutMs }) {
@@ -154,7 +247,13 @@ async function probe({ env, timeoutMs }) {
   }
   const { assetHubRpc, bulletinRpc, gatewayUrl } = loaded;
 
-  // 1. Asset Hub: WS + system_chain + ReviveApi.address (Revive lives here).
+  // DotNS config check first — it needs no network, so a misconfigured env
+  // fails before we open a socket.
+  const dotnsConfig = checkDotnsConfigured(loaded.entry.contracts);
+  if (!dotnsConfig.ok) fail(dotnsConfig.kind, dotnsConfig.message, Date.now() - t0);
+
+  // 1. Asset Hub: WS + system_chain + ReviveApi.address (Revive lives here),
+  //    plus one state_getStorage per DotNS contract to prove code presence.
   const ah = await probeChain({
     url: assetHubRpc,
     timeoutMs,
@@ -170,6 +269,7 @@ async function probe({ env, timeoutMs }) {
             ? `unexpected response: ${r}`
             : null,
       },
+      ...dotnsStorageCalls(loaded.entry.contracts, 3),
     ],
   });
   if (!ah.ok) fail(ah.kind, `asset-hub ${ah.message}`, Date.now() - t0);
@@ -198,21 +298,25 @@ async function probe({ env, timeoutMs }) {
 
   const duration = Date.now() - t0;
   console.log(
-    `healthy: ${env} (asset-hub=${ah.result.system_chain}, bulletin=${bul.result.system_chain}, gateway=${gatewayStatus}, ${duration}ms)`,
+    `healthy: ${env} (asset-hub=${ah.result.system_chain}, bulletin=${bul.result.system_chain}, gateway=${gatewayStatus}, dotns=ok, ${duration}ms)`,
   );
   emitOutput("outcome", "healthy");
   emitOutput("duration_ms", String(duration));
   process.exit(0);
 }
 
-const args = parseArgs(process.argv);
-if (!args.env) {
-  console.error("usage: probe-env-health.mjs --env <id> [--timeout-ms N]");
-  process.exit(2);
+// Only run the CLI when invoked directly (not when imported for tests, e.g.
+// the loadEnv() drift-guard test in test/probe-env-health.test.js).
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const args = parseArgs(process.argv);
+  if (!args.env) {
+    console.error("usage: probe-env-health.mjs --env <id> [--timeout-ms N]");
+    process.exit(2);
+  }
+  probe(args).catch((e) => {
+    console.error(`unhealthy: unknown ${e?.message || e}`);
+    emitOutput("outcome", "unknown");
+    emitOutput("error", String(e?.message || e).slice(0, 200));
+    process.exit(1);
+  });
 }
-probe(args).catch((e) => {
-  console.error(`unhealthy: unknown ${e?.message || e}`);
-  emitOutput("outcome", "unknown");
-  emitOutput("error", String(e?.message || e).slice(0, 200));
-  process.exit(1);
-});

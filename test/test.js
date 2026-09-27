@@ -3602,6 +3602,32 @@ describe("DotNS initial state", () => {
       assert.match(msg, /diagnostic: bare-revert/);
       assert.doesNotMatch(msg, /storage deposit/i);
     });
+
+    // bulletin-deploy #1518: the register diagnostic used to hardcode "typically
+    // 200+ PAS" — a figure that never matched any measured environment. It now
+    // reports the ACTUAL floor this specific call declared, so a user tops up
+    // the right amount even if the floor changes again without a release (a
+    // per-env registerStorageDeposit override).
+    test("register diagnostic reports the actual declared floor in PAS, not a hardcoded '200+ PAS'", () => {
+      const msg = __formatContractDryRunFailureForTest(
+        { revertData: "0x", revertFlags: 1n },
+        { ...baseContext, functionName: "register", registerStorageDeposit: 30_000_000_000n }, // 3 PAS
+      );
+      assert.doesNotMatch(msg, /200\+ PAS/,
+        ">> FAIL: register diagnostic prose: must not still hardcode the old 200+ PAS figure");
+      assert.match(msg, /3\.0000 PAS/,
+        ">> FAIL: register diagnostic prose: must report the caller-supplied floor (3 PAS), not a fixed constant");
+    });
+
+    test("register diagnostic falls back to MINIMUM_REGISTER_STORAGE_DEPOSIT when no floor is supplied", async () => {
+      const { fmtPas, MINIMUM_REGISTER_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      const msg = __formatContractDryRunFailureForTest(
+        { revertData: "0x", revertFlags: 1n },
+        { ...baseContext, functionName: "register" }, // no registerStorageDeposit in context
+      );
+      assert.match(msg, new RegExp(`${fmtPas(MINIMUM_REGISTER_STORAGE_DEPOSIT).replace(".", "\\.")} PAS`),
+        ">> FAIL: register diagnostic default: with no per-call floor supplied, must report MINIMUM_REGISTER_STORAGE_DEPOSIT, not omit the figure");
+    });
   });
 
   test("contractTransaction forwards custom environment contracts to submitTransaction", async () => {
@@ -15714,9 +15740,12 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       DOTNS_POP_RESOLVER: "0xDaC984884EcA8Fc44011f1D6C49B27828390A72B",
       DOTNS_NAME_ESCROW: "0x4881Afb78e7C908cAe818168B926229D93376520",
       POP_RULES: "0x747B456bE03aec0b42bd85C51513730FBD45DA31",
-      STORE_FACTORY: "0x709A027F446a9e2a4BB9cb9a9c754435b19e32B7",
-      LABEL_STORE_BEACON: "0xb57Ebc2e7085616d4906D1fE49af1cE13f7dffeF",
-      USER_STORE_BEACON: "0xb7C995601679840d36F37E86DB2d7dF30797eC5C",
+      // bulletin-deploy #1514: paseo-assethub's store set moved onto the v0.8.0
+      // proxy upstream; both old and new trios still have code on paseo-next-v2
+      // (verified on-chain), so this just follows the record.
+      STORE_FACTORY: "0x99605a926FcB40aB520F659c6505E5ff862771f6",
+      LABEL_STORE_BEACON: "0x2227d9807F5A71332Aaa0640643030f2A3bf84cD",
+      USER_STORE_BEACON: "0x3d1Ca165f7A5e387C2df02DB2FadD3149c1C72ad",
       MULTICALL3: "0xB4468000abD87D3c56cbFBd153161223D7b109e5",
     }, ">> FAIL: paseo-next-v2-contracts: assets/environments.json contract addresses drifted from the canonical DotNS deployment. Re-check paritytech/dotns DEPLOYMENTS.md — a stale address surfaces as \"No contract deployed at 0x… \" in preflight, not as a build error.");
     assert.strictEqual(env.tld, "paseo",
@@ -18296,7 +18325,9 @@ describe("readPreviousContenthashSafe (subdomain contenthash read — double-TLD
 });
 
 // ---------------------------------------------------------------------------
-// computeStorageDepositLimit — storage_deposit_limit buffer helper.
+// storageDepositLimitFor — storage_deposit_limit buffer helper (bulletin-deploy
+// #1491/#1518: renamed from computeStorageDepositLimit to match bulletin's
+// helper of the same purpose, so the two codebases stay aligned at sync).
 //
 // ReviveClientWrapper.dryRunReviveCall computes this buffer (20% headroom
 // over the dry-run estimate, floored at a minimum) and is documented as
@@ -18306,70 +18337,272 @@ describe("readPreviousContenthashSafe (subdomain contenthash read — double-TLD
 // ReviveClientWrapper — so it had grown its own inline copy of the identical
 // formula instead. Extracted into this standalone function so both paths
 // share one implementation.
+//
+// bulletin-deploy #1491/#1518 found a real bug in the shape this helper used
+// to have: the per-env `registerStorageDeposit` override (environments.json)
+// only ever moved the preflight balance gate (feeFloorFor/topUpTargetFor),
+// never the floor actually threaded into this function at either call site —
+// so an operator's configured floor never reached the DECLARED
+// storage_deposit_limit on a submitted Revive.call. Fixed by giving
+// ReviveClientWrapper a settable `_storageDepositFloor` (defaulted to the
+// module constant, overridden via setStorageDepositFloor from
+// DotNS.recreateReviveClient with this._registerStorageDeposit) and by
+// threading this._registerStorageDeposit directly at the
+// submitBatchedContractCalls call site, which builds its own Revive.call
+// extrinsics rather than going through the wrapper.
 // ---------------------------------------------------------------------------
 
-describe("computeStorageDepositLimit (storage_deposit_limit buffer helper)", () => {
+describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
   const DEFAULT_MINIMUM = 2_000_000_000_000n; // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT
 
   test("zero estimate returns the minimum", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
-    assert.equal(computeStorageDepositLimit(0n), DEFAULT_MINIMUM,
-      ">> FAIL: computeStorageDepositLimit zero estimate: expected the minimum floor, dry-runs with no storage effect must still get a workable limit");
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
+    assert.equal(storageDepositLimitFor(0n), DEFAULT_MINIMUM,
+      ">> FAIL: storageDepositLimitFor zero estimate: expected the minimum floor, dry-runs with no storage effect must still get a workable limit");
   });
 
   test("a buffered estimate below the minimum is clamped up to the minimum", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
     // 1_000_000_000_000n * 1.2 = 1_200_000_000_000n, still below the 2e12 floor.
-    assert.equal(computeStorageDepositLimit(1_000_000_000_000n), DEFAULT_MINIMUM,
-      ">> FAIL: computeStorageDepositLimit clamp: a thin estimate's 20%-buffered value must not undercut the minimum floor");
+    assert.equal(storageDepositLimitFor(1_000_000_000_000n), DEFAULT_MINIMUM,
+      ">> FAIL: storageDepositLimitFor clamp: a thin estimate's 20%-buffered value must not undercut the minimum floor");
   });
 
   test("a buffered estimate above the minimum passes through buffered, not clamped", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
     // 10_000_000_000_000n * 120 / 100 = 12_000_000_000_000n, above the 2e12 floor.
-    assert.equal(computeStorageDepositLimit(10_000_000_000_000n), 12_000_000_000_000n,
-      ">> FAIL: computeStorageDepositLimit above-floor case: expected the 20%-buffered estimate, not the floor");
+    assert.equal(storageDepositLimitFor(10_000_000_000_000n), 12_000_000_000_000n,
+      ">> FAIL: storageDepositLimitFor above-floor case: expected the 20%-buffered estimate, not the floor");
   });
 
   test("boundary — buffered value exactly equal to the minimum", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
     // estimate * 120 / 100 lands exactly on 2_000_000_000_000n for this input.
     const estimate = 1_666_666_666_667n;
     const buffered = (estimate * 120n) / 100n;
     assert.equal(buffered, DEFAULT_MINIMUM, "test setup sanity: buffered must land exactly on the minimum for this boundary case");
-    assert.equal(computeStorageDepositLimit(estimate), DEFAULT_MINIMUM,
-      ">> FAIL: computeStorageDepositLimit boundary: a buffered value exactly at the minimum must return the minimum (not clamp-related off-by-one)");
+    assert.equal(storageDepositLimitFor(estimate), DEFAULT_MINIMUM,
+      ">> FAIL: storageDepositLimitFor boundary: a buffered value exactly at the minimum must return the minimum (not clamp-related off-by-one)");
   });
 
-  test("a custom minimum overrides the default floor", async () => {
-    const { computeStorageDepositLimit } = await import("../dist/dotns.js");
-    assert.equal(computeStorageDepositLimit(0n, 5_000_000_000n), 5_000_000_000n,
-      ">> FAIL: computeStorageDepositLimit custom minimum: zero estimate must return the caller-supplied minimum, not the hardcoded default");
-    assert.equal(computeStorageDepositLimit(1n, 5_000_000_000n), 5_000_000_000n,
-      ">> FAIL: computeStorageDepositLimit custom minimum clamp: a negligible estimate must clamp to the caller-supplied minimum");
+  test("a custom floor overrides the default minimum", async () => {
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
+    assert.equal(storageDepositLimitFor(0n, 5_000_000_000n), 5_000_000_000n,
+      ">> FAIL: storageDepositLimitFor custom floor: zero estimate must return the caller-supplied floor, not the hardcoded default");
+    assert.equal(storageDepositLimitFor(1n, 5_000_000_000n), 5_000_000_000n,
+      ">> FAIL: storageDepositLimitFor custom floor clamp: a negligible estimate must clamp to the caller-supplied floor");
   });
 
-  // Drift guard: the bug this fixes was the SAME 20%-buffer-floored-at-minimum
+  // #1518: this is the per-env floor itself — environments.json's
+  // registerStorageDeposit is what makes this reachable in production; both
+  // call sites used to hardcode the generic 200 PAS default and ignore it.
+  test("the floor is per environment, not the built-in default", async () => {
+    const { storageDepositLimitFor } = await import("../dist/dotns.js");
+    assert.equal(storageDepositLimitFor(0n, 5_000_000_000n), 5_000_000_000n,
+      ">> FAIL: storageDepositLimitFor per-env floor: a custom (lower) env floor must win over the generic default, not be ignored");
+  });
+
+  // Drift guard: the bug this fixes was the SAME 20%-buffer-floored-at-floor
   // formula recomputed inline at a second call site (submitBatchedContractCalls)
   // instead of going through dryRunReviveCall's helper. A return-value test on
-  // computeStorageDepositLimit alone can't catch a future call site
-  // reintroducing its own inline copy — source-scan for the telltale
-  // "* 120n) / 100n" buffer expression and require it appear exactly once.
-  test("dotns.ts: the 20% buffer formula appears in exactly one place (computeStorageDepositLimit)", () => {
+  // storageDepositLimitFor alone can't catch a future call site reintroducing
+  // its own inline copy — source-scan for the telltale "* 120n) / 100n" buffer
+  // expression. storageDepositLimitFor contributes 1 occurrence; weightLimitFor
+  // (bulletin #1522, same 20% factor applied to ref_time and proof_size
+  // separately) legitimately contributes 2 more — both inside the one
+  // canonical function, so this is still a single source of truth per helper.
+  test("dotns.ts: the 20% buffer formula appears only inside storageDepositLimitFor and weightLimitFor", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
     const matches = dotnsSrc.match(/\*\s*120n\)\s*\/\s*100n/g) || [];
-    assert.equal(matches.length, 1,
-      `>> FAIL: storage_deposit_limit buffer drift-guard: found the "* 120n) / 100n" formula ${matches.length} time(s) in dotns.ts, ` +
-      `expected exactly 1 (inside computeStorageDepositLimit) — a second inline copy means the two call sites can drift again`);
+    assert.equal(matches.length, 3,
+      `>> FAIL: 20%-buffer drift-guard: found the "* 120n) / 100n" formula ${matches.length} time(s) in dotns.ts, ` +
+      `expected exactly 3 (1 inside storageDepositLimitFor + 2 inside weightLimitFor for ref_time/proof_size) — ` +
+      `any other count means a call site grew its own inline copy again`);
   });
 
-  test("dotns.ts: both dryRunReviveCall and submitBatchedContractCalls call computeStorageDepositLimit", () => {
+  test("dotns.ts: both dryRunReviveCall and submitBatchedContractCalls call storageDepositLimitFor", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
-    const callSites = (dotnsSrc.match(/computeStorageDepositLimit\(/g) || []).length;
+    const callSites = (dotnsSrc.match(/storageDepositLimitFor\(/g) || []).length;
     // 1 definition + 2 call sites = 3 occurrences of the identifier followed by "(".
     assert.ok(callSites >= 3,
-      `>> FAIL: storage_deposit_limit helper routing: expected computeStorageDepositLimit referenced at least 3 times ` +
+      `>> FAIL: storage_deposit_limit helper routing: expected storageDepositLimitFor referenced at least 3 times ` +
       `(1 definition + dryRunReviveCall + submitBatchedContractCalls), found ${callSites}`);
+  });
+
+  test("dotns.ts: submitBatchedContractCalls threads this._registerStorageDeposit, not a bare default call", () => {
+    const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
+    assert.match(dotnsSrc, /storageDepositLimitFor\(headEstimate\.storageDeposit,\s*this\._registerStorageDeposit\)/,
+      ">> FAIL: submitBatchedContractCalls must pass this._registerStorageDeposit as the floor — the per-env config, " +
+      "otherwise it silently falls back to the generic 200 PAS default regardless of environments.json");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// weightLimitFor — weight_limit buffer helper (bulletin-deploy #1522).
+//
+// weight_limit used to be declared at exactly the dry-run estimate, with no
+// margin — unlike storage_deposit_limit (storageDepositLimitFor, buffered
+// since #1518). A dry run measures the chain as it was; a write elsewhere
+// between the estimate and inclusion can push the real requirement above the
+// declared limit and trap the call. Same 20% factor as storageDepositLimitFor,
+// applied to both ref_time and proof_size, deliberately with NO floor.
+// ---------------------------------------------------------------------------
+
+describe("weightLimitFor (weight_limit buffer helper, #1522)", () => {
+  test("buffers both ref_time and proof_size by 20%", async () => {
+    const { weightLimitFor } = await import("../dist/dotns.js");
+    const result = weightLimitFor({ referenceTime: 1_000_000_000n, proofSize: 100_000n });
+    assert.deepStrictEqual(result, { ref_time: 1_200_000_000n, proof_size: 120_000n },
+      ">> FAIL: weightLimitFor buffer factor: both components must scale by exactly 120/100, matching storageDepositLimitFor's proven-safe margin");
+  });
+
+  test("no floor: a tiny estimate stays tiny (proportional-only, unlike storageDepositLimitFor)", async () => {
+    const { weightLimitFor } = await import("../dist/dotns.js");
+    const result = weightLimitFor({ referenceTime: 10n, proofSize: 1n });
+    assert.deepStrictEqual(result, { ref_time: 12n, proof_size: 1n },
+      ">> FAIL: weightLimitFor no-floor: unlike storage, weight is dry-run against the exact call being submitted, so a small estimate must buffer proportionally, not jump to an arbitrary minimum");
+  });
+
+  test("dotns.ts: both dryRunReviveCall and submitBatchedContractCalls call weightLimitFor", () => {
+    const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
+    const callSites = (dotnsSrc.match(/weightLimitFor\(/g) || []).length;
+    assert.ok(callSites >= 3,
+      `>> FAIL: weight_limit helper routing: expected weightLimitFor referenced at least 3 times ` +
+      `(1 definition + dryRunReviveCall + submitBatchedContractCalls), found ${callSites}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ReviveClientWrapper.setStorageDepositFloor — verifies the per-env floor
+// actually reaches the SUBMITTED extrinsic's storage_deposit_limit (and that
+// the buffered weight_limit rides along), not just dryRunReviveCall's return
+// value. Drives submitTransaction end to end with a fake client capturing the
+// literal args client.tx.Revive.call receives.
+// ---------------------------------------------------------------------------
+
+describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitted extrinsic (#1491/#1518)", () => {
+  test("submitTransaction's built Revive.call uses the configured floor, not the generic default", async () => {
+    const { ReviveClientWrapper } = await import("../dist/dotns.js");
+    const w = new ReviveClientWrapper({});
+    w.ensureAccountMapped = async () => {};
+    w.checkIfAccountMapped = async () => true;
+    w.getEvmAddress = async () => "0xSigner";
+    w.estimateGasForCall = async () => ({
+      success: true,
+      gasRequired: { referenceTime: 1_000_000_000n, proofSize: 100_000n },
+      storageDeposit: 0n, // a call that overwrites storage rather than adding it
+    });
+    let captured;
+    w.client = { tx: { Revive: { call: (args) => { captured = args; return { marker: "extrinsic" }; } } } };
+    w.signAndSubmitWithRetry = async (buildExtrinsic) => {
+      buildExtrinsic();
+      return { kind: "hash", hash: "0xtx" };
+    };
+
+    // Env floor: 5 PAS (bulletin's measured paseo-next-v2 value), well below
+    // the 200 PAS generic default this wrapper would otherwise fall back to.
+    w.setStorageDepositFloor(50_000_000_000n);
+    await w.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, { rpcs: [] });
+
+    assert.ok(captured, ">> FAIL: submitTransaction setup: fake signAndSubmitWithRetry must trigger buildExtrinsic — check the fake client wiring above");
+    assert.strictEqual(captured.storage_deposit_limit, 50_000_000_000n,
+      ">> FAIL: submitTransaction storage_deposit_limit: the SUBMITTED extrinsic must declare the wrapper's configured per-env floor, not the generic 200 PAS default");
+    assert.deepStrictEqual(captured.weight_limit, { ref_time: 1_200_000_000n, proof_size: 120_000n },
+      ">> FAIL: submitTransaction weight_limit: must be buffered 20% via weightLimitFor even when storage_deposit_limit comes from a custom floor");
+  });
+
+  test("with no floor configured, falls back to the generic REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT default", async () => {
+    const { ReviveClientWrapper } = await import("../dist/dotns.js");
+    const w = new ReviveClientWrapper({});
+    w.ensureAccountMapped = async () => {};
+    w.checkIfAccountMapped = async () => true;
+    w.getEvmAddress = async () => "0xSigner";
+    w.estimateGasForCall = async () => ({
+      success: true,
+      gasRequired: { referenceTime: 1_000_000_000n, proofSize: 100_000n },
+      storageDeposit: 0n,
+    });
+    let captured;
+    w.client = { tx: { Revive: { call: (args) => { captured = args; return { marker: "extrinsic" }; } } } };
+    w.signAndSubmitWithRetry = async (buildExtrinsic) => {
+      buildExtrinsic();
+      return { kind: "hash", hash: "0xtx" };
+    };
+
+    await w.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, { rpcs: [] });
+
+    assert.strictEqual(captured.storage_deposit_limit, 2_000_000_000_000n,
+      ">> FAIL: submitTransaction default floor: an unconfigured wrapper (e.g. a bare `new ReviveClientWrapper(...)`) must still declare a safe, known floor rather than 0");
+  });
+});
+
+describe("DotNS: recreateReviveClient wires the connected instance's registerStorageDeposit into the wrapper (#1518)", () => {
+  test("dotns.ts: recreateReviveClient calls setStorageDepositFloor(this._registerStorageDeposit) right after construction", () => {
+    const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
+    const recreateFnMatch = dotnsSrc.match(/private recreateReviveClient\(endpoint: string\): void \{[\s\S]*?\n  \}/);
+    assert.ok(recreateFnMatch, ">> FAIL: recreateReviveClient not found — did the method get renamed/restructured?");
+    assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloor\(this\._registerStorageDeposit\)/,
+      ">> FAIL: recreateReviveClient must call setStorageDepositFloor(this._registerStorageDeposit) — this is the ONLY place a " +
+      "ReviveClientWrapper is constructed, so missing this call here means the per-env floor never reaches a fresh wrapper");
+  });
+});
+
+// submitBatchedContractCalls builds Revive.call extrinsics directly (it does
+// not go through ReviveClientWrapper.dryRunReviveCall), so it needs the
+// per-env floor and the weight buffer threaded explicitly at this call site
+// too (see the drift-guard tests above). Drives the real private method with
+// a fake clientWrapper and captures the literal args reaching
+// client.tx.Revive.call for both inner calls in the batch.
+describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and the per-env storage floor on every inner call (#1491/#1518/#1522)", () => {
+  test("both inner Revive.call entries in the batch get the buffered weight_limit and the configured registerStorageDeposit floor", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d["_registerStorageDeposit"] = 50_000_000_000n; // 5 PAS — the measured paseo-next-v2 floor
+    const capturedCalls = [];
+    d.clientWrapper = {
+      ensureAccountMapped: async () => {},
+      estimateGasForCall: async () => ({
+        success: true,
+        gasRequired: { referenceTime: 2_000_000_000n, proofSize: 200_000n },
+        storageDeposit: 0n, // overwrite-shaped call — zero estimate must still floor at the env value, not 200 PAS
+      }),
+      client: {
+        tx: {
+          Revive: {
+            call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
+          },
+          Utility: {
+            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+          },
+        },
+      },
+      signAndSubmitWithRetry: async (buildBatch) => {
+        buildBatch();
+        return { kind: "hash", hash: "0xbatch" };
+      },
+    };
+
+    const abiOne = [{ type: "function", name: "setSubnodeOwner", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const abiTwo = [{ type: "function", name: "setResolver", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const result = await d["submitBatchedContractCalls"](
+      [
+        { contractAddress: "0xAAAA000000000000000000000000000000AAAA", abi: abiOne, functionName: "setSubnodeOwner", args: [] },
+        { contractAddress: "0xBBBB000000000000000000000000000000BBBB", abi: abiTwo, functionName: "setResolver", args: [] },
+      ],
+      () => {},
+      "test batch",
+    );
+
+    assert.strictEqual(result.kind, "hash", ">> FAIL: submitBatchedContractCalls setup: fake signAndSubmitWithRetry must resolve — check the fake clientWrapper wiring above");
+    assert.strictEqual(capturedCalls.length, 2, ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
+    for (const call of capturedCalls) {
+      assert.deepStrictEqual(call.weight_limit, { ref_time: 2_400_000_000n, proof_size: 240_000n },
+        ">> FAIL: submitBatchedContractCalls weight_limit: must be buffered 20% via weightLimitFor on every inner call, from the head dry-run estimate");
+      assert.strictEqual(call.storage_deposit_limit, 50_000_000_000n,
+        ">> FAIL: submitBatchedContractCalls storage_deposit_limit: must floor at this._registerStorageDeposit (the connected instance's per-env config), not the generic 200 PAS default");
+    }
   });
 });
 

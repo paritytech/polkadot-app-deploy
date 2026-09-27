@@ -269,7 +269,7 @@ function deriveSignerKeypair(keyring, account) {
 // one client for the whole pass, building each row, catching a failed
 // action into { action: "FAILED", error }, destroying the client) was
 // previously duplicated between the two. This file's own header argues
-// against exactly that kind of copy for computeStorageDepositLimit; this
+// against exactly that kind of copy for storageDepositLimitFor; this
 // factors it out instead of adding a second instance of the same drift risk.
 //
 // Writes stay SEQUENTIAL within this loop (never Promise.all across

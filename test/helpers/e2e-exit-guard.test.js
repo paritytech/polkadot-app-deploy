@@ -121,6 +121,18 @@ describe("e2e exit guard", () => {
       `>> FAIL: exit guard: our own stdio sockets must be filtered out; got:\n${r.report}`);
   });
 
+  test("names the host a leaked outbound socket connected to, not only its IP", () => {
+    // Several hosts can share one IP, so the report must name the host.
+    const r = run(`const net = await import("node:net");`
+      + ` const srv = net.createServer();`
+      + ` srv.listen(0, "127.0.0.1", () => {`
+      + `   net.connect({ host: "localhost", port: srv.address().port, family: 4 }, () => armExitGuard(300));`
+      + ` });`);
+    assert.equal(r.status, NO_RETRY_EXIT_CODE, `>> FAIL: exit guard: a leaked socket must exit ${NO_RETRY_EXIT_CODE}, got ${r.status}`);
+    assert.match(r.report, /handle Socket -> localhost 127\.0\.0\.1:\d+/,
+      `>> FAIL: exit guard: a leaked outbound socket must be named with the host it dialled; got:\n${r.report}`);
+  });
+
   test("a guard failure is not classified as a retryable flake", () => {
     // A deterministic leak must not be retried (#1393).
     const r = run(`process.stderr.write("Connection lost\\n"); setInterval(() => {}, 5000); armExitGuard(300);`);

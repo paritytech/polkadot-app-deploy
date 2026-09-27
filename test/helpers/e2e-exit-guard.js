@@ -84,7 +84,12 @@ function safely(fn, fallback = []) {
 
 function describeHandle(h) {
   const type = h?.constructor?.name ?? typeof h;
-  if (h.remoteAddress) return `${type} -> ${h.remoteAddress}:${h.remotePort}`;
+  // servername: TLS SNI. _host: the host passed to connect(), null when TLS wraps an existing socket.
+  if (h.remoteAddress) {
+    const host = h.servername || h._host;
+    const prefix = host ? host + " " : "";
+    return `${type} -> ${prefix}${h.remoteAddress}:${h.remotePort}`;
+  }
   if (h.pid) return `${type} pid=${h.pid} ${(h.spawnargs ?? []).join(" ")}`;
   // A piped stdio socket answers address() with {}, which reads as a server.
   const addr = safely(() => h.address?.(), null);

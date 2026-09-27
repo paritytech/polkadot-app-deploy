@@ -21883,6 +21883,89 @@ describe("regression guard: claim-pgas.ts must not contain hardcoded extension e
 });
 
 // ---------------------------------------------------------------------------
+// bulletin #1360: makeOneShotBuildRingProof pins the one_shot(ringExponent,
+// memberEntropy, members, context, msg) argument order in one place, so the
+// two call sites (src/dotns.ts, src/personhood/bootstrap.ts) cannot drift
+// independently. bulletin-deploy's own #1229 was exactly this class of drift
+// in a third (tools/) call site that polkadot-app-deploy doesn't have.
+// ---------------------------------------------------------------------------
+describe("makeOneShotBuildRingProof (bulletin #1360)", () => {
+  test("calls one_shot with (ringExponent, memberEntropy, members, context, msg) in that exact order", async () => {
+    const { makeOneShotBuildRingProof } = await import("../dist/personhood/ring-proof.js");
+    const memberEntropy = new Uint8Array([0xaa, 0xaa, 0xaa, 0xaa]);
+    const members = new Uint8Array([0xbb, 0xbb, 0xbb]);
+    const context = new Uint8Array([0xcc, 0xcc]);
+    const msg = new Uint8Array([0xdd]);
+    const ringExponent = 9;
+
+    let capturedArgs = null;
+    const fakeOneShot = (...args) => {
+      capturedArgs = args;
+      return { proof: new Uint8Array([1]), alias: new Uint8Array([2]), decoy: "should not leak through" };
+    };
+
+    const buildRingProof = makeOneShotBuildRingProof(fakeOneShot, memberEntropy);
+    const result = await buildRingProof({ ringExponent, members, context, msg });
+
+    assert.equal(capturedArgs.length, 5,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): one_shot must be called with exactly 5 positional args");
+    assert.equal(capturedArgs[0], ringExponent,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 0 must be ringExponent — this is the class of drift bulletin's #1229 hit (ringExponent dropped, everything shifted left)");
+    assert.equal(capturedArgs[1], memberEntropy,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 1 must be memberEntropy");
+    assert.equal(capturedArgs[2], members,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 2 must be members");
+    assert.equal(capturedArgs[3], context,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 3 must be context");
+    assert.equal(capturedArgs[4], msg,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 4 must be msg");
+
+    assert.deepEqual(Object.keys(result).sort(), ["alias", "proof"],
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): return value must be exactly {proof, alias} — no extra fields from one_shot's result should leak through");
+    assert.deepEqual(result.proof, new Uint8Array([1]));
+    assert.deepEqual(result.alias, new Uint8Array([2]));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1360 regression guard: verifiablejs's one_shot must only ever be
+// called from src/personhood/ring-proof.ts. If a new call site hand-rolls its
+// own `one_shot(...)` call instead of going through makeOneShotBuildRingProof,
+// the argument-order drift class becomes possible again. Scoped to src/ only
+// — polkadot-app-deploy has no tools/reprove-alias.mjs equivalent.
+// ---------------------------------------------------------------------------
+describe("regression guard: verifiable.one_shot must only be called from ring-proof.ts (bulletin #1360)", () => {
+  test("no src/ file other than src/personhood/ring-proof.ts calls one_shot(", () => {
+    const offenders = [];
+
+    function walk(dir) {
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name);
+        const st = fs.statSync(p);
+        if (st.isDirectory()) {
+          walk(p);
+          continue;
+        }
+        if (!/\.ts$/.test(name)) continue;
+        if (p.endsWith(path.join("src", "personhood", "ring-proof.ts"))) continue;
+        // Strip backtick-quoted spans first so doc-comment mentions like
+        // `` `verifiablejs.one_shot(...)` `` (src/personhood/encoding.ts) don't
+        // count as a call — only look for an actual `one_shot(` call expression.
+        const text = fs.readFileSync(p, "utf8").replace(/`[^`]*`/g, "");
+        if (/\bone_shot\s*\(/.test(text)) offenders.push(p);
+      }
+    }
+
+    walk("src");
+
+    assert.deepEqual(offenders, [],
+      `>> FAIL: regression-guard bulletin #1360: found a direct one_shot(...) call outside src/personhood/ring-proof.ts in: ${offenders.join(", ")}. ` +
+      "Route ring-proof construction through makeOneShotBuildRingProof so the argument order (ringExponent, memberEntropy, members, context, msg) " +
+      "cannot drift independently between call sites.");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // PR 3: verifiablejs 1.3.0-beta.4 upgrade + people-collection identifier rename
 // (handover §1 + §2)
 // ---------------------------------------------------------------------------

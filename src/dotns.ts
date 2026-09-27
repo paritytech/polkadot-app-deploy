@@ -5309,6 +5309,7 @@ export class DotNS {
     const { connectPeopleClient } = await import("./personhood/people-client.js");
     const { reproveAliasToAccount } = await import("./personhood/reprove.js");
     const { deriveMemberEntropy, deriveMemberKey } = await import("./personhood/member-key.js");
+    const { makeOneShotBuildRingProof } = await import("./personhood/ring-proof.js");
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore — verifiablejs/nodejs DTS path differs from the types field
     const verifiable = await import("verifiablejs/nodejs") as typeof import("verifiablejs/nodejs");
@@ -5324,10 +5325,7 @@ export class DotNS {
         account: this.substrateAddress as any,
         memberKey,
         signCall: this.signer,
-        buildRingProof: async ({ ringExponent, members, context, msg }) => {
-          const r = verifiable.one_shot(ringExponent, memberEntropy, members, context, msg);
-          return { proof: r.proof, alias: r.alias };
-        },
+        buildRingProof: makeOneShotBuildRingProof(verifiable.one_shot, memberEntropy),
       });
       return result;
     } catch (e: any) {

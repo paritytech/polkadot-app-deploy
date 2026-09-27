@@ -2067,6 +2067,11 @@ export async function storeDirectoryV2(
   // computed here is reused at every other call site below instead of
   // re-invoking detectFramework.
   const framework = detectFramework(directoryPath);
+  // Hoisted once: buildOrderedCar's classifyFn runs per file, per merkleize
+  // pass (Phase A and Phase B) — reusing one context object instead of a
+  // fresh `{ framework }` literal per call avoids an allocation on every file
+  // of every deploy for a value that never changes within a deploy.
+  const classifyCtx = { framework };
   const deployedAt = opts.reproducibleSource
     ? resolveReproducibleTimestamp(opts.reproducibleSource)
     : new Date().toISOString();
@@ -2097,7 +2102,7 @@ export async function storeDirectoryV2(
     useKubo = hasIPFS();
   }
   const phaseA = await withSpan("deploy.merkleize", `1a. merkleize (${useKubo ? "kubo" : "js"}, stable)`, { "deploy.directory": dirBasename, "deploy.merkle": useKubo ? "kubo" : "js" }, async () => {
-    const r = await merkleizeWithStableOrder(directoryPath, prevManifest?.stableBlockOrder, { useKubo, phase: "Phase A", classifyFn: (p) => classifyFile(p, { framework }) });
+    const r = await merkleizeWithStableOrder(directoryPath, prevManifest?.stableBlockOrder, { useKubo, phase: "Phase A", classifyFn: (p) => classifyFile(p, classifyCtx) });
     sampleMemory("merkleize_end");
     return r;
   });
@@ -2261,7 +2266,7 @@ export async function storeDirectoryV2(
   // 7. Re-merkleize with the same blockOrder. Only the manifest-bearing
   // block(s) change; everything else is byte-identical.
   const phaseB = await withSpan("deploy.merkleize", "1c. merkleize (js, finalise)", { "deploy.directory": dirBasename }, async () => {
-    const r = await merkleizeWithStableOrder(directoryPath, phaseA.stableOrder, { useKubo, phase: "Phase B", classifyFn: (p) => classifyFile(p, { framework }) });
+    const r = await merkleizeWithStableOrder(directoryPath, phaseA.stableOrder, { useKubo, phase: "Phase B", classifyFn: (p) => classifyFile(p, classifyCtx) });
     sampleMemory("merkleize_finalise_end");
     return r;
   });

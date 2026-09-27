@@ -167,9 +167,14 @@ export function classifyFileHeuristic(filePath: string, framework?: string | nul
 
   const rules = framework ? FRAMEWORK_RULES[framework] : undefined;
   if (rules) {
-    // Split only when a rule set actually consults the basename — nuxt's
+    // Derive the basename only when a rule set actually consults it — nuxt's
     // rules test the full path, so it would otherwise allocate per file.
-    if (rules.volatileExact && rules.volatileExact.includes(filePath.split("/").pop() ?? filePath)) return "volatile";
+    // lastIndexOf+slice avoids the array allocation split("/") would cost
+    // on every file of every deploy.
+    if (rules.volatileExact) {
+      const basename = filePath.slice(filePath.lastIndexOf("/") + 1);
+      if (rules.volatileExact.includes(basename)) return "volatile";
+    }
     if (rules.stablePrefixes?.some((prefix) => filePath.startsWith(prefix))) return "stable";
     if (rules.scopedHashRe?.some(({ prefix, re }) => filePath.startsWith(prefix) && re.test(filePath))) return "stable";
   }

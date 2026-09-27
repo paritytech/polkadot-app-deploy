@@ -568,14 +568,38 @@ export function shouldPublishManifest(opts: {
   return opts.configFound && !opts.noManifest;
 }
 
-/** storageSigner > signer > mnemonic > pool precedence for storage routing. Exported for unit testing. */
+/**
+ * storageSigner > signer (unless session-backed with no slot, bulletin #1452) > mnemonic > pool
+ * precedence for storage routing. `selectStorageReconnect` delegates to this so the two
+ * never drift apart. Exported for unit testing.
+ */
 export function __selectStorageProviderModeForTest(
-  options: Pick<DeployOptions, "storageSigner" | "storageSignerAddress" | "signer" | "signerAddress" | "mnemonic">,
+  options: Pick<DeployOptions, "storageSigner" | "storageSignerAddress" | "signer" | "signerAddress" | "mnemonic" | "sessionSigner">,
 ): "storageSigner" | "signer" | "direct" | "pool" {
   if (options.storageSigner && options.storageSignerAddress) return "storageSigner";
-  if (options.signer && options.signerAddress) return "signer";
+  // bulletin #1452: a phone-backed session signer with no allowance slot must fall through to
+  // pool/mnemonic, not sign chunks itself. A caller-injected external signer (sessionSigner
+  // unset — e.g. playground-cli) is unaffected and still routes to "signer" here.
+  if (options.signer && options.signerAddress && !options.sessionSigner) return "signer";
   if (options.mnemonic) return "direct";
   return "pool";
+}
+
+/**
+ * Build the signer-related DeployOptions fields from a resolved `resolveDeployActors`
+ * result. Pulled out of the resolve branch (bulletin #1452) so the session-vs-local
+ * distinction that gates Bulletin storage routing is directly unit-testable without
+ * exercising `resolveDeployActors`' SSO stack. Exported for unit testing.
+ */
+export function deployActorsToSignerOptions(
+  actors: { worker: { signer: PolkadotSigner; address: string; source: string }; recipientH160?: string },
+): Pick<DeployOptions, "signer" | "signerAddress" | "transferTo" | "sessionSigner"> {
+  return {
+    signer: actors.worker.signer,
+    signerAddress: actors.worker.address,
+    ...(actors.recipientH160 ? { transferTo: actors.recipientH160 } : {}),
+    sessionSigner: actors.worker.source === "session",
+  };
 }
 
 /**
@@ -692,7 +716,10 @@ export function describeSlotFallbackReason(e: unknown): string {
 }
 
 export function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
-  if (options.storageSigner && options.storageSignerAddress) {
+  // Delegate the mode decision to the pure, unit-tested selector (bulletin #1452) so this
+  // function and __selectStorageProviderModeForTest can never disagree about which branch runs.
+  const mode = __selectStorageProviderModeForTest(options);
+  if (mode === "storageSigner") {
     // Committed-signer: once the slot provider fails on the first attempt,
     // every subsequent reconnect uses pool. Prevents signer drift mid-upload
     // (nonce/attribution would break if storage switched signers between chunks).
@@ -722,13 +749,15 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
       }
     };
   }
-  // External signer (options.signer + options.signerAddress): use getSignerProvider for
-  // Bulletin storage when no dedicated slot signer is available. This supports
-  // programmatic callers (playground-cli, library consumers) that pass their own
-  // PolkadotSigner without a pre-allocated BulletInAllowance slot key.
-  if (options.signer && options.signerAddress)
+  // External signer (options.signer + options.signerAddress, NOT session-backed): use
+  // getSignerProvider for Bulletin storage when no dedicated slot signer is available.
+  // This supports programmatic callers (playground-cli, library consumers) that pass
+  // their own PolkadotSigner without a pre-allocated BulletInAllowance slot key. A
+  // phone-backed session signer with no slot (mode "pool" — bulletin #1452) falls
+  // through below.
+  if (mode === "signer")
     return () => getSignerProvider(options.signer!, options.signerAddress!);
-  if (options.mnemonic)
+  if (mode === "direct")
     return () => getDirectProvider(options.mnemonic!, options.derivationPath);
   return () => getProvider();
 }
@@ -996,8 +1025,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   // existence + non-expiry ONLY — we do NOT gate on the txs/bytes allowance
   // counters. The Bulletin `store` extrinsic uses soft limits, so an authorized,
   // unexpired account stores fine even with exhausted/zeroed quota counters
-  // (the allowance fields are no longer the gate). Deploy no longer
-  // self-authorizes (#745); fail fast if there is no active authorization —
+  // (the allowance fields are no longer the gate; an exhausted-but-unexpired
+  // account is warned about below — bulletin #1547 — not blocked). Deploy no
+  // longer self-authorizes (#745); fail fast if there is no active authorization —
   // it must be granted out-of-band (testnet faucet / personhood / pool bootstrap).
   //
   // Arm order matters: the raw papi read can throw *synchronously* on a destroyed
@@ -1022,6 +1052,25 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   const sufficient = isAuthorizationSufficient(uploadAuth, currentBlockNum);
   if (!sufficient) {
     throw new NonRetryableError(`Account ${ss58} has no active Bulletin authorization (missing or expired). Request authorization on-chain (testnet faucet / personhood / pool bootstrap), then retry.`);
+  }
+
+  // bulletin #1547 (check/warn half only): existence+expiry alone doesn't mean full
+  // priority — an unexpired account can still be out of transaction/byte quota, which
+  // drops it behind accounts that have headroom (never a store failure, only a priority
+  // loss; see quotaHeadroomDimensions' comment in pool.ts). Now that chunks are known,
+  // size the real need (one tx per chunk; total bytes as an upper bound) and warn.
+  // polkadot-app-deploy never self-authorizes Bulletin storage, so unlike bulletin-deploy
+  // this never re-grants — reuses uploadAuth/currentBlockNum read just above instead of a
+  // second RPC round trip.
+  const authResult = await ensureAuthorized(unsafeApi, ss58 as string, "storage account", {
+    needs: { transactions: chunks.length, bytes: BigInt(totalBytes) },
+    precheckedAuth: { auth: uploadAuth, currentBlock: currentBlockNum },
+  });
+  if (authResult.quotaExhausted) {
+    console.warn(
+      `   Warning: Bulletin storage account ${ss58}'s allowance is exhausted (${authResult.dimensions.join("/")}). ` +
+      `polkadot-app-deploy does not auto-reauthorize, so uploads are BEST EFFORT — queued behind accounts that still have quota.`,
+    );
   }
 
   let reconnectionsUsed = 0;
@@ -2027,6 +2076,22 @@ export function applyManifestFetchAttributes(fetched: { source: string; attempts
 //
 // Spec: docs-internal/superpowers/specs/2026-05-07-incremental-upload-v2-design.md
 // Plan: docs-internal/superpowers/plans/2026-05-07-incremental-upload-v2.md (Task 12)
+
+/**
+ * `present === null` is "could not measure", not "absent". Re-upload is the
+ * remedy for a chunk that is gone, not one we could not read (bulletin #1445).
+ */
+export function partitionFinalityProbe(
+  results: { cid: string; present: boolean | null; failureReason?: string }[],
+): { absent: string[]; indeterminate: string[]; reason?: string } {
+  const indeterminate = results.filter(r => r.present === null);
+  return {
+    absent: results.filter(r => r.present === false).map(r => r.cid),
+    indeterminate: indeterminate.map(r => r.cid),
+    reason: indeterminate[0]?.failureReason,
+  };
+}
+
 export async function storeDirectoryV2(
   directoryPath: string,
   opts: StoreDirectoryOptions = {}
@@ -2086,7 +2151,7 @@ export async function storeDirectoryV2(
   // old positions). Backend chosen by jsMerkle option, matching the legacy
   // storeDirectory's behaviour:
   //   - jsMerkle: true       → JS importer (works everywhere, no daemon)
-  //   - jsMerkle: false      → Kubo, hard-required (throws if ipfs not on PATH)
+  //   - jsMerkle: false      → Kubo (throws if ipfs not on PATH; a failed ipfs call falls back to JS)
   //   - jsMerkle: undefined  → smart default: Kubo if available, JS otherwise
   // The same buildOrderedCar runs over both backends' output, so the resulting
   // CAR is byte-identical regardless of merkleizer choice for identical content.
@@ -2353,13 +2418,20 @@ export async function storeDirectoryV2(
     const grandpaCids = [...phaseB.chunkCids, storageCid];
     console.log(`   Finality check: probing ${grandpaCids.length} chunks at chain-finalised state (aka GRANDPA)...`);
     const finalityResults = await probeChunks(grandpaCids, { client: phaseALiveProvider.client!, atFinalized: true });
-    let missingCids = new Set(finalityResults.filter(r => r.present === false).map(r => r.cid));
+    const { absent, indeterminate, reason } = partitionFinalityProbe(finalityResults);
+    let missingCids = new Set(absent);
     setDeployAttribute("deploy.probe.finality_miss_count", missingCids.size);
+    setDeployAttribute("deploy.probe.finality_indeterminate_count", indeterminate.length);
+    if (indeterminate.length > 0) {
+      console.log(`   ${indeterminate.length} of ${grandpaCids.length} chunks could not be probed (${reason}); finality unverified for those`);
+    }
 
     let reuploadCount = 0;
     let laggingFinalityCount = 0;
     if (missingCids.size === 0) {
-      console.log(`   ✓ All ${grandpaCids.length} chunks finalised`);
+      console.log(indeterminate.length === 0
+        ? `   ✓ All ${grandpaCids.length} chunks finalised`
+        : `   ${grandpaCids.length - indeterminate.length} of ${grandpaCids.length} chunks finalised, ${indeterminate.length} unverified`);
     } else {
       // Step 2: wait for natural finalisation. Phase B's just-landed chunks
       // (and especially the root, which was the LAST extrinsic submitted)
@@ -2623,7 +2695,7 @@ export async function storeDirectoryV2(
   } else if (rootProbe[0]?.present === true) {
     console.log(`   ✓ Root finalised on chain`);
   } else {
-    console.log(`   Root re-check inconclusive (RPC error) — GRANDPA probe above already verified; continuing.`);
+    console.log(`   Root finality unverified (probe returned no answer); content is in best-block, continuing.`);
   }
 
   return { storageCid, ipfsCid: phaseB.cid, carBytes: phaseB.carBytes };
@@ -2637,6 +2709,16 @@ export interface DeployOptions {
   signer?: PolkadotSigner;
   /** SS58 address for the signer (required when signer is provided). */
   signerAddress?: string;
+  /**
+   * Internal: `signer`/`signerAddress` were resolved from a phone-backed login
+   * session (`resolveDeployActors`'s `actors.worker.source === "session"`), as
+   * opposed to a local `--suri`/mnemonic-derived worker or a caller-injected
+   * `PolkadotSigner` (programmatic callers, e.g. playground-cli). Set by
+   * `deployActorsToSignerOptions`. Storage routing must not silently sign
+   * Bulletin chunks with this signer when no allowance slot is available —
+   * a session signer with no slot must route to pool instead. See bulletin #1452.
+   */
+  sessionSigner?: boolean;
   /** Slot-account signer for Bulletin chunk uploads. When set, used instead of pool/mnemonic
    *  for storage. DotNS still uses signer/signerAddress. */
   storageSigner?: PolkadotSigner;
@@ -3175,12 +3257,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         isTestnet: isTestnetEnv,
         sessionPresent: hasSession,
       });
-      options = {
-        ...options,
-        signer: actors.worker.signer,
-        signerAddress: actors.worker.address,
-        ...(actors.recipientH160 ? { transferTo: actors.recipientH160 } : {}),
-      };
+      options = { ...options, ...deployActorsToSignerOptions(actors) };
       sessionCleanup = actors.worker.destroy.bind(actors.worker);
       if (actors.worker.source === "session") resolvedUserSession = actors.worker;
       if (actors.recipientH160) {

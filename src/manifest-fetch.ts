@@ -25,7 +25,12 @@ import { parseManifest, type EmbeddedManifest, MANIFEST_DIR, MANIFEST_FILENAME }
 // from environments.ts's resolveEndpoints().ipfs, threaded through
 // storeDirectoryV2's opts.gateway). Without a gateway, fetchPreviousManifest
 // short-circuits to heuristic_fallback rather than silently hitting a
-// hardcoded URL pointing at the wrong environment.
+// hardcoded URL pointing at the wrong environment. That short-circuit is
+// itself distinguishable from "every configured gateway failed" (bulletin
+// #1537) via a dedicated reason string plus a dedicated manifest.fetch span
+// outcome value — search fetchPreviousManifest for no_gateway_configured.
+// A caller that forgets to pass a gateway now gets a loud, greppable signal
+// instead of silently collapsing into the same output as a real outage.
 // Per-tier timeout — patience pattern matching dotli/polkadot-desktop.
 // Was 5s historically; that turned out to be too short when the gateway
 // was hitting back-pressure. dotli polls indefinitely at 10s interval;
@@ -478,6 +483,29 @@ export async function fetchManifestFromChain(
 
 // ───────────────────────────── Public API ──────────────────────────────────
 
+// Shared attribute set for `manifest.fetch` parent spans — used by both the
+// no-gateway short-circuit and the per-gateway tier-ladder loop below, so the
+// two never drift apart (renaming/adding an attribute needs one edit, not two).
+// `budget_ms` is intentionally not part of this shared set: only the
+// per-gateway path spends a timeout budget, so it's added at that call site.
+function manifestFetchAttributes(params: {
+  gateway: string;
+  cid: string;
+  outcome: string;
+  attempts: number;
+  bytes: number;
+  elapsedMs: number;
+}): Record<string, string> {
+  return {
+    "manifest.fetch.gateway": params.gateway,
+    "manifest.fetch.cid": params.cid,
+    "manifest.fetch.outcome": params.outcome,
+    "manifest.fetch.attempts": String(params.attempts),
+    "manifest.fetch.bytes": String(params.bytes),
+    "manifest.fetch.elapsed_ms": String(params.elapsedMs),
+  };
+}
+
 export async function fetchPreviousManifest(
   prevContenthash: string | null,
   options: FetchOptions = {}
@@ -533,6 +561,41 @@ export async function fetchPreviousManifest(
   //    span; each range attempt inside it gets a `manifest.fetch.tier` child span.
   const gatewayList = (options.gateways ?? (options.gateway ? [options.gateway] : []))
     .map((g) => g.replace(/\/$/, ""));
+
+  // No gateway configured at all — distinct from "every configured gateway
+  // failed" (bulletin #1537). Without this short-circuit the loop below never
+  // executes and silently falls through to the exact same source + a generic
+  // "unknown" reason as a real outage — a caller that forgot to pass a
+  // gateway becomes indistinguishable from a real outage, since nothing in
+  // the return value, logs, or Sentry could tell the two apart. Emit a span
+  // with a distinguishing outcome attribute so the no-gateway case is
+  // observable in traces too, not only in the code that reads the return
+  // value.
+  if (gatewayList.length === 0) {
+    const cid = prevContenthash.slice(0, 12);
+    Sentry.startSpan(
+      {
+        op: "manifest.fetch",
+        name: `manifest fetch ${cid} (no gateway)`,
+        attributes: manifestFetchAttributes({
+          gateway: "",
+          cid,
+          outcome: "no_gateway_configured",
+          attempts: 0,
+          bytes: 0,
+          elapsedMs: 0,
+        }),
+      },
+      () => {}
+    );
+    return {
+      source: "heuristic_fallback",
+      reason: "no gateway configured",
+      attempts: 0,
+      bytesDownloaded: 0,
+    };
+  }
+
   const budget = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const start = Date.now();
   let lastReason = "unknown";
@@ -547,12 +610,14 @@ export async function fetchPreviousManifest(
     const gateway = gatewayRaw.replace(/\/ipfs\/?$/, "");
     const url = `${gateway}/ipfs/${prevContenthash}`;
     const gatewayStart = Date.now();
+    const cid = prevContenthash.slice(0, 12);
 
     // Parent span groups all tier attempts for one gateway. Attributes capture
     // the gateway URL and final outcome so you can filter without opening children.
     //
     // Span op: `manifest.fetch`
-    // Attributes:
+    // Attributes (see manifestFetchAttributes for the shared set; budget_ms
+    // is added here since only this path spends a timeout budget):
     //   manifest.fetch.gateway    — normalised gateway base URL
     //   manifest.fetch.cid        — first 12 chars of CID
     //   manifest.fetch.budget_ms  — total budget in ms
@@ -563,19 +628,25 @@ export async function fetchPreviousManifest(
     const tierResult = await Sentry.startSpan(
       {
         op: "manifest.fetch",
-        name: `manifest fetch ${prevContenthash.slice(0, 12)}`,
+        name: `manifest fetch ${cid}`,
         attributes: {
           "manifest.fetch.gateway": gateway,
-          "manifest.fetch.cid": prevContenthash.slice(0, 12),
+          "manifest.fetch.cid": cid,
           "manifest.fetch.budget_ms": String(budget),
         },
       },
       async (span) => {
         const result = await fetchAcrossTiers(url, budget, start);
-        span.setAttribute("manifest.fetch.outcome", result.outcome);
-        span.setAttribute("manifest.fetch.attempts", String(result.attempts));
-        span.setAttribute("manifest.fetch.bytes", String(result.bytesDownloaded));
-        span.setAttribute("manifest.fetch.elapsed_ms", String(Date.now() - gatewayStart));
+        span.setAttributes(
+          manifestFetchAttributes({
+            gateway,
+            cid,
+            outcome: result.outcome,
+            attempts: result.attempts,
+            bytes: result.bytesDownloaded,
+            elapsedMs: Date.now() - gatewayStart,
+          })
+        );
         return result;
       }
     );

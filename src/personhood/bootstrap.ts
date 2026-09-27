@@ -27,6 +27,7 @@ import { DOTNS_CONTEXT_BYTES, PGAS_ASSET_ID, PEOPLE_MEMBER_IDENTIFIER_HEX } from
 import { deriveMemberEntropy, deriveMemberKey } from "./member-key.js";
 import { bindPersonalIdToAccount } from "./bind-personal-id.js";
 import { claimPgas, type BuildRingProof } from "./claim-pgas.js";
+import { makeOneShotBuildRingProof } from "./ring-proof.js";
 import { bindPaidAliasToAccount } from "./bind-paid-alias.js";
 import { runChainPrereqProbes } from "./chain-prereqs.js";
 
@@ -367,10 +368,7 @@ export async function runBootstrap({
       });
     }
 
-    const buildRingProof: BuildRingProof = async ({ ringExponent, members, context, msg }) => {
-      const result = verifiable.one_shot(ringExponent, memberEntropy, members, context, msg);
-      return { proof: result.proof, alias: result.alias };
-    };
+    const buildRingProof: BuildRingProof = makeOneShotBuildRingProof(verifiable.one_shot, memberEntropy);
 
     // Step 3: claim PGAS if balance insufficient.
     if (currentState.pgasBalance < currentState.paidAliasFee) {

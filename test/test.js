@@ -17,7 +17,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
@@ -30,8 +30,8 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingTransactions, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
-import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
+import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
 import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest, classifyFinalityGap, probeFinalityGap, getBestBlockNumber } from "../dist/chunk-probe.js";
@@ -8500,6 +8500,73 @@ describe("remaining quota helpers", () => {
     assert.strictEqual(remainingTransactions(exhausted), 0n,
       ">> FAIL: remainingTransactions: an over-consumed allowance must report 0, never a negative number");
   });
+
+  test("remainingStoreBytes subtracts STORE bytes used, ignoring the renew counter", () => {
+    const auth = {
+      expiration: 10, transactionsAllowance: 10, transactionsUsed: 0,
+      bytesAllowance: 1_000n, bytesUsed: 400n, bytesPermanentUsed: 900n,
+    };
+    assert.strictEqual(remainingStoreBytes(auth), 600n,
+      ">> FAIL: remainingStoreBytes: must report bytesAllowance - bytesUsed (the priority-boost-relevant STORE counter), ignoring bytesPermanentUsed entirely — that's remainingRenewBytes' job");
+  });
+
+  test("remainingStoreBytes clamps at zero instead of reporting a negative budget", () => {
+    const over = {
+      expiration: 10, transactionsAllowance: 10, transactionsUsed: 0,
+      bytesAllowance: 100n, bytesUsed: 250n, bytesPermanentUsed: 0n,
+    };
+    assert.strictEqual(remainingStoreBytes(over), 0n,
+      ">> FAIL: remainingStoreBytes: store bytes can legitimately exceed the allowance (the pallet saturates, never gates) — must report 0, never negative");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// quotaHeadroomDimensions — bulletin #1547: which quota dimension(s) of `auth`
+// fall short of a caller's stated needs. Distinct from isAuthorizationSufficient
+// (expiry-only, unchanged) — this only compares quota, and callers must confirm
+// existence + non-expiry separately first.
+// ---------------------------------------------------------------------------
+describe("quotaHeadroomDimensions (bulletin #1547)", () => {
+  function mkAuth({ txsAllowance = 1000, txsUsed = 0, bytesAllowance = 100_000_000n, bytesUsed = 0n } = {}) {
+    return {
+      expiration: 999_999, transactionsAllowance: txsAllowance, transactionsUsed: txsUsed,
+      bytesAllowance, bytesUsed, bytesPermanentUsed: 0n,
+    };
+  }
+
+  test("fully sufficient auth (plenty of both) reports no exhausted dimensions", () => {
+    const auth = mkAuth();
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 5, bytes: 1_000n }), [],
+      ">> FAIL: quotaHeadroomDimensions: an account with far more than needed in both dimensions must report empty");
+  });
+
+  test("transactions below needs is flagged, bytes untouched", () => {
+    const auth = mkAuth({ txsAllowance: 10, txsUsed: 9 }); // 1 left
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 5 }), ["transactions"],
+      ">> FAIL: quotaHeadroomDimensions: 1 remaining tx against a need of 5 must flag 'transactions'");
+  });
+
+  test("bytes below needs is flagged only when needs.bytes is provided", () => {
+    const auth = mkAuth({ bytesAllowance: 1_000n, bytesUsed: 900n }); // 100 left
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1, bytes: 500n }), ["bytes"],
+      ">> FAIL: quotaHeadroomDimensions: 100 remaining store bytes against a need of 500 must flag 'bytes'");
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1 }), [],
+      ">> FAIL: quotaHeadroomDimensions: omitting needs.bytes must skip the bytes check entirely, not treat it as a need of 0");
+  });
+
+  test("both dimensions below needs are both flagged", () => {
+    const auth = mkAuth({ txsAllowance: 10, txsUsed: 10, bytesAllowance: 1_000n, bytesUsed: 1_000n });
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1, bytes: 1n }), ["transactions", "bytes"],
+      ">> FAIL: quotaHeadroomDimensions: an account exhausted on both counters must report both dimensions");
+  });
+
+  test("DEFAULT_AUTHORIZATION_NEEDS is small enough that a fresh 1000tx/100MB grant clears it", () => {
+    const auth = mkAuth();
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth), [],
+      ">> FAIL: DEFAULT_AUTHORIZATION_NEEDS must not falsely flag a freshly-granted, fully-unused authorization");
+    assert.deepStrictEqual(DEFAULT_AUTHORIZATION_NEEDS, { transactions: 1 },
+      ">> FAIL: DEFAULT_AUTHORIZATION_NEEDS must stay a small, documented constant (regression pin — a silent bump here changes every pre-chunking call site's behavior)");
+  });
 });
 
 describe("fetchPoolAuthorizations reads authorization state through the runtime API", () => {
@@ -8566,6 +8633,63 @@ describe("ensureAuthorized quota awareness", () => {
       /cannot grant it/,
       "should throw mainnet error when auth is expired",
     );
+  });
+
+  // bulletin #1547 (check/warn half only): an unexpired-but-quota-low account is a
+  // DIFFERENT, softer condition than missing/expired — the chain never gates `store` on
+  // quota. polkadot-app-deploy never self-authorizes, so unlike bulletin-deploy there is
+  // no testnet top-up branch here at all: every quota-exhausted-but-unexpired account
+  // gets the same result — warn via the return value, never throw, never grant.
+  test("unexpired but quota-exhausted → returns quotaExhausted:true naming the dimension, and does NOT throw", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 10, txsUsed: 10 }); // 0 left, unexpired
+    const api = buildApi({ auth }); // no tx.* stub at all — a grant-path bug would crash on missing tx.*
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 5 } });
+    assert.deepStrictEqual(result, { quotaExhausted: true, dimensions: ["transactions"] },
+      ">> FAIL: bulletin #1547: an exhausted, unexpired account must report quotaExhausted:true naming the dimension, and must NOT throw");
+  });
+
+  test("never grants: an api stub with no tx.* at all must not be touched for a quota-exhausted account", async () => {
+    _resetTestnetCacheForTests();
+    // Deliberately no `tx` property anywhere on this stub. If ensureAuthorized ever tried
+    // to sign+submit an authorize_account extrinsic (the bulletin-deploy behavior this
+    // port explicitly excludes), it would throw a TypeError reading api.tx.* — this test
+    // pins that it never reaches for it.
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1, txsUsed: 1, bytesAllowance: 10n, bytesUsed: 10n });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 5, bytes: 100n } });
+    assert.strictEqual(result.quotaExhausted, true);
+    assert.deepStrictEqual(result.dimensions.sort(), ["bytes", "transactions"],
+      ">> FAIL: bulletin #1547: both dimensions exhausted must both be reported");
+  });
+
+  test("sufficient quota (needs met) → returns quotaExhausted:false", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1000, txsUsed: 0 });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 500 } });
+    assert.deepStrictEqual(result, { quotaExhausted: false, dimensions: [] },
+      ">> FAIL: bulletin #1547: a fully-sufficient account must report quotaExhausted:false");
+  });
+
+  test("default needs (no opts.needs passed) does not flag a freshly-granted account", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1000, txsUsed: 0 });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test"); // no needs at all — exercises DEFAULT_AUTHORIZATION_NEEDS
+    assert.deepStrictEqual(result, { quotaExhausted: false, dimensions: [] });
+  });
+
+  test("precheckedAuth skips the read entirely", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 10, txsUsed: 10 });
+    const api = { ...authApi(async () => { throw new Error("must not read — precheckedAuth was supplied"); }) };
+    const result = await ensureAuthorized(api, ADDRESS, "test", {
+      needs: { transactions: 1 },
+      precheckedAuth: { auth: { expiration: MOCK_BLOCK + 100, transactionsAllowance: 10, transactionsUsed: 10, bytesAllowance: 100n, bytesUsed: 0n, bytesPermanentUsed: 0n }, currentBlock: MOCK_BLOCK },
+    });
+    assert.deepStrictEqual(result, { quotaExhausted: true, dimensions: ["transactions"] },
+      ">> FAIL: bulletin #1547: precheckedAuth must be used directly instead of re-reading via the api");
   });
 });
 
@@ -9488,6 +9612,71 @@ function connectionErrorSubscribable() {
 const stubSigner = {};
 const STUB_SS58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
 const ONE_BYTE_CHUNK = new Uint8Array([0x42]);
+
+// ---------------------------------------------------------------------------
+// storeChunkedContent's quota-exhausted warning (bulletin #1547, check/warn
+// half only). polkadot-app-deploy never self-authorizes Bulletin storage, so
+// unlike bulletin-deploy there is no telemetry/re-grant path here — just a
+// console.warn and a guaranteed non-throw.
+// ---------------------------------------------------------------------------
+describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/warn half)", () => {
+  function authStubApi(authFields) {
+    return {
+      query: { System: { Number: { getValue: async () => 1000 } } },
+      ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999, ...authFields }), { can_store: async () => true }),
+      tx: {
+        TransactionStorage: {
+          store_with_cid_config: () => ({
+            signSubmitAndWatch: (_signer, _opts) => normalSubscribable(),
+          }),
+        },
+      },
+    };
+  }
+
+  test("quota-exhausted, unexpired account → warns, does NOT throw", async () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      // txsAllowance:1/txsUsed:1 → 0 remaining, unexpired → quota-only exhaustion (transactions).
+      const api = authStubApi({ txsAllowance: 1, txsUsed: 1, bytesAllowance: 100_000_000n, bytesUsed: 0n });
+      await storeChunkedContent([ONE_BYTE_CHUNK], {
+        client: { destroy() {} },
+        unsafeApi: api,
+        signer: stubSigner,
+        ss58: STUB_SS58,
+        fetchNonce: async () => 100,
+      });
+      assert.ok(warnings.some(w => /exhausted/i.test(w)),
+        ">> FAIL: bulletin #1547: a one-line warning naming the exhausted allowance must be printed");
+      assert.ok(!warnings.some(w => /granting|granted|signAndSubmit/i.test(w)),
+        ">> FAIL: bulletin #1547 (check/warn half only): the warning must not claim or perform any re-authorization");
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+
+  test("sufficient quota → no warning, deploy proceeds silently on the auth front", async () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      const api = authStubApi({ txsAllowance: 1000, txsUsed: 0, bytesAllowance: 100_000_000n, bytesUsed: 0n });
+      await storeChunkedContent([ONE_BYTE_CHUNK], {
+        client: { destroy() {} },
+        unsafeApi: api,
+        signer: stubSigner,
+        ss58: STUB_SS58,
+        fetchNonce: async () => 100,
+      });
+      assert.ok(!warnings.some(w => /exhausted/i.test(w)),
+        ">> FAIL: bulletin #1547: a fully-sufficient account must not print an exhausted-quota warning");
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
 
 describe("watchTransaction found:false handling", () => {
   test("normal success: reconnect NOT called", async () => {
@@ -11696,6 +11885,25 @@ describe("merkle backends — JS vs Kubo (incremental-upload-v2)", () => {
     } finally { fs.rmSync(dir, { recursive: true }); }
   });
 
+  test("a failing ipfs call falls back to the JS backend (bulletin #1557)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kubo-fallback-"));
+    const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "kubo-shim-"));
+    const prevPath = process.env.PATH;
+    try {
+      buildFixture({ targetDir: dir, seed: "kubo-fallback" });
+      fs.writeFileSync(path.join(shimDir, "ipfs"), '#!/bin/sh\necho "simulated ipfs failure" >&2\nexit 1\n', { mode: 0o755 });
+      process.env.PATH = `${shimDir}${path.delimiter}${prevPath}`;
+
+      const got = await merkleizeBackend(dir, true, "Phase B");
+      const expected = await merkleizeJSBackend(dir);
+      assert.equal(got.rootCid, expected.rootCid, ">> FAIL: kubo fallback: rootCid diverged from the JS backend");
+    } finally {
+      process.env.PATH = prevPath;
+      fs.rmSync(dir, { recursive: true });
+      fs.rmSync(shimDir, { recursive: true });
+    }
+  });
+
   test("hidden directories (.bulletin-deploy/) are included in both JS and Kubo backends", { skip: !hasIPFS() }, async () => {
     // Regression test for the Kubo --hidden flag fix: before the fix, ipfs add -r
     // without --hidden silently excluded dot-prefixed directories, so the embedded
@@ -11860,6 +12068,46 @@ describe("manifest-fetch (gateway-based)", () => {
     // No domain → no cache attempt. Hardcoded fake gateway that won't resolve.
     const r = await fetchPreviousManifest("bafyx", { gateway: "https://unreachable.invalid", timeoutMs: 100 });
     assert.equal(r.source, "heuristic_fallback");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1537: fetchPreviousManifest must distinguish "no gateway
+// configured" from "every configured gateway failed". Both used to collapse
+// to the same source + reason ("heuristic_fallback" / "all gateways
+// exhausted: unknown"), so a caller that forgot to pass a gateway got
+// byte-identical output to a real outage.
+// ---------------------------------------------------------------------------
+describe("manifest-fetch: no-gateway vs all-gateways-failed distinguishability (bulletin #1537)", () => {
+  test("no gateway configured yields a reason distinct from a failed gateway's reason", async () => {
+    const noGateway = await fetchPreviousManifest("bafyx1534", {});
+    const failedGateway = await fetchPreviousManifest("bafyx1534", {
+      gateway: "https://unreachable.invalid",
+      timeoutMs: 100,
+    });
+
+    assert.equal(noGateway.source, "heuristic_fallback",
+      ">> FAIL: bulletin #1537 no-gateway source: fetchPreviousManifest with no gateway configured must still return heuristic_fallback");
+    assert.equal(failedGateway.source, "heuristic_fallback",
+      ">> FAIL: bulletin #1537 failed-gateway source: fetchPreviousManifest with a failing gateway must return heuristic_fallback");
+    assert.notEqual(noGateway.reason, failedGateway.reason,
+      ">> FAIL: bulletin #1537 distinguishability: no-gateway reason must differ from the all-gateways-failed reason, or a caller that forgot to pass a gateway is indistinguishable from a real outage");
+    assert.doesNotMatch(noGateway.reason, /all gateways exhausted/,
+      ">> FAIL: bulletin #1537 distinguishability: no-gateway reason must not reuse the all-gateways-exhausted category, or a missing gateway still reads as an outage");
+    assert.doesNotMatch(failedGateway.reason, /no gateway configured/,
+      ">> FAIL: bulletin #1537 distinguishability: a configured-but-failing gateway must not be reported as unconfigured");
+  });
+
+  test("no-gateway reason string names the misconfiguration explicitly", async () => {
+    const r = await fetchPreviousManifest("bafyx1534b", {});
+    assert.match(r.reason, /no gateway configured/i,
+      ">> FAIL: bulletin #1537 no-gateway reason wording: reason string must explicitly name the missing-gateway misconfiguration, not a generic exhaustion message");
+  });
+
+  test("no-gateway case is observable via a distinguishing span attribute, not just the return value", () => {
+    const src = fs.readFileSync("src/manifest-fetch.ts", "utf8");
+    assert.match(src, /\boutcome:\s*["']no_gateway_configured["']/,
+      ">> FAIL: bulletin #1537 telemetry: manifest-fetch.ts must pass outcome: \"no_gateway_configured\" into the manifest.fetch span attributes so the no-gateway case is visible in Sentry traces, not only in the return value");
   });
 });
 
@@ -12221,6 +12469,28 @@ describe("chunk-probe (incremental-upload-v2)", () => {
     const r = await probeChunks([PROBE_CID1, PROBE_CID2], { client });
     assert.equal(r[0].present, true);
     assert.equal(r[1].present, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// partitionFinalityProbe (bulletin #1445) — present: null is "could not
+// measure", not "absent". A probe that returned null for every chunk must
+// not be reported as a pass.
+// ---------------------------------------------------------------------------
+describe("partitionFinalityProbe (bulletin #1445)", () => {
+  const r = (cid, present, failureReason) => ({ cid, present, ...(failureReason ? { failureReason } : {}) });
+
+  test("an unmeasurable chunk is reported, not treated as absent", () => {
+    const { absent, indeterminate, reason } = partitionFinalityProbe(["a", "b", "c"].map((c) => r(c, null, "metadata_error")));
+    assert.deepStrictEqual(absent, [], ">> FAIL: null routed into absent would re-upload chunks nobody said were missing (bulletin #1445)");
+    assert.deepStrictEqual(indeterminate, ["a", "b", "c"], ">> FAIL: null must be reported, or the checkmark prints for a probe that never ran (bulletin #1445)");
+    assert.equal(reason, "metadata_error", ">> FAIL: the failure reason must survive for triage");
+  });
+
+  test("only a measured absence is absent", () => {
+    const { absent, indeterminate } = partitionFinalityProbe([r("a", true), r("b", false), r("c", null, "rpc_error")]);
+    assert.deepStrictEqual(absent, ["b"], ">> FAIL: only present === false may re-upload");
+    assert.deepStrictEqual(indeterminate, ["c"], ">> FAIL: only present === null is indeterminate");
   });
 });
 
@@ -21609,6 +21879,89 @@ describe("regression guard: claim-pgas.ts must not contain hardcoded extension e
     assert.ok(hasSpecRef,
       ">> FAIL: regression-guard §4.3: claim-pgas.ts source must reference docs-internal/dotns-bootstrap-handover.md " +
       "near buildImplicationExclude so future maintainers have a path to the spec");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1360: makeOneShotBuildRingProof pins the one_shot(ringExponent,
+// memberEntropy, members, context, msg) argument order in one place, so the
+// two call sites (src/dotns.ts, src/personhood/bootstrap.ts) cannot drift
+// independently. bulletin-deploy's own #1229 was exactly this class of drift
+// in a third (tools/) call site that polkadot-app-deploy doesn't have.
+// ---------------------------------------------------------------------------
+describe("makeOneShotBuildRingProof (bulletin #1360)", () => {
+  test("calls one_shot with (ringExponent, memberEntropy, members, context, msg) in that exact order", async () => {
+    const { makeOneShotBuildRingProof } = await import("../dist/personhood/ring-proof.js");
+    const memberEntropy = new Uint8Array([0xaa, 0xaa, 0xaa, 0xaa]);
+    const members = new Uint8Array([0xbb, 0xbb, 0xbb]);
+    const context = new Uint8Array([0xcc, 0xcc]);
+    const msg = new Uint8Array([0xdd]);
+    const ringExponent = 9;
+
+    let capturedArgs = null;
+    const fakeOneShot = (...args) => {
+      capturedArgs = args;
+      return { proof: new Uint8Array([1]), alias: new Uint8Array([2]), decoy: "should not leak through" };
+    };
+
+    const buildRingProof = makeOneShotBuildRingProof(fakeOneShot, memberEntropy);
+    const result = await buildRingProof({ ringExponent, members, context, msg });
+
+    assert.equal(capturedArgs.length, 5,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): one_shot must be called with exactly 5 positional args");
+    assert.equal(capturedArgs[0], ringExponent,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 0 must be ringExponent — this is the class of drift bulletin's #1229 hit (ringExponent dropped, everything shifted left)");
+    assert.equal(capturedArgs[1], memberEntropy,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 1 must be memberEntropy");
+    assert.equal(capturedArgs[2], members,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 2 must be members");
+    assert.equal(capturedArgs[3], context,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 3 must be context");
+    assert.equal(capturedArgs[4], msg,
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): arg 4 must be msg");
+
+    assert.deepEqual(Object.keys(result).sort(), ["alias", "proof"],
+      ">> FAIL: makeOneShotBuildRingProof (bulletin #1360): return value must be exactly {proof, alias} — no extra fields from one_shot's result should leak through");
+    assert.deepEqual(result.proof, new Uint8Array([1]));
+    assert.deepEqual(result.alias, new Uint8Array([2]));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1360 regression guard: verifiablejs's one_shot must only ever be
+// called from src/personhood/ring-proof.ts. If a new call site hand-rolls its
+// own `one_shot(...)` call instead of going through makeOneShotBuildRingProof,
+// the argument-order drift class becomes possible again. Scoped to src/ only
+// — polkadot-app-deploy has no tools/reprove-alias.mjs equivalent.
+// ---------------------------------------------------------------------------
+describe("regression guard: verifiable.one_shot must only be called from ring-proof.ts (bulletin #1360)", () => {
+  test("no src/ file other than src/personhood/ring-proof.ts calls one_shot(", () => {
+    const offenders = [];
+
+    function walk(dir) {
+      for (const name of fs.readdirSync(dir)) {
+        const p = path.join(dir, name);
+        const st = fs.statSync(p);
+        if (st.isDirectory()) {
+          walk(p);
+          continue;
+        }
+        if (!/\.ts$/.test(name)) continue;
+        if (p.endsWith(path.join("src", "personhood", "ring-proof.ts"))) continue;
+        // Strip backtick-quoted spans first so doc-comment mentions like
+        // `` `verifiablejs.one_shot(...)` `` (src/personhood/encoding.ts) don't
+        // count as a call — only look for an actual `one_shot(` call expression.
+        const text = fs.readFileSync(p, "utf8").replace(/`[^`]*`/g, "");
+        if (/\bone_shot\s*\(/.test(text)) offenders.push(p);
+      }
+    }
+
+    walk("src");
+
+    assert.deepEqual(offenders, [],
+      `>> FAIL: regression-guard bulletin #1360: found a direct one_shot(...) call outside src/personhood/ring-proof.ts in: ${offenders.join(", ")}. ` +
+      "Route ring-proof construction through makeOneShotBuildRingProof so the argument order (ringExponent, memberEntropy, members, context, msg) " +
+      "cannot drift independently between call sites.");
   });
 });
 

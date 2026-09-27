@@ -65,11 +65,11 @@ on:
         type: string
         default: ''
       gateway:
-        description: 'Gateway host used to construct browser URLs in the deployment summary and PR comment (e.g. "dot.li", "paseo.li"). Does not affect the deploy itself — only the URL displayed.'
+        description: 'FALLBACK ONLY (issue #1157): gateway host used to construct the browser URL in the deployment summary and PR comment (e.g. "dot.li", "paseo.li") when polkadot-app-deploy could not supply one itself — a cache-hit run (deploy step skipped) or a polkadot-app-deploy version older than the browserUrl output. On a normal run this is ignored in favor of the env-resolved URL polkadot-app-deploy already computed (correct gateway + previewnet query suffix). Does not affect the deploy itself — only the URL displayed.'
         type: string
         default: 'dot.li'
       gateway-path-style:
-        description: 'If true, build URLs as https://{gateway}/{domain}.dot (e.g. paseo.li/my-app.dot). If false (default), use subdomain form https://{domain}.{gateway} (e.g. my-app.paseo.li).'
+        description: 'Applies only to the FALLBACK URL (see `gateway`). If true, build it as https://{gateway}/{domain}.dot (e.g. paseo.li/my-app.dot). If false (default), use subdomain form https://{domain}.{gateway} (e.g. my-app.paseo.li).'
         type: boolean
         default: false
       comment-header:
@@ -317,9 +317,17 @@ jobs:
             DOMAIN="${DOMAIN%.dot}"
             echo "cid=${{ steps.cached-deploy.outputs.cid }}" >> "$GITHUB_OUTPUT"
             echo "domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
+            # Cache hit: the deploy step (and polkadot-app-deploy itself) never ran,
+            # so there's no env-resolved browser URL. Explicit empty value (not
+            # an omitted key) — see the "Compute browser URL" step for why.
+            echo "browserUrl=" >> "$GITHUB_OUTPUT"
           else
             echo "cid=${{ steps.deploy.outputs.cid }}" >> "$GITHUB_OUTPUT"
             echo "domain=${{ steps.deploy.outputs.domain }}" >> "$GITHUB_OUTPUT"
+            # #1157: env-resolved URL polkadot-app-deploy already computed — see
+            # the "Compute browser URL" step for how it's used and why it can
+            # be empty (older polkadot-app-deploy versions predate this output).
+            echo "browserUrl=${{ steps.deploy.outputs.browserUrl }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Compute browser URL
@@ -327,10 +335,21 @@ jobs:
         if: steps.final.outputs.domain != ''
         env:
           DOMAIN: ${{ steps.final.outputs.domain }}
+          # #1157: polkadot-app-deploy already resolves the env's real webGateway
+          # (assets/environments.json) plus the previewnet query suffix — reuse
+          # that ONE resolution rather than recomputing a second, out-of-sync
+          # URL here. RESOLVED_URL is only empty on a cache-hit run (the
+          # deploy step, and polkadot-app-deploy itself, never ran) or with a
+          # polkadot-app-deploy version older than the browserUrl output; the
+          # gateway/gateway-path-style inputs are the fallback for that case
+          # only and do NOT get the previewnet suffix.
+          RESOLVED_URL: ${{ steps.final.outputs.browserUrl }}
           GATEWAY: ${{ inputs.gateway }}
           PATH_STYLE: ${{ inputs.gateway-path-style }}
         run: |
-          if [ "$PATH_STYLE" = "true" ]; then
+          if [ -n "$RESOLVED_URL" ]; then
+            URL="$RESOLVED_URL"
+          elif [ "$PATH_STYLE" = "true" ]; then
             URL="https://${GATEWAY}/${DOMAIN}.dot"
           else
             URL="https://${DOMAIN}.${GATEWAY}"

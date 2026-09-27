@@ -51,6 +51,14 @@ export interface DeployResult {
   fullDomain: string;
   cid: string;
   ipfsCid?: string;
+  /**
+   * The env-aware browser URL for the deployed site — same value browserUrlFor()
+   * produces for the "Check it out here" console line (issue #1157). Exposed here
+   * so callers embedding deploy() as a library (and the CLI's GITHUB_OUTPUT write,
+   * and the reusable workflow's PR-comment step) can reuse the ONE resolution
+   * instead of recomputing a gateway URL from a hardcoded default.
+   */
+  browserUrl: string;
 }
 
 export type DeployContent = string | Uint8Array | Uint8Array[];
@@ -3874,11 +3882,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
       console.log("\n" + "=".repeat(60));
       console.log("DEPLOYMENT COMPLETE!");
       console.log("=".repeat(60));
+      const browserUrl = browserUrlFor(name, envId, envWebGateway);
       console.log("\nCheck it out here:");
-      console.log(`   ${browserUrlFor(name, envId, envWebGateway)}`);
+      console.log(`   ${browserUrl}`);
       console.log(`   ${name}.${envTld}  (in a Polkadot app: mobile or desktop)`);
       console.log("\n" + "=".repeat(60) + "\n");
-      return { domainName: name, fullDomain: `${name}.${envTld}`, cid: cid as string, ipfsCid };
+      return { domainName: name, fullDomain: `${name}.${envTld}`, cid: cid as string, ipfsCid, browserUrl };
     } finally {
       // Flush the module-level failover flag in case onStatusChanged fired after
       // the deploy span attribute was already written. Idempotent if already set.

@@ -524,6 +524,11 @@ try {
   if (output) {
     fs.appendFileSync(output, `cid=${result.cid}\n`);
     fs.appendFileSync(output, `domain=${result.domainName}\n`);
+    // #1157: same env-aware URL as the "Check it out here" console line —
+    // lets the reusable workflow's PR-comment/summary step reuse this
+    // resolution instead of recomputing a gateway URL from its own
+    // hardcoded-dot.li default.
+    fs.appendFileSync(output, `browserUrl=${result.browserUrl}\n`);
   }
 
   console.log(`CID: ${result.cid}`);

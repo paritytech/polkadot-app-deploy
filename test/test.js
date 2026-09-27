@@ -22937,6 +22937,103 @@ describe("browserUrlFor", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// DeployResult.browserUrl + its plumbing (#1157)
+// browserUrlFor() already resolved the env's real webGateway (and the
+// previewnet suffix) for the CLI's "Check it out here" console line — this
+// section pins that the SAME resolution reaches DeployResult, bin/polkadot-
+// app-deploy's GITHUB_OUTPUT, and the reusable workflow's PR-comment/summary
+// URL, instead of a second, out-of-sync mechanism recomputing a gateway URL
+// from a hardcoded default.
+// ---------------------------------------------------------------------------
+
+describe("DeployResult.browserUrl (#1157)", () => {
+  test("DeployResult interface declares browserUrl: string", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf-8");
+    const ifaceMatch = src.match(/export interface DeployResult \{[\s\S]*?\n\}/);
+    assert.ok(ifaceMatch, ">> FAIL: DeployResult.browserUrl: could not locate the DeployResult interface in src/deploy.ts");
+    assert.match(
+      ifaceMatch[0],
+      /browserUrl:\s*string;/,
+      ">> FAIL: DeployResult.browserUrl: DeployResult must declare `browserUrl: string` so library callers (and the CLI's GITHUB_OUTPUT write) can reuse the env-resolved URL instead of recomputing one"
+    );
+  });
+
+  test("deploy()'s return site reuses ONE browserUrlFor(...) call — no second URL mechanism", () => {
+    // Checked directly rather than via a fixed-size preceding-text window: a
+    // byte-distance window is brittle to unrelated edits between the `const
+    // browserUrl = ...` assignment and the return statement shifting the
+    // assignment out of the window and failing the test for a reason
+    // unrelated to the invariant.
+    const src = fs.readFileSync("src/deploy.ts", "utf-8");
+    const returnStatement = "return { domainName: name, fullDomain: `${name}.${envTld}`, cid: cid as string, ipfsCid, browserUrl }";
+    assert.ok(src.includes(returnStatement), ">> FAIL: browserUrl-single-resolution: deploy()'s DeployResult return must include a `browserUrl` field");
+    assert.ok(
+      !returnStatement.includes("browserUrlFor("),
+      ">> FAIL: browserUrl-single-resolution: the return statement must reuse the `browserUrl` variable, not call browserUrlFor(...) again"
+    );
+    assert.match(
+      src,
+      /const browserUrl = browserUrlFor\(name, envId, envWebGateway\);\s*\n\s*console\.log\("\\nCheck it out here:"\);\s*\n\s*console\.log\(`   \$\{browserUrl\}`\);/,
+      ">> FAIL: browserUrl-single-resolution: expected `const browserUrl = browserUrlFor(name, envId, envWebGateway)` assigned once, immediately followed by the console.log lines that print it — the SAME value must feed both the console output and the returned browserUrl field"
+    );
+  });
+
+  test("bin/polkadot-app-deploy writes browserUrl to GITHUB_OUTPUT", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+    assert.match(
+      bin,
+      /appendFileSync\(output, `browserUrl=\$\{result\.browserUrl\}\\n`\)/,
+      ">> FAIL: bin-browserUrl-output: bin/polkadot-app-deploy must append `browserUrl=${result.browserUrl}` to GITHUB_OUTPUT alongside cid/domain, so a consumer's reusable-workflow step can read the env-resolved URL"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: browser-URL step prefers the CLI-resolved URL over the gateway fallback", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const stepMatch = wf.match(/- name: Compute browser URL[\s\S]*?(?=\n {6}- name:|\Z)/);
+    assert.ok(stepMatch, ">> FAIL: workflow-browser-url: could not locate the 'Compute browser URL' step");
+    const step = stepMatch[0];
+    assert.match(
+      step,
+      /RESOLVED_URL:\s*\$\{\{\s*steps\.final\.outputs\.browserUrl\s*\}\}/,
+      ">> FAIL: workflow-browser-url: step must read steps.final.outputs.browserUrl (the CLI's env-resolved URL)"
+    );
+    assert.match(
+      step,
+      /if \[ -n "\$RESOLVED_URL" \]; then\s*\n\s*URL="\$RESOLVED_URL"/,
+      ">> FAIL: workflow-browser-url: a non-empty RESOLVED_URL must win over the inputs.gateway-based fallback construction"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: 'Set deployment outputs' propagates browserUrl on both the cache-hit and fresh-deploy branches", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const stepMatch = wf.match(/- name: Set deployment outputs[\s\S]*?(?=\n {6}- name:|\Z)/);
+    assert.ok(stepMatch, ">> FAIL: workflow-final-outputs: could not locate the 'Set deployment outputs' step");
+    const step = stepMatch[0];
+    assert.match(
+      step,
+      /echo "browserUrl=\$\{\{ steps\.deploy\.outputs\.browserUrl \}\}" >> "\$GITHUB_OUTPUT"/,
+      ">> FAIL: workflow-final-outputs: fresh-deploy branch must propagate steps.deploy.outputs.browserUrl"
+    );
+    assert.match(
+      step,
+      /echo "browserUrl=" >> "\$GITHUB_OUTPUT"/,
+      ">> FAIL: workflow-final-outputs: cache-hit branch must emit an explicit empty browserUrl (deploy step never ran, so no env-resolved URL exists) rather than omitting the key"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: gateway input is documented as a fallback, not the primary mechanism", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const gatewayInput = wf.match(/gateway:\s*\n\s*description: '([^']*)'/);
+    assert.ok(gatewayInput, ">> FAIL: workflow-gateway-doc: could not locate the `gateway` input description");
+    assert.match(
+      gatewayInput[1],
+      /FALLBACK ONLY/,
+      ">> FAIL: workflow-gateway-doc: `gateway` input description must flag itself as fallback-only now that polkadot-app-deploy's own env-resolved URL is preferred"
+    );
+  });
+});
+
 // import { shouldEmit } from "../tools/cache-savings-totals.mjs";
 
 describe.skip("shouldEmit (cache-savings-totals DSN gate)", () => { // skipped in public snapshot: tool not shipped

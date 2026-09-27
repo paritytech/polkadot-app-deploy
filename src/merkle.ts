@@ -425,7 +425,14 @@ export async function buildOrderedCar(
   newStable.sort((a, b) =>
     (b.size - a.size) || (a.fileCid < b.fileCid ? -1 : a.fileCid > b.fileCid ? 1 : 0)
   );
-  for (const f of newStable) section1Files.push(f);
+  // Dedup by fileCid here too, matching the anchored loop above, so Phase A
+  // and Phase B pack section 1 identically (full story: test/car-section1-dedup.test.js).
+  // `newStable`'s own filter above is now a perf nicety, not a correctness requirement.
+  for (const f of newStable) {
+    if (placed.has(f.fileCid)) continue;
+    section1Files.push(f);
+    placed.add(f.fileCid);
+  }
 
   // ─── Section 2 file order (volatile): size desc + CID asc ───────────────────
   volatileFiles.sort((a, b) =>

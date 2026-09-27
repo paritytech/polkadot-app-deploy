@@ -483,6 +483,7 @@ export function computeDeployOutcome(
 //   naming.already_owned           — domain is already owned by a different EVM address
 //   naming.governance_reserved     — label DotNS naming rules forbid registering (Reserved/trailing-digit/hyphen-base), decided by ownership in preflight (#1185)
 //   naming.short_names_closed      short base refused because PopRules.shortNamesEnabled is off. Not a personhood problem; only the PopRules owner can open the band
+//   naming.soulbound               — name was issued through the PoP gateway and is permanently non-transferable (DotnsRegistrar.isSoulbound, v0.6.0+)
 //   naming.subdomain_orphan        — subdomain parent is owned by a different address
 //   verify.contenthash_mismatch    — post-deploy on-chain contenthash differs from what was written
 //   verify.dagpb_not_finalised     — DAG-PB root not finalised; chain may have dropped the extrinsic
@@ -515,6 +516,7 @@ export type DeployErrorKind =
   | 'naming.already_owned'
   | 'naming.governance_reserved'
   | 'naming.short_names_closed'
+  | 'naming.soulbound'
   | 'naming.subdomain_orphan'
   | 'verify.contenthash_mismatch'
   | 'verify.dagpb_not_finalised'
@@ -567,6 +569,9 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // shows up in the data later, widening this is a one-line change with evidence
   // behind it; over-matching now would be invisible.
   [/^aborted by user\b/i, 'user.aborted'],
+  // Ahead of the generic contract-revert rule: a soulbound refusal is a
+  // permanent naming fact, not a transient chain error.
+  [/is soulbound and cannot be transferred/i, 'naming.soulbound'],
   [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"/i, 'contract-revert'],
   [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within|Commitment still too new after \d+s/i, 'chain-timeout'],
   [/\bstale\b.*nonce|nonce.*\bstale\b|"type"\s*:\s*"(?:Future|Stale)"|Invalid::Future|tx rejected by pool/i, 'nonce-stale'],

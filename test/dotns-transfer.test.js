@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient, computeSubnodeIds } from "../dist/dotns.js";
+import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient, computeSubnodeIds, DEFAULT_TLD } from "../dist/dotns.js";
 import { namehash, zeroAddress, decodeFunctionData, toFunctionSelector } from "viem";
 
 // bulletin-deploy #1443: transferSubname now ALSO probes isAuthorised
@@ -52,20 +52,26 @@ test("weiToNative: remainder rounds up so msg.value >= fee", () => {
 });
 
 // Build a DotNS instance with chain I/O stubbed. transferName only touches
-// contractCall (ownerOf, transferFloor) and contractTransaction.
-function stubDotns({ owner, evmAddress, floorWei = 0n, txHash = "0xabc" }) {
+// contractCall (ownerOf, isSoulbound, transferFloor) and contractTransaction.
+// `soulbound` is what isSoulbound returns: a boolean, or an Error to throw.
+function stubDotns({ owner, evmAddress, floorWei = 0n, txHash = "0xabc", soulbound = false }) {
   const d = Object.create(DotNS.prototype);
   d.connected = true;
   d.evmAddress = evmAddress;
   d._contracts = { DOTNS_REGISTRAR: "0xReg", POP_RULES: "0xPop" };
   d._nativeToEthRatio = 100000000n;
+  d._tld = DEFAULT_TLD;
+  d.calls = [];
   d.ensureConnected = () => {};
   d.contractCall = async (_addr, _abi, fn) => {
+    d.calls.push(fn);
     if (fn === "ownerOf") return owner;
+    if (fn === "isSoulbound") { if (soulbound instanceof Error) throw soulbound; return soulbound; }
     if (fn === "transferFloor") return floorWei;
     throw new Error("unexpected call " + fn);
   };
-  d.contractTransaction = async () => ({ kind: "hash", hash: txHash });
+  // transferFrom moves the name, so the post-transfer ownerOf re-read sees the recipient.
+  d.contractTransaction = async (_addr, _val, _abi, _fn, args) => { owner = args[1]; return { kind: "hash", hash: txHash }; };
   return d;
 }
 
@@ -81,14 +87,7 @@ test("transferName: errors when a third party owns it", async () => {
 });
 
 test("transferName: transfers when worker owns it", async () => {
-  // ownerOf returns worker first, recipient on the post-transfer re-read.
   const d = stubDotns({ owner: "0xWORKER", evmAddress: "0xWORKER", floorWei: 10n * 10n ** 18n });
-  let calls = 0;
-  d.contractCall = async (_a, _abi, fn) => {
-    if (fn === "transferFloor") return 10n * 10n ** 18n;
-    if (fn === "ownerOf") return ++calls === 1 ? "0xWORKER" : "0xRECIP";
-    throw new Error("unexpected " + fn);
-  };
   const r = await d.transferName("giftbox", "0xRECIP");
   assert.equal(r.status, "ok");
   assert.equal(r.txHash, "0xabc");
@@ -138,6 +137,36 @@ test("transferName: refuses to transfer to the zero address before any chain cal
     () => d.transferName("giftbox", zeroAddress),
     /zero address/i,
     ">> FAIL: transferName burn guard: expected transferName to refuse --to the zero address before any ownerOf/transferFloor call",
+  );
+});
+
+test("transferName: refuses a soulbound name before quoting the fee", async () => {
+  const d = stubDotns({ owner: ADDR_SIGNER, evmAddress: ADDR_SIGNER, soulbound: true });
+  await assert.rejects(
+    () => d.transferName("giftbox", ADDR_OWNER),
+    /is soulbound and cannot be transferred.*PoP gateway/s,
+    ">> FAIL: transferName soulbound guard: expected a refusal naming gateway issuance as the cause",
+  );
+  assert.ok(!d.calls.includes("transferFloor"),
+    ">> FAIL: transferName soulbound guard ran AFTER the fee quote, which itself reverts NameSoulbound — the guard must come first");
+});
+
+test("transferName: a registrar too old to have isSoulbound lets the transfer proceed", async () => {
+  const d = stubDotns({ owner: ADDR_SIGNER, evmAddress: ADDR_SIGNER, soulbound: new Error("Contract reverted (flags=1) with data: 0x") });
+  assert.equal((await d.transferName("giftbox", ADDR_OWNER)).status, "ok",
+    ">> FAIL: a bare revert from a pre-v0.6.0 registrar blocked a transfer the chain would accept");
+});
+
+test("transferName: an undecodable isSoulbound read lets the transfer proceed, but a dead connection does not", async () => {
+  const unreadable = stubDotns({ owner: ADDR_SIGNER, evmAddress: ADDR_SIGNER, soulbound: new Error("Contract call returned empty data") });
+  assert.equal((await unreadable.transferName("giftbox", ADDR_OWNER)).status, "ok",
+    ">> FAIL: an unreadable isSoulbound blocked a transfer the chain may well accept");
+
+  const dropped = stubDotns({ owner: ADDR_SIGNER, evmAddress: ADDR_SIGNER, soulbound: new Error("isSoulbound timed out after 30000ms") });
+  await assert.rejects(
+    () => dropped.transferName("giftbox", ADDR_OWNER),
+    /timed out after 30000ms/,
+    ">> FAIL: a read that never completed was swallowed as 'not soulbound'",
   );
 });
 

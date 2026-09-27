@@ -931,6 +931,7 @@ const DOTNS_REGISTRAR_ABI = [
 const DOTNS_REGISTRAR_TRANSFER_ABI = [
   ...DOTNS_REGISTRAR_ABI,
   { inputs: [{ name: "from", type: "address" }, { name: "to", type: "address" }, { name: "tokenId", type: "uint256" }], name: "transferFrom", outputs: [], stateMutability: "payable", type: "function" },
+  { inputs: [{ name: "tokenId", type: "uint256" }], name: "isSoulbound", outputs: [{ name: "", type: "bool" }], stateMutability: "view", type: "function" },
 ] as const;
 
 const POP_RULES_ABI = [
@@ -1818,6 +1819,10 @@ function isShortNameBand(baseLength: number): boolean {
 
 export function shortNamesClosedReason(label: string, baseLength: number, tld: string, environmentId: string | null | undefined): string {
   return `${label}.${tld} has a ${baseLength}-character base and short names are not on sale on ${environmentId ?? "this environment"}. PopRules.shortNamesEnabled is off, which closes the 6 to 8 character band to every signer, whatever their personhood status. Use a base of 9 characters or more, for example ${exampleNoStatusLabel(label, tld)}.`;
+}
+
+export function soulboundTransferReason(label: string, tld: string): string {
+  return `${label}.${tld} is soulbound and cannot be transferred. It was issued through the PoP gateway, which binds a name to the account that received it. Nothing clears the flag, so no account can move this name at any point in the future.`;
 }
 
 // #paseo-tld: `tld` selects which suffix is THIS environment's own — it must
@@ -3650,6 +3655,21 @@ export class DotNS {
     return this._shortNamesEnabled === "unknown" ? null : this._shortNamesEnabled;
   }
 
+  /** False when the registrar gave no usable answer, including one too old to
+   *  have the function at all: let the chain refuse rather than guess. A read
+   *  that never completed propagates, so a network blip is not "not soulbound". */
+  private async readIsSoulbound(tokenId: bigint): Promise<boolean> {
+    try {
+      return (await withTimeout(
+        this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_TRANSFER_ABI, "isSoulbound", [tokenId]),
+        30000, "isSoulbound",
+      )) === true;
+    } catch (e: any) {
+      if (READ_NEVER_COMPLETED_RE.test(e?.message ?? String(e))) throw e;
+      return false;
+    }
+  }
+
   /** Live transfer-fee quote. transferFloor is a pure PopRules view — it
    *  classifies the label and reads both tiers, so it works BEFORE the name is
    *  registered (unlike quoteTransferFee, which reverts on an unregistered token). */
@@ -3681,6 +3701,11 @@ export class DotNS {
     }
     if (owner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
       throw new Error(`Cannot transfer ${validated}.${this._tld}: it is owned by ${owner}, not the worker ${this.evmAddress}.`);
+    }
+    // _quoteTransferFee reverts on a soulbound name (NameSoulbound), so this
+    // has to sit before the quote below, not just before transferFrom.
+    if (await this.readIsSoulbound(tokenId)) {
+      throw new NonRetryableError(soulboundTransferReason(validated, this._tld));
     }
     const { feeWei, feeNative } = await this.quoteTransferFloorNative(validated, this.evmAddress!, toH160);
     const txRes = await this.contractTransaction(

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { collectUnitTestFiles } from "../scripts/run-unit-tests.mjs";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 // Personhood bootstrap imports (loaded after build)
-import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason } from "../dist/dotns.js";
+import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason } from "../dist/dotns.js";
 import { getAdapter } from "../dist/dotns-protocol.js";
 import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
@@ -1462,6 +1462,10 @@ describe("classifyErrorKind", () => {
   // cannot drift apart while still agreeing with each other.
   test("naming.short_names_closed: shortNamesClosedReason's message", () => {
     assert.strictEqual(classifyErrorKind(shortNamesClosedReason("hodlem", 6, "paseo", "paseo-next-v2")), "naming.short_names_closed");
+  });
+
+  test("naming.soulbound: soulboundTransferReason's message", () => {
+    assert.strictEqual(classifyErrorKind(soulboundTransferReason("giftbox", "dot")), "naming.soulbound");
   });
 
   test("connection: WS halt", () => {

@@ -23,7 +23,7 @@
  *      the flag directly (if a public accessor exists) so that gap is at
  *      least VISIBLE, even though bulletin-deploy doesn't act on it.
  *
- *   2. DotnsPopController.isSoulbound(uint256) on an UNKNOWN (never-minted)
+ *   2. DotnsRegistrar.isSoulbound(uint256) on an UNKNOWN (never-minted)
  *      tokenId — does it revert, or return false? This is the retired half
  *      of the v0.6.0 discriminator decision (#1410): isPopIssued(label) was
  *      chosen over isSoulbound(tokenId) as the profile-detection probe
@@ -33,6 +33,8 @@
  *      for reasons unrelated to the function's mere presence. This probe
  *      answers which behavior isSoulbound actually has, closing that
  *      question empirically instead of leaving it asserted-but-unverified.
+ *      isSoulbound lives on DotnsRegistrar (v0.8.0 DotnsRegistrar.sol:238) and
+ *      returns false for an unknown token rather than reverting.
  *
  *   3. The detected DotNS ABI profile (via the SAME live-probe path
  *      DotNS.connect() itself runs — see detectProtocolVersion, src/dotns.ts)
@@ -46,13 +48,6 @@
  *      code present-or-unverified with neither discriminator answering (a
  *      genuinely unrecognized ABI, or a connection/RPC issue). Each has a
  *      different remedy — see this env's own OUTCOME line below.
- *
- * IMPORTANT — isSoulbound's exact signature is NOT independently confirmed
- * against dotns contract source the way isPopIssued's is (see
- * src/dotns-protocol.ts's POP_CONTROLLER_PROBE_ABI comment); it is assumed
- * from the task description that named it (`isSoulbound(uint256)` -> bool).
- * If this probe reports "ERROR" rather than "REVERTS" or "returns false",
- * the assumed signature itself may be wrong — read the error message.
  *
  * Every query is a read-only dry-run (ReviveApi.call). No transactions, no
  * state writes. Reads contract addresses from assets/environments.json via
@@ -74,7 +69,6 @@ const SHORT_NAMES_ENABLED_ABI = [
   { type: "function", name: "shortNamesEnabled", inputs: [], outputs: [{ name: "", type: "bool" }], stateMutability: "view" },
 ];
 
-// Assumed signature (see module doc comment's IMPORTANT note above).
 const IS_SOULBOUND_ABI = [
   { type: "function", name: "isSoulbound", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ name: "", type: "bool" }], stateMutability: "view" },
 ];
@@ -110,7 +104,7 @@ for (let i = 0; i < rawArgv.length; i++) {
     console.log("");
     console.log("Reports (does not assert) on three open v0.6.0 questions:");
     console.log("  1. PopRules.shortNamesEnabled (is there a public accessor? what does it say?)");
-    console.log("  2. DotnsPopController.isSoulbound(uint256) on an unknown tokenId: reverts, or false?");
+    console.log("  2. DotnsRegistrar.isSoulbound(uint256) on an unknown tokenId: reverts, or false?");
     console.log("  3. The detected DotNS ABI profile, and whether isPopIssued answered here.");
     process.exit(0);
   }
@@ -133,6 +127,7 @@ const resolved = resolveEndpoints(doc, ENV_ID);
 const RPC = resolved.assetHub[0];
 const POP_RULES = envEntry.contracts?.POP_RULES;
 const DOTNS_POP_CONTROLLER = envEntry.contracts?.DOTNS_POP_CONTROLLER;
+const DOTNS_REGISTRAR = envEntry.contracts?.DOTNS_REGISTRAR;
 if (!RPC || !POP_RULES) {
   console.error(`env "${ENV_ID}" is missing an asset-hub endpoint or POP_RULES address`);
   process.exit(2);
@@ -148,6 +143,7 @@ console.log(`environments.json:    ${source}`);
 console.log(`RPC (asset-hub):      ${RPC}`);
 console.log(`POP_RULES:            ${POP_RULES}`);
 console.log(`DOTNS_POP_CONTROLLER: ${DOTNS_POP_CONTROLLER ?? "(not configured for this env)"}`);
+console.log(`DOTNS_REGISTRAR:      ${DOTNS_REGISTRAR ?? "(not configured for this env)"}`);
 console.log("");
 
 // --- 3. Detected ABI profile (reuses the library's own live-probe path) ---
@@ -217,25 +213,35 @@ console.log("\n=== 2. PopRules.shortNamesEnabled (owner-settable 6-8 band gate, 
   }
 }
 
-// --- 2. DotnsPopController.isSoulbound(unknown tokenId) ---
-console.log("\n=== 3. DotnsPopController.isSoulbound(uint256) on an unknown tokenId (retires the isPopIssued-vs-isSoulbound discriminator question, #1416) ===");
-if (!DOTNS_POP_CONTROLLER) {
-  console.log(`SKIPPED — DOTNS_POP_CONTROLLER has no configured address for env "${ENV_ID}".`);
+// --- 2. DotnsRegistrar.isSoulbound(unknown tokenId) ---
+console.log("\n=== 3. DotnsRegistrar.isSoulbound(uint256) on an unknown tokenId ===");
+if (!DOTNS_REGISTRAR) {
+  console.log(`SKIPPED — DOTNS_REGISTRAR has no configured address for env "${ENV_ID}".`);
 } else {
   const client = createClient(getWsProvider(RPC, { heartbeatTimeout: 60_000 }));
   try {
     const api = client.getUnsafeApi();
     await probeAndReport(
-      () => dryRun(api, alice.address, DOTNS_POP_CONTROLLER, IS_SOULBOUND_ABI, "isSoulbound", [UNKNOWN_TOKEN_ID]),
+      () => dryRun(api, alice.address, DOTNS_REGISTRAR, IS_SOULBOUND_ABI, "isSoulbound", [UNKNOWN_TOKEN_ID]),
       {
         onOk: (result) => `isSoulbound(${UNKNOWN_TOKEN_ID}) returns ${result} — does NOT revert on an unknown tokenId.`,
-        onRevert: () => `REVERTS on an unknown tokenId (tokenId=${UNKNOWN_TOKEN_ID}). This is why isPopIssued was chosen as the v0.6.0 discriminator instead: a probe that reverts on ordinary unregistered input is a weaker "function exists" signal than one that answers cleanly.`,
-        onError: (e) => `ERROR (not a plain revert — connection/RPC issue, or the assumed signature "isSoulbound(uint256)" is wrong; see this file's IMPORTANT note): ${e.message}`,
+        onRevert: () => `REVERTS on an unknown tokenId (tokenId=${UNKNOWN_TOKEN_ID}) — unexpected on a v0.6.0+ registrar, where it is a plain mapping read.`,
+        onError: (e) => `ERROR (not a plain revert — connection/RPC issue): ${e.message}`,
       },
     );
+  } finally {
+    client.destroy();
+  }
+}
 
-    // Companion read: does isPopIssued itself answer here? (Same probe the
-    // library's own detectProtocolVersion runs — see POP_CONTROLLER_PROBE_ABI.)
+// Companion read: does isPopIssued itself answer here? (Same probe the
+// library's own detectProtocolVersion runs — see POP_CONTROLLER_PROBE_ABI.)
+if (!DOTNS_POP_CONTROLLER) {
+  console.log(`SKIPPED isPopIssued companion read — DOTNS_POP_CONTROLLER has no configured address for env "${ENV_ID}".`);
+} else {
+  const client = createClient(getWsProvider(RPC, { heartbeatTimeout: 60_000 }));
+  try {
+    const api = client.getUnsafeApi();
     await probeAndReport(
       () => dryRun(api, alice.address, DOTNS_POP_CONTROLLER, POP_CONTROLLER_PROBE_ABI, "isPopIssued", [PROTOCOL_PROBE_LABEL]),
       {

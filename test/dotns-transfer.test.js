@@ -3,7 +3,44 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient, computeSubnodeIds } from "../dist/dotns.js";
-import { namehash, zeroAddress, decodeFunctionData } from "viem";
+import { namehash, zeroAddress, decodeFunctionData, toFunctionSelector } from "viem";
+
+// bulletin-deploy #1443: transferSubname now ALSO probes isAuthorised
+// (checkNodeAuthorization) before ever reaching a setSubnodeOwner shape
+// probe or a plain owner()-equality check. Both isAuthorised and
+// setSubnodeOwner go through the same clientWrapper.performDryRunCall, so
+// stubs that care about ONE of the two dispatch on the encoded call's
+// function selector. Valid (checksummable-shape) hex addresses are required
+// wherever a value reaches viem's real encodeFunctionData — which is now
+// true of every `evmAddress` in this suite, since checkNodeAuthorization
+// always encodes it as isAuthorised's `account` argument.
+const IS_AUTHORISED_SELECTOR = toFunctionSelector("isAuthorised(bytes32,address)");
+const ADDR_SIGNER = "0x1111111111111111111111111111111111111111";
+const ADDR_OWNER = "0x2222222222222222222222222222222222222222";
+const ADDR_OPERATOR = "0x8888888888888888888888888888888888888888";
+const ADDR_STRANGER = "0x7777777777777777777777777777777777777777";
+
+// Canonical raw shapes ReviveClientWrapper.performDryRunCall resolves to —
+// shared by the isAuthorised probe stubs below and the setSubnodeOwner
+// shape-probe stubs further down.
+function bareRevertAuthProbeResult() {
+  return {
+    gasConsumed: { referenceTime: 0n, proofSize: 0n },
+    gasRequired: { referenceTime: 0n, proofSize: 0n },
+    storageDeposit: { value: 0n },
+    result: { isOk: false, isErr: true, value: { data: "0x", flags: 1n } },
+  };
+}
+// Encodes a bare ABI bool return (32-byte word, low byte 0/1) — matches what
+// DotnsRegistry.isAuthorised actually returns on success.
+function encodedBoolProbeResult(value) {
+  return {
+    gasConsumed: { referenceTime: 0n, proofSize: 0n },
+    gasRequired: { referenceTime: 0n, proofSize: 0n },
+    storageDeposit: { value: 0n },
+    result: { isOk: true, isErr: false, value: { data: "0x" + "00".repeat(31) + (value ? "01" : "00"), flags: 0n } },
+  };
+}
 
 test("weiToNative: zero stays zero", () => {
   assert.equal(weiToNative(0n, 100000000n), 0n);
@@ -124,6 +161,16 @@ function stubSubname({ parentOwner, evmAddress, currentSubOwner, afterOwner, txH
   d._contracts = { DOTNS_REGISTRY: "0xRegistry" };
   d._tld = tld;
   d.ensureConnected = () => {};
+  d.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  // bulletin-deploy #1443: checkNodeAuthorization (the parent-authorisation
+  // gate transferSubname now calls) always probes DotnsRegistry.isAuthorised
+  // via a raw dry run before falling back to owner()-equality — this suite's
+  // older tests model a registry that PREDATES that accessor, so the probe
+  // bare-reverts (selector not found) and the fallback exercises the exact
+  // owner()-equality behaviour these tests already pin via
+  // contractCallNullable below. Tests that want isAuthorised itself
+  // consulted override this with their own clientWrapper.
+  d.clientWrapper = { performDryRunCall: async () => bareRevertAuthProbeResult() };
   let ownerCalls = 0;
   d.__nullableCalls = [];
   d.contractCallNullable = async (_addr, _abi, fn, args) => {
@@ -142,30 +189,30 @@ function stubSubname({ parentOwner, evmAddress, currentSubOwner, afterOwner, txH
 }
 
 test("transferSubname: errors when the signer does not own the parent", async () => {
-  const d = stubSubname({ parentOwner: "0xPARENT", evmAddress: "0xWORKER" });
+  const d = stubSubname({ parentOwner: "0xPARENT", evmAddress: ADDR_SIGNER });
   await assert.rejects(() => d.transferSubname("app", "foo", "0xRECIP"), /only the owner of the parent/i);
 });
 
 test("transferSubname: errors when the parent is not registered", async () => {
-  const d = stubSubname({ parentOwner: null, evmAddress: "0xOWNER" });
+  const d = stubSubname({ parentOwner: null, evmAddress: ADDR_OWNER });
   await assert.rejects(() => d.transferSubname("app", "foo", "0xRECIP"), /not registered/i);
 });
 
 test("transferSubname: no-op when the recipient already owns it", async () => {
-  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xRECIP" });
+  const d = stubSubname({ parentOwner: ADDR_OWNER, evmAddress: ADDR_OWNER, currentSubOwner: "0xRECIP" });
   const r = await d.transferSubname("app", "foo", "0xrecip");
   assert.equal(r.status, "skipped-already-owned");
 });
 
 test("transferSubname: reassigns via setSubnodeOwner when the signer owns the parent", async () => {
-  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xOLD", afterOwner: "0xRECIP" });
+  const d = stubSubname({ parentOwner: ADDR_OWNER, evmAddress: ADDR_OWNER, currentSubOwner: "0xOLD", afterOwner: "0xRECIP" });
   const r = await d.transferSubname("app", "foo", "0xRECIP");
   assert.equal(r.status, "ok");
   assert.equal(r.txHash, "0xsub");
 });
 
 test("transferSubname: throws when the reassignment does not land", async () => {
-  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xOLD", afterOwner: "0xOLD" });
+  const d = stubSubname({ parentOwner: ADDR_OWNER, evmAddress: ADDR_OWNER, currentSubOwner: "0xOLD", afterOwner: "0xOLD" });
   await assert.rejects(() => d.transferSubname("app", "foo", "0xRECIP"), /did not land/i);
 });
 
@@ -191,8 +238,8 @@ test("transferSubname: refuses to transfer to the zero address before any chain 
 // passing.
 test("transferSubname: node derivation — parentNode/subnode/setSubnodeOwner all use this._tld, not a hardcoded .dot", async () => {
   const d = stubSubname({
-    parentOwner: "0xOWNER",
-    evmAddress: "0xOWNER",
+    parentOwner: ADDR_OWNER,
+    evmAddress: ADDR_OWNER,
     currentSubOwner: "0xOLD",
     afterOwner: "0xRECIP",
     tld: "paseo",
@@ -290,6 +337,136 @@ test("guard: transferSubname routes node derivation through computeSubnodeIds, w
   );
 });
 
+// ---------------------------------------------------------------------------
+// bulletin-deploy #1443: checkNodeAuthorization / DotnsRegistry.isAuthorised(node, account).
+//
+// Per upstream v0.7.0 IDotnsRegistry.sol/DotnsRegistry.sol: isAuthorised is
+// "the canonical authorisation check the registry enforces on owner-gated
+// entry points" and the "single source of truth" _authorised/isAuthorised
+// both delegate to. Strictly wider than raw owner()-equality: a non-zero
+// stored subnode owner must match, OR (for a tokenised node) the
+// registrar's ERC-721 owner, an operator-for-all delegate, or a
+// single-token approval all qualify. transferSubname's parent-authorisation
+// gate used to test raw ownership equality only, refusing an
+// approved/operator delegate the chain itself would accept.
+
+// Isolated stub for checkNodeAuthorization itself — no transferSubname
+// plumbing, just the two chain reads the method makes (owner(), then the
+// raw isAuthorised dry-run probe).
+function stubNodeAuthProbe({ owner, isAuthorisedResult, bareRevert = false }) {
+  const d = Object.create(DotNS.prototype);
+  d.connected = true;
+  d._contracts = { DOTNS_REGISTRY: "0xRegistry" };
+  d.ensureConnected = () => {};
+  d.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  d.contractCallNullable = async (_addr, _abi, fn) => {
+    if (fn !== "owner") throw new Error("unexpected call " + fn);
+    return owner;
+  };
+  let probeCalls = 0;
+  d.clientWrapper = {
+    performDryRunCall: async () => {
+      probeCalls += 1;
+      return bareRevert ? bareRevertAuthProbeResult() : encodedBoolProbeResult(isAuthorisedResult);
+    },
+  };
+  return { d, getProbeCalls: () => probeCalls };
+}
+
+test("checkNodeAuthorization: consults isAuthorised and allows an operator-for-all signer who does not own the node", async () => {
+  const { d, getProbeCalls } = stubNodeAuthProbe({ owner: ADDR_OWNER, isAuthorisedResult: true });
+  const result = await d.checkNodeAuthorization("0x" + "11".repeat(32), ADDR_OPERATOR);
+  assert.deepEqual(
+    result, { authorised: true, owner: ADDR_OWNER },
+    `>> FAIL: checkNodeAuthorization operator-for-all: expected {authorised:true, owner:"${ADDR_OWNER}"}, got ${JSON.stringify(result)}`,
+  );
+  assert.equal(getProbeCalls(), 1, ">> FAIL: checkNodeAuthorization operator-for-all: expected exactly one isAuthorised probe");
+});
+
+test("checkNodeAuthorization: refuses a signer who is neither owner nor approved, but still reports the parent's owner", async () => {
+  const { d } = stubNodeAuthProbe({ owner: ADDR_OWNER, isAuthorisedResult: false });
+  const result = await d.checkNodeAuthorization("0x" + "11".repeat(32), ADDR_STRANGER);
+  assert.deepEqual(
+    result, { authorised: false, owner: ADDR_OWNER },
+    `>> FAIL: checkNodeAuthorization refusal: expected {authorised:false, owner:"${ADDR_OWNER}"} so a caller can still name the owner in its error message, got ${JSON.stringify(result)}`,
+  );
+});
+
+test("checkNodeAuthorization: isAuthorised absent (bare revert) falls back to the ownership-equality check instead of refusing outright", async () => {
+  const { d: ownerMatches } = stubNodeAuthProbe({ owner: ADDR_OWNER, bareRevert: true });
+  const matched = await ownerMatches.checkNodeAuthorization("0x" + "11".repeat(32), ADDR_OWNER);
+  assert.deepEqual(
+    matched, { authorised: true, owner: ADDR_OWNER },
+    `>> FAIL: checkNodeAuthorization fallback (match): isAuthorised absent must fall back to owner()-equality, not refuse outright; got ${JSON.stringify(matched)}`,
+  );
+
+  const { d: ownerDiffers } = stubNodeAuthProbe({ owner: ADDR_OWNER, bareRevert: true });
+  const mismatched = await ownerDiffers.checkNodeAuthorization("0x" + "11".repeat(32), ADDR_STRANGER);
+  assert.deepEqual(
+    mismatched, { authorised: false, owner: ADDR_OWNER },
+    `>> FAIL: checkNodeAuthorization fallback (mismatch): expected the ownership-equality fallback to refuse a non-owner, got ${JSON.stringify(mismatched)}`,
+  );
+});
+
+// End-to-end through the real write path: transferSubname's parent gate.
+function stubSubnameWithAuthProbe({ parentOwner, evmAddress, authorised, currentSubOwner = null, afterOwner = null, tld = "dot", sublabel = "app", parentLabel = "foo", txHash = "0xsub" }) {
+  const d = Object.create(DotNS.prototype);
+  d.connected = true;
+  d.evmAddress = evmAddress;
+  d._tld = tld;
+  d._contracts = { DOTNS_REGISTRY: "0xRegistry" };
+  d.ensureConnected = () => {};
+  d.substrateAddress = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+  let probeCalls = 0;
+  d.clientWrapper = {
+    performDryRunCall: async () => {
+      probeCalls += 1;
+      return encodedBoolProbeResult(authorised);
+    },
+  };
+  const { parentNode, subnode } = computeSubnodeIds(sublabel, parentLabel, tld);
+  let subnodeCalls = 0;
+  d.contractCallNullable = async (_addr, _abi, fn, args) => {
+    if (fn !== "owner") throw new Error("unexpected call " + fn);
+    const node = args[0];
+    if (node === parentNode) return parentOwner;
+    if (node === subnode) {
+      subnodeCalls += 1;
+      return subnodeCalls === 1 ? currentSubOwner : afterOwner;
+    }
+    throw new Error(`stubSubnameWithAuthProbe: owner() called with unrecognised node ${node}`);
+  };
+  let subnodeOwnerRecord = null;
+  d.contractTransaction = async (_addr, _value, _abi, fn, args) => {
+    if (fn !== "setSubnodeOwner") throw new Error("unexpected tx " + fn);
+    subnodeOwnerRecord = args[0];
+    return { kind: "hash", hash: txHash };
+  };
+  return { d, getProbeCalls: () => probeCalls, getSubnodeOwnerRecord: () => subnodeOwnerRecord };
+}
+
+test("transferSubname: an operator-for-all signer who does not own the parent is allowed to reassign", async () => {
+  const { d, getProbeCalls, getSubnodeOwnerRecord } = stubSubnameWithAuthProbe({
+    parentOwner: ADDR_OWNER, evmAddress: ADDR_OPERATOR, authorised: true, currentSubOwner: "0xOLD", afterOwner: "0xRECIP",
+  });
+  const r = await d.transferSubname("app", "foo", "0xRECIP");
+  assert.equal(r.status, "ok", `>> FAIL: transferSubname operator-for-all: expected status "ok", got "${r.status}"`);
+  assert.equal(getProbeCalls(), 1, ">> FAIL: transferSubname operator-for-all: expected exactly one isAuthorised probe");
+  assert.equal(
+    getSubnodeOwnerRecord().owner, "0xRECIP",
+    ">> FAIL: transferSubname operator-for-all: setSubnodeOwner must still target the requested recipient even though the signer isn't the parent owner",
+  );
+});
+
+test("transferSubname: refuses a signer who is neither the parent owner nor approved, naming the parent's owner", async () => {
+  const { d } = stubSubnameWithAuthProbe({ parentOwner: ADDR_OWNER, evmAddress: ADDR_STRANGER, authorised: false });
+  await assert.rejects(
+    () => d.transferSubname("app", "foo", "0xRECIP"),
+    (err) => new RegExp(ADDR_OWNER, "i").test(err.message) && err.message.includes(ADDR_STRANGER),
+    ">> FAIL: transferSubname operator-for-all refusal: expected an error naming both the parent's owner and the refused signer",
+  );
+});
+
 test("feeFloorFor: adds the transfer fee to the register floor", () => {
   const base = feeFloorFor("register", 2000000000000n, 0n, 0n);
   const withFee = feeFloorFor("register", 2000000000000n, 0n, 5000000000n);
@@ -331,7 +508,7 @@ test("subname dispatch: a sublabel classifyRegistrability would refuse as a top-
   assert.equal(parsed.fullName, "app1.mydomain.dot", ">> FAIL: subname dispatch: fullName must round-trip the input");
 
   // Mirror transfer.ts's actual dispatch: `parsed.isSubdomain ? transferSubname(...) : transferName(...)`.
-  const d = stubSubname({ parentOwner: "0xOWNER", evmAddress: "0xOWNER", currentSubOwner: "0xOLD", afterOwner: "0xRECIP" });
+  const d = stubSubname({ parentOwner: ADDR_OWNER, evmAddress: ADDR_OWNER, currentSubOwner: "0xOLD", afterOwner: "0xRECIP" });
   const r = parsed.isSubdomain
     ? await d.transferSubname(parsed.sublabel, parsed.parentLabel, "0xRECIP")
     : await d.transferName(parsed.label, "0xRECIP");
@@ -387,8 +564,8 @@ function okProbeResult() {
 // more than once in the same test (needed for the caching test below, where
 // a second real-looking write must reuse rather than re-probe the shape).
 function stubSubnameForShapeProbe({
-  parentOwner = "0xOWNER",
-  evmAddress = "0xOWNER",
+  parentOwner = ADDR_OWNER,
+  evmAddress = ADDR_OWNER,
   initialSubOwner = "0xOLD",
   tld = "dot",
   sublabel = "app",
@@ -408,9 +585,19 @@ function stubSubnameForShapeProbe({
   // this test's probe stub actually runs.
   d.__setSubnodeOwnerShapeForTest(null);
 
+  // bulletin-deploy #1443: transferSubname ALSO probes isAuthorised
+  // (checkNodeAuthorization) before ever reaching the setSubnodeOwner shape
+  // probe these tests exist to exercise — both go through the same
+  // clientWrapper.performDryRunCall, so dispatch by selector: isAuthorised
+  // always bare-reverts (this stub simulates a chain that predates that
+  // accessor — orthogonal to what these tests probe), falling back to
+  // owner()-equality, which passes because parentOwner === evmAddress by
+  // default. Only the OTHER (setSubnodeOwner) probe calls count towards
+  // getProbeCalls().
   let probeCalls = 0;
   d.clientWrapper = {
     performDryRunCall: async (_origin, _addr, _value, encodedData) => {
+      if (encodedData.slice(0, 10) === IS_AUTHORISED_SELECTOR) return bareRevertAuthProbeResult();
       probeCalls += 1;
       return probeDryRunCall(encodedData);
     },
@@ -582,10 +769,17 @@ test("setSubnodeOwner shape cache is shared across call sites: registerSubdomain
   d.ensureConnected = () => {};
   d.__setSubnodeOwnerShapeForTest(null);
 
+  // Both the isAuthorised probe (checkNodeAuthorization, run on every
+  // transferSubname call) and the setSubnodeOwner shape probe this test
+  // actually exercises share this one clientWrapper — dispatch by selector
+  // so only the shape probe counts towards probeCalls (isAuthorised always
+  // bare-reverts, falling back to owner()-equality, which passes because
+  // every owner() mock below returns the same address as d.evmAddress).
   let probeCalls = 0;
   d.clientWrapper = {
     client: { query: { Timestamp: { Now: { getValue: async () => 1_000_000n } } } },
-    performDryRunCall: async () => {
+    performDryRunCall: async (_origin, _addr, _value, encodedData) => {
+      if (encodedData.slice(0, 10) === IS_AUTHORISED_SELECTOR) return bareRevertAuthProbeResult();
       probeCalls += 1;
       return bareRevertProbeResult();
     },

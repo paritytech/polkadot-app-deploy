@@ -354,6 +354,22 @@ describe("validateProductConfig", () => {
       ">> FAIL: validateProductConfig unknown TLD: 'demoapp.example' must still be rejected — only KNOWN_TLDS suffixes are valid");
   });
 
+  // bulletin-deploy #1449 (folded into #1443): subname depth is observed at
+  // deploy time (src/deploy.ts), not gated at schema-validation time —
+  // validateProductConfig accepts a product-config domain at any nesting
+  // depth, same as parseDomainName itself accepts any depth. There is no
+  // cap and no override flag anywhere in this CLI.
+  for (const domain of ["demoapp.dot", "worker.demoapp.dot", "worker.app.demoapp.dot", "a.b.c.d.dot"]) {
+    test(`accepts domain '${domain}' regardless of subname nesting depth`, () => {
+      const result = validateProductConfig({ ...VALID_CONFIG, domain });
+      assert.equal(
+        result.ok,
+        true,
+        `expected domain '${domain}' to validate; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+      );
+    });
+  }
+
   // Keeps src/manifest/schema.ts's hand-copied KNOWN_TLDS list (documented as
   // "kept in sync with dotns.ts's KNOWN_TLDS by hand") from silently drifting
   // — schema.ts deliberately doesn't import dotns.ts (stays free of the

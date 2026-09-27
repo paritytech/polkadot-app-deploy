@@ -22,9 +22,10 @@ import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./ma
 import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
 import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
-import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD } from "./dotns.js";
+import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode } from "./dotns.js";
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions } from "./dotns.js";
 import type { DotnsAbiProfile } from "./dotns-protocol.js";
+import { subnameNestingLevels } from "./subname-depth.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet } from "./pool.js";
@@ -2782,6 +2783,17 @@ export function assertSubdomainOwnerMatchesSigner(
  * Neither addition weakens the refusal: both still throw, they only add an
  * actionable line after the unchanged "is owned by ..." sentence that
  * telemetry's naming.subdomain_orphan classifier keys on (src/telemetry.ts).
+ *
+ * bulletin-deploy #1443 added two more fixes on top:
+ *   - `parentOwner` is now read via checkNodeAuthorization's isAuthorised-
+ *     backed owner(node), which can return the zero address for a node that
+ *     was never created — normalised to the unowned branch here, since the
+ *     burn sentinel is not an account anyone can be asked to transfer from.
+ *   - once nested subnames are allowed, `parentLabel` may itself be a
+ *     multi-label path ("app.supafaust"). Such a parent cannot be registered
+ *     directly, so an unowned nested parent names the immediate requirement
+ *     (whoever owns the grandparent must create and hand it over) instead of
+ *     emitting a register command that would fail for the same reason.
  */
 export function formatSubdomainParentError(
   fullName: string,
@@ -2796,12 +2808,31 @@ export function formatSubdomainParentError(
   // profile so every existing call/test keeps its exact prior verdict.
   profile: DotnsAbiProfile = "poprules-startingPrice",
 ): string {
-  if (parentOwner !== null) {
+  // bulletin-deploy #1443: a zero-address owner is the registry's "no owner"
+  // sentinel, not an account. Callers now read it straight off
+  // isAuthorised-backed owner(node) (checkNodeAuthorization), which returns
+  // 0x000...0 for a node that was never created — so without this the
+  // owned-by-someone-else branch below would fire and tell the caller to ask
+  // the burn address for its private key. Normalise it to the unowned
+  // branch, which already says the right thing.
+  const owner = parentOwner !== null && /^0x0{40}$/i.test(parentOwner) ? null : parentOwner;
+  // bulletin-deploy #1443: a nested parent ("app.supafaust") cannot be
+  // registered as a base name, so the "register the parent" remedy below
+  // would emit a command that fails for the same reason. Name the immediate
+  // requirement instead.
+  const parentIsNested = parentLabel.includes(".");
+  if (owner === null && parentIsNested) {
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} does not exist.\n\n` +
+      `It is itself a subname, so it cannot be registered directly — whoever owns ` +
+      `${parentLabel.slice(parentLabel.indexOf(".") + 1)}.${tld} has to create it first, then hand it to ` +
+      `this signer (${selfAddress || "this account"}).`;
+  }
+  if (owner !== null) {
     const transferBullet = selfAddress
-      ? `  - ask the ${parentOwner} account to hand the parent to this signer, run BY that account: ${CLI_NAME} transfer ${parentLabel}.${tld} --to ${selfAddress} --mnemonic <the ${parentOwner} account's key>\n`
+      ? `  - ask the ${owner} account to hand the parent to this signer, run BY that account: ${CLI_NAME} transfer ${parentLabel}.${tld} --to ${selfAddress} --mnemonic <the ${owner} account's key>\n`
       : "";
     const ownedParentBullet = `  - deploy the subdomain under a parent this signer already owns instead.`;
-    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${parentOwner}, not by this signer.\n\n` +
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${owner}, not by this signer.\n\n` +
       (transferBullet ? `Either:\n${transferBullet}${ownedParentBullet}` : ownedParentBullet);
   }
   const registrability = classifyRegistrability(parentLabel, profile);
@@ -2998,6 +3029,16 @@ export async function deploy(content: DeployContent, domainName: string | null =
   // THIS parse, which on an env with no configured tld is still the
   // pre-connect DEFAULT_TLD guess, not necessarily the real one.
   let parsed: ParsedDomainName | null = domainName ? parseDomainName(domainName, envTld) : null;
+  // bulletin-deploy #1443/#1449: subname depth is observed, not gated —
+  // parseDomainName never refuses on depth grounds. Print a factual,
+  // no-advice notice when nesting goes past the ordinary case (a parent path
+  // containing a dot, i.e. more than 2 labels before the TLD), so a typo or a
+  // doubled suffix is obvious on sight. Nothing is being blocked here, so
+  // there's no remedy to offer.
+  if (parsed?.isSubdomain && parsed.parentLabel!.includes(".")) {
+    const levels = subnameNestingLevels(1 + parsed.parentLabel!.split(".").length);
+    console.log(`   NOTE: "${domainName}" parses as sublabel "${parsed.sublabel}" under parent path "${parsed.parentLabel}.${envTld}" (${levels} levels of subname nesting).`);
+  }
 
   let sessionCleanup: (() => void) | undefined;
   // Cheap session-file probe — does NOT load the SSO stack. A logged-in user has
@@ -3171,6 +3212,15 @@ export async function deploy(content: DeployContent, domainName: string | null =
     setDeployAttribute("deploy.env", envId);
     setDeployAttribute("deploy.label", parsed?.label ?? name);
     setDeployAttribute("deploy.subdomain", String(parsed?.isSubdomain ?? false));
+    // bulletin-deploy #1443/#1449: recorded on every subname deploy (not only
+    // the unusually deep ones) so it has a baseline to compare against — a
+    // metric that only appears in the unusual case can't show whether nested
+    // names are rare or routine. 1 = the ordinary case (a single-label
+    // parent); numeric, not a String()-wrapped value, so it aggregates in
+    // Sentry.
+    if (parsed?.isSubdomain) {
+      setDeployAttribute("deploy.dotns.subname_levels", subnameNestingLevels(1 + parsed.parentLabel!.split(".").length));
+    }
     if (envNetwork) setDeployAttribute("deploy.network", envNetwork);
     if (envSource) setDeployAttribute("deploy.environments_source", envSource);
     setDeployAttribute("deploy.transfer.enabled", options.transferTo ? "true" : "false");
@@ -3239,15 +3289,31 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
       // Subdomain deploys use a different on-chain path (setSubnodeOwner on
       // the Registry, no commit-reveal or PoP). Skip the TLD preflight and
-      // just verify the signer owns the parent; if the subname is already
-      // ours or unowned, the DotNS phase below will do the right thing.
+      // just verify the signer is authorised over the parent; if the subname
+      // is already ours or unowned, the DotNS phase below will do the right
+      // thing.
+      //
+      // bulletin-deploy #1443: authorisation is checked via the registry's own
+      // isAuthorised(parentNode, account) (DotNS.checkNodeAuthorization), NOT
+      // checkOwnership(parentLabel) — that reads the REGISTRAR's ERC-721
+      // ownerOf, which only resolves for a top-level, tokenised parent. Once
+      // nested subnames are allowed (parentLabel can itself be a multi-label
+      // path like "app.supafaust", a subnode with no ERC-721 tokenId at all),
+      // checkOwnership either reverts or reads back "owned by no one" for a
+      // parent the signer genuinely owns/is-approved-for, routing into
+      // formatSubdomainParentError's UNOWNED branch with a confidently wrong
+      // "register the parent" suggestion. checkNodeAuthorization is also
+      // correct at depth 1 (falls back to owner()-equality when isAuthorised
+      // is absent), so this replaces the old call outright rather than
+      // supplementing it.
       if (parsed?.isSubdomain) {
         try {
           const subResult = await preflight.checkSubdomainOwnership(parsed.sublabel!, parsed.parentLabel!);
           assertSubdomainOwnerMatchesSigner(subResult, preflight.evmAddress, parsed.sublabel!, parsed.parentLabel!, envTld);
           if (!subResult.owned) {
-            const { owned: parentOwned, owner: parentOwner } = await preflight.checkOwnership(parsed.parentLabel!);
-            if (!parentOwned) {
+            const parentNode = computeDomainNode(parsed.parentLabel!, envTld);
+            const { authorised: parentAuthorised, owner: parentOwner } = await preflight.checkNodeAuthorization(parentNode, preflight.evmAddress!);
+            if (!parentAuthorised) {
               throw new NonRetryableError(
                 formatSubdomainParentError(parsed.fullName, parsed.parentLabel!, parentOwner ?? null, preflight.evmAddress ?? "", envTld, preflight.protocolVersion)
               );
@@ -3547,8 +3613,15 @@ export async function deploy(content: DeployContent, domainName: string | null =
           } else if (owner) {
             throw new Error(`Subdomain ${parsed.fullName} is owned by ${owner}, not ${dotns.evmAddress}`);
           } else {
-            const parentOwnership = await dotns.checkOwnership(parsed.parentLabel!);
-            if (!parentOwnership.owned) throw new Error(`You must own ${parsed.parentLabel}.${envTld} to register subdomains under it`);
+            // bulletin-deploy #1443: checkNodeAuthorization (registry
+            // isAuthorised, owner()-equality fallback), not
+            // checkOwnership(parentLabel) — see the comment at the earlier
+            // preflight call site for why a registrar-based ownerOf read is
+            // wrong once parentLabel can itself be a multi-label nested-subname
+            // path.
+            const parentNode = computeDomainNode(parsed.parentLabel!, envTld);
+            const { authorised: parentAuthorised } = await dotns.checkNodeAuthorization(parentNode, dotns.evmAddress!);
+            if (!parentAuthorised) throw new Error(`You must own (or be approved for) ${parsed.parentLabel}.${envTld} to register subdomains under it`);
             console.log(`   Status: Registering subdomain...`);
             await dotns.registerSubdomain(parsed.sublabel!, parsed.parentLabel!);
             registeredFresh = true;

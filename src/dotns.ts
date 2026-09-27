@@ -4,6 +4,7 @@ import { createClient, Enum } from "polkadot-api";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { getWsProvider } from "polkadot-api/ws";
 import { PGAS_ASSET_LOCATION } from "./personhood/constants.js";
+import { resolveEffectiveMnemonic, mnemonicConflictNotice } from "./mnemonic.js";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { Binary } from "polkadot-api";
@@ -2891,7 +2892,22 @@ export class DotNS {
       this.signer = options.signer!;
       this.substrateAddress = options.signerAddress!;
     } else {
-      const mnemonicArg = options.mnemonic || process.env.DOTNS_MNEMONIC || process.env.MNEMONIC;
+      // bulletin #1553/#1461: shared with bin/polkadot-app-deploy via
+      // src/mnemonic.ts, rather than reading process.env directly with a
+      // locally-decided order — this used to read DOTNS_MNEMONIC before
+      // MNEMONIC, the opposite of everywhere else, but was unreachable via
+      // the CLI (bin always pre-resolves options.mnemonic first) so the
+      // disagreement only bit a direct DotNS.connect()/deploy()-as-a-library
+      // caller that left options.mnemonic unset.
+      if (!options.mnemonic) {
+        const notice = mnemonicConflictNotice({ envMnemonic: process.env.MNEMONIC, envDotnsMnemonic: process.env.DOTNS_MNEMONIC });
+        if (notice) console.error(notice);
+      }
+      const mnemonicArg = resolveEffectiveMnemonic({
+        flagMnemonic: options.mnemonic,
+        envMnemonic: process.env.MNEMONIC,
+        envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
+      });
       const keyUriArg = options.keyUri || process.env.DOTNS_KEY_URI;
       let source = keyUriArg || mnemonicArg || DEFAULT_MNEMONIC;
       const isKeyUri = Boolean(keyUriArg);

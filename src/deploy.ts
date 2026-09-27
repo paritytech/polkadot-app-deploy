@@ -533,23 +533,19 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
   return { client, unsafeApi, signer, ss58 };
 }
 
-/**
- * Resolve the mnemonic the CLI should act with, in precedence order:
- * `--mnemonic` flag > `MNEMONIC` env var > `DOTNS_MNEMONIC` env var.
- *
- * Exists so the bin's flag/env resolution is unit-testable and so the two
- * env vars are forwarded consistently: previously the bin only forwarded
- * `flags.mnemonic` into `options.mnemonic`, so an env-only mnemonic never
- * reached `chooseSignerInput` and a persisted session silently won instead —
- * even though `chooseSignerInput` already prefers mnemonic first.
- */
-export function resolveEffectiveMnemonic(opts: {
-  flagMnemonic: string | undefined;
-  envMnemonic: string | undefined;
-  envDotnsMnemonic: string | undefined;
-}): string | undefined {
-  return opts.flagMnemonic ?? opts.envMnemonic ?? opts.envDotnsMnemonic;
-}
+// #1107 introduced this resolver so the bin's flag/env resolution is
+// unit-testable and so the two env vars are forwarded consistently
+// (previously the bin only forwarded `flags.mnemonic` into
+// `options.mnemonic`, so an env-only mnemonic never reached
+// `chooseSignerInput` and a persisted session silently won instead — even
+// though `chooseSignerInput` already prefers mnemonic first).
+//
+// bulletin #1553/#1461: moved to src/mnemonic.ts and re-exported here
+// (rather than defined locally) so `DotNS.connect` (src/dotns.ts) can share
+// the exact same precedence logic without a deploy.ts <-> dotns.ts import
+// cycle — deploy.ts already imports from dotns.ts. Keeping one definition
+// removes the possibility of the two files' precedence drifting apart again.
+export { resolveEffectiveMnemonic, mnemonicConflictNotice } from "./mnemonic.js";
 
 /**
  * Resolve the environment id the CLI should target, in precedence order:

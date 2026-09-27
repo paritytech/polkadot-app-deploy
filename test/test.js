@@ -10555,7 +10555,7 @@ describe("watchTransaction found:false handling", () => {
 // ---------------------------------------------------------------------------
 import { resolveStateDir, stateFilePath, loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const BIN_PATH = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkadot-app-deploy");
 
@@ -24854,7 +24854,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -25246,6 +25246,138 @@ describe("bin/polkadot-app-deploy confirmPhoneReady non-interactive gate (#1363,
       ">> FAIL: bin/polkadot-app-deploy: a genuine interactive Ctrl-C must still reject with 'aborted by user' — only the non-interactive path gets the new distinct error");
     assert.match(bin, /answer === "y" \|\| answer === "yes"/,
       ">> FAIL: bin/polkadot-app-deploy: the explicit y/yes confirmation requirement (#194) must be unchanged");
+  });
+});
+
+// bulletin #1553/#1461: MNEMONIC and DOTNS_MNEMONIC used to be ranked in
+// opposite order by resolveEffectiveMnemonic (MNEMONIC-first, above) and
+// DotNS.connect's own fallback (DOTNS_MNEMONIC-first) — invisible via the CLI
+// because bin/polkadot-app-deploy always pre-resolves options.mnemonic before
+// DotNS.connect ever looks at its own env fallback. src/mnemonic.ts is now
+// the single shared implementation.
+const MN1553_A = "bottom drive obey lake curtain smoke basket hold race lonely fit walk"; // well-known dev phrase
+const MN1553_B = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+describe("resolveEffectiveMnemonic env-vs-env precedence (bulletin #1553/#1461)", () => {
+  test("both env vars set, no flag → MNEMONIC wins (the exact case #1461 found untested)", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_B });
+    assert.strictEqual(resolved, MN1553_A,
+      ">> FAIL: mnemonic-precedence: with both MNEMONIC and DOTNS_MNEMONIC set and no --mnemonic flag, MNEMONIC must win — pre-fix, DotNS.connect's own fallback disagreed and picked DOTNS_MNEMONIC on this exact input");
+  });
+
+  test("empty-string MNEMONIC is treated as unset, not a winning blank value (GH Actions unset-secret shape)", () => {
+    // `MNEMONIC: ${{ secrets.X }}` on an unset secret resolves to "" — must
+    // fall through to DOTNS_MNEMONIC, not win as a blank mnemonic.
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: "", envDotnsMnemonic: MN1553_B });
+    assert.strictEqual(resolved, MN1553_B, ">> FAIL: mnemonic-precedence: an empty-string MNEMONIC must fall through to DOTNS_MNEMONIC rather than winning as a blank value");
+  });
+
+  test("whitespace-only --mnemonic flag falls through to MNEMONIC", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: "   ", envMnemonic: MN1553_A, envDotnsMnemonic: undefined });
+    assert.strictEqual(resolved, MN1553_A, ">> FAIL: mnemonic-precedence: a whitespace-only --mnemonic flag must fall through to the MNEMONIC env var rather than winning as a blank value");
+  });
+});
+
+describe("mnemonicConflictNotice (bulletin #1553/#1461)", () => {
+  test("both set and differ → a notice naming both env vars, never their values", () => {
+    const notice = mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_B });
+    assert.ok(notice, ">> FAIL: mnemonic-notice: both set and differing must produce a non-null notice");
+    assert.match(notice, /MNEMONIC/, ">> FAIL: mnemonic-notice: notice must name MNEMONIC");
+    assert.match(notice, /DOTNS_MNEMONIC/, ">> FAIL: mnemonic-notice: notice must name DOTNS_MNEMONIC");
+    assert.ok(!notice.includes(MN1553_A) && !notice.includes(MN1553_B),
+      ">> FAIL: mnemonic-notice: notice must never include a raw mnemonic value (trust-boundary: no key material in logs)");
+  });
+
+  test("both set to the SAME value → no notice", () => {
+    const notice = mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_A });
+    assert.strictEqual(notice, null, ">> FAIL: mnemonic-notice: identical values must not be flagged as a conflict");
+  });
+
+  test("only one set → no notice", () => {
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: undefined }), null, ">> FAIL: mnemonic-notice: MNEMONIC alone must not be flagged");
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: undefined, envDotnsMnemonic: MN1553_B }), null, ">> FAIL: mnemonic-notice: DOTNS_MNEMONIC alone must not be flagged");
+  });
+
+  test("neither set → no notice", () => {
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: undefined, envDotnsMnemonic: undefined }), null, ">> FAIL: mnemonic-notice: nothing set must not be flagged");
+  });
+});
+
+describe("DotNS.connect() shares resolveEffectiveMnemonic's precedence (bulletin #1553/#1461)", () => {
+  const repoRoot = path.resolve(BIN_PATH, "../..");
+  const dotnsUrl = pathToFileURL(path.join(repoRoot, "dist/dotns.js")).href;
+
+  async function addressFor(mnemonic) {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    return keyring.addFromMnemonic(mnemonic).address;
+  }
+
+  test("options.mnemonic absent, both env vars set and differ → derives the signer from MNEMONIC, not DOTNS_MNEMONIC", async () => {
+    const addressA = await addressFor(MN1553_A);
+    // Run in a CHILD process rather than in-process: connect()'s network
+    // step against an unreachable RPC can take much longer than the
+    // signer-derivation step this test cares about, and an in-process await
+    // left the pending connection an open handle with no way to force it
+    // closed. A child process can be killed outright via spawnSync's timeout
+    // once the value we need (substrateAddress, set synchronously before any
+    // network call) has been captured and printed.
+    const script = [
+      `import { DotNS } from ${JSON.stringify(dotnsUrl)};`,
+      `const dotns = new DotNS();`,
+      `dotns.connect({ rpc: "ws://127.0.0.1:1" }).catch(() => {});`,
+      `setTimeout(() => { process.stdout.write(JSON.stringify({ address: dotns.substrateAddress ?? null })); process.exit(0); }, 1200);`,
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8",
+      timeout: 6000,
+      killSignal: "SIGKILL",
+      env: { ...process.env, MNEMONIC: MN1553_A, DOTNS_MNEMONIC: MN1553_B },
+    });
+    assert.ok(result.stdout, `>> FAIL: dotns-connect-precedence: child process produced no stdout (status ${result.status}, signal ${result.signal}, stderr: ${result.stderr})`);
+    // dotns.ts's own connect() prints "   SS58 Address: ..." to stdout
+    // before our marker JSON does — take only the last line.
+    const lastLine = result.stdout.trim().split("\n").pop();
+    const { address } = JSON.parse(lastLine);
+    assert.strictEqual(address, addressA,
+      ">> FAIL: dotns-connect-precedence: with no options.mnemonic and both env vars set and differing, DotNS.connect must derive its signer from MNEMONIC, not DOTNS_MNEMONIC — this is dotns.ts's own resolution point for a direct connect() caller that bypasses bin's pre-collapse (e.g. deploy() used as a library, or DotNS used directly)");
+  });
+});
+
+describe("CLI end-to-end: bin/polkadot-app-deploy's mnemonic collapse doesn't defeat the fix (bulletin #1553/#1461)", () => {
+  test("MNEMONIC and DOTNS_MNEMONIC both set, no --mnemonic flag → the CLI signs with MNEMONIC and warns about the conflict on stderr", async () => {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    const addressA = keyring.addFromMnemonic(MN1553_A).address;
+
+    const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "mn1553test-"));
+    fs.writeFileSync(path.join(buildDir, "index.html"), "<html></html>");
+    let result;
+    try {
+      result = spawnSync(process.execPath, [BIN_PATH, buildDir, "mnemonic1553test", "--no-manifest"], {
+        cwd: path.resolve(BIN_PATH, "../.."),
+        encoding: "utf8",
+        timeout: 8000,
+        killSignal: "SIGKILL",
+        env: {
+          ...process.env,
+          MNEMONIC: MN1553_A,
+          DOTNS_MNEMONIC: MN1553_B,
+          // Unreachable on purpose — this test only needs the signer to be
+          // derived and printed, which happens before any network call; the
+          // deploy is expected (and allowed) to fail after.
+          DOTNS_RPC: "ws://127.0.0.1:1",
+          PAD_UPDATE_CHECK: "0",
+        },
+      });
+    } finally {
+      fs.rmSync(buildDir, { recursive: true, force: true });
+    }
+
+    assert.match(result.stdout, new RegExp(`SS58 Address: ${addressA}`),
+      `>> FAIL: cli-mnemonic-collapse: bin/polkadot-app-deploy must sign with the MNEMONIC-derived address (${addressA}) even though it pre-collapses MNEMONIC/DOTNS_MNEMONIC into a single options.mnemonic before DotNS.connect ever runs — got stdout:\n${result.stdout}`);
+    assert.match(result.stderr, /Both MNEMONIC and DOTNS_MNEMONIC are set/,
+      ">> FAIL: cli-mnemonic-collapse: the CLI must print the conflict notice on stderr when both env vars are set and differ");
   });
 });
 

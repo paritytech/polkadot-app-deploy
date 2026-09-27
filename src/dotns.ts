@@ -1163,6 +1163,10 @@ function formatContractDryRunFailure(
     encodedData: string;
     args?: unknown[];
     contracts?: Record<string, string>;
+    /** bulletin-deploy #1518: the storage-deposit floor actually declared on this
+     *  call, so the bare-revert diagnostic below can name the real configured
+     *  amount instead of a stale hardcoded one. */
+    registerStorageDeposit?: bigint;
   },
 ): string {
   const functionName = context.functionName ?? "unknown";
@@ -1187,9 +1191,14 @@ function formatContractDryRunFailure(
   const isBareRevert = isBareRevertResult(gasEstimate.revertData, gasEstimate.revertFlags);
   if (isBareRevert && BARE_REVERT_DIAGNOSTIC_FUNCTIONS.has(functionName)) {
     if (functionName === "register") {
+      const floor = context.registerStorageDeposit ?? MINIMUM_REGISTER_STORAGE_DEPOSIT;
       lines.push(
         `  diagnostic: bare-revert (empty 0x) during register. Most likely cause: insufficient signer balance for storage deposit.`,
-        `    A fresh TLD register() requires sufficient free balance to cover the chain's storage deposit (typically 200+ PAS).`,
+        // bulletin-deploy #1518: this used to say "typically 200+ PAS" — a hardcoded,
+        // never-measured figure. The number that actually matters is the FLOOR this
+        // specific call declared, since pallet-revive requires the signer's free
+        // balance to cover the declared limit, not the (much smaller) real charge.
+        `    A fresh TLD register() requires sufficient free balance to cover the declared storage-deposit limit (currently ${fmtPas(floor)} PAS for this environment).`,
         `    Other possible causes:`,
         `    1. PoP status changed between preflight and registration (race condition).`,
         `    2. Commitment timing: the revealed commitment is still too new or already expired.`,
@@ -1915,31 +1924,43 @@ function parsePersonhoodStatusResult(result: unknown): number {
 // own estimate is zero or thin. This is a *different* concept from
 // MINIMUM_REGISTER_STORAGE_DEPOSIT (line ~184 below): that one is the
 // env-configurable (this._registerStorageDeposit) floor for a fresh TLD
-// register() specifically. This one is a generic per-Revive.call floor used
-// by any dry-run, register included. They happen to share the same numeric
-// value today (2_000_000_000_000n / 200 PAS) — that's a coincidence of the
-// current chain's storage pricing, not a coupling. Keep them as separate
-// named constants so an env-specific register-deposit override can never
-// silently change this generic floor, or vice versa.
+// register() specifically. This one is the DEFAULT generic per-Revive.call
+// floor used when no caller-specific floor is known (e.g. a bare
+// `new ReviveClientWrapper(...)` nobody has configured, such as a test).
+// They happen to share the same numeric value today (2_000_000_000_000n /
+// 200 PAS) — that's a coincidence of the current chain's storage pricing,
+// not a coupling.
+//
+// bulletin-deploy #1491/#1518: the per-env registerStorageDeposit override
+// used to only move the preflight balance gate (feeFloorFor/topUpTargetFor)
+// and never reach the actual DECLARED storage_deposit_limit on a submitted
+// Revive.call — so an operator lowering (or raising) the env's configured
+// floor saw no effect on what the chain actually required. Fixed by giving
+// ReviveClientWrapper a settable floor (see setStorageDepositFloor below),
+// defaulted to this constant and overridden with the connected DotNS
+// instance's this._registerStorageDeposit right after construction
+// (recreateReviveClient) — see storageDepositLimitFor's call sites.
 const REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT = 2_000_000_000_000n;
 
 // Shared storage_deposit_limit buffer formula for Revive.call dry-runs: 20%
 // headroom over the dry-run's own storageDeposit estimate, floored at
-// REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT so a zero/thin estimate still gets a
-// workable limit. Both the single-call path (ReviveClientWrapper's
-// dryRunReviveCall, used by submitTransaction and submitBatchedTransactions)
-// and the batched contract-call path (DotNS.submitBatchedContractCalls, used
-// by subdomain registration) must go through this one function — duplicating
+// `floor` (defaults to REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT) so a zero/thin
+// estimate still gets a workable limit. Both the single-call path
+// (ReviveClientWrapper's dryRunReviveCall, used by submitTransaction and
+// submitBatchedTransactions) and the batched contract-call path
+// (DotNS.submitBatchedContractCalls, used by subdomain registration and
+// setContenthash+setText) must go through this one function — duplicating
 // this arithmetic inline at a second call site is exactly how the two drift,
 // leaving one path with a stale buffer and a rejected or underfunded call.
-// Exported for unit tests.
-export function computeStorageDepositLimit(
+// Named to match bulletin-deploy's helper of the same purpose, so the two
+// codebases stay aligned at the next sync. Exported for unit tests.
+export function storageDepositLimitFor(
   estimatedStorageDeposit: bigint,
-  minimum: bigint = REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT,
+  floor: bigint = REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT,
 ): bigint {
-  if (estimatedStorageDeposit === 0n) return minimum;
+  if (estimatedStorageDeposit === 0n) return floor;
   const buffered = (estimatedStorageDeposit * 120n) / 100n;
-  return buffered < minimum ? minimum : buffered;
+  return buffered < floor ? floor : buffered;
 }
 
 export class ReviveClientWrapper {
@@ -1948,8 +1969,25 @@ export class ReviveClientWrapper {
 
   client: any;
   mappedAccounts: Set<string>;
+  // bulletin-deploy #1518: the storage-deposit floor this wrapper declares on
+  // every Revive.call it dry-runs/submits (dryRunReviveCall, used by
+  // submitTransaction and submitBatchedTransactions). Defaults to the module
+  // constant so a wrapper nobody configured (e.g. a bare
+  // `new ReviveClientWrapper(client)` in a test) still declares a safe,
+  // known floor rather than silently falling back to 0.
+  // DotNS.recreateReviveClient — the only place a wrapper is ever
+  // constructed — calls setStorageDepositFloor right after construction, so
+  // every dry-run path through this wrapper picks up the owning DotNS
+  // instance's configured/measured this._registerStorageDeposit
+  // automatically; no per-call parameter to thread (and forget) at each new
+  // call site.
+  private _storageDepositFloor: bigint = REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT;
 
   constructor(client: any) { this.client = client; this.mappedAccounts = new Set(); }
+
+  setStorageDepositFloor(floor: bigint): void {
+    this._storageDepositFloor = floor;
+  }
 
   async getEvmAddress(substrateAddress: string): Promise<string> {
     if (isAddress(substrateAddress)) return substrateAddress;
@@ -2278,13 +2316,13 @@ export class ReviveClientWrapper {
         encodedData,
         args: context.args,
         contracts: context.contracts,
+        registerStorageDeposit: this._storageDepositFloor,
       });
       throw new ContractDryRunRevertError(msg, (gasEstimate.revertData ?? "0x") as `0x${string}`, gasEstimate.revertFlags ?? 0n);
     }
-    const storageDepositLimit = computeStorageDepositLimit(gasEstimate.storageDeposit);
     return {
       weight_limit: { ref_time: gasEstimate.gasRequired.referenceTime, proof_size: gasEstimate.gasRequired.proofSize },
-      storage_deposit_limit: storageDepositLimit,
+      storage_deposit_limit: storageDepositLimitFor(gasEstimate.storageDeposit, this._storageDepositFloor),
     };
   }
 
@@ -2756,6 +2794,15 @@ export class DotNS {
     if (this.client) { try { this.client.destroy(); } catch { /* ignore teardown errors */ } }
     this.client = createClient(getWsProvider(endpoint, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
     this.clientWrapper = new ReviveClientWrapper(this.client.getUnsafeApi());
+    // bulletin-deploy #1518: this is the ONLY place a ReviveClientWrapper is
+    // ever constructed (grep confirms), so it is the one place that cannot
+    // miss telling a fresh wrapper what storage-deposit floor to declare on
+    // every Revive.call it dry-runs — _registerStorageDeposit is already set
+    // by this point (connect() applies options.registerStorageDeposit before
+    // calling this), and it persists across reconnects (setContenthash's
+    // read-back retry, connect's own ReviveApi.address retry), so
+    // re-applying it here on every recreation is always correct, never stale.
+    this.clientWrapper.setStorageDepositFloor(this._registerStorageDeposit);
   }
 
   async connect(options: DotNSConnectOptions = {}): Promise<this> {
@@ -4061,12 +4108,17 @@ export class DotNS {
       proof_size: headEstimate.gasRequired.proofSize,
       ref_time: headEstimate.gasRequired.referenceTime,
     };
-    // Route through the same computeStorageDepositLimit() helper
+    // Route through the same storageDepositLimitFor() helper
     // ReviveClientWrapper.dryRunReviveCall uses, instead of recomputing the
-    // 20%-buffer-floored-at-minimum formula inline — the two had drifted
+    // 20%-buffer-floored-at-floor formula inline — the two had drifted
     // into separate copies of the same arithmetic (issue: storage_deposit_limit
-    // buffer formula duplicated past its own helper).
-    const storage_deposit_limit = computeStorageDepositLimit(headEstimate.storageDeposit);
+    // buffer formula duplicated past its own helper). this._registerStorageDeposit
+    // is the same per-env floor threaded into ReviveClientWrapper via
+    // setStorageDepositFloor (bulletin-deploy #1491/#1518) — this call site
+    // builds its own Revive.call extrinsics directly rather than going
+    // through the wrapper's dryRunReviveCall, so it must be passed explicitly
+    // here too.
+    const storage_deposit_limit = storageDepositLimitFor(headEstimate.storageDeposit, this._registerStorageDeposit);
 
     const client = this.clientWrapper.client;
     const buildBatch = () => {

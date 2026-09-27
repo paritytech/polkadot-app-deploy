@@ -12,7 +12,7 @@
       "tld": "paseo",
       "autoAccountMapping": true,
       "nativeToEthRatio": 100000000,
-      "registerStorageDeposit": 2000000000000,
+      "registerStorageDeposit": 50000000000,
       "contracts": {
         "DOTNS_PROTOCOL_REGISTRY": "0xD19e3D0C97CF501125a04A97405e3e6592fa846E",
         "DOTNS_REGISTRAR": "0x4f06E818Ba3d987704fd91cf3d868E4b019106Ab",

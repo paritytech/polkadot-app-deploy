@@ -17,12 +17,14 @@
  *     have enough PAS balance to pay the reprove fee.
  *   - PAD_ENV=paseo-next-v2 (set by the workflow job)
  */
-import { test, describe } from "node:test";
+import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS } from "../dist/dotns.js";
 import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig } from "../dist/environments.js";
+import { trackTimers, armExitGuard } from "./helpers/e2e-exit-guard.js";
 
 const ENABLED = process.env.E2E === "1";
+if (ENABLED) trackTimers();
 const REPROVE_MNEMONIC = process.env.E2E_REPROVE_MNEMONIC ?? "";
 const PAD_ENV = process.env.PAD_ENV ?? null;
 const DEPLOY_TIMEOUT_MS = 15 * 60 * 1000;
@@ -43,6 +45,7 @@ async function resolveDotnsEnvConnectOptions() {
 }
 
 describe("S-REPROVE — auto-reprove on bound-likely-stale", { skip: !ENABLED }, () => {
+  after(() => armExitGuard());
   // Positive path: inject "bound-likely-stale" via the test seam, verify that
   // preflight runs the reprove branch and emits the expected log lines.
   test(

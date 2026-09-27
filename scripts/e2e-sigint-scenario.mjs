@@ -39,18 +39,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 const FIXTURE_DIR = required("FIXTURE_DIR");
-const PAD_ENV = process.env.PAD_ENV ?? process.env.DOTNS_ENV ?? "";
 if (process.env.DOTNS_ENV && !process.env.PAD_ENV) {
   console.warn("DOTNS_ENV is deprecated; use PAD_ENV. Will be removed in a future release.");
 }
-const LABEL = process.env.LABEL ?? (PAD_ENV === "paseo-next-v2" ? "e2epoolns01" : "e2epool");
+// An unset PAD_ENV is not "no environment": the CLI deploys to DEFAULT_ENV_ID
+// (src/environments.ts), so the fixtures follow it.
+const ENV_ID = process.env.PAD_ENV || process.env.DOTNS_ENV || "paseo-next-v2";
+const LABEL = process.env.LABEL ?? (ENV_ID === "paseo-next-v2" ? "e2epoolns01" : "e2epool");
 // e2eownedns03, not e2eownedns02: verified live 2026-08-22 via checkOwnership
 // that e2eownedns02.paseo was squatted by a third party (0x237a2b18…) after
 // the Asset Hub re-genesis — e2eownedns03.paseo is the one actually owned by
 // Bob (0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01). See test/e2e.test.js's S3 block.
-const OWNED_LABEL = process.env.OWNED_LABEL ?? (PAD_ENV === "paseo-next-v2" ? "e2eownedns03" : "e2eowned");
+const OWNED_LABEL = process.env.OWNED_LABEL ?? (ENV_ID === "paseo-next-v2" ? "e2eownedns03" : "e2eowned");
 const DEPLOY_TAG = process.env.DEPLOY_TAG ?? "e2e-local-s7";
-const RPC = process.env.BULLETIN_RPC ?? "wss://paseo-bulletin-rpc.polkadot.io";
 const MNEMONIC = process.env.MNEMONIC ?? process.env.DOTNS_MNEMONIC;
 const ANCHOR_TIMEOUT_MS = 10 * 60 * 1000;     // ceiling for the deploy to reach chunk-upload
 const POST_ANCHOR_DELAY_MS = 3000;            // let upload start pumping bytes before SIGINT
@@ -96,13 +97,13 @@ function ok(msg) {
 // ── Run 1: kill mid-chunk-upload ─────────────────────────────────
 console.log("─── S7 Run 1: spawn bulletin-deploy and SIGINT mid-chunk-upload ───");
 
-const envFlag = PAD_ENV ? ["--env", PAD_ENV] : [];
+const envFlag = ["--env", ENV_ID];
 // Bare label: the DotNS TLD is per-environment (".paseo" on paseo-next-v2,
 // ".dot" elsewhere), and the CLI appends the env's resolved TLD itself.
 // Hardcoding ".dot" here made the CLI's wrong-TLD guard reject every
 // paseo-next-v2 run before the scenario could even start.
 const args1 = [FIXTURE_DIR, LABEL, "--js-merkle", "--tag", DEPLOY_TAG, ...envFlag];
-const env1 = PAD_ENV ? { ...process.env } : { ...process.env, BULLETIN_RPC: RPC };
+const env1 = { ...process.env };
 if (MNEMONIC) env1.MNEMONIC = MNEMONIC;
 
 // Honor PAD_BIN so the source-build path in nightly CI can point

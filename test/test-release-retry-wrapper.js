@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
 import { spawn } from "node:child_process";
-import { classifyForRetry } from "../tools/release-retry-wrapper.mjs";
+import { classifyForRetry, HARNESS_GUARD_MARKER, NO_RETRY_EXIT_CODE } from "../tools/release-retry-wrapper.mjs";
 
 const WRAPPER = new URL("../tools/release-retry-wrapper.mjs", import.meta.url).pathname;
 
@@ -17,6 +17,78 @@ test("classifyForRetry: flake-class patterns return exit 75", () => {
   for (const stderr of flakes) {
     assert.strictEqual(classifyForRetry(stderr), 75,
       `expected exit 75 (retry-eligible) for stderr containing: ${stderr.slice(0, 50)}`);
+  }
+});
+
+test("classifyForRetry: unverifiable code presence is retry-eligible, a missing contract is not", () => {
+  // null = the code-presence query failed (retry). false = a verdict (no retry).
+  assert.strictEqual(
+    classifyForRetry("paseo-next-v2 (POP_RULES 0xabc): Could not determine the DotNS ABI profile: neither pricingVersion() (v0.5.8-rc1) nor startingPrice() (poprules-startingPrice) answered. Code presence at this address could not be verified either (the runtime code-presence query failed), so a wrong/undeployed POP_RULES address is also possible."),
+    75,
+  );
+  assert.strictEqual(
+    classifyForRetry("paseo-next-v2 (POP_RULES 0xabc): No contract deployed at this address — could not detect the DotNS ABI profile because no contract code was found here."),
+    1,
+  );
+});
+
+test("classifyForRetry: a harness-guard failure is never retried, even alongside flake wording", () => {
+  // S8 and S-GRANDPA-REUPLOAD log "Connection lost" while passing, so without
+  // this a deterministic leak would rerun the whole scenario (#1393).
+  const output = `Connection lost and max reconnections (3) exhausted\n${HARNESS_GUARD_MARKER} process still alive 30s after the suite finished.`;
+  // 1 is the code CI produces: node --test normalises its child's exit code.
+  assert.strictEqual(classifyForRetry(output, 1), 1,
+    ">> FAIL: retry-wrapper: a harness-guard failure must fail fast, not classify as a flake");
+  assert.strictEqual(classifyForRetry(output, NO_RETRY_EXIT_CODE), NO_RETRY_EXIT_CODE,
+    ">> FAIL: retry-wrapper: a direct CLI no-retry exit must also fail fast");
+  // Keyed on the code, so a flake earlier in the same run still retries when
+  // the harness exited cleanly.
+  assert.strictEqual(classifyForRetry("Connection lost and max reconnections (3) exhausted", 1), 75,
+    ">> FAIL: retry-wrapper: a genuine flake must still retry");
+});
+
+// End to end in the shape CI uses: wrapper -> node --test -> a leaking file that
+// also logs flake wording.
+test("wrapper: a harness leak in a leg that logs flake wording does not retry", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { spawn } = await import("node:child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "wrapper-e2e-"));
+  const guard = new URL("./helpers/e2e-exit-guard.js", import.meta.url).href;
+  fs.writeFileSync(path.join(dir, "leaky.test.js"), `
+import { test } from "node:test";
+import { trackTimers, armExitGuard } from ${JSON.stringify(guard)};
+trackTimers();
+test("passes but leaks", () => {
+  process.stderr.write("Connection lost and max reconnections (3) exhausted\\n");
+  setInterval(() => {}, 5000);
+});
+process.on("exit", () => {});
+setTimeout(() => armExitGuard(300), 100);
+`);
+  try {
+    // Otherwise the inner runner sees the outer one, skips every file and exits 0.
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const child = spawn(process.execPath, [WRAPPER, process.execPath, "--test", path.join(dir, "leaky.test.js")], { stdio: ["ignore", "pipe", "pipe"], env });
+    let out = "";
+    child.stdout.on("data", (c) => { out += c; });
+    child.stderr.on("data", (c) => { out += c; });
+    const code = await new Promise((resolve, reject) => {
+      const t = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("timed out")); }, 60_000);
+      child.on("close", (c) => { clearTimeout(t); resolve(c); });
+    });
+    const tail = out.trim().split("\n").slice(-3).join(" | ");
+    // Positive first: otherwise a fixture that fails to load passes this test.
+    assert.ok(out.includes(HARNESS_GUARD_MARKER),
+      `>> FAIL: retry-wrapper: the fixture never printed the guard marker, so this test proves nothing; ${tail}`);
+    assert.ok(out.includes("Connection lost"),
+      `>> FAIL: retry-wrapper: the fixture never logged flake wording, so this test proves nothing; ${tail}`);
+    assert.strictEqual(code, 1,
+      `>> FAIL: retry-wrapper: a deterministic harness leak must fail fast with the child's code, not be retried as a flake; got ${code}; ${tail}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });
 

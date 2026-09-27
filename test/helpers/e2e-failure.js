@@ -29,6 +29,7 @@ const FLAKE_PATTERNS = [
   { needle: "fetchManifestRoundtrip failed", class: "gateway_timeout", summary: "IPFS gateway couldn't serve the deployed CID within budget. Often a Bulletin→IPFS bridge issue rather than gateway-down; check tools/.find-bulletin-chunk.mjs to confirm bytes are on chain." },
   { needle: "Contract execution would revert", class: "contract_revert", summary: "Revive dry-run rejected the call. Read the revert data — often a domain-state or PoP-status mismatch, not a flake." },
   { needle: "Contract reverted (flags=1)", class: "contract_revert", summary: "Revive call reverted on chain. flags=1 = execution revert; data field carries the selector." },
+  { needle: "Code presence at this address could not be verified", class: "code_presence_unverifiable", summary: "The runtime code-presence query at a DotNS contract address failed, so a missing contract and a live one are indistinguishable. Transient RPC; release-retry-wrapper retries it." },
   { needle: "Not connected. Call connect() first", class: "post_disconnect_async_leak", summary: "Late async callback in bulletin-deploy fired a chain read after disconnect() returned. Observed in S-ext-signer's npm-install path when setContenthash actually broadcasts a tx (rather than taking the 'already set' fast-path). Almost always passes on retry. Suspected source: post-tx verification or WS subscription cleanup landing after the test exits. Follow-up investigation needed." },
 ];
 

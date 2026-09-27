@@ -48,12 +48,27 @@ const FLAKE_PATTERNS = [
   // assertion that never emits this string, so retrying cannot mask a real
   // integrity regression.
   "roundtrip budget exhausted",
+  // hasContractCode returned null: the runtime code-presence query itself
+  // failed. A contract that is genuinely absent answers false and produces a
+  // different message, so retrying this cannot mask a missing contract.
+  "Code presence at this address could not be verified",
 ];
 
 // output: combined stdout+stderr text from the child. Any flake pattern
 // appearing anywhere in the child's output makes the run retry-eligible.
+// Printed by the E2E harness when it outlives its suite. A leak is deterministic,
+// and the WS-fault scenarios log flake wording while passing, so it must not retry.
+export const HARNESS_GUARD_MARKER = ">> FAIL: e2e harness:";
+
+// EXIT_CODE_NO_RETRY from src/errors.ts, reachable only when the wrapper spawns
+// the CLI directly: node --test normalises its child's code to 1, which is why
+// the marker is checked too.
+export const NO_RETRY_EXIT_CODE = 78;
+
 export function classifyForRetry(output, childExitCode = 1) {
   if (childExitCode === 0) return 0;
+  if (childExitCode === NO_RETRY_EXIT_CODE) return NO_RETRY_EXIT_CODE;
+  if (output.includes(HARNESS_GUARD_MARKER)) return childExitCode || 1;
   for (const pat of FLAKE_PATTERNS) {
     if (output.includes(pat)) return 75;
   }

@@ -4,7 +4,7 @@ import * as path from "path";
 import { execSync } from "child_process";
 import { CLI_NAME } from "./cli-name.js";
 import { resolveEffectiveMnemonic } from "./mnemonic.js";
-import { hasPersistedSession, STALE_SESSION_MESSAGE, DOT_DAPP_ID, DOT_PRODUCT_ID, getPeopleChainEndpoints } from "./auth-config.js";
+import { hasPersistedSession, STALE_SESSION_DEPLOY_MESSAGE, DOT_DAPP_ID, DOT_PRODUCT_ID, getPeopleChainEndpoints } from "./auth-config.js";
 import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
@@ -3555,13 +3555,16 @@ export async function deploy(content: DeployContent, domainName: string | null =
         console.log(`   Using ${actors.worker.source} signer: ${actors.worker.address}`);
       }
     } catch (e) {
-      if (options.suri) throw e;
       if ((e as { name?: string } | null)?.name === "SignerNotAvailableError") {
-        if (hasSession) console.error(STALE_SESSION_MESSAGE);
-        else console.log(`   Login session unavailable or expired — falling back to pool. Run \`${CLI_NAME} login\` to use your identity.`);
-      } else {
-        throw e; // includes MainnetDefaultWorkerError — surface it
+        // #234 (see src/deploy-actors.ts's resolveDeployActors for the full
+        // rationale): fail fast, before any chain write, instead of falling
+        // through to the default dev signer. hasSession is always true here —
+        // chooseSignerInput only returns "resolve" without an explicit --suri
+        // when hasSession is true, and resolveDeployActors only throws this
+        // class when sessionPresent is true.
+        throw new NonRetryableError(STALE_SESSION_DEPLOY_MESSAGE);
       }
+      throw e; // includes MainnetDefaultWorkerError — surface it
     }
   }
 

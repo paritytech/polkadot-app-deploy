@@ -1,7 +1,7 @@
 // Decides WHO signs a deploy and WHO receives the name, for the
 // zero-mobile-signature flow. Composes the vendored resolveSigner with the
 // session-address lookup. Testnet-only default-to-Alice; mainnet deferred.
-import { resolveSigner } from "./auth/index.js";
+import { resolveSigner, SignerNotAvailableError } from "./auth/index.js";
 import type { ResolvedSigner, AuthClient, AllocatableResource } from "./auth/index.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { BULLETIN_RESOURCE } from "./auth/index.js";
@@ -60,19 +60,25 @@ export async function resolveDeployActors(
       handle = null;
     }
     if (!handle) {
-      // #35 (Defect 2 Part 1): the session file is present on disk (sessionPresent)
-      // but the SSO stack could not load a usable signer — it may be stale / written
-      // by an older version, have lost the 3s waitForSessions race (a valid session
-      // whose async disk-flush hasn't settled), or its localStorage-backed store
-      // isn't readable in Node. Do NOT hard-fail transfer mode — fall back to a
-      // normal non-transfer deploy where the resolved worker signs directly.
-      // (mainnet + no --suri already threw MainnetDefaultWorkerError above, so this
-      // fallback only applies on testnet or when --suri was given.)
-      console.error(
-        "⚠  Found a login session on disk but couldn't load it — deploying without transfer " +
-        "(the worker signs directly). Log in again if you meant to transfer to your account.",
-      );
-      return { worker };
+      // #234 (SUPERSEDES #35 / Defect 2 Part 1's soft fallback this branch used
+      // to take): the session file is present on disk (sessionPresent) but the
+      // SSO stack could not load a usable signer — it may be stale / written by
+      // an older version, have lost the 3s waitForSessions race, or its
+      // localStorage-backed store isn't readable in Node. The old behaviour fell
+      // back to a non-transfer deploy where `worker` (DEFAULT_WORKER_SURI/Alice,
+      // unless --suri was passed) signed and registered the name directly with
+      // no transfer target — if registration completed, the label ended up
+      // owned by a key anyone can use (the public dev phrase, absent --suri) and
+      // unrecoverable. Fail fast instead, regardless of --suri: an unreadable
+      // session means the intended recipient is unknown either way, and mainnet
+      // + no --suri already threw MainnetDefaultWorkerError above so this can
+      // only be reached on testnet or when --suri was given.
+      //
+      // SignerNotAvailableError is the same class the plain (non-transfer)
+      // branch below already throws for an unloadable session — deploy.ts's
+      // catch converts it into a fail-fast NonRetryableError naming the
+      // logout/login remedy (or --mnemonic) before any chain write.
+      throw new SignerNotAvailableError();
     }
     try {
       return { worker, recipientH160: handle.addresses.productH160 };

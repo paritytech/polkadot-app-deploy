@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolveDeployActors, MainnetDefaultWorkerError } from "../dist/deploy-actors.js";
+import { SignerNotAvailableError } from "../dist/auth/index.js";
 
 // Fake authClient: getSessionSigner returns a handle with addresses + destroy.
 // Includes `signer` + `userSession` so the session branch of resolveSigner
@@ -47,28 +48,41 @@ test("transfer off: no recipient, and the session signer + userSession survive (
   assert.ok(r.worker.userSession, ">> FAIL: transfer-off: worker.userSession must be present or the SSS allowance preflight silently no-ops for real users");
 });
 
-// #35 Defect 2 Part 1 — split-brain: the on-disk probe says a session exists
-// (sessionPresent=true) but getSessionSigner() can't load it (returns null).
-// Must NOT hard-fail transfer mode; must fall back to a normal non-transfer deploy.
-test("session present on disk but not loadable (#35): falls back to non-transfer, does NOT throw", async () => {
-  const r = await resolveDeployActors(
-    fakeAuthClient({ session: false }),
-    { suri: undefined, transferEnabled: true, isTestnet: true, sessionPresent: true },
+// #234 SUPERSEDES #35 (Defect 2 Part 1)'s soft fallback: the on-disk probe says
+// a session exists (sessionPresent=true) but getSessionSigner() can't load it
+// (returns null). The old behaviour fell back to a non-transfer deploy where
+// the worker (DEFAULT_MNEMONIC/Alice, absent --suri) signed and registered the
+// name directly with no transfer target — if registration completed, the label
+// ended up owned by a key anyone can use and was unrecoverable. Must now FAIL
+// FAST (throw SignerNotAvailableError, which deploy.ts's catch converts into a
+// NonRetryableError naming the logout/login or --mnemonic remedy) before any
+// chain write, not fall back.
+test("session present on disk but not loadable (#234, was #35): FAILS FAST, does NOT fall back", async () => {
+  await assert.rejects(
+    () => resolveDeployActors(
+      fakeAuthClient({ session: false }),
+      { suri: undefined, transferEnabled: true, isTestnet: true, sessionPresent: true },
+    ),
+    SignerNotAvailableError,
+    ">> FAIL: #234: an unloadable session must fail fast (throw), not silently fall back to a no-transfer deploy on the default dev key",
   );
-  assert.equal(r.recipientH160, undefined,
-    ">> FAIL: #35: an unloadable session must NOT engage transfer mode (recipient unset) — it must fall back to a non-transfer deploy, not hard-fail");
-  assert.ok(r.worker,
-    ">> FAIL: #35: must still resolve a worker so the fallback deploy can proceed");
 });
 
-test("session not loadable + --suri provided (#35): falls back to non-transfer with the suri worker", async () => {
-  const r = await resolveDeployActors(
-    fakeAuthClient({ session: false }),
-    { suri: "//Bob", transferEnabled: true, isTestnet: true, sessionPresent: true },
+test("session not loadable + --suri provided (#234, was #35): FAILS FAST even with an explicit --suri worker", async () => {
+  // --suri only pins WHO signs; it says nothing about who the label should end
+  // up owned by. An unreadable session still means the intended recipient
+  // (the signed-in user's H160) is unknown, so this must fail fast too —
+  // --mnemonic (a full explicit signer, handled upstream by chooseSignerInput
+  // before resolveDeployActors is ever called) is the one override that skips
+  // this whole path; --suri is not.
+  await assert.rejects(
+    () => resolveDeployActors(
+      fakeAuthClient({ session: false }),
+      { suri: "//Bob", transferEnabled: true, isTestnet: true, sessionPresent: true },
+    ),
+    SignerNotAvailableError,
+    ">> FAIL: #234: --suri must not bypass the fail-fast when the session is unreadable — the recipient is still unknown",
   );
-  assert.equal(r.recipientH160, undefined,
-    ">> FAIL: #35: with --suri but an unloadable session, must deploy non-transfer (no recipient)");
-  assert.ok(r.worker, ">> FAIL: #35: --suri worker must resolve for the fallback deploy");
 });
 
 test("session not loadable + NON-testnet + no suri (#35): still throws MainnetDefaultWorkerError (mainnet guard unchanged)", async () => {

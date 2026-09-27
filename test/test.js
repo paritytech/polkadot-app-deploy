@@ -23578,16 +23578,35 @@ describe("verifiablejs beta.4 upgrade + people-collection identifier (handover �
 });
 
 // ---------------------------------------------------------------------------
-// Test-suite wiring guard: a *.test.js (or test-*.js) file that no command
-// runs is dead — it gives false "covered" confidence while never executing
-// in CI. (This is exactly how the chain-call encode bug shipped: a test
-// asserted the wrong contract AND other suites were never wired in.) Assert
-// every such file is either picked up by scripts/run-unit-tests.mjs's own
-// selection logic (imported above, not reimplemented here, so the guard and
-// the runner cannot silently drift apart) or explicitly referenced by a
-// workflow or script — that's how the E2E pair (test/e2e.test.js,
-// test/e2e-reprove.test.js) stays wired despite being deliberately excluded
-// from the unit-test selection.
+// Test-suite wiring guard: a test file that no command runs is dead — it
+// gives false "covered" confidence while never executing in CI. (This is
+// exactly how the chain-call encode bug shipped: a test asserted the wrong
+// contract AND other suites were never wired in.)
+//
+// Deny-by-default (#210): the old guard only ever walked files matching
+// known test-file naming conventions (*.test.js, test.js, test-*.js), so a
+// file under any OTHER name — wrapper_test.js, a .spec.js, a nested file
+// matching neither convention — was invisible to the guard, not just
+// unexempted from it. This asserts the actual property we want ("every
+// .js/.mjs file under test/ executes somewhere, or is legitimately non-test
+// data"), not a whitelist of shapes seen breaking so far.
+//
+// Every .js/.mjs file under test/ must be one of:
+//   (a) selected by scripts/run-unit-tests.mjs's collectUnitTestFiles
+//       (imported above, not reimplemented here, so the guard and the
+//       runner cannot silently drift apart);
+//   (b) referenced by name in package.json, a .github/workflows/*.y*ml
+//       step, or a scripts/*.sh|.mjs file — how the E2E pair
+//       (test/e2e.test.js, test/e2e-reprove.test.js) and
+//       test/helpers/e2e-ci-prep.js stay wired despite being excluded from,
+//       or absent from, the unit-test selection; or
+//   (c) referenced by a literal path from another file under test/ — a
+//       static import/require, a dynamic import with a literal path, or a
+//       literal fixture-directory path (e.g. path.resolve("test/fixtures/…"))
+//       that is an ancestor of the file. That covers helper modules
+//       (test/helpers/e2e-failure.js) and bulk data fixtures walked by
+//       directory rather than imported file-by-file
+//       (test/fixtures/realistic-vite/**).
 // ---------------------------------------------------------------------------
 
 describe("test-suite wiring — no orphaned test files", () => {
@@ -23596,11 +23615,13 @@ describe("test-suite wiring — no orphaned test files", () => {
   // comparisons against fs paths on any repo path containing characters
   // that get percent-escaped in a URL.
   const repoRoot = path.dirname(fileURLToPath(new URL(".", import.meta.url)));
+  const testDirRoot = path.join(repoRoot, "test");
 
-  const buildCorpus = () => {
-    const readIfExists = (p) => {
-      try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
-    };
+  const readIfExists = (p) => {
+    try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
+  };
+
+  const buildNameCorpus = () => {
     const corpusParts = [readIfExists(path.join(repoRoot, "package.json"))];
     const addDir = (dir, exts, exclude = new Set()) => {
       let entries;
@@ -23621,42 +23642,86 @@ describe("test-suite wiring — no orphaned test files", () => {
     return corpusParts.join("\n");
   };
 
-  const walkTestFiles = () => {
-    const testFiles = [];
-    // Mirrors collectUnitTestFiles's own root-vs-recursive split exactly:
-    // *.test.js is a candidate at any depth, but test.js / test-*.js only
-    // count at the test/ root (a nested test/helpers/test-utils.js is a
-    // fixture, not a test file no one wired in).
-    const walk = (dir, isRoot) => {
+  // Deny-by-default: every .js/.mjs under test/, no naming filter. (The old
+  // walk only ever matched *.test.js / test.js / test-*.js, so a file under
+  // any other name was never even looked at.)
+  const walkAllJsFiles = () => {
+    const files = [];
+    const walk = (dir) => {
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
         const full = path.join(dir, e.name);
-        if (e.isDirectory()) { walk(full, false); continue; }
-        const isCandidate = e.name.endsWith(".test.js") ||
-          (isRoot && (e.name === "test.js" || /^test-.*\.js$/.test(e.name)));
-        if (isCandidate) testFiles.push(full);
+        if (e.isDirectory()) { walk(full); continue; }
+        if (e.name.endsWith(".js") || e.name.endsWith(".mjs")) files.push(full);
       }
     };
-    walk(path.join(repoRoot, "test"), true);
-    return testFiles;
+    walk(testDirRoot);
+    return files;
   };
 
-  test("every test/**/*.test.js and test/test-*.js is selected by the unit-test runner or referenced by a workflow/script", () => {
-    const testFiles = walkTestFiles();
-    if (testFiles.length === 0) return; // test/ absent (dist-only context)
+  // Every ancestor directory of a posix-style repo-relative path, down to
+  // (but not including) the top-level bucket directory directly under test/
+  // — e.g. "test/fixtures/x/y/f.js" yields ["test/fixtures/x/y",
+  // "test/fixtures/x"], NOT "test/fixtures". Lets a literal directory
+  // reference (a fixture tree walked with fs.readdirSync rather than
+  // imported file-by-file) satisfy condition (c) for every file under it.
+  // Stopping short of the 2-segment "test/fixtures" / "test/helpers" level
+  // is deliberate: those bucket names are near-universal substrings (any
+  // reference to a file anywhere under them contains that prefix), so
+  // allowing them as candidates would let ONE reference into a bucket
+  // directory silently exempt every unrelated file elsewhere in it.
+  const ancestorDirs = (relRepo) => {
+    const parts = relRepo.split("/");
+    const out = [];
+    for (let i = parts.length - 1; i > 2; i--) out.push(parts.slice(0, i).join("/"));
+    return out;
+  };
 
-    const corpus = buildCorpus();
+  test("every .js/.mjs file under test/ is selected by the unit-test runner, referenced by name, or referenced by path from another test/ file", () => {
+    const allFiles = walkAllJsFiles();
+    if (allFiles.length === 0) return; // test/ absent (dist-only context)
+
+    const nameCorpus = buildNameCorpus();
     const selected = new Set(collectUnitTestFiles());
+    // Condition (c)'s corpus: the concatenated content of every file under
+    // test/, so a literal import/require path or a literal fixture-directory
+    // path written in ANY test/ file counts as a reference to that file.
+    const moduleCorpus = allFiles.map((f) => readIfExists(f)).join("\n");
+    // Sibling files (e.g. a fixture directory's many files) generate
+    // overlapping candidate strings — memoize so each distinct candidate is
+    // scanned against the corpus once, not once per file that produces it.
+    const corpusHitCache = new Map();
+    const corpusHas = (s) => {
+      if (corpusHitCache.has(s)) return corpusHitCache.get(s);
+      const hit = moduleCorpus.includes(s);
+      corpusHitCache.set(s, hit);
+      return hit;
+    };
 
-    const orphans = testFiles
-      .filter((f) => !selected.has(f) && !corpus.includes(path.basename(f)))
+    const isReferencedByPath = (f) => {
+      const relRepo = path.relative(repoRoot, f).split(path.sep).join("/");
+      const relTest = path.relative(testDirRoot, f).split(path.sep).join("/");
+      const candidates = [relRepo, relTest, `./${relTest}`, ...ancestorDirs(relRepo)];
+      for (const c of candidates) {
+        if (c && corpusHas(c)) return true;
+      }
+      return false;
+    };
+
+    const orphans = allFiles
+      .filter((f) => !selected.has(f))
+      .filter((f) => !nameCorpus.includes(path.basename(f)))
+      .filter((f) => !isReferencedByPath(f))
       .map((f) => path.relative(repoRoot, f))
       .sort();
+
     assert.deepEqual(orphans, [],
       `>> FAIL: test-wiring: orphaned test file(s) that no command runs: ${orphans.join(", ")}. ` +
-      `Either it's picked up by scripts/run-unit-tests.mjs's selection (test/**/*.test.js, test/test.js, test/test-*.js, minus the E2E pair) ` +
-      `or it must be referenced by name in package.json, a .github/workflows step, or a scripts/*.sh|.mjs file — an unreferenced file never executes in CI.`);
+      `Each file under test/ must be (a) selected by scripts/run-unit-tests.mjs's collectUnitTestFiles, ` +
+      `(b) referenced by name in package.json, a .github/workflows step, or a scripts/*.sh|.mjs file, or ` +
+      `(c) imported (or, for a bulk fixture directory, path-referenced) by another file under test/ — ` +
+      `an unreferenced file never executes in CI.`);
   });
 
   test("the unit-test selection excludes the E2E pair but includes test/test.js and test/test-release-retry-wrapper.js", () => {

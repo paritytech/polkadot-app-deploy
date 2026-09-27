@@ -422,7 +422,16 @@ function cameFromOurConfig(msg: string): boolean {
 // hyphen-base, reserved-base) and both ownership branches. Without it, the
 // trailing-digits variant has no other matching pattern here and would
 // fall through to a bug-report prompt for a plain operator naming mistake.
-const GENERIC_USER_ERROR = /personhood|owned by|owner mismatch|reserved for original|invalid domain label|not authorized for bulletin|insufficient balance|insufficient funds|quota exhausted|insufficient .* authorization|bip39 mnemonic|ipfs cli not installed|base name is \d+ chars|cannot register it|NameNotAvailable|name must be lowercase/i;
+//
+// #1363: nonInteractivePhoneConfirmationError's (src/deploy.ts) fixed message
+// prefix. Shared with the ERROR_KIND_RULES entry further down so the two
+// classifications can't independently drift out of sync with a future
+// reword of that message — only one string to update.
+const PHONE_NONINTERACTIVE_FRAGMENT = "phone confirmation required for .+ but this run is non-interactive";
+const GENERIC_USER_ERROR = new RegExp(
+  `personhood|owned by|owner mismatch|reserved for original|invalid domain label|not authorized for bulletin|insufficient balance|insufficient funds|quota exhausted|insufficient .* authorization|bip39 mnemonic|ipfs cli not installed|base name is \\d+ chars|cannot register it|NameNotAvailable|name must be lowercase|${PHONE_NONINTERACTIVE_FRAGMENT}`,
+  "i",
+);
 
 export function isExpectedError(msg: string): boolean {
   if (GENERIC_USER_ERROR.test(msg)) return true;
@@ -502,6 +511,10 @@ export function computeDeployOutcome(
 //                                    NOT named *_not_authorized / *_auth_*: Sentry's org relayPiiConfig masks any attribute VALUE containing "auth", so such a kind would
 //                                    render as asterisks in every dashboard grouped by deploy.error_kind — verified empirically, see the sweep write-up.
 //   user.aborted                   — operator interrupted the run (Ctrl-C / SIGINT); not a product failure
+//   signer.phone_confirmation_unavailable — phone-confirmation gate fired with no TTY/interactive
+//                                    session to answer it (#1363) — distinct from user.aborted so a
+//                                    non-interactive caller (CI, no --mnemonic) that hits the gate
+//                                    isn't misclassified as an operator cancellation
 //   tool.invariant                 — internal invariant assertion failed
 //   unknown                        — none of the above patterns matched
 export type DeployErrorKind =
@@ -533,6 +546,7 @@ export type DeployErrorKind =
   | 'signer.message_too_large'
   | 'storage.rejected'
   | 'user.aborted'
+  | 'signer.phone_confirmation_unavailable'
   | 'tool.invariant'
   | 'unknown';
 
@@ -569,6 +583,22 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // shows up in the data later, widening this is a one-line change with evidence
   // behind it; over-matching now would be invisible.
   [/^aborted by user\b/i, 'user.aborted'],
+  // #1363: nonInteractivePhoneConfirmationError's fixed prefix (src/deploy.ts)
+  // — the phone-confirmation gate fired with no TTY/interactive session to
+  // answer it. Ordered right after user.aborted (same family, opposite cause:
+  // this one is NEVER a deliberate cancellation) so a non-interactive caller
+  // that hits the gate is never folded into the operator-cancellation kind.
+  // Deliberately UNANCHORED (unlike user.aborted just above): traced the full
+  // propagation path (confirmPhoneReady → _awaitPhoneReady → contractTransaction
+  // → {submitCommitment,finalizeRegistration,setContenthash} → withSpan chain →
+  // withDeploySpan) and confirmed every hop rethrows the same Error object
+  // unchanged — no wrapper currently prefixes this message. But this rule ADDS
+  // a bucket rather than removing spans from the failure rate (contrast
+  // user.aborted, anchored because over-matching there silently deletes real
+  // failures) and the phrase can't plausibly appear as a sub-clause of an
+  // unrelated error, so there's no upside to anchoring — only fragility if a
+  // future wrapper is added upstream.
+  [new RegExp(PHONE_NONINTERACTIVE_FRAGMENT, 'i'), 'signer.phone_confirmation_unavailable'],
   // Ahead of the generic contract-revert rule: a soulbound refusal is a
   // permanent naming fact, not a transient chain error.
   [/is soulbound and cannot be transferred/i, 'naming.soulbound'],

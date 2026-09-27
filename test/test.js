@@ -2062,6 +2062,35 @@ describe("classifyErrorKind", () => {
       ">> FAIL: user.aborted: the rule is unanchored — a real chunk failure was reclassified as an operator interrupt and vanished from the failure rate");
   });
 
+  // signer.phone_confirmation_unavailable (#1363) — a non-interactive caller
+  // (CI, no TTY) hit the phone-confirmation gate. Distinct from user.aborted:
+  // this is NEVER a deliberate cancellation, so it must not land in the kind
+  // that dashboards treat as "not a product failure", nor fall into 'unknown'
+  // the way it did pre-fix (misclassified as an operator abort).
+  test("signer.phone_confirmation_unavailable: nonInteractivePhoneConfirmationError's message classifies distinctly from user.aborted and unknown", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    const kind = classifyErrorKind(err.message);
+    assert.strictEqual(kind, "signer.phone_confirmation_unavailable",
+      `>> FAIL: signer.phone_confirmation_unavailable: got ${kind} — the non-interactive phone-gate failure must have its own kind, not fall into unknown`);
+    assert.notStrictEqual(kind, "user.aborted",
+      ">> FAIL: signer.phone_confirmation_unavailable: must not be folded into user.aborted — nobody deliberately cancelled a CI run");
+  });
+
+  test("signer.phone_confirmation_unavailable: still classifies if a future wrapper prefixes the message (deliberately unanchored)", () => {
+    // Traced the live propagation path (confirmPhoneReady -> _awaitPhoneReady ->
+    // contractTransaction -> withSpan chain -> withDeploySpan) and confirmed no
+    // current layer wraps/prefixes this message — every hop rethrows the same
+    // Error object. This rule is left unanchored anyway (unlike user.aborted,
+    // which must stay anchored so over-matching can't delete real failures from
+    // the failure rate): this rule only ADDS a bucket, so there's no downside to
+    // tolerating a future wrapper, and no plausible unrelated message contains
+    // this phrase by accident.
+    const err = nonInteractivePhoneConfirmationError("Register");
+    const wrapped = `dotns register failed: ${err.message}`;
+    assert.strictEqual(classifyErrorKind(wrapped), "signer.phone_confirmation_unavailable",
+      `>> FAIL: signer.phone_confirmation_unavailable: a wrapped/prefixed variant of the message must still classify correctly; got ${classifyErrorKind(wrapped)}`);
+  });
+
   // naming.contract_unavailable (1 span) — env config carries a zero/absent
   // address, caught before the call rather than as empty return data.
   test("naming.contract_unavailable: invalid configured contract address", () => {
@@ -24141,7 +24170,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -24440,6 +24469,99 @@ describe("resolveEffectiveMnemonic env/flag precedence (#1107)", () => {
     const choice = chooseSignerInput({ mnemonic: resolved, suri: undefined, hasInjectedSigner: false, hasSession: true });
     assert.strictEqual(choice, "mnemonic",
       ">> FAIL: resolveEffectiveMnemonic + chooseSignerInput: an env-only MNEMONIC must still win over a persisted session (#1107 — the bin previously forwarded undefined here, so hasSession made this 'resolve' and the deploy silently used the signed-in session instead)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// nonInteractivePhoneConfirmationError (#1363) — non-interactive callers must
+// not hit "aborted by user"
+//
+// Pre-fix: bin/polkadot-app-deploy's confirmPhoneReady hook unconditionally
+// built a readline interface and awaited a keypress. In CI (no TTY),
+// readline's "close" event fires immediately (nothing will ever answer), and
+// the gate rejected with `new Error("aborted by user")` — indistinguishable
+// from a deliberate Ctrl-C. This is the pure, readline-free piece of the fix:
+// the message + error type the CLI now throws BEFORE creating readline once
+// it detects a non-interactive environment (via the existing isInteractive()
+// helper, not a new mechanism).
+// ---------------------------------------------------------------------------
+describe("nonInteractivePhoneConfirmationError (#1363)", () => {
+  test("returns a NonRetryableError — retrying an unattended CI run fails identically every time", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    assert.ok(err instanceof NonRetryableError,
+      `>> FAIL: nonInteractivePhoneConfirmationError: must be a NonRetryableError so bin/polkadot-app-deploy exits EXIT_CODE_NO_RETRY instead of a retryable-looking generic failure; got ${err.constructor.name}`);
+  });
+
+  test("message names the label, states the run is non-interactive, and never says 'aborted by user'", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    assert.match(err.message, /Link content/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name which signature step was blocked");
+    assert.match(err.message, /non-interactive/i,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must say the run is non-interactive, not disguise the cause");
+    assert.doesNotMatch(err.message, /aborted by user/i,
+      ">> FAIL: nonInteractivePhoneConfirmationError: must never reuse the 'aborted by user' phrasing — that's the issue this fixes (misattributing a CI failure to an operator who was never there)");
+  });
+
+  test("message names the actionable fix: --mnemonic, MNEMONIC, and DOTNS_MNEMONIC", () => {
+    // There is no safe default for a phone signature (unlike a yes/no prompt,
+    // silently proceeding would submit an unapproved transaction), so the
+    // message must point the caller at a signer that never needs phone
+    // confirmation instead of guessing on their behalf.
+    const err = nonInteractivePhoneConfirmationError("Commitment");
+    assert.match(err.message, /--mnemonic/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the --mnemonic flag as the fix");
+    assert.match(err.message, /\bMNEMONIC\b/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the MNEMONIC env var as an alternative fix");
+    assert.match(err.message, /DOTNS_MNEMONIC/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the DOTNS_MNEMONIC env var as an alternative fix");
+  });
+
+  test("error_category classifies as 'user' — the fix is in the caller's hands (pass --mnemonic), not the tool's", () => {
+    const err = nonInteractivePhoneConfirmationError("Register");
+    const category = classifyDeployError(err.message);
+    assert.strictEqual(category, "user",
+      `>> FAIL: nonInteractivePhoneConfirmationError category: got ${category} — this is an actionable caller-side fix, same family as insufficient-balance/invalid-label, not an environment/internal fault`);
+  });
+});
+
+describe("bin/polkadot-app-deploy confirmPhoneReady non-interactive gate (#1363, source wiring)", () => {
+  // bin/polkadot-app-deploy is a plain executable script (not compiled, no
+  // top-level exports), and driving it far enough to hit the live
+  // confirmPhoneReady closure requires a real chain connection — that's E2E
+  // territory. These assertions pin the wiring the interactive-vs-CI split
+  // depends on, the same way this file's other bin/polkadot-app-deploy tests
+  // check source shape directly rather than executing the script end-to-end.
+  const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+
+  test("imports isInteractive from version-check.js and nonInteractivePhoneConfirmationError from deploy.js", () => {
+    assert.match(bin, /isInteractive/,
+      ">> FAIL: bin/polkadot-app-deploy must import isInteractive from ../dist/version-check.js — reuse the existing TTY/CI detection, not a second mechanism");
+    assert.match(bin, /nonInteractivePhoneConfirmationError/,
+      ">> FAIL: bin/polkadot-app-deploy must import and use nonInteractivePhoneConfirmationError from ../dist/deploy.js");
+  });
+
+  test("confirmPhoneReady checks isInteractive() BEFORE readline.createInterface is reached", () => {
+    const confirmBlock = bin.slice(bin.indexOf("confirmPhoneReady: ("), bin.indexOf("readline.createInterface"));
+    assert.ok(confirmBlock.length > 0 && confirmBlock.includes("isInteractive"),
+      ">> FAIL: bin/polkadot-app-deploy: the isInteractive() check must run before readline.createInterface — otherwise a non-TTY run still builds a readline interface it can never satisfy");
+    assert.match(confirmBlock, /!isInteractive\(\)/,
+      ">> FAIL: bin/polkadot-app-deploy: confirmPhoneReady must gate on !isInteractive(), rejecting before creating readline");
+  });
+
+  test("the interactive branch (readline prompt, Y/yes handling, genuine Ctrl-C abort) is still present, unmodified in behavior", () => {
+    // The fix must ONLY add a guard in front of the existing prompt — a real
+    // interactive deploy must still see "Check your phone", accept y/yes, and
+    // a genuine Ctrl-C during the prompt must still reject as "aborted by
+    // user" (that classification stays correct for an actual interactive
+    // cancellation; #1363 only stops CI from reaching it).
+    assert.match(bin, /Check your phone/,
+      ">> FAIL: bin/polkadot-app-deploy: interactive phone-check prompt text must still be present");
+    assert.match(bin, /readline\.createInterface/,
+      ">> FAIL: bin/polkadot-app-deploy: interactive readline wiring must still be present for a real TTY session");
+    assert.match(bin, /new Error\("aborted by user"\)/,
+      ">> FAIL: bin/polkadot-app-deploy: a genuine interactive Ctrl-C must still reject with 'aborted by user' — only the non-interactive path gets the new distinct error");
+    assert.match(bin, /answer === "y" \|\| answer === "yes"/,
+      ">> FAIL: bin/polkadot-app-deploy: the explicit y/yes confirmation requirement (#194) must be unchanged");
   });
 });
 

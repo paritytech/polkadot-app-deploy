@@ -652,6 +652,38 @@ export function isPhoneSignerActive(
 }
 
 /**
+ * Build the error bin/polkadot-app-deploy's `confirmPhoneReady` hook throws when
+ * the phone-confirmation gate fires in a non-interactive environment (issue #1363).
+ *
+ * Pre-fix, the CLI unconditionally created a `readline` interface and awaited a
+ * keypress; in a non-interactive shell (no TTY, or CI) readline's `"close"` event
+ * fires immediately because there is no input to deliver, and the gate rejected
+ * with `new Error("aborted by user")` — indistinguishable from a deliberate
+ * Ctrl-C, blaming an operator who was never there. There is no safe default to
+ * fall back to here: unlike a yes/no prompt, silently proceeding would submit a
+ * transaction nobody approved on their phone. So a non-interactive caller must
+ * hard-fail with a message naming the actual fix — swap to a signer that never
+ * needs phone confirmation.
+ *
+ * `NonRetryableError` (not a plain `Error`): retrying in the same CI environment
+ * fails the identical way every time, so bin/polkadot-app-deploy should exit
+ * with EXIT_CODE_NO_RETRY rather than a retryable-looking generic failure.
+ *
+ * Pure and readline-free (unlike the CLI's readline wiring) so it's directly
+ * unit-testable; bin/polkadot-app-deploy calls this only after checking
+ * version-check.ts's `isInteractive()` itself, reusing that existing TTY/CI
+ * detection rather than adding a second one.
+ */
+export function nonInteractivePhoneConfirmationError(label: string): NonRetryableError {
+  return new NonRetryableError(
+    `Phone confirmation required for "${label}" but this run is non-interactive ` +
+      `(no TTY, or a CI environment was detected) — there is nobody to press Y. ` +
+      `Use a signer that never needs phone confirmation: pass --mnemonic, or set ` +
+      `the MNEMONIC or DOTNS_MNEMONIC environment variable.`,
+  );
+}
+
+/**
  * Decide whether to hand the name over to the signed-in user after a deploy.
  * The handover only fires when the worker FRESHLY REGISTERED the name in this
  * run (#928): updating the content of a name that already exists must never

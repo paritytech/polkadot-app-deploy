@@ -1,5 +1,6 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { collectUnitTestFiles } from "../scripts/run-unit-tests.mjs";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 // Personhood bootstrap imports (loaded after build)
 import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow } from "../dist/dotns.js";
@@ -20440,52 +20441,97 @@ describe("verifiablejs beta.4 upgrade + people-collection identifier (handover �
 });
 
 // ---------------------------------------------------------------------------
-// Test-suite wiring guard: a *.test.js file that no command runs is dead —
-// it gives false "covered" confidence while never executing in CI. (This is
-// exactly how the chain-call encode bug shipped: a test asserted the wrong
-// contract AND other suites were never wired in.) Assert every test file is
-// referenced by package.json, a workflow, or a script.
+// Test-suite wiring guard: a *.test.js (or test-*.js) file that no command
+// runs is dead — it gives false "covered" confidence while never executing
+// in CI. (This is exactly how the chain-call encode bug shipped: a test
+// asserted the wrong contract AND other suites were never wired in.) Assert
+// every such file is either picked up by scripts/run-unit-tests.mjs's own
+// selection logic (imported above, not reimplemented here, so the guard and
+// the runner cannot silently drift apart) or explicitly referenced by a
+// workflow or script — that's how the E2E pair (test/e2e.test.js,
+// test/e2e-reprove.test.js) stays wired despite being deliberately excluded
+// from the unit-test selection.
 // ---------------------------------------------------------------------------
 
 describe("test-suite wiring — no orphaned test files", () => {
-  test("every test/**/*.test.js AND test-*.js is referenced by package.json, a workflow, or a script", () => {
-    const repoRoot = new URL("..", import.meta.url).pathname;
+  // repoRoot must come from fileURLToPath, not a bare URL.pathname — the
+  // latter is percent-encoded and would break path.join/path.relative
+  // comparisons against fs paths on any repo path containing characters
+  // that get percent-escaped in a URL.
+  const repoRoot = path.dirname(fileURLToPath(new URL(".", import.meta.url)));
 
+  const buildCorpus = () => {
     const readIfExists = (p) => {
       try { return fs.readFileSync(p, "utf8"); } catch { return ""; }
     };
     const corpusParts = [readIfExists(path.join(repoRoot, "package.json"))];
-    const addDir = (dir, exts) => {
+    const addDir = (dir, exts, exclude = new Set()) => {
       let entries;
       try { entries = fs.readdirSync(dir); } catch { return; }
       for (const e of entries) {
+        if (exclude.has(e)) continue;
         if (exts.some((x) => e.endsWith(x))) corpusParts.push(readIfExists(path.join(dir, e)));
       }
     };
     addDir(path.join(repoRoot, ".github", "workflows"), [".yml", ".yaml"]);
-    addDir(path.join(repoRoot, "scripts"), [".sh", ".mjs"]);
-    const corpus = corpusParts.join("\n");
+    // Exclude run-unit-tests.mjs itself: it's the selection logic under
+    // test here (via collectUnitTestFiles), not an independent "this file is
+    // wired in" reference. Its own EXCLUDED_FILENAMES literal happens to
+    // contain the E2E pair's names, which would otherwise let this corpus
+    // scan rubber-stamp them regardless of whether anything else actually
+    // runs them.
+    addDir(path.join(repoRoot, "scripts"), [".sh", ".mjs"], new Set(["run-unit-tests.mjs"]));
+    return corpusParts.join("\n");
+  };
 
+  const walkTestFiles = () => {
     const testFiles = [];
-    const walk = (dir) => {
+    // Mirrors collectUnitTestFiles's own root-vs-recursive split exactly:
+    // *.test.js is a candidate at any depth, but test.js / test-*.js only
+    // count at the test/ root (a nested test/helpers/test-utils.js is a
+    // fixture, not a test file no one wired in).
+    const walk = (dir, isRoot) => {
       let entries;
       try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
       for (const e of entries) {
         const full = path.join(dir, e.name);
-        if (e.isDirectory()) walk(full);
-        // Both naming conventions in use here. Matching only "*.test.js" is how
-        // test/test-release-retry-wrapper.js sat unrun with 11 assertions — it is a
-        // "test-*.js", so this walk never saw it.
-        else if (e.name.endsWith(".test.js") || /^test-[a-z0-9-]+\.js$/.test(e.name)) testFiles.push(e.name);
+        if (e.isDirectory()) { walk(full, false); continue; }
+        const isCandidate = e.name.endsWith(".test.js") ||
+          (isRoot && (e.name === "test.js" || /^test-.*\.js$/.test(e.name)));
+        if (isCandidate) testFiles.push(full);
       }
     };
-    walk(path.join(repoRoot, "test"));
+    walk(path.join(repoRoot, "test"), true);
+    return testFiles;
+  };
+
+  test("every test/**/*.test.js and test/test-*.js is selected by the unit-test runner or referenced by a workflow/script", () => {
+    const testFiles = walkTestFiles();
     if (testFiles.length === 0) return; // test/ absent (dist-only context)
 
-    const orphans = testFiles.filter((f) => !corpus.includes(f)).sort();
+    const corpus = buildCorpus();
+    const selected = new Set(collectUnitTestFiles());
+
+    const orphans = testFiles
+      .filter((f) => !selected.has(f) && !corpus.includes(path.basename(f)))
+      .map((f) => path.relative(repoRoot, f))
+      .sort();
     assert.deepEqual(orphans, [],
       `>> FAIL: test-wiring: orphaned test file(s) that no command runs: ${orphans.join(", ")}. ` +
-      `Add each to package.json "test"/"test:e2e" or a .github/workflows step — an unreferenced *.test.js never executes in CI.`);
+      `Either it's picked up by scripts/run-unit-tests.mjs's selection (test/**/*.test.js, test/test.js, test/test-*.js, minus the E2E pair) ` +
+      `or it must be referenced by name in package.json, a .github/workflows step, or a scripts/*.sh|.mjs file — an unreferenced file never executes in CI.`);
+  });
+
+  test("the unit-test selection excludes the E2E pair but includes test/test.js and test/test-release-retry-wrapper.js", () => {
+    const selectedNames = new Set(collectUnitTestFiles().map((f) => path.relative(repoRoot, f)));
+    assert.ok(!selectedNames.has("test/e2e.test.js"),
+      ">> FAIL: test-wiring: test/e2e.test.js must stay OUT of the default unit-test selection (self-skips unless E2E=1, but its top-level imports still execute at collection time)");
+    assert.ok(!selectedNames.has("test/e2e-reprove.test.js"),
+      ">> FAIL: test-wiring: test/e2e-reprove.test.js must stay OUT of the default unit-test selection (same reason as e2e.test.js)");
+    assert.ok(selectedNames.has("test/test.js"),
+      ">> FAIL: test-wiring: test/test.js (this file) must be INCLUDED in the unit-test selection");
+    assert.ok(selectedNames.has("test/test-release-retry-wrapper.js"),
+      ">> FAIL: test-wiring: test/test-release-retry-wrapper.js must be INCLUDED in the unit-test selection (test-*.js at test/ root)");
   });
 });
 

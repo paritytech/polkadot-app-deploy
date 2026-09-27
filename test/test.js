@@ -40,7 +40,7 @@ import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLoca
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
 import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
-import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked } from "./e2e.test.js";
+import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
@@ -607,6 +607,87 @@ describe("pickFreshRunLabel (test/e2e.test.js) — sanitization-stable fresh lab
       noStatusRunLabel("e2esubcheck"),
       ">> FAIL: pickFreshRunLabel-fix: NoStatus branch (signerPopStatus < 2) must be unaffected by the buildFreshLabelFromTag fix",
     );
+  });
+});
+
+// S-V060-UNBLOCK label builders (test/e2e.test.js, bulletin #1423/#1410) —
+// pins the exact shape invariants each builder promises, then confirms
+// classifyRegistrability itself treats each shape the way the E2E scenario's
+// comments claim: illegal on every older profile, registrable on v0.6.0.
+// Offline/pure — no chain needed, mirrors the buildFreshLabelFromTag tests
+// directly above.
+//
+// NOTE: the twin's src/dotns.ts already implements the v0.6.0 naming-rule
+// branches these tests exercise. Before this port, no test called
+// classifyDotnsLabel/classifyRegistrability with profile "v0.6.0" for these
+// two label shapes specifically — the twin's existing v0.6.0 coverage was
+// all on protocol DETECTION (connect()'s ABI-profile probe), a different
+// concern. These label-builder tests are new here, not a pre-existing gap
+// this port merely documents.
+describe("S-V060-UNBLOCK label builders (test/e2e.test.js) — shape invariants + cross-profile classification (#1410)", () => {
+  const sha7s = ["a1b2cd9", "3fc11234", "deadbee", "0ffbeef", "cafe123", "2994449" /* all-digit, the buildFreshLabelFromTag regression sha */];
+  const runIds = ["26648857693", "26652530002", "26700011234"];
+  const tags = runIds.flatMap((runId) => sha7s.map((sha7) => `${runId}${sha7}`));
+
+  test('buildBase8TwoDigitLabel: base-8 + exactly 2 trailing digits, distinct across runs, distinct from buildOneTrailingDigitLabel', () => {
+    const labels = tags.map((tag) => buildBase8TwoDigitLabel(tag));
+    for (const label of labels) {
+      assert.match(label, /^[a-z0-9]{10}$/, `>> FAIL: buildBase8TwoDigitLabel: "${label}" is not a 10-char lowercase-alnum label`);
+      assert.equal(countTrailingDigits(label), 2, `>> FAIL: buildBase8TwoDigitLabel: "${label}" must have EXACTLY 2 trailing digits, got ${countTrailingDigits(label)}`);
+      assert.equal(label.length - countTrailingDigits(label), 8, `>> FAIL: buildBase8TwoDigitLabel: "${label}" base length must be 8`);
+    }
+    assert.equal(new Set(labels).size, labels.length,
+      `>> FAIL: buildBase8TwoDigitLabel: labels collided across distinct (runId, sha7) tags: ${JSON.stringify(labels)} — entropy must be taken from the tag's tail (sha-derived), not its monotonic run-id head.`);
+  });
+
+  test('buildOneTrailingDigitLabel: exactly 1 trailing digit, base >= 9 as written, distinct across runs', () => {
+    const labels = tags.map((tag) => buildOneTrailingDigitLabel(tag));
+    for (const label of labels) {
+      assert.match(label, /^[a-z0-9]{11}$/, `>> FAIL: buildOneTrailingDigitLabel: "${label}" is not an 11-char lowercase-alnum label`);
+      assert.equal(countTrailingDigits(label), 1, `>> FAIL: buildOneTrailingDigitLabel: "${label}" must have EXACTLY 1 trailing digit, got ${countTrailingDigits(label)}`);
+      assert.ok(label.length >= 9, `>> FAIL: buildOneTrailingDigitLabel: "${label}" must be >= 9 chars as written`);
+    }
+    assert.equal(new Set(labels).size, labels.length,
+      `>> FAIL: buildOneTrailingDigitLabel: labels collided across distinct (runId, sha7) tags: ${JSON.stringify(labels)}.`);
+  });
+
+  // labelA's shape is NOT a naming-rule violation on any profile
+  // (classifyRegistrability accepts it everywhere — 2 trailing digits is
+  // compliant, baseLength 8 or 10 is well above the reserved-base floor).
+  // The old-profile demand is a personhood-TIER requirement (PopLite),
+  // decided by classifyDotnsLabel/canRegister, not by classifyRegistrability.
+  test("labelA (base-8+2-digit): old profiles demand PopLite personhood; v0.6.0 is open (NoStatus)", () => {
+    const sampleTag = "266528571232994449";
+    const label = buildBase8TwoDigitLabel(sampleTag);
+
+    for (const profile of ["poprules-startingPrice", "v0.5.8-rc1"]) {
+      assert.equal(classifyRegistrability(label, profile).registrable, true,
+        `>> FAIL: v060-unblock-labelA: "${label}" must be registrable (naming-rule-legal) on profile "${profile}" — the personhood tier, not the shape, is what old profiles object to`);
+      const r = classifyDotnsLabel(label, DEFAULT_TLD, profile);
+      assert.equal(r.status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite,
+        `>> FAIL: v060-unblock-labelA: "${label}" must demand ProofOfPersonhoodLite on profile "${profile}", got status ${r.status} (${r.message})`);
+    }
+
+    const newR = classifyDotnsLabel(label, DEFAULT_TLD, "v0.6.0");
+    assert.equal(newR.status, ProofOfPersonhoodStatus.NoStatus,
+      `>> FAIL: v060-unblock-labelA: "${label}" must be NoStatus on v0.6.0 (open to any account), got status ${newR.status} (${newR.message})`);
+  });
+
+  // labelB IS a naming-rule violation on old profiles (the independent
+  // trailing-digit-count gate), and that rule is entirely deleted on v0.6.0.
+  test("labelB (1 trailing digit, base>=9): old profiles refuse via the trailing-digits naming rule; v0.6.0 is registrable", () => {
+    const sampleTag = "266528571232994449";
+    const label = buildOneTrailingDigitLabel(sampleTag);
+
+    for (const profile of ["poprules-startingPrice", "v0.5.8-rc1"]) {
+      const r = classifyRegistrability(label, profile);
+      assert.equal(r.registrable, false, `>> FAIL: v060-unblock-labelB: "${label}" must be non-registrable on profile "${profile}"`);
+      assert.equal(r.rule, "trailing-digits", `>> FAIL: v060-unblock-labelB: "${label}" must be refused via the trailing-digits rule on profile "${profile}", got ${r.rule}`);
+    }
+
+    const newR = classifyRegistrability(label, "v0.6.0");
+    assert.equal(newR.registrable, true,
+      `>> FAIL: v060-unblock-labelB: "${label}" must be registrable on v0.6.0 (the trailing-digits rule is gone) — got ${JSON.stringify(newR)}`);
   });
 });
 
@@ -16144,6 +16225,26 @@ describe("paseo-next-v2 E2E harness wiring", () => {
         `>> FAIL: nightly-always-gate: ${jobName} must have always() in its if: to override transitive auto-skip from detect-noop-push (see retro: e2e run 26648057966 / v0.7.30-rc.0 gating)`,
       );
     }
+  });
+
+  test("dispatch-s-v060-unblock only runs on workflow_dispatch test-suite='v060', never on PR/push/schedule/release (bulletin #1423/#1410)", () => {
+    // This repo has no preview env to fall back to while paseo-next-v2 lags
+    // the v0.6.0 redeploy — S-V060-UNBLOCK must NOT run automatically. It is
+    // dispatch-only, gated specifically on inputs.test-suite == 'v060'
+    // (distinct from every 'nightly'-gated job above).
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const block = workflowJobBlock(wf, "dispatch-s-v060-unblock");
+    assert.ok(block, "dispatch-s-v060-unblock job not found");
+    assert.match(
+      block,
+      /if:\s*[\s\S]*?github\.event_name == 'workflow_dispatch' && inputs\.test-suite == 'v060'/,
+      ">> FAIL: dispatch-s-v060-unblock must gate on workflow_dispatch + inputs.test-suite == 'v060'",
+    );
+    assert.doesNotMatch(
+      block,
+      /github\.event_name == 'pull_request'|github\.event_name == 'push'|github\.event_name == 'schedule'|github\.event_name == 'release'/,
+      ">> FAIL: dispatch-s-v060-unblock must not be reachable from pull_request/push/schedule/release — it is dispatch-only",
+    );
   });
 
   test("no nightly job hardcodes BULLETIN_DEPLOY_ENV or env: to paseo-next-v2", () => {

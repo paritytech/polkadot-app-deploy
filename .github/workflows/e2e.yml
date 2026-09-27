@@ -75,11 +75,12 @@ on:
         type: string
         default: ''
       test-suite:
-        description: 'E2E suite to run manually. "nightly" tests the reusable deploy workflow; "pr" runs the PR matrix against source.'
+        description: 'E2E suite to run manually. "nightly" tests the reusable deploy workflow; "pr" runs the PR matrix against source; "v060" runs S-V060-UNBLOCK from source against the selected env, gated hard-fail on DotNS ABI profile v0.6.0 (issue #1410).'
         type: choice
         options:
           - nightly
           - pr
+          - v060
         default: nightly
       runner:
         description: 'Runner label for E2E jobs (GitHub-hosted).'
@@ -662,6 +663,78 @@ jobs:
                 body,
               });
             }
+
+  # ---- Dispatch-only: v0.6.0 validation (bulletin #1423/#1410) ----------
+  #
+  # S-V060-UNBLOCK (test/e2e.test.js) exercises v0.6.0-only DotNS naming
+  # semantics (issue #1410) that do not exist on every env yet. This repo has
+  # no preview env to fall back to (unlike bulletin-deploy) — it targets
+  # whatever select-env resolves, which is why validating it stays a manual
+  # dispatch rather than automatic nightly/PR coverage. It therefore does NOT
+  # run on pull_request/push, and does NOT fold into the nightly fan-out (this
+  # job's `if:` only fires for `workflow_dispatch` + `inputs.test-suite ==
+  # 'v060'`, structurally distinct from the 'nightly' value every nightly-*
+  # job gates on below). `test/` is not published to npm (see package.json's
+  # `files` allowlist), so this scenario can only ever run from a SOURCE
+  # checkout — there is no npm-install path to fall back to; this job always
+  # builds from the checked-out ref.
+  #
+  # E2E_REQUIRE_PROFILE=v0.6.0 turns "chain not yet on v0.6.0" into a hard
+  # FAILURE rather than S-V060-UNBLOCK's own default soft-skip (see the
+  # scenario's own gateOnV060Profile) — appropriate here because dispatching
+  # this leg IS the explicit ask for v0.6.0 validation; a quiet skip would
+  # read as a false green.
+  dispatch-s-v060-unblock:
+    name: Dispatch · S-V060-UNBLOCK (gated hard-fail on DotNS ABI profile v0.6.0)
+    needs: [select-env]
+    if: always() && needs.select-env.result == 'success' && github.event_name == 'workflow_dispatch' && inputs.test-suite == 'v060'
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
+      - run: npm run build
+      - name: Run S-V060-UNBLOCK against the selected env, hard-failing if it is not yet on DotNS ABI profile v0.6.0
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        env:
+          E2E: "1"
+          E2E_SCENARIO: s-v060-unblock
+          E2E_REQUIRE_PROFILE: v0.6.0
+          E2E_SIGNER: pool
+          E2E_MERKLE: js
+          PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
+          DEPLOY_TAG: e2e-ci-dispatch
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        with:
+          timeout_minutes: 15
+          max_attempts: 2
+          retry_wait_seconds: 30
+          retry_on: any
+          command: node --test test/e2e.test.js
+      - name: Upload polkadot-app-deploy forensic log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-log-s-v060-unblock
+          path: e2e-reports/
+          retention-days: 7
+          if-no-files-found: ignore
 
   # ---- Nightly ----------------------------------------------------
 

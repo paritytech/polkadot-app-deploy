@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { createHash } from "node:crypto";
 import { mutateFixture, makeMultiChunkFixture } from "./helpers/e2e-fixture.js";
 import { buildFixture as buildIncrementalFixture } from "./helpers/e2e-incremental-fixture.js";
 import { buildManifestSidecar, buildPvmAppManifest } from "./helpers/e2e-manifest-fixture.js";
@@ -403,6 +404,115 @@ async function resolveE2eBulletinRpc() {
 
 function normalizeGatewayBase(url) {
   return url.replace(/\/+$/, "").replace(/\/ipfs$/, "");
+}
+
+// --- S-V060-UNBLOCK label builders (bulletin #1423, issue #1410) --------
+//
+// These build the two label SHAPES v0.6.0 unblocks, deliberately WITHOUT
+// going through sanitizeDomainLabel or noStatusRunLabel/pickFreshRunLabel —
+// both of those exist to normalize a label to something already registrable
+// on every profile, which would defeat the entire point here (the shapes
+// below are illegal PRE-v0.6.0 by design; sanitizing them away would test
+// nothing). validateDomainLabel itself does no digit-shape rewriting (only
+// charset/length/hyphen-edge checks — see src/CLAUDE.md), so a raw string
+// built here reaches classifyLabelStatus completely unmodified.
+//
+// Digit->letter substitution (0-9 -> a-j) so a numeric tag (RUN_TOKEN is
+// `${GITHUB_RUN_ID}${sha7}`) can supply per-run entropy for the BASE portion
+// of a label without ever contributing a digit itself — both builders need
+// total control over the trailing digit COUNT (exactly 2 for one, exactly 1
+// for the other), so the entropy segment must never end in (or consist of)
+// a raw digit.
+function tagToLetters(tag) {
+  return String(tag)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .replace(/[0-9]/g, (d) => String.fromCharCode(97 + Number(d)));
+}
+
+// Both label shapes below need a FIXED-WIDTH entropy segment (8 chars total
+// for the base-8 shape leaves only 5 free chars once the fixed prefix/anchor
+// letter are accounted for) — too narrow to embed `tag` verbatim the way
+// buildFreshLabelFromTag does. A naive tail-slice of `tag` was tried first
+// and rejected: RUN_TOKEN is `${GITHUB_RUN_ID}${sha7}`, and slicing only the
+// last N characters lands entirely inside sha7 (7 chars, longer than either
+// entropy segment), so two DIFFERENT run_ids sharing the SAME HEAD sha (the
+// exact, documented buildFreshLabelFromTag regression — sha7 genuinely
+// repeats across a run of nightlies until `main` advances) produced the
+// IDENTICAL label. Hashing the WHOLE tag (SHA-1, cheap, deterministic, no
+// external dependency) instead makes every output character sensitive to
+// every input character via the hash's avalanche property, so run_id and
+// sha7 both matter regardless of entropy-segment width.
+function hashLettersFromTag(tag, length) {
+  const hex = createHash("sha1").update(String(tag)).digest("hex");
+  return tagToLetters(hex).slice(0, length);
+}
+
+// The production "dotworld01" shape: an 8-character base with EXACTLY 2
+// trailing digits. Old profiles (poprules-startingPrice/v0.5.8-rc1):
+// baseLength = 10 - 2 = 8 (the 6-8 band), trailingDigits===2 means
+// isLiteSignal is true, so classifyByLadder returns PopLite — a NoStatus
+// signer cannot register it (classifyRegistrability itself does NOT object
+// to this shape; the demand is a personhood-TIER requirement, checked
+// separately by canRegister/classifyDotnsLabel, not a naming-rule
+// violation). v0.6.0: no lite-username match (no '.' separator), so
+// baseLength = label.length AS WRITTEN = 10 -> NoStatus, open to any account
+// (classifyLabelStatus's v0.6.0 branch, src/dotns.ts). `tag` is an explicit
+// param (mirrors buildFreshLabelFromTag) so this is unit-testable without
+// depending on module-level RUN_TOKEN state.
+export function buildBase8TwoDigitLabel(tag) {
+  const entropy = hashLettersFromTag(tag, 5);
+  const base = `dw${entropy}x`; // 2 + 5 + 1 = 8 chars, always ends in a letter
+  return `${base}01`; // 10 chars total, exactly 2 trailing digits
+}
+
+// A "myapp-pr7" shape: EXACTLY 1 trailing digit, total length >= 9 as
+// written. Old profiles: classifyLabelStatus's trailing-digit-count gate
+// fires on trailingDigits===1 regardless of baseLength -> Reserved
+// (unregistrable — classifyRegistrability itself refuses this one, rule
+// "trailing-digits"). v0.6.0: that rule is deleted entirely (#1410) ->
+// baseLength = label.length AS WRITTEN (>= 9) -> NoStatus.
+export function buildOneTrailingDigitLabel(tag) {
+  const entropy = hashLettersFromTag(tag, 8);
+  return `pr${entropy}7`; // 2 + 8 + 1 = 11 chars, exactly 1 trailing digit
+}
+
+// Detect the live DotNS ABI profile via a short-lived, read-only connection —
+// the SAME detection connect() itself runs (detectProtocolVersion, src/dotns.ts),
+// never inferred from E2E_ENV_ID's name or environments.json config (a
+// configured `dotnsProtocol` pin is asserted against the live probe, never
+// obeyed over it — see connect()'s own comment). Reads the profile via the
+// public `protocolVersion` getter, not by scraping connect()'s own log line.
+// Used by S-V060-UNBLOCK to decide whether the chain has the v0.6.0 redeploy
+// before spending a real deploy attempt on label shapes that only make sense
+// there.
+//
+// Returns a STRUCTURED outcome, not a bare profile string, because "no
+// contract code at the configured POP_RULES address" and "a different, real
+// ABI profile is live" are DIFFERENT conditions with DIFFERENT remedies (wait
+// for an in-flight redeploy vs. point --env at a chain that already has
+// v0.6.0) and must never be collapsed into one "not v0.6.0" message —
+// classifyProtocolVersion (src/dotns-protocol.ts) gives the no-code case its
+// own distinct reason text ("No contract deployed at this address…") for
+// exactly this reason; this helper preserves that distinction instead of
+// flattening it. Any OTHER detection failure (code present-or-unverified but
+// neither discriminator answered; a genuine connection/RPC error) is NOT
+// classified as either of the two known outcomes and is rethrown — an
+// unclassified condition must fail loudly, never silently read as a skip.
+async function detectDotnsProfile() {
+  const probe = new DotNS();
+  try {
+    await probe.connect({ mnemonic: DEFAULT_MNEMONIC, ...(await resolveDotnsEnvConnectOptions()) });
+    return { profile: probe.protocolVersion, noCode: false, error: null };
+  } catch (e) {
+    const msg = e?.message ?? String(e);
+    if (/No contract deployed at this address/.test(msg)) {
+      return { profile: null, noCode: true, error: msg };
+    }
+    throw e;
+  } finally {
+    probe.disconnect();
+  }
 }
 
 describe("e2e", { skip: !ENABLED }, () => {
@@ -2059,6 +2169,180 @@ describe("e2e", { skip: !ENABLED }, () => {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
         fs.rmSync(sidecarDir, { recursive: true, force: true });
       }
+    });
+  });
+
+  // S-V060-UNBLOCK — bulletin #1423/#1410. v0.6.0 deletes PopRules'
+  // trailing-digit-count rule and changes how baseLength is measured,
+  // unblocking two label shapes that are illegal on every earlier generation:
+  //   A. base-8 + exactly 2 trailing digits (the production "dotworld01"
+  //      shape) — old profiles: 6-8 base band + 2-digit Lite signal => PopLite.
+  //   B. exactly 1 trailing digit, base >= 9 as written ("myapp-pr7" shape)
+  //      — old profiles: the independent 1-or-3+-trailing-digit rule => Reserved.
+  // Both classify NoStatus on v0.6.0 (open to any account).
+  //
+  // NOTE — this twin has no preview env, so this scenario only ever runs
+  // against paseo-next-v2.
+  //
+  // GATED, not by SCENARIO's static describe-skip (profile is only knowable
+  // from a live chain probe), but dynamically per-test via detectDotnsProfile():
+  //   - default (no E2E_REQUIRE_PROFILE): a non-v0.6.0 chain SKIPS loudly,
+  //     naming the detected profile — a silent skip here would be a false
+  //     green identical in shape to the noStatusRunLabel blind spot this
+  //     scenario exists to close.
+  //   - E2E_REQUIRE_PROFILE=v0.6.0: a non-v0.6.0 chain FAILS instead, because
+  //     the caller explicitly asked for v0.6.0 validation and did not get it.
+  //
+  // False-green guard: on testnets, when preflight's canRegister check fails
+  // for a NoStatus signer, the CLI can self-serve a fresh personhood proof via
+  // AliasAccounts.reprove_alias_account (the "auto-reprove" path, src/dotns.ts's
+  // preflight internals) and retry — a signer whose alias happens to be stale
+  // would then pass preflight via a REFRESHED PoP grant, not via v0.6.0's
+  // NoStatus semantics, and the deploy would succeed for entirely the wrong
+  // reason on an OLD-profile chain too. Every assertion below therefore checks
+  // the MECHANISM (profile + classification + absence of that self-grant
+  // path), not just exit code 0.
+  describe("S-V060-UNBLOCK — v0.6.0 unblocks base-8+2-digit and 1-trailing-digit labels (#1410)", { skip: SCENARIO !== "s-v060-unblock" }, () => {
+    let detectedProfile = null;
+    before(async () => {
+      detectedProfile = await detectDotnsProfile();
+    });
+
+    // Returns true when the test should proceed; false when it skipped.
+    // Throws (via failWith) in gate mode when the required profile is absent.
+    //
+    // THREE distinct outcomes, never collapsed into one another — each has a
+    // different remedy:
+    //   1. profile === "v0.6.0" -> proceed.
+    //   2. noCode -> no contract code at the configured POP_RULES address
+    //      (e.g. a redeploy in flight, or a stale/wrong configured address).
+    //      This is explicitly NOT "wrong profile" and must never be reported
+    //      as such — the message says "no contract code", full stop.
+    //   3. a different, real profile answered -> "not v0.6.0", named.
+    function gateOnV060Profile(t) {
+      if (detectedProfile.profile === "v0.6.0") return true;
+
+      if (detectedProfile.noCode) {
+        if (process.env.E2E_REQUIRE_PROFILE === "v0.6.0") {
+          failWith({
+            scenario: "S-V060-UNBLOCK",
+            message: `E2E_REQUIRE_PROFILE=v0.6.0 was set but there is NO CONTRACT CODE at the configured DotNS address — v0.6.0 validation did not run`,
+            context: detectedProfile.error,
+            hint: "this is NOT \"the wrong profile\" — environments.json's configured POP_RULES address currently has nothing deployed (e.g. a redeploy in flight). Wait for the redeploy to land and re-run, or fix environments.json/--contract if the configured address is simply stale.",
+          });
+        }
+        console.log("=".repeat(60));
+        console.log(`>> S-V060-UNBLOCK: SKIPPING — NO CONTRACT CODE at the configured DotNS address; cannot determine the ABI profile at all.`);
+        console.log(`   ${detectedProfile.error}`);
+        console.log(`   This is DIFFERENT from "wrong profile" — it usually means a redeploy is in flight. Set`);
+        console.log(`   E2E_REQUIRE_PROFILE=v0.6.0 to turn this into a hard failure instead of a skip.`);
+        console.log("=".repeat(60));
+        t.skip("no contract code at the configured DotNS address — cannot determine ABI profile");
+        return false;
+      }
+
+      if (process.env.E2E_REQUIRE_PROFILE === "v0.6.0") {
+        failWith({
+          scenario: "S-V060-UNBLOCK",
+          message: `E2E_REQUIRE_PROFILE=v0.6.0 was set but the connected chain detected DotNS ABI profile "${detectedProfile.profile}" — v0.6.0 validation did not run`,
+          hint: "this env has not received the v0.6.0 DotNS redeploy yet. Point --env at an env that has the v0.6.0 redeploy, or drop E2E_REQUIRE_PROFILE to let this scenario soft-skip instead.",
+        });
+      }
+      console.log("=".repeat(60));
+      console.log(`>> S-V060-UNBLOCK: SKIPPING — detected DotNS ABI profile "${detectedProfile.profile}", not "v0.6.0".`);
+      console.log(`   This scenario exercises v0.6.0-only naming semantics (base-8+2-digit / 1-trailing-digit`);
+      console.log(`   labels) that do not exist on this chain yet. Set E2E_REQUIRE_PROFILE=v0.6.0 to turn a`);
+      console.log(`   missing v0.6.0 chain into a hard failure instead of a skip.`);
+      console.log("=".repeat(60));
+      t.skip(`detected DotNS ABI profile "${detectedProfile.profile}", not v0.6.0`);
+      return false;
+    }
+
+    // Asserts the mechanism a successful v0.6.0-unblock deploy must show, and
+    // must NOT show, for one label. Shared by both label tests below so the
+    // two can't drift apart on what "for the right reason" means.
+    async function assertV060UnblockMechanism({ label, tld, combined }) {
+      assertStdoutMatches(combined, /DotNS ABI profile v0\.6\.0 detected/, {
+        scenario: "S-V060-UNBLOCK",
+        what: `${label}: deploy log must report the v0.6.0 ABI profile`,
+        hint: "detectProtocolVersion logs 'DotNS ABI profile <profile> detected on <env>' (src/dotns.ts) — missing means the chain served a different profile mid-run, or the log line format moved.",
+      });
+
+      assertStdoutMatches(combined, new RegExp(`DotNS: ${label}\\.${tld} requires NoStatus\\b`), {
+        scenario: "S-V060-UNBLOCK",
+        what: `${label}: preflight must classify NoStatus (v0.6.0 dropped the rule that would otherwise require personhood/reject this shape)`,
+        hint: "deploy.ts logs 'DotNS: <label>.<tld> requires <Status>' via popStatusName(classification.status) — a different status here means v0.6.0 semantics did not apply as expected for this label shape.",
+      });
+
+      // False-green guard (see this describe's own doc comment): none of
+      // the auto-reprove/self-grant log markers may appear. Their presence
+      // means the deploy succeeded via a refreshed personhood proof, not via
+      // v0.6.0's NoStatus semantics — indistinguishable at the exit-code
+      // level, so this is the one place that tells the difference.
+      for (const marker of ["Submitting reprove_alias_account", "alias revision stale", "Refresh complete (revision"]) {
+        assert.ok(
+          !combined.includes(marker),
+          `>> FAIL: S-V060-UNBLOCK: ${label}: deploy log contains "${marker}" — the PoP auto-reprove/self-grant path fired. ` +
+          `That would make this deploy succeed via an on-chain personhood refresh, not v0.6.0's NoStatus semantics — a false ` +
+          `green identical to the failure mode this scenario exists to catch. seen tail: ${combined.slice(-500)}`,
+        );
+      }
+
+      // Second false-green guard, same shape as the one above but via a
+      // DIFFERENT door: RUN_TOKEN is fixed for the whole run (and across a
+      // nick-fields/retry re-attempt of this same test file — no
+      // run_attempt in its entropy, unlike sibling scenarios), so the label
+      // is IDENTICAL on a retry. If attempt 1 registered successfully but
+      // the test failed later (e.g. the contenthash read flaked) before
+      // reaching this assertion, attempt 2 finds the label already owned by
+      // this same signer — the preflight's "already-owned-by-us" branch
+      // (src/dotns.ts) returns BEFORE the classification/PoP gate ever
+      // runs, so classification/NoStatus still print (deploy.ts's reqSuffix
+      // appends this exact marker right after them) even though registration
+      // itself was never exercised on THIS run. That is a green result that
+      // never actually proved the label registrable.
+      assert.ok(
+        !combined.includes("already owned, requirement not enforced"),
+        `>> FAIL: S-V060-UNBLOCK: ${label}: deploy log contains "already owned, requirement not enforced" — this label was ` +
+        `ALREADY OWNED by this signer before this run started (likely a stale name from a prior attempt/retry sharing the ` +
+        `same RUN_TOKEN), so this run took the already-owned fast path and never exercised registration. That proves ` +
+        `nothing about the label's registrability — rerun with a fresh RUN_TOKEN (a new GITHUB_RUN_ID/sha, or transfer/` +
+        `release the stale name) so a real register() attempt runs. seen tail: ${combined.slice(-500)}`,
+      );
+    }
+
+    // Shared by both label-shape tests below — the deploy/assert/cleanup
+    // sequence is identical for both; only the label builder differs.
+    async function runV060UnblockCase(t, buildLabel) {
+      if (!gateOnV060Profile(t)) return;
+
+      const tld = await resolveE2eTld();
+      const label = buildLabel(RUN_TOKEN);
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      try {
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-V060-UNBLOCK", step: `deploy ${label}` });
+        const combined = `${stdout}\n${stderr}`;
+        await assertV060UnblockMechanism({ label, tld, combined });
+
+        const deployedCid = parseDeployedCid(stdout, "S-V060-UNBLOCK");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-V060-UNBLOCK", label });
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+      }
+    }
+
+    test("base-8 + 2 trailing digits unblocked (the production \"dotworld01\" shape)", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async (t) => {
+      await runV060UnblockCase(t, buildBase8TwoDigitLabel);
+    });
+
+    test("1 trailing digit, base >= 9 as written unblocked (the \"myapp-pr7\" shape)", { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async (t) => {
+      await runV060UnblockCase(t, buildOneTrailingDigitLabel);
     });
   });
 });

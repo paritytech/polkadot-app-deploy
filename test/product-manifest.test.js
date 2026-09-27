@@ -19,9 +19,10 @@ import {
   publishManifest,
   formatConfigLoadError,
 } from "../dist/index.js";
-import { registerOrEnsureResolver, domainMatchesEnvTld } from "../dist/manifest/publish.js";
+import { registerOrEnsureResolver, domainMatchesEnvTld, manifestSignerOptions } from "../dist/manifest/publish.js";
 import { NonRetryableError } from "../dist/errors.js";
 import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
+import { deriveProductSigner } from "../dist/product-account.js";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -1147,5 +1148,21 @@ describe("reconcileManifestDomain (#1572)", () => {
       () => reconcileManifestDomain("app.myapp.dot", "app.myapp", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
       ">> FAIL: reconcileManifestDomain subdomain-shape-matches: a nested subname must normalize and compare the same as a top-level label",
     );
+  });
+});
+
+describe("manifestSignerOptions", () => {
+  const MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+  test("passes the mnemonic through when no product name is set", () => {
+    assert.deepEqual(manifestSignerOptions({ mnemonic: MNEMONIC, derivationPath: "//a" }), { mnemonic: MNEMONIC, derivationPath: "//a" });
+  });
+
+  test("signs manifest writes as the product account under --product-name", () => {
+    const r = manifestSignerOptions({ mnemonic: MNEMONIC, productName: "uid.paseo" });
+    assert.equal(r.signerAddress, deriveProductSigner(MNEMONIC, "uid.paseo").ss58,
+      ">> FAIL: setResolver on the registry is owner-only; the manifest must be signed by the same account deploy() registered the name with");
+    assert.equal(r.mnemonic, undefined);
+    assert.equal(r.localSigner, true);
   });
 });

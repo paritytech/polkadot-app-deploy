@@ -25040,7 +25040,8 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText, resolveProductSigner } from "../dist/deploy.js";
+import { deriveProductSigner } from "../dist/product-account.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -26268,5 +26269,25 @@ describe("e2e.yml: prerequisites job wiring (ensure-e2e-authorized)", () => {
     }
     assert.deepStrictEqual(dangling, [],
       `>> FAIL: e2e-prereq-wiring: ${dangling.length} dangling needs: reference(s) (job depends on a job that doesn't exist): ${dangling.join(", ")}`);
+  });
+});
+
+describe("resolveProductSigner", () => {
+  const MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+  test("returns null when no product name is given", () => {
+    assert.equal(resolveProductSigner({ mnemonic: MNEMONIC }), null);
+  });
+
+  test("derives the RFC-0022 product account and marks it in-process", () => {
+    const r = resolveProductSigner({ productName: "uid.paseo", mnemonic: MNEMONIC });
+    assert.equal(r.signerAddress, deriveProductSigner(MNEMONIC, "uid.paseo").ss58,
+      ">> FAIL: every DotNS write under --product-name must come from the product account, or the manifest's setResolver reverts NotAuthorised against a name that account owns");
+    assert.equal(r.mnemonic, undefined);
+    assert.equal(r.localSigner, true, ">> FAIL: a derived key signs in-process; without localSigner the deploy waits for a phone approval that never comes");
+  });
+
+  test("refuses a product name combined with a derivation path", () => {
+    assert.throws(() => resolveProductSigner({ productName: "uid.paseo", mnemonic: MNEMONIC, derivationPath: "//x" }), /cannot be combined/);
   });
 });

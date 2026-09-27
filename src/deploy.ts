@@ -2981,6 +2981,27 @@ export interface DeployOptions {
   manifestPending?: boolean;
 }
 
+// Shared by deploy() and publishManifest() so both derive the same key.
+export function resolveProductSigner(
+  options: Pick<DeployOptions, "productName" | "mnemonic" | "signer" | "signerAddress" | "suri" | "derivationPath">,
+): Pick<DeployOptions, "signer" | "signerAddress" | "mnemonic" | "localSigner"> | null {
+  if (!options.productName) return null;
+  if (options.signer || options.signerAddress || options.suri || options.derivationPath) {
+    throw new NonRetryableError("--product-name derives the signer itself; it cannot be combined with --suri, --derivation-path, or an external signer.");
+  }
+  const productMnemonic = resolveEffectiveMnemonic({
+    flagMnemonic: options.mnemonic,
+    envMnemonic: process.env.MNEMONIC,
+    envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
+  });
+  if (!productMnemonic) {
+    throw new NonRetryableError("--product-name needs a mnemonic (--mnemonic or the MNEMONIC env var) to derive the product account from.");
+  }
+  const product = deriveProductSigner(productMnemonic, options.productName);
+  console.log(`   Product deployer: ${product.ss58} (product ${product.productName}, index 0)`);
+  return { signer: product.signer, signerAddress: product.ss58, mnemonic: undefined, localSigner: true };
+}
+
 // Resolve the DeployOptions that affect DotNS authentication into the shape
 // DotNS.connect expects. Three branches:
 //   1. external signer (QR/mobile): pass signer + signerAddress straight through.
@@ -3310,22 +3331,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   // alike, so the deployed name is owned by the very account a host hands the
   // product at runtime. Resolved here, before signer-choice, so the rest of
   // the pipeline sees a plain injected signer and needs no product awareness.
-  if (options.productName) {
-    if (options.signer || options.signerAddress || options.suri || options.derivationPath) {
-      throw new NonRetryableError("--product-name derives the signer itself; it cannot be combined with --suri, --derivation-path, or an external signer.");
-    }
-    const productMnemonic = resolveEffectiveMnemonic({
-      flagMnemonic: options.mnemonic,
-      envMnemonic: process.env.MNEMONIC,
-      envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
-    });
-    if (!productMnemonic) {
-      throw new NonRetryableError("--product-name needs a mnemonic (--mnemonic or the MNEMONIC env var) to derive the product account from.");
-    }
-    const product = deriveProductSigner(productMnemonic, options.productName);
-    console.log(`   Product deployer: ${product.ss58} (product ${product.productName}, index 0)`);
-    options = { ...options, signer: product.signer, signerAddress: product.ss58, mnemonic: undefined, localSigner: true };
-  }
+  options = { ...options, ...resolveProductSigner(options) };
   // Resolve the target environment. options.bulletinEndpoints / assetHubEndpoints
   // bypass the loader for tests and library callers.
   const envId = options.env ?? DEFAULT_ENV_ID;

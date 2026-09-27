@@ -18,6 +18,7 @@ import {
   storeDirectory,
   storeFile,
   resolveDotnsConnectOptions,
+  resolveProductSigner,
   resolveBulletinEndpoints,
   setBulletinEndpoints,
   selectStorageReconnect,
@@ -70,6 +71,8 @@ export interface PublishManifestOptions {
   mnemonic?: string;
   /** Optional Substrate-style derivation path. */
   derivationPath?: string;
+  /** Sign as the RFC-0022 product account, the same key deploy() registers the name with. */
+  productName?: string;
 }
 
 export interface PublishManifestResult {
@@ -148,17 +151,22 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   console.log(`  Uploading icon (${iconBytes.length} B)…`);
 
   // Bulletin storage for the icon and executables must use the SAME identity
-  // that signs the DotNS writes below (connectDotNS resolves opts.mnemonic/
-  // derivationPath already) — reuse selectStorageReconnect's mnemonic>pool
-  // precedence (deploy() itself uses the same function) instead of an empty
-  // options object, which always fell back to the bare pool-mode provider.
-  // That fallback happened to look harmless on every existing manifest E2E
-  // scenario, because their pinned pool index was small enough to also be
-  // deploy()'s own default 10-account pool window — but a pool leg pinned
-  // outside that window (BULLETIN_POOL_ACCOUNT_INDEX >= 10) fails here even
-  // though the exact account is already authorized and just stored this
-  // deploy's own content, since pool mode never even derives it.
-  const reconnect = selectStorageReconnect({ mnemonic: opts.mnemonic, derivationPath: opts.derivationPath });
+  // that signs the DotNS writes below — reuse selectStorageReconnect's
+  // storageSigner > signer > mnemonic > pool precedence (deploy() itself uses
+  // the same function) instead of an empty options object, which always fell
+  // back to the bare pool-mode provider. That fallback happened to look
+  // harmless on every existing manifest E2E scenario, because their pinned
+  // pool index was small enough to also be deploy()'s own default 10-account
+  // pool window — but a pool leg pinned outside that window
+  // (BULLETIN_POOL_ACCOUNT_INDEX >= 10) fails here even though the exact
+  // account is already authorized and just stored this deploy's own content,
+  // since pool mode never even derives it.
+  //
+  // Resolved ONCE and shared with connectDotNS below: resolveProductSigner
+  // logs "Product deployer: …", and resolving twice would print the line
+  // twice under --product-name.
+  const signerOpts = manifestSignerOptions(opts);
+  const reconnect = selectStorageReconnect(signerOpts);
   const storage = await reconnect();
   let iconCid!: string;
   const executableCids: Record<string, string> = {};
@@ -185,7 +193,7 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
     try { storage.client.destroy(); } catch { /* already destroyed */ }
   }
 
-  const dotns = await connectDotNS(opts, resolved, popSelfServe, envId);
+  const dotns = await connectDotNS(signerOpts, resolved, popSelfServe, envId);
 
   try {
     const baseLabel = stripDotSuffix(config.domain, envTld);
@@ -268,16 +276,20 @@ async function readFileOrThrow(p: string, label: string): Promise<Uint8Array> {
   }
 }
 
+// See resolveProductSigner.
+export function manifestSignerOptions(
+  opts: Pick<PublishManifestOptions, "mnemonic" | "derivationPath" | "productName">,
+): Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress" | "localSigner"> {
+  const product = resolveProductSigner({ productName: opts.productName, mnemonic: opts.mnemonic, derivationPath: opts.derivationPath });
+  return product ?? { mnemonic: opts.mnemonic, derivationPath: opts.derivationPath };
+}
+
 async function connectDotNS(
-  opts: PublishManifestOptions,
+  deployOptsShim: Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress" | "localSigner">,
   resolved: ResolvedEndpoints,
   popSelfServe: PopSelfServeConfig | null,
   envId: string,
 ): Promise<DotNS> {
-  const deployOptsShim: Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress"> = {
-    mnemonic: opts.mnemonic,
-    derivationPath: opts.derivationPath,
-  };
   const connectOpts = resolveDotnsConnectOptions(
     deployOptsShim,
     resolved.assetHub,

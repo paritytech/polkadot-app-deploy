@@ -620,6 +620,7 @@ try {
           rpc: flags.rpc,
           mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,
+          productName: flags.productName,
         });
         // #1164: deploy() deferred the real completion banner (manifestPending
         // was set above) — print it now that the manifest phase actually

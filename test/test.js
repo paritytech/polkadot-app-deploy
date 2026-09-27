@@ -11883,6 +11883,46 @@ describe("manifest-fetch (gateway-based)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// bulletin #1537: fetchPreviousManifest must distinguish "no gateway
+// configured" from "every configured gateway failed". Both used to collapse
+// to the same source + reason ("heuristic_fallback" / "all gateways
+// exhausted: unknown"), so a caller that forgot to pass a gateway got
+// byte-identical output to a real outage.
+// ---------------------------------------------------------------------------
+describe("manifest-fetch: no-gateway vs all-gateways-failed distinguishability (bulletin #1537)", () => {
+  test("no gateway configured yields a reason distinct from a failed gateway's reason", async () => {
+    const noGateway = await fetchPreviousManifest("bafyx1534", {});
+    const failedGateway = await fetchPreviousManifest("bafyx1534", {
+      gateway: "https://unreachable.invalid",
+      timeoutMs: 100,
+    });
+
+    assert.equal(noGateway.source, "heuristic_fallback",
+      ">> FAIL: bulletin #1537 no-gateway source: fetchPreviousManifest with no gateway configured must still return heuristic_fallback");
+    assert.equal(failedGateway.source, "heuristic_fallback",
+      ">> FAIL: bulletin #1537 failed-gateway source: fetchPreviousManifest with a failing gateway must return heuristic_fallback");
+    assert.notEqual(noGateway.reason, failedGateway.reason,
+      ">> FAIL: bulletin #1537 distinguishability: no-gateway reason must differ from the all-gateways-failed reason, or a caller that forgot to pass a gateway is indistinguishable from a real outage");
+    assert.doesNotMatch(noGateway.reason, /all gateways exhausted/,
+      ">> FAIL: bulletin #1537 distinguishability: no-gateway reason must not reuse the all-gateways-exhausted category, or a missing gateway still reads as an outage");
+    assert.doesNotMatch(failedGateway.reason, /no gateway configured/,
+      ">> FAIL: bulletin #1537 distinguishability: a configured-but-failing gateway must not be reported as unconfigured");
+  });
+
+  test("no-gateway reason string names the misconfiguration explicitly", async () => {
+    const r = await fetchPreviousManifest("bafyx1534b", {});
+    assert.match(r.reason, /no gateway configured/i,
+      ">> FAIL: bulletin #1537 no-gateway reason wording: reason string must explicitly name the missing-gateway misconfiguration, not a generic exhaustion message");
+  });
+
+  test("no-gateway case is observable via a distinguishing span attribute, not just the return value", () => {
+    const src = fs.readFileSync("src/manifest-fetch.ts", "utf8");
+    assert.match(src, /\boutcome:\s*["']no_gateway_configured["']/,
+      ">> FAIL: bulletin #1537 telemetry: manifest-fetch.ts must pass outcome: \"no_gateway_configured\" into the manifest.fetch span attributes so the no-gateway case is visible in Sentry traces, not only in the return value");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // readPersistentLocalManifest unit tests
 // ---------------------------------------------------------------------------
 describe("readPersistentLocalManifest", () => {

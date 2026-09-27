@@ -2490,7 +2490,9 @@ jobs:
     # before any chunk upload or registration transaction is attempted, so
     # it never contends for a nonce or a shared domain with any other leg —
     # no scenario-ordering dependency needed (no `needs:` on another
-    # nightly-s* job), and no poolIndex pin required.
+    # nightly-s* job). Port of bulletin-deploy #1588: BULLETIN_POOL_ACCOUNT_INDEX
+    # IS pinned below (to pool account 0) even though this scenario never
+    # writes — see that env var's own comment for why.
     needs: [build-nightly, select-env, ensure-e2e-authorized]
     if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-reserved-invariant')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
@@ -2552,6 +2554,22 @@ jobs:
           E2E_SIGNER: pool
           E2E_MERKLE: js
           PAD_ENV: ${{ matrix.env }}
+          # #1588 (port of bulletin-deploy): pin to pool account 0 (#863's
+          # BULLETIN_POOL_ACCOUNT_INDEX mechanism) instead of the unpinned
+          # default (bare Alice). This job must never write: connect()'s
+          # account-mapping check runs BEFORE the Reserved refusal, and an
+          # unmapped/underfunded signer would submit a real mapping/top-up
+          # tx there. Index 0 is deliberately picked from the STANDARD pool
+          # (0-9) that bin/polkadot-app-bootstrap provisions everywhere by
+          # default — no new provisioning needed on any env. Index 0 is
+          # also nightly-pr-coverage's s1-pool-js leg (a concurrent
+          # WRITER), but sharing it is safe here specifically BECAUSE this
+          # scenario is read-only by design: it never signs or submits
+          # anything (test/e2e.test.js asserts the absence of every
+          # mapping/top-up log marker), so it can't race s1-pool-js's
+          # nonce — a nonce assertion would have made this unsafe to
+          # share, which is why there isn't one.
+          BULLETIN_POOL_ACCOUNT_INDEX: "0"
           GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_SHA: ${{ github.sha }}
         with:

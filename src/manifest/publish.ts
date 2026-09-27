@@ -20,6 +20,7 @@ import {
   resolveDotnsConnectOptions,
   resolveBulletinEndpoints,
   setBulletinEndpoints,
+  selectStorageReconnect,
   type DeployOptions,
 } from "../deploy.js";
 import { DotNS, DEFAULT_TLD, stripTldSuffix, type OwnershipResult } from "../dotns.js";
@@ -130,21 +131,43 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   console.log(`\nManifest publish — ${config.domain}`);
   console.log(`  Loaded config: ${sourcePath}`);
   console.log(`  Uploading icon (${iconBytes.length} B)…`);
-  const iconCid = await storeFile(iconBytes, { hashCode: BLAKE2B_256_MULTIHASH_CODE });
-  console.log(`  Icon CID: ${iconCid}`);
 
+  // Bulletin storage for the icon and executables must use the SAME identity
+  // that signs the DotNS writes below (connectDotNS resolves opts.mnemonic/
+  // derivationPath already) — reuse selectStorageReconnect's mnemonic>pool
+  // precedence (deploy() itself uses the same function) instead of an empty
+  // options object, which always fell back to the bare pool-mode provider.
+  // That fallback happened to look harmless on every existing manifest E2E
+  // scenario, because their pinned pool index was small enough to also be
+  // deploy()'s own default 10-account pool window — but a pool leg pinned
+  // outside that window (BULLETIN_POOL_ACCOUNT_INDEX >= 10) fails here even
+  // though the exact account is already authorized and just stored this
+  // deploy's own content, since pool mode never even derives it.
+  const reconnect = selectStorageReconnect({ mnemonic: opts.mnemonic, derivationPath: opts.derivationPath });
+  const storage = await reconnect();
+  let iconCid!: string;
   const executableCids: Record<string, string> = {};
-  for (const exec of config.executables) {
-    const execAbs = path.resolve(configDir, exec.path);
-    if (opts.buildDirCid && path.resolve(opts.buildDirCid.absPath) === execAbs) {
-      console.log(`  Executable [${exec.kind}] reused build-dir CID: ${opts.buildDirCid.cid}`);
-      executableCids[exec.kind] = opts.buildDirCid.cid;
-      continue;
+  try {
+    iconCid = await storeFile(iconBytes, { ...storage, hashCode: BLAKE2B_256_MULTIHASH_CODE });
+    console.log(`  Icon CID: ${iconCid}`);
+
+    for (const exec of config.executables) {
+      const execAbs = path.resolve(configDir, exec.path);
+      if (opts.buildDirCid && path.resolve(opts.buildDirCid.absPath) === execAbs) {
+        console.log(`  Executable [${exec.kind}] reused build-dir CID: ${opts.buildDirCid.cid}`);
+        executableCids[exec.kind] = opts.buildDirCid.cid;
+        continue;
+      }
+      console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
+      const { storageCid } = await storeDirectory(execAbs, storage, undefined, true);
+      console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
+      executableCids[exec.kind] = storageCid;
     }
-    console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
-    const { storageCid } = await storeDirectory(execAbs, {}, undefined, true);
-    console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
-    executableCids[exec.kind] = storageCid;
+  } finally {
+    // Best-effort: a reconnect inside storeDirectory may already have
+    // destroyed and replaced this client (same guard every other destroy
+    // call site in deploy.ts uses).
+    try { storage.client.destroy(); } catch { /* already destroyed */ }
   }
 
   const dotns = await connectDotNS(opts, resolved, popSelfServe, envId);
@@ -152,7 +175,23 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   try {
     // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
     // DotNS._tld / connectDotNS above), so pass the bare label.
-    const baseLabel = stripDotSuffix(config.domain, resolved.tld ?? DEFAULT_TLD);
+    const envTld = resolved.tld ?? DEFAULT_TLD;
+
+    // The schema validator deliberately no longer enumerates known TLDs (it
+    // validates shape only), so a typo like ".dto" reaches here unrejected.
+    // This is the layer that knows the environment's TLD, so this is where
+    // the mismatch gets named. Uncaught, the mismatched domain would flow
+    // into ensureContentResolver, which appends the env TLD again —
+    // producing a namehash for a nonsense compound name that nobody owns,
+    // surfacing as an opaque not-the-owner revert deep inside the chain call.
+    if (!domainMatchesEnvTld(config.domain, envTld)) {
+      throw new NonRetryableError(
+        `Domain "${config.domain}" does not end in this environment's DotNS TLD ".${envTld}" ` +
+        `(env: ${envId}). Set "domain" in your product config to "<name>.${envTld}", ` +
+        `or deploy against the environment whose TLD matches.`,
+      );
+    }
+    const baseLabel = stripDotSuffix(config.domain, envTld);
 
     await dotns.ensureContentResolver(baseLabel);
 
@@ -300,4 +339,13 @@ function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
 // was dead code.
 function stripDotSuffix(domain: string, tld: string): string {
   return stripTldSuffix(domain, tld);
+}
+
+// Does `domain` end in `.<tld>`? Exported so the wrong-env-TLD guard above is
+// testable without a live DotNS connection. Case-insensitive to match
+// stripTldSuffix and DOMAIN_RE, which both use the `i` flag; a domain equal
+// to the bare TLD ("paseo" against "paseo") is a mismatch, since it carries
+// no label.
+export function domainMatchesEnvTld(domain: string, tld: string): boolean {
+  return domain.toLowerCase().endsWith(`.${tld.toLowerCase()}`);
 }

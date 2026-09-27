@@ -45,14 +45,18 @@ const FUNDING_MODES: readonly FundingMode[] = ["CARD", "BANK", "CRYPTO"];
 
 /** dotNS label rule: 1 to 63 chars of `[a-z0-9-]`, no leading or trailing hyphen. */
 const LABEL = String.raw`(?!-)[a-z0-9-]{1,63}(?<!-)`;
-// Mirrors src/dotns.ts's KNOWN_TLDS without importing that chain-aware module
-// (see the file doc comment above: this validator stays free of the
-// polkadot-api dep). DotNS's TLD is per-environment — paseo-next-v2 uses
-// ".paseo" — so a hardcoded ".dot$" here would reject every valid
-// paseo-next-v2 product config outright. Keep this list in sync with
-// dotns.ts's KNOWN_TLDS by hand; test/test.js asserts the two never drift.
-const KNOWN_TLDS = ["dot", "paseo"] as const;
-const DOMAIN_RE = new RegExp(`^${LABEL}(\\.${LABEL})*\\.(?:${KNOWN_TLDS.join("|")})$`, "i");
+// The TLD is a per-network on-chain value (DotnsProtocolRegistry.tld()), so
+// enumerating known TLDs here means every new network needs a code change
+// plus a release before its product configs validate — exactly the failure
+// mode a network's TLD changing underneath it would trigger. This
+// validator's job is shape, not membership: whether a given domain is the
+// RIGHT TLD for the target environment is a chain-aware question, answered
+// in src/manifest/publish.ts — the layer that has the environment's resolved
+// TLD in hand (see domainMatchesEnvTld there). It rejects a domain that does
+// not end in that TLD before any chain call, which is what keeps a typo from
+// becoming an opaque not-the-owner revert.
+const TLD_FRAGMENT = "[a-z]{2,63}";
+const DOMAIN_RE = new RegExp(`^${LABEL}(\\.${LABEL})*\\.${TLD_FRAGMENT}$`, "i");
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -60,6 +64,33 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Validate `icon.format`, shared by `validateRootManifest` (read) and
+ * `validateProductConfig` (publish).
+ *
+ * Shape (both sides, unconditional) — `format` must be a non-empty string,
+ * same requirement as `icon.cid`/`icon.path` right next to it.
+ *
+ * Value (`strict` picks the side):
+ * - `strict: false` (read side) — an unrecognised value is exempt: a Host
+ *   that cannot decode it renders a placeholder and keeps the product
+ *   launchable. This package has no icon-rendering surface of its own, so
+ *   tolerating the value here is the entirety of the read-side obligation.
+ * - `strict: true` (publish side) — publishers MUST NOT emit an
+ *   unrecognised value, so it still fails validation.
+ */
+function validateIconFormat(format: unknown, label: string, strict: boolean): string[] {
+  if (!isNonEmptyString(format)) {
+    return [`${label} icon.format must be a non-empty string (got ${JSON.stringify(format)})`];
+  }
+  if (strict && !ICON_FORMATS.includes(format as IconFormat)) {
+    return [
+      `${label} icon.format must be one of ${ICON_FORMATS.join(", ")} (got ${JSON.stringify(format)})`,
+    ];
+  }
+  return [];
 }
 
 function isAppVersion(value: unknown): value is AppVersion {
@@ -212,7 +243,8 @@ function validateAppV2(input: Record<string, unknown>, prefix: string): string[]
     ...rejectUnknownFields(runtime, ["kind", "abiVersion", "entrypoint"], `${prefix}runtime `),
     ...validateRelativeEntrypoint(runtime.entrypoint, ".polkavm", `${prefix}runtime.`),
   ];
-  if (runtime.abiVersion !== 1) errors.push(`${prefix}runtime.abiVersion must be 1`);
+  if (runtime.abiVersion !== 1 && runtime.abiVersion !== 2)
+    errors.push(`${prefix}runtime.abiVersion must be 1 or 2`);
   if (!isPlainObject(input.capabilities)) {
     errors.push(`${prefix}capabilities must be an object`);
     return errors;
@@ -283,8 +315,13 @@ function validateWorkerFields(input: Record<string, unknown>, p: string): string
   const inc = input.includes;
   if (typeof inc.chat !== "boolean") errors.push(`${p}includes.chat must be a boolean`);
   if (typeof inc.pocket !== "boolean") errors.push(`${p}includes.pocket must be a boolean`);
-  if (inc.chat === false && inc.pocket === false) {
-    errors.push(`${p}includes must have at least one of chat / pocket = true`);
+  // Absent is legal and means false; present-but-not-a-boolean is not, because
+  // a ceiling that cannot be read reliably must not resolve at all.
+  if (inc.funding !== undefined && typeof inc.funding !== "boolean") {
+    errors.push(`${p}includes.funding must be a boolean when present`);
+  }
+  if (inc.chat === false && inc.pocket === false && inc.funding !== true) {
+    errors.push(`${p}includes must have at least one of chat / pocket / funding = true`);
   }
   return errors;
 }
@@ -302,9 +339,7 @@ export function validateRootManifest(input: unknown): ValidationResult<RootManif
     errors.push("root manifest icon must be an object");
   } else {
     if (!isNonEmptyString(input.icon.cid)) errors.push("root manifest icon.cid must be a non-empty string");
-    if (!ICON_FORMATS.includes(input.icon.format as IconFormat)) {
-      errors.push(`root manifest icon.format must be one of ${ICON_FORMATS.join(", ")} (got ${JSON.stringify(input.icon.format)})`);
-    }
+    errors.push(...validateIconFormat(input.icon.format, "root manifest", /* strict */ false));
   }
   return errors.length === 0 ? { ok: true, value: input as unknown as RootManifest } : { ok: false, errors };
 }
@@ -346,7 +381,9 @@ export function validateProductConfig(input: unknown): ValidationResult<ProductC
     return { ok: false, errors: ["product config must be an object (did you forget `export default`?)"] };
   }
   if (!isNonEmptyString(input.domain) || !DOMAIN_RE.test(input.domain)) {
-    errors.push(`product config domain must be a non-empty dotNS name ending in one of: ${KNOWN_TLDS.map(t => `.${t}`).join(", ")}`);
+    errors.push(
+      "product config domain must be a non-empty dotNS name ending in a TLD of 2 or more letters (e.g. 'myapp.dot')",
+    );
   }
   if (!isNonEmptyString(input.displayName)) errors.push("product config displayName must be a non-empty string");
   if (typeof input.description !== "string") errors.push("product config description must be a string");
@@ -354,9 +391,7 @@ export function validateProductConfig(input: unknown): ValidationResult<ProductC
     errors.push("product config icon must be an object");
   } else {
     if (!isNonEmptyString(input.icon.path)) errors.push("product config icon.path must be a non-empty string");
-    if (!ICON_FORMATS.includes(input.icon.format as IconFormat)) {
-      errors.push(`product config icon.format must be one of ${ICON_FORMATS.join(", ")}`);
-    }
+    errors.push(...validateIconFormat(input.icon.format, "product config", /* strict */ true));
   }
   if (!Array.isArray(input.executables) || input.executables.length === 0) {
     errors.push("product config executables must be a non-empty array");

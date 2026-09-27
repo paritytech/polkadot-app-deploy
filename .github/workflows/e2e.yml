@@ -950,6 +950,8 @@ jobs:
           - { scenario: s-subdomain,              signer: pool,   merkle: js,   poolIndex: 7 }
           - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 8 }
           - { scenario: s-manifest-env,           signer: pool,   merkle: js,   poolIndex: 9 }
+          # App v2 PolkaVM manifest publish and executable read-back.
+          - { scenario: s-manifest-pvm,           signer: pool,   merkle: js,   poolIndex: 12 }
           # S-TRANSFER: register-as-worker then hand over via the `transfer`
           # command, plus idempotent re-run. Existed in test/e2e.test.js and
           # scripts/e2e-pass.sh since its introduction but was never wired

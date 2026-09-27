@@ -5,9 +5,9 @@ import * as os from "os";
 import * as path from "path";
 import { mutateFixture, makeMultiChunkFixture } from "./helpers/e2e-fixture.js";
 import { buildFixture as buildIncrementalFixture } from "./helpers/e2e-incremental-fixture.js";
-import { buildManifestSidecar } from "./helpers/e2e-manifest-fixture.js";
+import { buildManifestSidecar, buildPvmAppManifest } from "./helpers/e2e-manifest-fixture.js";
 import { runBulletinDeploy } from "./helpers/e2e-cli.js";
-import { resolveContenthashOnChain } from "./helpers/e2e-verify.js";
+import { resolveContenthashOnChain, resolveTextRecordOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
 import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, loadEnvironments, resolveEndpoints, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
@@ -113,6 +113,21 @@ async function readContenthashWithRetry(label, expected, attempts = 6, delayMs =
     }
   }
   return onChain;
+}
+
+// Poll a text record until `ready(raw)` holds. On-chain reads can lose a race
+// with tail-in-flight txs, same as readContenthashWithRetry above.
+async function readTextRecordWithRetry(label, key, envId, ready, attempts = 6, delayMs = 10_000) {
+  let raw = "";
+  for (let i = 1; i <= attempts; i++) {
+    raw = await resolveTextRecordOnChain(label, key, envId);
+    if (ready(raw)) return raw;
+    if (i < attempts) {
+      console.log(`  ${key} text-record read attempt ${i}/${attempts}: ${raw ? "present, not ready yet" : "empty"}, retrying in ${delayMs / 1000}s`);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+  return raw;
 }
 
 let signerPopStatus = -1;
@@ -1940,6 +1955,48 @@ describe("e2e", { skip: !ENABLED }, () => {
             scenario: "S-MANIFEST-ENV",
             message: `icon CID ${iconCid} not retrievable (byte-identical) from ${PAD_ENV}'s own gateway (${iconUrl}) within 5 min (last HTTP status ${lastStatus})`,
             hint: "publishManifest may have uploaded the icon to the wrong Bulletin chain (DEFAULT_BULLETIN_RPC instead of the resolved env) — the #1094 regression this scenario guards against.",
+          });
+        }
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("S-MANIFEST-PVM: App v2 PolkaVM manifest publishes and round-trips on app.<label>", { skip: SCENARIO !== "s-manifest-pvm" }, () => {
+    test(`deploy ${SIGNER}/${MERKLE} with a PolkaVM App v2 manifest`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      const scenario = "S-MANIFEST-PVM";
+      const label = perLegPoolLabel() ?? pickFreshRunLabel("e2epvmman");
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      // Nothing runs it; with manifest.json it makes detectBuildMarkers see a PolkaVM app build.
+      fs.writeFileSync(path.join(fixtureDir, "app.polkavm"), `e2e polkavm placeholder ${RUN_TAG}\n`);
+      const appManifest = buildPvmAppManifest();
+      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld, appManifest });
+      try {
+        const args = [...buildArgs(fixtureDir, `${label}.${tld}`), "--config", configPath];
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args,
+          env: rpcEnv(),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario });
+
+        // The executable's path is the build dir, so app.<label> carries the deploy's CID.
+        const deployedCid = parseDeployedCid(stdout, scenario);
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(`app.${label}`, expected);
+        assertOnChainMatches(onChain, expected, { scenario, label: `app.${label}` });
+
+        const wantJson = JSON.stringify(appManifest);
+        const gotJson = await readTextRecordWithRetry(`app.${label}`, "executable", PAD_ENV, (raw) => raw === wantJson);
+        if (gotJson !== wantJson) {
+          failWith({
+            scenario,
+            message: `'executable' text record on app.${label}.${tld} does not byte-match the validated manifest`,
+            context: `wrote: ${wantJson}\nchain: ${gotJson === "" ? "(unset)" : gotJson}`,
+            hint: "The record lands in the same tx as the contenthash checked above, and the read was retried, so this is not lag: src/manifest/publish.ts wrote bytes other than JSON.stringify of the manifest.",
           });
         }
       } finally {

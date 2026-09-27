@@ -1,10 +1,13 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "fs";
+import * as os from "os";
 import * as path from "path";
 import { mutateFixture } from "./e2e-fixture.js";
 import { runBulletinDeploy } from "./e2e-cli.js";
 import { classifyFixtureState } from "./e2e-failure.js";
+import { buildManifestSidecar, buildPvmAppManifest } from "./e2e-manifest-fixture.js";
+import { preflightProductConfig } from "@parity/polkadot-app-deploy";
 
 describe("mutateFixture", () => {
   test("copies fixture to a fresh tempdir and injects runTag into index.html", async () => {
@@ -312,7 +315,7 @@ describe("e2e-failure: assertOnChainMatches", () => {
     assert.throws(
       () => assertOnChainMatches("0xdeadbeef", "0xabc", { scenario: "S4", label: "e2epool" }),
       (err) => {
-        assert.match(err.message, /^>> FAIL: S4: on-chain contenthash mismatch on e2epool\.dot/);
+        assert.match(err.message, /^>> FAIL: S4: on-chain contenthash mismatch on e2epool$/m);
         assert.match(err.message, /wrote:\s+0xabc/);
         assert.match(err.message, /chain:\s+0xdeadbeef/);
         return true;
@@ -373,5 +376,22 @@ describe("classifyFixtureState", () => {
     const out = "Deployment failed: chunk upload timed out after 180s";
     assert.strictEqual(classifyFixtureState({ output: out, expectedOwner: BOB }).kind, "ok",
       ">> FAIL: classifyFixtureState: unrelated failures must fall through to the normal assertions, not be blamed on fixtures");
+  });
+});
+
+// Offline half of S-MANIFEST-PVM: the deploy's own preflight must accept the fixture.
+describe("buildManifestSidecar: App v2 PolkaVM executable", () => {
+  test("passes the product preflight and embeds the bytes the executable record carries", async () => {
+    const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "pvm-build-"));
+    const appManifest = buildPvmAppManifest();
+    const { configPath, sidecarDir } = buildManifestSidecar({ buildDir, label: "e2epvmman", tld: "dot", appManifest });
+    try {
+      await preflightProductConfig({ path: configPath });
+      assert.equal(fs.readFileSync(path.join(buildDir, "manifest.json"), "utf8"), JSON.stringify(appManifest),
+        ">> FAIL: S-MANIFEST-PVM fixture: the embedded manifest.json differs from the bytes the executable record carries");
+    } finally {
+      fs.rmSync(sidecarDir, { recursive: true, force: true });
+      fs.rmSync(buildDir, { recursive: true, force: true });
+    }
   });
 });

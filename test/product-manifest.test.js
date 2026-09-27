@@ -19,12 +19,9 @@ import {
   publishManifest,
   formatConfigLoadError,
 } from "../dist/index.js";
-import { registerOrEnsureResolver } from "../dist/manifest/publish.js";
+import { registerOrEnsureResolver, domainMatchesEnvTld } from "../dist/manifest/publish.js";
 import { NonRetryableError } from "../dist/errors.js";
 import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
-import { KNOWN_TLDS as DOTNS_KNOWN_TLDS } from "../dist/dotns.js";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -48,15 +45,55 @@ describe("validateRootManifest", () => {
     assert.ok(result.errors.some(e => e.includes("$v must be 1")));
   });
 
-  test("rejects unknown icon format", () => {
+  // A Host reading this on-chain record must not fail validation over an
+  // unrecognised icon.format — it renders a placeholder and keeps the
+  // product launchable. This test used to assert the reverse (rejection);
+  // that strictness still exists, just on the publish side — see
+  // validateProductConfig's "still rejects an unrecognised icon.format" test
+  // below, unaffected by this change.
+  test("tolerates an unrecognised icon.format (read side must not fail)", () => {
     const result = validateRootManifest({
       $v: 1,
       displayName: "DemoApp",
       description: "",
       icon: { cid: "bafy", format: "webp" },
     });
-    assert.equal(result.ok, false);
-    assert.ok(result.errors.some(e => e.includes("icon.format")));
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest unrecognised-icon-format-tolerated: a Host must not fail validation over an unrecognised icon.format and must instead render a placeholder; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // The exemption is for an unrecognised *value*, not a missing or
+  // wrong-typed field. Shape stays strict on both sides, same as icon.cid
+  // right next to it.
+  test("rejects icon.format entirely absent — shape error, not an unrecognised value", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy" },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      `>> FAIL: validateRootManifest icon-format-absent-rejected: a missing icon.format is a shape error (same as a missing icon.cid), not the unrecognised-value exemption; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("rejects a non-string icon.format — shape error, not an unrecognised value", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: 42 },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      `>> FAIL: validateRootManifest icon-format-non-string-rejected: icon.format must be a string before "is it a recognised one" is even the question; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
   });
 
   test("rejects when icon is missing entirely", () => {
@@ -81,7 +118,7 @@ const APP_V2_MANIFEST = {
   appVersion: [0, 1, 7],
   runtime: {
     kind: "polkavm",
-    abiVersion: 1,
+    abiVersion: 2,
     entrypoint: "app.polkavm",
   },
   capabilities: {
@@ -152,6 +189,22 @@ describe("validateExecutableManifest — App v2", () => {
     const entrypointResult = validateExecutableManifest(unsafeEntrypoint);
     assert.equal(entrypointResult.ok, false);
     assert.ok(entrypointResult.errors.some((error) => error.includes("entrypoint")));
+  });
+
+  test("accepts runtime ABI 1 and 2, rejects other values", () => {
+    const abi1 = structuredClone(APP_V2_MANIFEST);
+    abi1.runtime.abiVersion = 1;
+    assert.equal(validateExecutableManifest(abi1).ok, true);
+
+    const abi3 = structuredClone(APP_V2_MANIFEST);
+    abi3.runtime.abiVersion = 3;
+    const result = validateExecutableManifest(abi3);
+    assert.equal(result.ok, false);
+    assert.ok(
+      result.errors.some((error) =>
+        error.includes("runtime.abiVersion must be 1 or 2"),
+      ),
+    );
   });
 
   test("rejects PolkaVM manifests without graphics", () => {
@@ -282,7 +335,32 @@ describe("validateExecutableManifest — worker", () => {
       entrypoint: "index.js", includes: { chat: false, pocket: false },
     });
     assert.equal(result.ok, false);
-    assert.ok(result.errors.some(e => e.includes("at least one of chat / pocket")));
+    assert.ok(result.errors.some(e => e.includes("at least one of chat / pocket / funding")));
+  });
+
+  test("accepts a worker whose only ceiling is funding", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: false, pocket: false, funding: true },
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("accepts a worker record published before funding existed", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: false, pocket: true },
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("rejects a non-boolean funding ceiling", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: true, pocket: false, funding: "yes" },
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("includes.funding")));
   });
 
   test("rejects worker entrypoint with leading slash", () => {
@@ -333,6 +411,14 @@ describe("validateProductConfig", () => {
     assert.equal(result.ok, true);
   });
 
+  // The read-side tolerance for an unrecognised icon.format does not extend
+  // to the publish side — publishers MUST NOT emit an unrecognised format.
+  test("still rejects an unrecognised icon.format on the publish side", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, icon: { path: "./icon.png", format: "webp" } });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((e) => e.includes("icon.format")));
+  });
+
   test("rejects a domain without .dot suffix", () => {
     const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp" });
     assert.equal(result.ok, false);
@@ -348,10 +434,24 @@ describe("validateProductConfig", () => {
       `>> FAIL: validateProductConfig .paseo: expected ok:true, got errors: ${JSON.stringify(result.ok ? [] : result.errors)}`);
   });
 
-  test("still rejects a domain ending in an unknown TLD", () => {
-    const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp.example" });
-    assert.equal(result.ok, false,
-      ">> FAIL: validateProductConfig unknown TLD: 'demoapp.example' must still be rejected — only KNOWN_TLDS suffixes are valid");
+  // Domain validation is shape-based, not an enumerated TLD allowlist, so a
+  // network DotNS has never been configured for validates with no code
+  // change. This is the property that broke when previewnet's real TLD
+  // changed underneath a hardcoded allowlist in bulletin-deploy (#1241).
+  for (const tld of ["dot", "paseo", "example", "newnet"]) {
+    test(`accepts a domain ending in an arbitrary well-formed TLD (.${tld})`, () => {
+      const result = validateProductConfig({ ...VALID_CONFIG, domain: `demoapp.${tld}` });
+      assert.equal(
+        result.ok,
+        true,
+        `expected domain 'demoapp.${tld}' to validate; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+      );
+    });
+  }
+
+  test("accepts a subdomain under an arbitrary well-formed TLD", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, domain: "sub.demoapp.example" });
+    assert.equal(result.ok, true);
   });
 
   // bulletin-deploy #1449 (folded into #1443): subname depth is observed at
@@ -370,21 +470,23 @@ describe("validateProductConfig", () => {
     });
   }
 
-  // Keeps src/manifest/schema.ts's hand-copied KNOWN_TLDS list (documented as
-  // "kept in sync with dotns.ts's KNOWN_TLDS by hand") from silently drifting
-  // — schema.ts deliberately doesn't import dotns.ts (stays free of the
-  // polkadot-api dep), so nothing else would catch a divergence.
-  test("schema.ts's KNOWN_TLDS list stays in sync with dotns.ts's KNOWN_TLDS", () => {
-    const schemaSrc = readFileSync(fileURLToPath(new URL("../src/manifest/schema.ts", import.meta.url)), "utf8");
-    const m = schemaSrc.match(/const KNOWN_TLDS = \[([^\]]+)\] as const;/);
-    assert.ok(m, ">> FAIL: could not find schema.ts's KNOWN_TLDS declaration to compare");
-    const schemaTlds = m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean);
-    assert.deepEqual(
-      schemaTlds.sort(),
-      [...DOTNS_KNOWN_TLDS].sort(),
-      `>> FAIL: KNOWN_TLDS drift: src/manifest/schema.ts has ${JSON.stringify(schemaTlds)} but src/dotns.ts has ${JSON.stringify(DOTNS_KNOWN_TLDS)} — a config domain valid on-chain could now fail schema validation, or vice versa`,
-    );
-  });
+  for (const domain of [
+    "demoapp.d", // TLD shorter than 2 chars
+    "demoapp.d0t", // digit in TLD
+    "demoapp.do-t", // hyphen in TLD
+    "demoapp.12", // all-digit TLD
+    "demoapp.", // empty TLD
+    "-demoapp.dot", // label starts with hyphen
+    "demoapp-.dot", // label ends with hyphen
+    "my..app.dot", // empty label
+    "my_app.dot", // underscore not allowed
+  ]) {
+    test(`rejects malformed domain '${domain}'`, () => {
+      const result = validateProductConfig({ ...VALID_CONFIG, domain });
+      assert.equal(result.ok, false, `expected domain '${domain}' to be rejected`);
+      assert.ok(result.errors.some((e) => e.includes("domain")));
+    });
+  }
 
   test("rejects empty executables array", () => {
     const result = validateProductConfig({ ...VALID_CONFIG, executables: [] });
@@ -765,6 +867,28 @@ describe("formatConfigLoadError — pure helper", () => {
     const message = formatConfigLoadError("/proj/polkadot-app-deploy.config.ts", "plain string throw");
     assert.match(message, /threw while loading: plain string throw\./, `>> FAIL: formatConfigLoadError non-Error throw: expected stringified value (got "${message}")`);
   });
+});
+
+// The schema validator no longer enumerates TLDs (shape only), so a typo'd
+// TLD like ".dto" validates as well-formed and reaches the publish layer.
+// This guard is the only thing that names the mismatch; uncaught, the full
+// mismatched domain flows into ensureContentResolver, which appends the env
+// TLD again and namehashes a compound nobody owns, surfacing as an opaque
+// not-the-owner revert from deep inside a chain call.
+describe("manifest/publish.ts: the wrong-env-TLD guard", () => {
+  for (const { domain, tld, expected, why } of [
+    { domain: "myapp.paseo", tld: "paseo", expected: true, why: "the env's own TLD must pass" },
+    { domain: "myapp.dto", tld: "paseo", expected: false, why: "a typo'd TLD must be rejected here — the schema validator no longer enumerates TLDs" },
+    { domain: "myapp.dot", tld: "paseo", expected: false, why: "another environment's real TLD is still wrong for THIS env" },
+    { domain: "MyApp.PASEO", tld: "paseo", expected: true, why: "must match case-insensitively, like stripTldSuffix and DOMAIN_RE" },
+    { domain: "paseo", tld: "paseo", expected: false, why: "the bare TLD carries no label, so it is a mismatch not a match" },
+    { domain: "myapp.paseo.dot", tld: "paseo", expected: false, why: "the TLD must be the FINAL segment, not merely present" },
+  ]) {
+    test(`domainMatchesEnvTld("${domain}", "${tld}") === ${expected}`, () => {
+      assert.strictEqual(domainMatchesEnvTld(domain, tld), expected,
+        `>> FAIL: manifest/publish.ts domainMatchesEnvTld("${domain}", "${tld}") should be ${expected}: ${why}`);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

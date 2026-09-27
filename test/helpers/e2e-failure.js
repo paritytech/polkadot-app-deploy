@@ -200,7 +200,7 @@ export function parseLineOrExplain(text, { pattern, scenario, what, hint }) {
  */
 export function assertOnChainMatches(actual, expected, { scenario, label }) {
   if (actual === expected) return;
-  const headline = `${scenario}: on-chain contenthash mismatch on ${label}.dot`;
+  const headline = `${scenario}: on-chain contenthash mismatch on ${label}`;
   const sections = [
     `   wrote:  ${expected}`,
     `   chain:  ${actual}`,

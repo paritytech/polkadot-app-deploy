@@ -44,7 +44,7 @@ import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
-import { encodeErrorResult, encodeFunctionData } from "viem";
+import { encodeErrorResult, encodeFunctionData, encodeFunctionResult } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { PassThrough } from "node:stream";
@@ -4733,10 +4733,11 @@ describe("DotNS ABI-profile-aware registration", () => {
 // classifier tests can't, since they call classifyProtocolVersion directly
 // and never touch detectProtocolVersion's plumbing.
 // ---------------------------------------------------------------------------
+const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
+const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", args: [] });
+const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("poprules-startingPrice").popRulesAbi, functionName: "startingPrice", args: [] });
+
 test("detectProtocolVersion passes hasContractCode's result through to classifyProtocolVersion unflattened (null stays null)", async () => {
-  const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
-  const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", args: [] });
-  const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("poprules-startingPrice").popRulesAbi, functionName: "startingPrice", args: [] });
   const PROBE_REVERTS = { result: { isOk: false, value: { data: "0x" } } };
 
   const d = new DotNS();
@@ -4765,6 +4766,106 @@ test("detectProtocolVersion passes hasContractCode's result through to classifyP
       return true;
     },
   );
+});
+
+// detectProtocolVersion + protocolVersion(). The probes cannot tell v0.6.0,
+// v0.7.0 and v0.8.0 apart, so a declared release is read alongside them. They
+// stay the authority: a declaration can lag the deployed code.
+describe("detectProtocolVersion reads the declared DotNS release", () => {
+  const REGISTRY_ADDR = "0xREGISTRYADDRESS0000000000000000000000";
+  const POP_CONTROLLER_ADDR = "0xPOPCONTROLLER00000000000000000000000";
+  const PROTOCOL_VERSION_ABI = [
+    { inputs: [], name: "protocolVersion", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
+  ];
+  const PROTOCOL_VERSION_CALLDATA = encodeFunctionData({ abi: PROTOCOL_VERSION_ABI, functionName: "protocolVersion", args: [] });
+  const ANSWERS = { result: { isOk: true, value: { data: encodeFunctionResult({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", result: 2n }) } } };
+  const REVERTS = { result: { isOk: false, value: { data: "0x", flags: 1n } } };
+  const declares = (semver) => ({ result: { isOk: true, value: { data: encodeFunctionResult({ abi: PROTOCOL_VERSION_ABI, functionName: "protocolVersion", result: semver }) } } });
+
+  // `probes` picks which generation the capability probes report:
+  //   "v0.6.0"  — pricingVersion + isPopIssued answer
+  //   "old"     — startingPrice answers instead (poprules-startingPrice)
+  //   "none"    — everything reverts, the unclassifiable chain
+  function makeDotNS({ declared, probes = "v0.6.0", hasCode = true }) {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d._environmentId = "paseo-next-v2";
+    d["_contracts"] = { ...d["_contracts"], POP_RULES: POP_RULES_ADDR, DOTNS_PROTOCOL_REGISTRY: REGISTRY_ADDR, DOTNS_POP_CONTROLLER: POP_CONTROLLER_ADDR };
+    d.clientWrapper = {
+      hasContractCode: async () => hasCode,
+      performDryRunCall: async (_signer, addr, _value, encodedData) => {
+        if (encodedData === PROTOCOL_VERSION_CALLDATA && addr === REGISTRY_ADDR) return declared === null ? REVERTS : declares(declared);
+        if (probes === "none") return REVERTS;
+        if (encodedData === PRICING_VERSION_CALLDATA) return probes === "v0.6.0" ? ANSWERS : REVERTS;
+        if (encodedData === STARTING_PRICE_CALLDATA) return probes === "old" ? ANSWERS : REVERTS;
+        if (addr === POP_CONTROLLER_ADDR) return probes === "v0.6.0" ? ANSWERS : REVERTS;
+        throw new Error(`unexpected encodedData in protocol-detect stub: ${encodedData}`);
+      },
+    };
+    return d;
+  }
+
+  async function captureLogs(fn) {
+    const lines = [];
+    const original = console.log;
+    console.log = (...args) => lines.push(args.join(" "));
+    try { await fn(); } finally { console.log = original; }
+    return lines.join("\n");
+  }
+
+  test("a declared release is reported alongside the profile, without warning at the verified ceiling", async () => {
+    const d = makeDotNS({ declared: "0.8.0" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0");
+    assert.match(logs, /declares DotNS 0\.8\.0/, ">> FAIL: the declared release is the only signal that a generation rollout happened — the profile alone cannot show it");
+    assert.doesNotMatch(logs, /WARNING/, ">> FAIL: warning on the newest verified release would train everyone to ignore it");
+  });
+
+  test("no declaration leaves the log exactly as it was before this change", async () => {
+    const d = makeDotNS({ declared: null });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0");
+    assert.doesNotMatch(logs, /declares DotNS/, ">> FAIL: a pre-v0.8.0 chain must not grow a line about a release it never declared");
+  });
+
+  test("a release newer than anything diffed against this client warns", async () => {
+    const d = makeDotNS({ declared: "0.9.0" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0", ">> FAIL: still deploy — refusing an unknown generation would strand every user the day dotns tags one");
+    assert.match(logs, /WARNING/, ">> FAIL: an undiffed generation must be loud; this warning is what v0.7.0 and v0.8.0 were missing");
+  });
+
+  test("a declaration that disagrees with the probes is reported, and the probes win", async () => {
+    // A half-applied upgrade: the registry carries protocolVersion() while
+    // PopRules still probes as an older generation.
+    const d = makeDotNS({ declared: "0.8.0", probes: "old" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "poprules-startingPrice", ">> FAIL: the probes read the deployed ABI; a declaration is written last in an upgrade and can lag it");
+    assert.match(logs, /NOTE:.*declares DotNS 0\.8\.0/, ">> FAIL: a chain claiming one generation while running another must say so");
+  });
+
+  test("a declaration cannot rescue a chain the probes cannot classify", async () => {
+    const d = makeDotNS({ declared: "0.8.0", probes: "none" });
+    await assert.rejects(() => d["detectProtocolVersion"](), /Could not determine the DotNS ABI profile/, ">> FAIL: an unrecognised PopRules ABI must still abort — a declared release says nothing about the shape of a contract that answered none of its probes");
+  });
+
+  test("an RPC failure reading the release does not abort a connect the probes can classify", async () => {
+    const d = makeDotNS({ declared: "0.8.0" });
+    const inner = d.clientWrapper.performDryRunCall;
+    d.clientWrapper.performDryRunCall = async (signer, addr, value, encodedData) => {
+      if (encodedData === PROTOCOL_VERSION_CALLDATA) throw new Error("WS disconnected");
+      return inner(signer, addr, value, encodedData);
+    };
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0", ">> FAIL: the probes answered, so the connect must still classify");
+    assert.doesNotMatch(logs, /declares DotNS/, ">> FAIL: a read that never completed must not be reported as a declaration");
+  });
+
+  test("a declaration cannot mask a wrong POP_RULES address", async () => {
+    const d = makeDotNS({ declared: "0.8.0", probes: "none", hasCode: false });
+    await assert.rejects(() => d["detectProtocolVersion"](), /No contract deployed/, ">> FAIL: a misconfigured address is a config error, not something a working registry on the same chain gets to paper over");
+  });
 });
 
 // ---------------------------------------------------------------------------

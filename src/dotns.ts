@@ -28,7 +28,7 @@ import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
-import { classifyProtocolVersion, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
+import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
 
 /** One step in the phone-signature plan fired at preflight. */
@@ -1029,6 +1029,8 @@ const DOTNS_CONTENT_RESOLVER_ABI = [
 const DOTNS_PROTOCOL_REGISTRY_ABI = [
   { inputs: [], name: "tld", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
   { inputs: [], name: "tldNode", outputs: [{ name: "", type: "bytes32" }], stateMutability: "view", type: "function" },
+  // v0.8.0 and up; reverts below it, empty until a release is declared.
+  { inputs: [], name: "protocolVersion", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
 ] as const;
 
 const DOTNS_TEXT_RESOLVER_ABI = [
@@ -3211,7 +3213,8 @@ export class DotNS {
   }
 
   /**
-   * Low-level dry-run read against DotnsProtocolRegistry (tld() / tldNode()).
+   * Low-level dry-run read against DotnsProtocolRegistry (tld() / tldNode() /
+   * protocolVersion()).
    * Deliberately does NOT reuse contractCall/contractCallNullable: both of
    * those throw on a revert or on empty data, which would make "contract
    * doesn't support this function yet" indistinguishable from "the RPC call
@@ -3227,7 +3230,7 @@ export class DotNS {
    *     "pre-#218", silently defaulting to the wrong TLD on a live env with
    *     no revert and no error — the worst failure mode in this whole change.
    */
-  private async dryRunRegistryString(functionName: "tld" | "tldNode"): Promise<RegistryDryRunResult<string>> {
+  private async dryRunRegistryString(functionName: "tld" | "tldNode" | "protocolVersion"): Promise<RegistryDryRunResult<string>> {
     this.ensureConnected();
     if (!this.clientWrapper) throw new Error(`DotNS registry read (${functionName}): polkadot-api client not available`);
     const registryAddress = this._contracts.DOTNS_PROTOCOL_REGISTRY;
@@ -3302,13 +3305,17 @@ export class DotNS {
     // hasCodeResult === false (in the classifier) and never from a silent
     // probe. Awaiting the code-presence read first would cost connect() an
     // extra RTT layer on every deploy for nothing.
-    const [hasCodeResult, pricingVersionOk, startingPriceOk, isPopIssuedOk] = await Promise.all([
+    const [hasCodeResult, pricingVersionOk, startingPriceOk, isPopIssuedOk, declaredResult] = await Promise.all([
       this.clientWrapper!.hasContractCode(popRulesAddress),
       this.probeViewFunctionOk(popRulesAddress, getAdapter("v0.5.8-rc1").popRulesAbi, "pricingVersion", []),
       this.probeViewFunctionOk(popRulesAddress, getAdapter("poprules-startingPrice").popRulesAbi, "startingPrice", []),
       popControllerAddress
         ? this.probeViewFunctionOk(popControllerAddress, POP_CONTROLLER_PROBE_ABI, "isPopIssued", [PROTOCOL_PROBE_LABEL])
         : Promise.resolve(null),
+      // Informational, so an RPC failure must not fail a connect the probes
+      // can classify. Caught here, not in dryRunRegistryString, which
+      // propagates on purpose for tld() — swallowing there picks a wrong TLD.
+      this.dryRunRegistryString("protocolVersion").catch((): RegistryDryRunResult<string> => ({ ok: false })),
     ]);
     const classification = classifyProtocolVersion({ hasCode: hasCodeResult, pricingVersionOk, startingPriceOk, isPopIssuedOk });
     if (classification.profile === null) {
@@ -3321,10 +3328,21 @@ export class DotNS {
       throw new Error(`${env} (${dotnsContractName(popRulesAddress, this._contracts)} ${popRulesAddress}): ${classification.reason}${hasCodeResult === true ? "" : this.contractSourceHint("POP_RULES")}`);
     }
     const profile = classification.profile;
+    const declared = classifyDeclaredProtocolVersion(declaredResult.ok ? declaredResult.value : null);
     this._protocolVersion = profile;
     this._adapter = getAdapter(profile);
     setDeployAttribute("deploy.dotns.protocol_version", profile);
-    console.log(`   DotNS ABI profile ${profile} detected on ${env}`);
+    // The probes cannot tell v0.6.0, v0.7.0 and v0.8.0 apart, so this is the
+    // only field that shows a generation rollout.
+    console.log(`   DotNS ABI profile ${profile} detected on ${env}${declared ? ` (declares DotNS ${declared.raw})` : ""}`);
+    // An upgrade declares last, so an aborted one leaves the old value
+    // standing. A declaration can lag the deployed code, never lead it.
+    if (declared && declared.profile !== profile) {
+      console.log(`   NOTE: ${env} declares DotNS ${declared.raw}, which is the ${declared.profile} profile, but the probes detect ${profile}. Using ${profile}: the probes read the ABI that is actually deployed.`);
+    }
+    if (declared?.aboveVerifiedCeiling) {
+      console.log(`   WARNING: ${env} declares DotNS ${declared.raw}, newer than ${HIGHEST_VERIFIED_DOTNS_RELEASE} — the newest release whose ABI has been checked against this client. Continuing on the ${profile} profile, which is correct only if that release changed nothing polkadot-app-deploy calls. Re-run the upstream ABI diff.`);
+    }
     // See this method's own doc comment above for why the isPopIssuedOk-null
     // fallback (no configured DOTNS_POP_CONTROLLER) is safe — v0.5.8-rc1 and
     // v0.6.0 share an identical registration/ABI adapter, so this only

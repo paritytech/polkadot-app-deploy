@@ -13763,6 +13763,268 @@ describe("portability: per-framework classifyFn preserves the C1 invariant (#152
   });
 });
 
+// ---------------------------------------------------------------------------
+// Phase A / Phase B chunk-subset invariant — permanent regression guard.
+// ---------------------------------------------------------------------------
+// A prior design proposal considered removing the two-merkleization Phase
+// A/B split because Phase A can, in theory, upload a chunk the final CAR
+// (Phase B) never references — paid for and orphaned. #1459 fixed one
+// concrete cause of exactly that (a duplicate-CID file double-counted in
+// section 1's packing between phases).
+//
+// This is NOT a bug fix. This is a discriminating experiment: a failing case
+// here would justify redesigning the two-phase split; a clean pass across
+// the shapes that historically diverged is evidence the divergence class is
+// closed post-#1459, and this guard is what keeps it closed.
+//
+// Mirrors real deploy.ts sequencing:
+//   1. writeEmbeddedManifestPlaceholder — a small placeholder manifest,
+//      written BEFORE Phase A's merkleize.
+//   2. Phase A merkleize + buildOrderedCar, anchored on the PRIOR deploy's
+//      stableOrder (or unanchored, for a first deploy). Phase A uploads its
+//      section-1 chunk set — `phaseA.section1ChunkCids`.
+//   3. finaliseEmbeddedManifest — the real, much larger manifest — written
+//      BEFORE Phase B's re-merkleize. This is the size delta that
+//      historically moved chunk boundaries.
+//   4. Phase B merkleize + buildOrderedCar, anchored on Phase A's OWN
+//      stableOrder. Phase B's `chunkCids` is what the deploy actually
+//      uploads/references for sections 0+1+2.
+//
+// buildOrderedCar `continue`s past MANIFEST_PATH before file classification,
+// so the manifest is always confined to section 0 — this harness DOES reach
+// the placeholder→finalised transition at unit level. The `finalisedBytes >
+// placeholderBytes` checks below are fixture sanity (confirming the
+// transition actually happened), not a standalone proof that section 1 is
+// independent of it — that independence falls out of buildOrderedCar's
+// structure (section 0 is packed separately and never merged into section
+// 1's byte stream), which the subset assertion exercises indirectly.
+//
+// Structural note, so a future reader doesn't mistake this for 4 independent
+// discriminators: Phase B always anchors on Phase A's OWN stableOrder, over
+// the same tree (deploy.ts's real sequencing, mirrored here). Given that,
+// buildOrderedCar's anchored-placement loop forces Phase B's section-1 order
+// to replay Phase A's exactly, so packSection (deterministic) must reproduce
+// Phase A's chunks byte-for-byte UNLESS the two phases' dedup-by-fileCid
+// disagrees — exactly the #1459 mechanism. That makes "duplicate-CID files"
+// the one case that can structurally fail; "unhashed index.html", "asset
+// rotation", and "control" regression-guard their own named issues (a file
+// never migrating into section 1, membership tracking a rotated anchor
+// correctly, exact byte-identity on a no-op redeploy) and validate the
+// subset property holds under those specific mutations too, rather than
+// stress the packing algorithm itself. The first test below is a synthetic
+// mutation case that proves `assertPhaseASubset` actually fires — the other
+// four passing green is otherwise ambiguous between "divergence class closed"
+// and "guard doesn't discriminate".
+describe("portability: Phase A upload set is a subset of Phase B's final CAR (#1517 discriminating experiment)", { concurrency: true }, () => {
+  // Fixture helpers shared by every case below.
+  function writeAsset(dir, relPath, sizeBytes, fillByte) {
+    fs.mkdirSync(path.join(dir, path.dirname(relPath)), { recursive: true });
+    fs.writeFileSync(path.join(dir, relPath), Buffer.alloc(sizeBytes, fillByte));
+  }
+
+  async function withTmpDir(prefix, fn) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    try {
+      return await fn(dir);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  // The "anchoring deploy" (deploy N-1): a plain, unanchored buildOrderedCar
+  // pass whose stableOrder feeds Phase A's prevStableOrder — the same role
+  // fetchPreviousManifest's stableBlockOrder plays in deploy.ts.
+  async function buildAnchoringDeploy(dir) {
+    const classifyFn = (p) => classifyFile(p, { framework: null });
+    const out = await merkleizeJSBackend(dir);
+    const build = await buildOrderedCar({ output: out, classifyFn });
+    return { out, build };
+  }
+
+  async function runPhaseAThenPhaseB(dir, { framework = null, phaseAPrevStableOrder = [] } = {}) {
+    const classifyFn = (p) => classifyFile(p, { framework });
+
+    writeEmbeddedManifestPlaceholder(dir, {
+      version: MANIFEST_VERSION,
+      previousContenthash: null,
+      deployedAt: "2026-01-01T00:00:00.000Z",
+      framework: null,
+    });
+    const placeholderBytes = fs.statSync(path.join(dir, MANIFEST_PATH)).size;
+    const outA = await merkleizeJSBackend(dir);
+    const phaseA = await buildOrderedCar({ output: outA, classifyFn, prevStableOrder: phaseAPrevStableOrder, phase: "Phase A" });
+
+    // The real finalised manifest: full file list + chunk map, materially
+    // larger than the placeholder — this is the byte-size transition that
+    // historically moved chunk boundaries. buildFilesMap is the exact
+    // function deploy.ts calls at this point, so this mirrors production
+    // classification instead of re-deriving it.
+    const files = buildFilesMap(dir, outA.fileCids, framework);
+    const chunks = {};
+    for (const cid of phaseA.chunkCids) chunks[cid] = { size: 1000, deployed_at: "2026-01-01T00:00:00.000Z" };
+    finaliseEmbeddedManifest(dir, {
+      version: MANIFEST_VERSION,
+      previousContenthash: null,
+      deployedAt: "2026-01-01T00:00:01.000Z",
+      framework,
+      files,
+      stableBlockOrder: phaseA.stableOrder,
+      blocks: phaseA.blockOrder,
+      chunks,
+    });
+    const finalisedBytes = fs.statSync(path.join(dir, MANIFEST_PATH)).size;
+    const outB = await merkleizeJSBackend(dir);
+    const phaseB = await buildOrderedCar({ output: outB, classifyFn, prevStableOrder: phaseA.stableOrder, phase: "Phase B" });
+
+    return { phaseA, phaseB, outA, outB, placeholderBytes, finalisedBytes };
+  }
+
+  function assertPhaseASubset(phaseA, phaseB, label) {
+    const phaseBSet = new Set(phaseB.chunkCids);
+    const orphaned = phaseA.section1ChunkCids.filter((c) => !phaseBSet.has(c));
+    assert.deepEqual(
+      orphaned,
+      [],
+      `>> FAIL: ${label}: Phase A uploaded ${orphaned.length} section-1 chunk(s) that Phase B's final CAR does not reference — ` +
+      `orphaned CIDs: [${orphaned.join(", ")}] ` +
+      `(phaseA s1=${phaseA.sectionSizes.section1}B/${phaseA.sectionChunkCounts.section1}chunks, ` +
+      `phaseB s0=${phaseB.sectionSizes.section0}B s1=${phaseB.sectionSizes.section1}B/${phaseB.sectionChunkCounts.section1}chunks s2=${phaseB.sectionSizes.section2}B)`
+    );
+  }
+
+  // Multi-chunk fixture sanity, shared by every case: enough stable bytes to
+  // force >=N section-1 chunks, so the subset check exercises a real chunk
+  // boundary rather than trivially holding for a single chunk.
+  function assertMultiChunkFixture(phaseA, minChunks = 2) {
+    assert.ok(phaseA.sectionChunkCounts.section1 >= minChunks,
+      `>> FAIL: fixture setup: expected >=${minChunks} section-1 chunks, got ${phaseA.sectionChunkCounts.section1} — fixture too small to exercise a chunk boundary`);
+  }
+
+  // Meta-test: prove assertPhaseASubset actually fires, on a synthetic
+  // divergence, before trusting the four real-fixture cases below to be
+  // meaningful rather than vacuous. Without this, five greens are ambiguous
+  // between "the divergence class is closed" and "this guard never catches
+  // anything."
+  test("assertPhaseASubset fires when Phase A's section-1 CIDs are not a subset of Phase B's chunkCids (synthetic)", () => {
+    const phaseA = {
+      section1ChunkCids: ["bafkOrphan1", "bafkShared1"],
+      sectionSizes: { section1: 2_000_000 },
+      sectionChunkCounts: { section1: 2 },
+    };
+    const phaseB = {
+      chunkCids: ["bafkHeader", "bafkShared1", "bafkRootDir"], // missing bafkOrphan1
+      sectionSizes: { section0: 100, section1: 1_000_000, section2: 200 },
+      sectionChunkCounts: { section1: 1 },
+    };
+    assert.throws(
+      () => assertPhaseASubset(phaseA, phaseB, "synthetic divergence"),
+      (err) => {
+        assert.match(err.message, /synthetic divergence/, "error must name the case");
+        // Exactly the orphaned CID, not the shared one that IS in phaseB.chunkCids.
+        assert.match(err.message, /orphaned CIDs: \[bafkOrphan1\]/, "error must list exactly the one orphaned CID, excluding the shared one");
+        return true;
+      },
+      ">> FAIL: assertPhaseASubset meta-test: helper did not throw on a genuine Phase-A/Phase-B divergence"
+    );
+  });
+
+  test("duplicate-CID files (#1459): byte-identical stable files at two paths stay deduped across Phase A and Phase B", async () => {
+    await withTmpDir("bd-phaseab-dup-", async (dir) => {
+      writeAsset(dir, "assets/logo-a.png", 600_000, 0x41);
+      writeAsset(dir, "assets/logo-b.png", 600_000, 0x41); // same bytes -> same CID, different path
+      writeAsset(dir, "assets/banner.png", 600_000, 0x42);
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const { phaseA, phaseB, outA, finalisedBytes, placeholderBytes } = await runPhaseAThenPhaseB(dir);
+
+      // Fixture sanity: confirm the duplicate really collapsed to ONE section-1
+      // entry (fileCid-keyed), not two — otherwise this case tests nothing.
+      const logoACid = outA.fileCids.get("assets/logo-a.png");
+      const logoBCid = outA.fileCids.get("assets/logo-b.png");
+      assert.equal(logoACid, logoBCid, ">> FAIL: fixture setup: logo-a.png and logo-b.png must produce the same CID for this to be a duplicate-CID case");
+      const occurrences = phaseA.stableOrder.filter((cid) => cid === logoACid).length;
+      assert.equal(occurrences, 1, `>> FAIL: duplicate-CID files: the duplicate CID appears ${occurrences} times in Phase A's stableOrder, expected exactly 1 (dedup should collapse it)`);
+      assert.ok(finalisedBytes > placeholderBytes, ">> FAIL: fixture setup: finalised manifest must be larger than the placeholder to exercise the size transition");
+      assertMultiChunkFixture(phaseA);
+
+      assertPhaseASubset(phaseA, phaseB, "duplicate-CID files (#1459)");
+    });
+  });
+
+  test("unhashed index.html, byte-identical across builds (#1383/#1389): stays volatile in both phases, never enters section 1", async () => {
+    await withTmpDir("bd-phaseab-idx-", async (dir) => {
+      writeAsset(dir, "assets/app.png", 700_000, 0x41);
+      writeAsset(dir, "assets/vendor.png", 700_000, 0x42);
+      // No content hash in the filename, and content is identical across
+      // Phase A and Phase B by construction (nothing rewrites it) — this is
+      // the exact "heuristically volatile but unchanged" shape #1383/#1389
+      // describe. classifyFn here never threads prevManifest (matches
+      // deploy.ts's actual classifyFn wrapper), so this stays a heuristic
+      // classification, not a CID-match one.
+      fs.writeFileSync(path.join(dir, "index.html"), "<html><body>same every deploy</body></html>");
+
+      const { phaseA, phaseB, outA, outB } = await runPhaseAThenPhaseB(dir);
+
+      const indexCidA = outA.fileCids.get("index.html");
+      const indexCidB = outB.fileCids.get("index.html");
+      assert.equal(indexCidA, indexCidB, ">> FAIL: fixture setup: index.html must be byte-identical (same CID) across Phase A and Phase B for this to be the #1383/#1389 shape");
+      assert.ok(!phaseA.stableOrder.includes(indexCidA), ">> FAIL: unhashed index.html: must not enter Phase A's section 1 (stable) despite being byte-identical");
+      assert.ok(!phaseB.stableOrder.includes(indexCidB), ">> FAIL: unhashed index.html: must not enter Phase B's section 1 (stable) despite being byte-identical");
+      assertMultiChunkFixture(phaseA);
+
+      assertPhaseASubset(phaseA, phaseB, "unhashed index.html, byte-identical (#1383/#1389)");
+    });
+  });
+
+  test("asset rotation (S-INC-ASSET-ROTATION): section-1 membership changes between the anchoring deploy and this one", async () => {
+    await withTmpDir("bd-phaseab-rot-old-", async (dirOld) => {
+      await withTmpDir("bd-phaseab-rot-new-", async (dirNew) => {
+        // Deploy N-1: assetA + assetB stable, unanchored (its own first build).
+        writeAsset(dirOld, "assets/assetA.png", 650_000, 0x41);
+        writeAsset(dirOld, "assets/assetB.png", 650_000, 0x42);
+        fs.writeFileSync(path.join(dirOld, "index.html"), "<html>old</html>");
+        const { out: outOld, build: buildOld } = await buildAnchoringDeploy(dirOld);
+
+        // Deploy N: assetA removed, assetB unchanged (byte-identical), assetC
+        // newly added — section-1 membership genuinely changes.
+        writeAsset(dirNew, "assets/assetB.png", 650_000, 0x42);
+        writeAsset(dirNew, "assets/assetC.png", 650_000, 0x43);
+        fs.writeFileSync(path.join(dirNew, "index.html"), "<html>new</html>");
+
+        const { phaseA, phaseB, outA } = await runPhaseAThenPhaseB(dirNew, { phaseAPrevStableOrder: buildOld.stableOrder });
+
+        // Fixture sanity: membership actually rotated.
+        const assetACid = outOld.fileCids.get("assets/assetA.png");
+        const assetCCid = outA.fileCids.get("assets/assetC.png");
+        assert.ok(!phaseA.stableOrder.includes(assetACid), ">> FAIL: fixture setup: removed assetA must not appear in Phase A's stableOrder");
+        assert.ok(phaseA.stableOrder.includes(assetCCid), ">> FAIL: fixture setup: newly-added assetC must appear in Phase A's stableOrder");
+        assert.ok(phaseA.sectionChunkCounts.section1 >= 1, ">> FAIL: fixture setup: expected at least 1 section-1 chunk");
+
+        assertPhaseASubset(phaseA, phaseB, "asset rotation (S-INC-ASSET-ROTATION)");
+      });
+    });
+  });
+
+  test("control: plain unchanged redeploy — identical tree across the anchoring build, Phase A, and Phase B", async () => {
+    await withTmpDir("bd-phaseab-ctl-", async (dir) => {
+      writeAsset(dir, "assets/asset1.png", 650_000, 0x41);
+      writeAsset(dir, "assets/asset2.png", 650_000, 0x42);
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const { build: buildOld } = await buildAnchoringDeploy(dir); // deploy N-1, unanchored
+      const { phaseA, phaseB } = await runPhaseAThenPhaseB(dir, { phaseAPrevStableOrder: buildOld.stableOrder });
+
+      assertMultiChunkFixture(phaseA);
+      // Stronger than subset: nothing changed, so section-1 membership must be
+      // byte-identical between Phase A and Phase B, not merely a subset.
+      assert.deepEqual([...phaseB.stableOrder].sort(), [...phaseA.stableOrder].sort(),
+        ">> FAIL: control unchanged redeploy: section-1 membership differs between Phase A and Phase B despite no content change");
+
+      assertPhaseASubset(phaseA, phaseB, "control: plain unchanged redeploy");
+    });
+  });
+});
+
 describe("storeChunkedContent isValid:false backstop", () => {
   test("ExistingProvider accepts probeFailedCids without TypeError", async () => {
     // Smoke-test: verify that storeChunkedContent destructures probeFailedCids

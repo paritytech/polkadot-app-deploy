@@ -10280,8 +10280,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     assert.ok(job, "nightly-pr-coverage job must exist");
     assert.match(job, /^ {4}runs-on:\s*ubuntu-latest$/m,
       "nightly-pr-coverage runs on ubuntu-latest");
-    // 15 matrix legs covering 13 distinct scenario names (s1 and s-inc each appear twice).
-    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env", "s-transfer", "s-transfer-subname"]) {
+    // 16 matrix legs covering 14 distinct scenario names (s1 and s-inc each appear twice).
+    for (const sc of ["s1", "s3", "s7", "s8", "s-inc", "s-inc-roundtrip", "s-inc-portability", "s-inc-asset-rotation", "s-content-only", "s-manifest-env", "s-manifest-pvm", "s-transfer", "s-transfer-subname"]) {
       assert.match(job, new RegExp(`scenario:\\s*${sc.replace(/-/g, "-")}\\b`),
         `nightly-pr-coverage matrix must include scenario ${sc}`);
     }
@@ -10313,6 +10313,13 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       job,
       /scenario:\s*s-manifest-env,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*9\s*}/,
       "nightly-pr-coverage must wire scenario s-manifest-env to signer pool, merkle js, poolIndex 9",
+    );
+
+    // App v2 PolkaVM manifest publish + executable-record read-back.
+    assert.match(
+      job,
+      /scenario:\s*s-manifest-pvm,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*12\s*}/,
+      "nightly-pr-coverage must wire scenario s-manifest-pvm to signer pool, merkle js, poolIndex 12",
     );
 
     // S-TRANSFER existed in test/e2e.test.js and scripts/e2e-pass.sh but had
@@ -22617,6 +22624,7 @@ describe("e2e-ensure-authorized: DRIFT GUARD — signer list derived from e2e.ym
       "//e2e-direct", "//e2e-fresh-direct", "//e2e-fresh-pool", "//e2e-s9", "//e2e-sgrandpa",
       "//deploy/0", "//deploy/1", "//deploy/2", "//deploy/3", "//deploy/4", "//deploy/5",
       "//deploy/6", "//deploy/7", "//deploy/8", "//deploy/9", "//deploy/10", "//deploy/11",
+      "//deploy/12",
     ];
     assert.deepStrictEqual(labels, expected,
       `>> FAIL: e2e-signer-drift-guard: the derived signer set no longer matches the pinned expectation (derived: ${JSON.stringify(labels)}). ` +

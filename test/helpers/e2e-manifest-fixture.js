@@ -40,9 +40,10 @@ const PNG_1X1 = Buffer.from(
  *                                double-suffixed config domain ("e2epoolns01.paseo.dot") once callers
  *                                began passing a label that already carried the env's TLD, which the
  *                                CLI rejected as a config/deploy domain mismatch (#1244).
+ * @param {object} [opts.appManifest] An App v2 manifest; emits an App v2 executable instead of App v1.
  * @returns {{ sidecarDir: string, configPath: string, iconPath: string }}
  */
-export function buildManifestSidecar({ buildDir, label, tld = "dot" }) {
+export function buildManifestSidecar({ buildDir, label, tld = "dot", appManifest }) {
   const sidecarDir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-manifest-"));
   const iconPath = path.join(sidecarDir, "icon.png");
   fs.writeFileSync(iconPath, PNG_1X1);
@@ -55,11 +56,28 @@ export function buildManifestSidecar({ buildDir, label, tld = "dot" }) {
     description: "E2E test fixture",
     icon: { path: "./icon.png", format: "png" },
     executables: [
-      { kind: "app", path: path.resolve(buildDir), appVersion: [0, 0, 0] },
+      {
+        kind: "app",
+        path: path.resolve(buildDir),
+        ...(appManifest ? { manifest: appManifest } : { appVersion: [0, 0, 0] }),
+      },
     ],
   };
 
   const configPath = path.join(sidecarDir, "polkadot-app-deploy.config.mjs");
   fs.writeFileSync(configPath, `export default ${JSON.stringify(config, null, 2)};\n`);
   return { sidecarDir, configPath, iconPath };
+}
+
+/** An App v2 PolkaVM manifest. A deploy writes its `JSON.stringify` to the `executable` text record. */
+export function buildPvmAppManifest() {
+  return {
+    $v: 2,
+    kind: "app",
+    appVersion: [0, 0, 0],
+    runtime: { kind: "polkavm", abiVersion: 1, entrypoint: "app.polkavm" },
+    capabilities: {
+      graphics: { abiVersion: 1, profile: "framebuffer", requiredFeatures: [] },
+    },
+  };
 }

@@ -83,7 +83,68 @@ const STABLE_EXTENSIONS = new Set([
 //   branch's 32 here would flip a 21-32 char ordinary segment such as
 //   "data-longdescriptivefilename.json" from volatile to stable — the
 //   regression test pins that.
-const CONTENT_HASH_RE = /[-.](?:[a-f0-9]{6,32}|[A-Za-z0-9_-]{6,20})\.[a-zA-Z0-9]+$/;
+export const CONTENT_HASH_RE = /[-.](?:[a-f0-9]{6,32}|[A-Za-z0-9_-]{6,20})\.[a-zA-Z0-9]+$/;
+
+// ── Per-framework rule table ────────────────────────────────────────────────
+//
+// #1355/#1390/#1527: CONTENT_HASH_RE started as one global regex and each new
+// bundler shape (Vite's base64url alphabet, webpack's longer digest, Nuxt's
+// separator-less hash) was handled by loosening it for every project. That
+// trades a cheap error (a stable file wrongly re-uploaded) for an expensive
+// one (mutable content wrongly cached in section 1) globally, to serve one
+// bundler.
+//
+// This table runs per-framework rules BEFORE the global fallback instead.
+// Each entry must NARROW — scope a claim to a path prefix the bundler
+// provably owns — never WIDEN a pattern that applies everywhere (C2: a false
+// "stable" is the expensive error; a false "volatile" only wastes an
+// upload). An unknown or undetected framework falls straight through to the
+// unchanged global fallback (CONTENT_HASH_RE + STABLE_EXTENSIONS), which is
+// the majority case (C3: detection degrades to the fallback, never guesses a
+// wrong rule set).
+export type FrameworkRules = {
+  /** Prefixes the bundler content-addresses wholesale — every file under them is stable. */
+  stablePrefixes?: readonly string[];
+  /** A hash shape accepted ONLY under the given prefix. */
+  scopedHashRe?: readonly { prefix: string; re: RegExp }[];
+  /** Basenames that stay volatile even inside a stablePrefix. */
+  volatileExact?: readonly string[];
+};
+
+// Separator-less basenames, e.g. _nuxt/CJPnFZM_2.js. Deliberately NOT global:
+// accepting this shape everywhere would make any 8+ char basename a hash.
+const NUXT_HASH_RE = /(?:^|\/)[A-Za-z0-9_-]{8,20}\.[a-zA-Z0-9]+$/;
+
+export const FRAMEWORK_RULES: Record<string, FrameworkRules> = {
+  // Next.js self-hosting docs: static assets under _next/static/ carry an
+  // immutable Cache-Control because "these immutable files contain a
+  // SHA-hash in the file name" — but _buildManifest.js and _ssgManifest.js
+  // sit under a build-id directory and carry no hash of their own. Their
+  // path is unique only while the build id is (Next keeps it constant when
+  // `deploymentId` is set), so with a fixed build id they are a stable path
+  // with mutable content — the C2 expensive error — unless excluded.
+  next: {
+    stablePrefixes: ["_next/static/"],
+    volatileExact: ["_buildManifest.js", "_ssgManifest.js"],
+  },
+  // Nuxt's app manifest writes _nuxt/builds/latest.json — re-read on every
+  // page load to detect a new deployment, so it has a fixed filename and
+  // changes content every build. A blanket `_nuxt/` stablePrefix would put
+  // it in section 1, so the rule is scoped to the hash shape instead of the
+  // prefix. _nuxt/builds/meta/<buildId>.json IS stable: that name is unique
+  // per build, so its content never changes under it.
+  nuxt: { scopedHashRe: [{ prefix: "_nuxt/", re: NUXT_HASH_RE }] },
+  // A PolkaVM app bundle. Nothing here is content-addressed, so the rules
+  // are about what the bundle means, not what its filenames look like: the
+  // payload directories never change, the executable and its manifest
+  // change every release. `game/` and `LICENSES/` are generic enough to be
+  // someone else's mutable content, so they are earned entirely by the
+  // detection marker (a parsed manifest.json field) being specific.
+  "polkavm-app": {
+    stablePrefixes: ["game/", "LICENSES/"],
+    volatileExact: ["app.polkavm", "manifest.json"],
+  },
+};
 
 export function isVolatilePath(p: string): boolean {
   return p.startsWith(`${MANIFEST_DIR}/`) || p === MANIFEST_DIR;
@@ -96,14 +157,26 @@ export type ClassifyContext = {
 };
 
 // Heuristic classification — used on first deploy or when prev manifest absent.
+//
+// Framework rules run BEFORE the global pattern and never replace it. An
+// unknown/null framework falls straight through the STABLE_EXTENSIONS +
+// CONTENT_HASH_RE fallback unchanged — the majority (unknown) case must
+// stay untouched.
 export function classifyFileHeuristic(filePath: string, framework?: string | null): FileType {
   if (isVolatilePath(filePath)) return "volatile";
-  if (CONTENT_HASH_RE.test(filePath)) return "stable";
+
+  const rules = framework ? FRAMEWORK_RULES[framework] : undefined;
+  if (rules) {
+    // Split only when a rule set actually consults the basename — nuxt's
+    // rules test the full path, so it would otherwise allocate per file.
+    if (rules.volatileExact && rules.volatileExact.includes(filePath.split("/").pop() ?? filePath)) return "volatile";
+    if (rules.stablePrefixes?.some((prefix) => filePath.startsWith(prefix))) return "stable";
+    if (rules.scopedHashRe?.some(({ prefix, re }) => filePath.startsWith(prefix) && re.test(filePath))) return "stable";
+  }
+
   const ext = filePath.split(".").pop()?.toLowerCase();
   if (ext && STABLE_EXTENSIONS.has(ext)) return "stable";
-  if (framework === "next") {
-    if (filePath.startsWith("_next/static/")) return "stable";
-  }
+  if (CONTENT_HASH_RE.test(filePath)) return "stable";
   return "volatile";
 }
 

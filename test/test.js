@@ -11200,6 +11200,121 @@ describe("manifest (incremental-upload-v2)", () => {
     });
   });
 
+  // Per-framework rule table (#1527/#1528 Phase 1). Replaces the one global
+  // regex with narrow, framework-scoped rules that run BEFORE the global
+  // fallback. C2: each rule set narrows (scopes a claim to a path prefix the
+  // bundler owns) rather than widens a pattern that applies everywhere. Each
+  // exclusion below is a file with a STABLE PATH but MUTABLE CONTENT — the
+  // expensive C2 error a wrong "stable" classification causes.
+  describe("classifyFileHeuristic: per-framework rule table (#1527/#1528 Phase 1)", () => {
+    test("next: _next/static/ is stable, the same basename outside the prefix is not", () => {
+      assert.equal(classifyFileHeuristic("_next/static/chunks/x.js", "next"), "stable",
+        ">> FAIL: next stablePrefix: _next/static/chunks/x.js expected stable");
+      assert.equal(classifyFileHeuristic("_next/server/x.js", "next"), "volatile",
+        ">> FAIL: next stablePrefix: _next/server/x.js is outside _next/static/, expected volatile (no content hash in name)");
+    });
+
+    test("next: _buildManifest.js and _ssgManifest.js stay volatile even under _next/static/", () => {
+      assert.equal(
+        classifyFileHeuristic("_next/static/AbCdEf123456/_buildManifest.js", "next"),
+        "volatile",
+        ">> FAIL: _buildManifest.js has no hash in its own name and its path is only unique while the build id is — must stay volatile even inside the stable prefix"
+      );
+      assert.equal(
+        classifyFileHeuristic("_next/static/AbCdEf123456/_ssgManifest.js", "next"),
+        "volatile",
+        ">> FAIL: _ssgManifest.js: same reasoning as _buildManifest.js"
+      );
+    });
+
+    test("nuxt: separator-less hash-shaped basenames under _nuxt/ are stable", () => {
+      assert.equal(classifyFileHeuristic("_nuxt/CJPnFZM_2.js", "nuxt"), "stable",
+        ">> FAIL: nuxt scopedHashRe: _nuxt/CJPnFZM_2.js expected stable (#1527)");
+    });
+
+    test("nuxt: _nuxt/builds/latest.json stays volatile — fixed filename, re-read to detect a new deployment", () => {
+      assert.equal(
+        classifyFileHeuristic("_nuxt/builds/latest.json", "nuxt"),
+        "volatile",
+        ">> FAIL: _nuxt/builds/latest.json: 'latest' is ordinary word-shaped, not hash-shaped — a blanket _nuxt/ stablePrefix would wrongly cache this mutable file, which is the C2 expensive error this design exists to avoid"
+      );
+    });
+
+    test("nuxt: _nuxt/builds/meta/<buildId>.json is stable — unique per build, so its content never changes under that name", () => {
+      assert.equal(classifyFileHeuristic("_nuxt/builds/meta/2f8a9c1d3e.json", "nuxt"), "stable",
+        ">> FAIL: nuxt build-id-named meta file expected stable (hash-shaped basename)");
+    });
+
+    test("polkavm-app: game/ and LICENSES/ are stable, app.polkavm and manifest.json stay volatile", () => {
+      assert.equal(classifyFileHeuristic("game/freedoom1.wad", "polkavm-app"), "stable",
+        ">> FAIL: polkavm-app stablePrefix game/: freedoom1.wad expected stable (never changes)");
+      assert.equal(classifyFileHeuristic("LICENSES/gpl-2.0.txt", "polkavm-app"), "stable",
+        ">> FAIL: polkavm-app stablePrefix LICENSES/: gpl-2.0.txt expected stable (never changes)");
+      assert.equal(
+        classifyFileHeuristic("app.polkavm", "polkavm-app"),
+        "volatile",
+        ">> FAIL: app.polkavm is the executable — changes every release, has no content hash in its name, must stay volatile"
+      );
+      assert.equal(
+        classifyFileHeuristic("manifest.json", "polkavm-app"),
+        "volatile",
+        ">> FAIL: manifest.json is version metadata — changes every release, must stay volatile"
+      );
+    });
+
+    test("determinism: classifyFileHeuristic(p, f) depends only on (p, f)", () => {
+      const cases = [
+        ["_next/static/chunks/x.js", "next"],
+        ["_next/static/AbCdEf123456/_buildManifest.js", "next"],
+        ["_nuxt/CJPnFZM_2.js", "nuxt"],
+        ["_nuxt/builds/latest.json", "nuxt"],
+        ["game/freedoom1.wad", "polkavm-app"],
+        ["app.polkavm", "polkavm-app"],
+        ["index.html", null],
+      ];
+      // Interleaved, not back-to-back: two adjacent calls with identical
+      // arguments cannot diverge for a pure string function, so repeating
+      // them proves nothing. Classifying every other case in between is what
+      // would catch a per-instance cache or a regex carrying lastIndex state.
+      const first = cases.map(([p, f]) => classifyFileHeuristic(p, f));
+      for (let i = 0; i < cases.length; i++) {
+        const [p, f] = cases[i];
+        assert.equal(
+          classifyFileHeuristic(p, f),
+          first[i],
+          `>> FAIL: classifyFileHeuristic(${p}, ${f}) changed after classifying every other case in between — it is carrying state across calls, so classification is not a pure function of (path, framework)`,
+        );
+      }
+    });
+
+    // Fallback: an unknown framework must classify EXACTLY as `null` does —
+    // the global fallback stays untouched for the majority (unknown) case.
+    // Corpus spans the #1390 table plus the #1355 realistic-vite fixture, plus
+    // each framework's own path shapes WITHOUT the matching hint (must not
+    // accidentally trip a rule that shouldn't apply).
+    test("unknown framework classifies exactly as no framework hint, across the #1390 table + realistic-vite fixture", () => {
+      const names = [
+        "index.html", "about/index.html", "notes.txt", "data.json", "styles.css", "readme.md", "robots.txt",
+        "index-a1b2c3d4.js", "main.a1b2c3d4e5f6a7b8.js", "main.a1b2c3d4e5f6a7b81.js",
+        "main.a1b2c3d4e5f6a7b8c9d0.js", "main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.js",
+        "app.abcdefghijklmnopqrst.css", "vendor-bundle.js", "report-2026-09-04.json",
+        "changelog2026.md", "data-longdescriptivefilename.json",
+        "_next/static/chunks/x.js", "_next/static/AbCdEf123456/_buildManifest.js",
+        "_nuxt/CJPnFZM_2.js", "_nuxt/builds/latest.json",
+        "game/freedoom1.wad", "app.polkavm", "manifest.json",
+      ];
+      const dir = path.resolve("test/fixtures/realistic-vite/v1/assets");
+      const fixtureNames = fs.readdirSync(dir).map((f) => `assets/${f}`);
+      for (const n of [...names, ...fixtureNames]) {
+        assert.equal(
+          classifyFileHeuristic(n, "some-unrecognised-bundler"),
+          classifyFileHeuristic(n, null),
+          `>> FAIL: ${n}: an unknown framework must classify identically to no framework hint — the global fallback must stay untouched`
+        );
+      }
+    });
+  });
+
   describe("parseManifest", () => {
     test("accepts a valid v2 manifest (chunks normalised to v3 shape)", () => {
       const r = parseManifest(JSON.stringify({
@@ -12806,28 +12921,123 @@ describe("buildFilesMap with fileCids (incremental-upload-v2)", () => {
     assert.ok("index.html" in map);
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  // #1528 Phase 1 wiring: buildFilesMap must thread a framework value into
+  // classifyFile so the per-framework rule table actually reaches the
+  // manifest's `files` map (previously the framework value reached nothing).
+  test("threads the framework param into classifyFile", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-bfm-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static", "chunks"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "_next", "static", "chunks", "x.js"), "x");
+    const fileCids = new Map([["_next/static/chunks/x.js", "bafabc"]]);
+    const withoutFramework = buildFilesMap(dir, fileCids);
+    const withFramework = buildFilesMap(dir, fileCids, "next");
+    assert.equal(withoutFramework["_next/static/chunks/x.js"].type, "volatile",
+      ">> FAIL: without a framework hint, an unhashed _next/static/ path stays volatile (global fallback unchanged)");
+    assert.equal(withFramework["_next/static/chunks/x.js"].type, "stable",
+      ">> FAIL: buildFilesMap must thread its framework param into classifyFile so the next stablePrefix rule applies");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });
 
+// Detection hardening (#1527/#1528/#1529 Phase 1): markers evaluated against
+// the deployed directory only (C1), returning null on ambiguity rather than
+// guessing (C3).
 describe("detectFramework", () => {
-  test("returns 'next' when _next/ exists", () => {
+  test("returns 'polkavm-app' when root manifest.json has runtime.kind:'polkavm' alongside app.polkavm", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
-    fs.mkdirSync(path.join(dir, "_next"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "polkavm" }, version: "1.0.0" }));
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(16, 0x00));
+    assert.equal(detectFramework(dir), "polkavm-app");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when app.polkavm is missing (manifest.json alone is not evidence)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "polkavm" } }));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when manifest.json's runtime.kind is not 'polkavm'", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), JSON.stringify({ runtime: { kind: "web" } }));
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(4));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does NOT return 'polkavm-app' when manifest.json is malformed JSON (fails closed, not a crash)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.writeFileSync(path.join(dir, "manifest.json"), "{not valid json");
+    fs.writeFileSync(path.join(dir, "app.polkavm"), Buffer.alloc(4));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'next' when _next/static/ exists", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static"), { recursive: true });
     assert.equal(detectFramework(dir), "next");
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("returns 'vite' when assets/ exists", () => {
+  test("does NOT return 'next' for a bare _next/ with no static/ subdir", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next"));
+    fs.writeFileSync(path.join(dir, "_next", "server-manifest.json"), "{}");
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'nuxt' when _nuxt/ exists", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_nuxt"));
+    assert.equal(detectFramework(dir), "nuxt");
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns 'vite' when assets/ contains at least one hash-shaped entry", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
     fs.mkdirSync(path.join(dir, "assets"));
+    fs.writeFileSync(path.join(dir, "assets", "main-Abc12345.js"), "x");
     assert.equal(detectFramework(dir), "vite");
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test("returns null when neither _next nor assets exists", () => {
+  // C3: an assets/ dir with no hashed entry must return null, not "vite" — a
+  // bare directory-name guess is what let detection flip between UNKNOWN and
+  // vite for vite-plugin-singlefile's inlined-HTML output.
+  test("returns null (not 'vite') when assets/ exists but no entry is hash-shaped", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "assets"));
+    fs.writeFileSync(path.join(dir, "assets", "data.json"), "{}");
+    fs.writeFileSync(path.join(dir, "assets", "logo.png"), "x"); // stable-extension, but not hash-shaped
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("returns null when no marker exists", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
     fs.writeFileSync(path.join(dir, "index.html"), "<html/>");
     assert.equal(detectFramework(dir), null);
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // C3: more than one marker present -> null, never a guess.
+  test("returns null when more than one marker is present (ambiguous — never guesses)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-"));
+    fs.mkdirSync(path.join(dir, "_next", "static"), { recursive: true });
+    fs.mkdirSync(path.join(dir, "_nuxt"));
+    assert.equal(detectFramework(dir), null);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // C1: detection is a pure function of the deployed directory only — no
+  // second parameter through which a prevManifest could ever be threaded in.
+  test("detectFramework takes only a directory path", () => {
+    assert.equal(detectFramework.length, 1,
+      ">> FAIL: detectFramework must stay a pure function of the deployed directory only (C1) — a second parameter would invite reading prevManifest here, which C1 forbids");
   });
 });
 
@@ -13491,6 +13701,62 @@ describe("portability: CAR-section classification independent of deploy history 
       const htmlCid = out2.fileCids.get("index.html");
       assert.ok(!car2.stableOrder.includes(htmlCid),
         "index.html must never enter the stable section — it has no content hash in its name");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1527/#1528 Phase 1: the framework-aware classifyFn threaded through
+// buildOrderedCar must preserve the same C1 invariant the describe block
+// above guards. The naive version of this test — build once with a
+// prevManifest and once without — passes even under a reverted classifier,
+// so it proves nothing. This mirrors the actual shape instead: classify tree
+// T with the new framework-aware classifyFn, capture its stableBlockOrder,
+// then run the CAR build again for the SAME T with that order fed back as
+// prevStableOrder, and assert section membership AND chunk boundaries (the
+// full ordered chunkCids array, not just the stable-order set) are
+// identical. That is what would have caught #1383: any classifyFn that lets
+// a file's classification depend on something other than (path, framework)
+// shifts chunk boundaries here.
+// ---------------------------------------------------------------------------
+describe("portability: per-framework classifyFn preserves the C1 invariant (#1527/#1528 Phase 1)", () => {
+  test("next-shaped tree: section membership and full chunk-boundary array identical across two identical builds", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-fw-port-"));
+    try {
+      fs.mkdirSync(path.join(dir, "_next", "static", "chunks", "abc123"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "_next", "static", "chunks", "abc123", "main.js"), Buffer.alloc(40_000, 0x41));
+      fs.mkdirSync(path.join(dir, "_next", "static", "abc123"), { recursive: true });
+      fs.writeFileSync(path.join(dir, "_next", "static", "abc123", "_buildManifest.js"), "self.__BUILD_MANIFEST=1;");
+      fs.writeFileSync(path.join(dir, "index.html"), "<html>unchanged</html>");
+
+      const framework = detectFramework(dir);
+      assert.equal(framework, "next", ">> FAIL: fixture setup: expected this tree to detect as 'next' for the test to be meaningful");
+      const classifyFn = (p) => classifyFile(p, { framework });
+
+      const out1 = await merkleizeJSBackend(dir);
+      const car1 = await buildOrderedCar({ output: out1, classifyFn });
+
+      const out2 = await merkleizeJSBackend(dir);
+      const car2 = await buildOrderedCar({ output: out2, classifyFn, prevStableOrder: car1.stableOrder });
+
+      // Section membership: exact set equality.
+      assert.deepEqual([...car2.stableOrder].sort(), [...car1.stableOrder].sort(),
+        ">> FAIL: next-shaped tree: section-1 (stable) file membership changed between two identical builds");
+
+      // Chunk boundaries: the FULL ordered chunk-CID array, not just the
+      // stable-order set — this is the #1389 assertion target ("chunk index
+      // 9 disappeared").
+      assert.deepEqual(car2.chunkCids, car1.chunkCids,
+        ">> FAIL: next-shaped tree: ordered chunk-CID array changed between two identical builds — chunk boundaries are not a pure function of (path, framework)");
+      assert.deepEqual(car2.sectionChunkCounts, car1.sectionChunkCounts,
+        ">> FAIL: next-shaped tree: section chunk counts changed between two identical builds");
+
+      // The excluded file must never migrate into section 1, on either pass.
+      const buildManifestCid = out2.fileCids.get("_next/static/abc123/_buildManifest.js");
+      assert.ok(!car1.stableOrder.includes(buildManifestCid) && !car2.stableOrder.includes(buildManifestCid),
+        ">> FAIL: _buildManifest.js (stable path, mutable content) must never enter section 1");
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

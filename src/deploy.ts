@@ -19,7 +19,7 @@ import { UnixFS } from "ipfs-unixfs";
 import { merkleizeJS, merkleizeWithStableOrder, rebuildOrderedCarFromBytes } from "./merkle.js";
 import { extractManifestFromCar, fetchPreviousManifest, writePersistentLocalManifest } from "./manifest-fetch.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./manifest-embed.js";
-import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
+import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, CONTENT_HASH_RE, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
 import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
 import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode } from "./dotns.js";
@@ -1836,7 +1836,7 @@ export async function readPreviousContenthashSafe(dotns: DotNS, bareLabel: strin
 // CID defaults to "" and the walk behaviour is unchanged.
 //
 // Exported for unit tests.
-export function buildFilesMap(buildDir: string, fileCids: Map<string, string> = new Map()): Record<string, ManifestFileEntry> {
+export function buildFilesMap(buildDir: string, fileCids: Map<string, string> = new Map(), framework: string | null = null): Record<string, ManifestFileEntry> {
   const map: Record<string, ManifestFileEntry> = {};
   function walk(dir: string, prefix = ""): void {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -1850,7 +1850,7 @@ export function buildFilesMap(buildDir: string, fileCids: Map<string, string> = 
         const fileCid = fileCids.get(rel) ?? "";
         let size = 0;
         try { size = fs.statSync(abs).size; } catch { /* manifest path-only */ }
-        const type = classifyFile(rel, { fileCid: fileCid || undefined });
+        const type = classifyFile(rel, { fileCid: fileCid || undefined, framework });
         map[rel] = { cid: fileCid, type, size };
       }
     }
@@ -1871,11 +1871,55 @@ async function readRetentionPeriodBlocks(unsafeApi: any): Promise<number> {
   }
 }
 
-// Cheap heuristic: detect the frontend framework used to generate the build dir.
+// Detect the frontend framework used to generate the build dir, by build
+// markers evaluated against the deployed directory only (C1 — never any
+// history/manifest). Order is presentation only: two markers are ambiguous
+// no matter which matched first, so reordering these checks changes nothing
+// unless the collision rule below changes too. Returns null on ambiguity
+// (more than one marker) or on no marker at all, rather than guessing (C3): a
+// misdetection would apply a real per-framework rule set to the wrong tree,
+// which is worse than falling back to the unchanged global heuristic.
+//
+// Intentionally the same regex object as the classification fallback, not an
+// independent vite pattern: "does this look like a bundler hash" is one
+// question asked in two places. Tightening CONTENT_HASH_RE therefore also
+// retunes vite DETECTION here — check both when you touch it.
+const VITE_ASSET_HASH_RE = CONTENT_HASH_RE;
+
 export function detectFramework(directoryPath: string): string | null {
-  if (fs.existsSync(path.join(directoryPath, "_next"))) return "next";
-  if (fs.existsSync(path.join(directoryPath, "assets"))) return "vite";
-  return null;
+  const markers: string[] = [];
+
+  // Most specific: a parsed manifest field, not a directory name.
+  try {
+    const manifestPath = path.join(directoryPath, "manifest.json");
+    const polkavmBinPath = path.join(directoryPath, "app.polkavm");
+    if (fs.existsSync(manifestPath) && fs.existsSync(polkavmBinPath)) {
+      const obj = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      if (obj && typeof obj === "object" && obj.runtime && obj.runtime.kind === "polkavm") {
+        markers.push("polkavm-app");
+      }
+    }
+  } catch { /* missing/malformed manifest.json: not a marker */ }
+
+  if (fs.existsSync(path.join(directoryPath, "_next", "static"))) markers.push("next");
+  if (fs.existsSync(path.join(directoryPath, "_nuxt"))) markers.push("nuxt");
+
+  // Vite requires evidence, not just a folder name: an assets/ dir whose
+  // vite-plugin-singlefile output inlines everything comes and goes between
+  // deploys, so a bare directory-presence check flips between UNKNOWN and
+  // "vite" for the same repo. Requiring a hash-shaped entry makes an inlined
+  // single-file build report UNKNOWN consistently — correct, since it has
+  // nothing left to classify.
+  const assetsDir = path.join(directoryPath, "assets");
+  if (fs.existsSync(assetsDir)) {
+    try {
+      const entries = fs.readdirSync(assetsDir);
+      if (entries.some((name) => VITE_ASSET_HASH_RE.test(name))) markers.push("vite");
+    } catch { /* unreadable assets dir: not a marker */ }
+  }
+
+  if (markers.length !== 1) return null;
+  return markers[0];
 }
 
 // ── Deploy size guardrails ─────────────────────────────────────────────────
@@ -1988,6 +2032,17 @@ export async function storeDirectoryV2(
   applyManifestFetchAttributes(fetched);
 
   // 2. Phase A — placeholder before first merkleize.
+  //
+  // Framework detection happens exactly once here, before
+  // writeEmbeddedManifestPlaceholder — the first thing that mutates the
+  // deployed tree (it creates .bulletin-deploy/manifest.json inside
+  // directoryPath). detectFramework reads only the directory being deployed
+  // (C1), so it must never observe a file this deploy created; computing it
+  // any later would risk that even though isVolatilePath already excludes
+  // .bulletin-deploy/ from every marker's own path space. The single value
+  // computed here is reused at every other call site below instead of
+  // re-invoking detectFramework.
+  const framework = detectFramework(directoryPath);
   const deployedAt = opts.reproducibleSource
     ? resolveReproducibleTimestamp(opts.reproducibleSource)
     : new Date().toISOString();
@@ -2018,7 +2073,7 @@ export async function storeDirectoryV2(
     useKubo = hasIPFS();
   }
   const phaseA = await withSpan("deploy.merkleize", `1a. merkleize (${useKubo ? "kubo" : "js"}, stable)`, { "deploy.directory": dirBasename, "deploy.merkle": useKubo ? "kubo" : "js" }, async () => {
-    const r = await merkleizeWithStableOrder(directoryPath, prevManifest?.stableBlockOrder, { useKubo, phase: "Phase A" });
+    const r = await merkleizeWithStableOrder(directoryPath, prevManifest?.stableBlockOrder, { useKubo, phase: "Phase A", classifyFn: (p) => classifyFile(p, { framework }) });
     sampleMemory("merkleize_end");
     return r;
   });
@@ -2138,7 +2193,7 @@ export async function storeDirectoryV2(
   const phaseAKnownPresent = new Set<string>(phaseAUploadCids);
 
   // 6. Phase B — finalise manifest with v3 fields.
-  const filesMap = buildFilesMap(directoryPath, phaseA.fileCids);
+  const filesMap = buildFilesMap(directoryPath, phaseA.fileCids, framework);
   const blocksList = [...phaseA.blocks.keys()];
   const chunksMap: Record<string, ManifestChunkEntry> = {};
   for (let i = 0; i < phaseA.section1ChunkCids.length; i++) {
@@ -2166,7 +2221,7 @@ export async function storeDirectoryV2(
     version: MANIFEST_VERSION,
     previousContenthash: prevContenthash,
     deployedAt,
-    framework: detectFramework(directoryPath),
+    framework,
     files: filesMap,
     stableBlockOrder: phaseA.stableOrder,
     blocks: blocksList,
@@ -2182,7 +2237,7 @@ export async function storeDirectoryV2(
   // 7. Re-merkleize with the same blockOrder. Only the manifest-bearing
   // block(s) change; everything else is byte-identical.
   const phaseB = await withSpan("deploy.merkleize", "1c. merkleize (js, finalise)", { "deploy.directory": dirBasename }, async () => {
-    const r = await merkleizeWithStableOrder(directoryPath, phaseA.stableOrder, { useKubo, phase: "Phase B" });
+    const r = await merkleizeWithStableOrder(directoryPath, phaseA.stableOrder, { useKubo, phase: "Phase B", classifyFn: (p) => classifyFile(p, { framework }) });
     sampleMemory("merkleize_finalise_end");
     return r;
   });
@@ -2441,7 +2496,6 @@ export async function storeDirectoryV2(
 
   // 10. Stats + telemetry.
   const retentionPeriodBlocks = await readRetentionPeriodBlocks(provider.unsafeApi);
-  const framework = detectFramework(directoryPath);
   const filesStableCount = [...phaseA.fileCids.entries()].filter(([p, cid]) => {
     if (p === MANIFEST_PATH) return false;
     return classifyFile(p, { prevManifest, fileCid: cid, framework }) === "stable";

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { collectUnitTestFiles } from "../scripts/run-unit-tests.mjs";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 // Personhood bootstrap imports (loaded after build)
-import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow } from "../dist/dotns.js";
+import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason } from "../dist/dotns.js";
 import { getAdapter } from "../dist/dotns-protocol.js";
 import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
@@ -20,7 +20,7 @@ import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
-import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -44,7 +44,7 @@ import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
-import { encodeErrorResult, encodeFunctionData } from "viem";
+import { encodeErrorResult, encodeFunctionData, encodeFunctionResult } from "viem";
 import { isInternalUser, classifyErrorArea, compareSemver, assessVersion, promptYesNo, isPreReleaseVersion, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { buildTitle, buildLabels, buildReportBody, setDeployContext, buildCliFlagsSummary, scrubSecrets, installLogCapture, getCapturedTail, isUserInputError } from "../dist/bug-report.js";
 import { PassThrough } from "node:stream";
@@ -312,13 +312,13 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
     for (const [input, expectedDigitCount, expectedAlternative] of cases) {
       assert.strictEqual(validateDomainLabel(input), input,
         `>> FAIL: relocated-trailing-digits: "${input}": validateDomainLabel must accept this unchanged post-#1185 (PopRules rules moved to preflight)`);
-      const r = classifyRegistrability(input);
+      const r = classifyRegistrability(input, "poprules-startingPrice");
       assert.strictEqual(r.registrable, false, `>> FAIL: relocated-trailing-digits: "${input}": classifyRegistrability should flag it`);
       assert.strictEqual(r.rule, "trailing-digits",
         `>> FAIL: relocated-trailing-digits: "${input}": expected rule trailing-digits (must win over hyphen-base/reserved-base), got ${r.rule}`);
       assert.match(r.message, new RegExp(`${expectedDigitCount} trailing digit`),
         `>> FAIL: relocated-trailing-digits: "${input}": message should name the trailing-digit count, got: ${r.message}`);
-      const msg = formatUnregistrableReason({ label: input, registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+      const msg = formatUnregistrableReason({ label: input, registrability: r, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
       assert.ok(msg.includes(expectedAlternative),
         `>> FAIL: relocated-trailing-digits: "${input}": message should still offer "${expectedAlternative}" as a compliant alternative, got: ${msg}`);
       assert.doesNotThrow(() => validateDomainLabel(expectedAlternative.replace(/\.dot$/, "")),
@@ -330,21 +330,21 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
     for (const input of ["palacehub-33", "palace-hub-app-88", "localdot-33-pr-78"]) {
       assert.strictEqual(validateDomainLabel(input), input,
         `>> FAIL: relocated-hyphen-base: "${input}": validateDomainLabel must accept this unchanged post-#1185`);
-      const r = classifyRegistrability(input);
+      const r = classifyRegistrability(input, "poprules-startingPrice");
       assert.strictEqual(r.registrable, false, `>> FAIL: relocated-hyphen-base: "${input}": classifyRegistrability should flag it`);
       assert.strictEqual(r.rule, "hyphen-base", `>> FAIL: relocated-hyphen-base: "${input}": expected rule hyphen-base, got ${r.rule}`);
     }
   });
 
   test("hyphen-base message identifies the broken base name and offers only re-registrable alternatives", () => {
-    const r = classifyRegistrability("palacehub-33");
-    const msg = formatUnregistrableReason({ label: "palacehub-33", registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+    const r = classifyRegistrability("palacehub-33", "poprules-startingPrice");
+    const msg = formatUnregistrableReason({ label: "palacehub-33", registrability: r, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.match(msg, /palacehub-/, "should quote the broken base name");
     const bulletMatches = [...msg.matchAll(/- ([a-z0-9-]+)\.dot/g)].map((m) => m[1]);
     assert.ok(bulletMatches.length > 0, `>> FAIL: hyphen-base message has no alternatives: ${msg}`);
     for (const alt of bulletMatches) {
       assert.doesNotThrow(() => validateDomainLabel(alt), `>> FAIL: offered alternative "${alt}" is not itself syntax-valid`);
-      assert.strictEqual(classifyRegistrability(alt).registrable, true, `>> FAIL: offered alternative "${alt}" is not itself registrable`);
+      assert.strictEqual(classifyRegistrability(alt, "poprules-startingPrice").registrable, true, `>> FAIL: offered alternative "${alt}" is not itself registrable`);
     }
   });
 
@@ -352,7 +352,7 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
     for (const input of ["foo", "abcde", "game"]) {
       assert.strictEqual(validateDomainLabel(input), input,
         `>> FAIL: relocated-reserved-base: "${input}": validateDomainLabel must accept this unchanged post-#1185`);
-      const r = classifyRegistrability(input);
+      const r = classifyRegistrability(input, "poprules-startingPrice");
       assert.strictEqual(r.registrable, false, `>> FAIL: relocated-reserved-base: "${input}": classifyRegistrability should flag it`);
       assert.strictEqual(r.rule, "reserved-base", `>> FAIL: relocated-reserved-base: "${input}": expected rule reserved-base, got ${r.rule}`);
       assert.match(r.message, /governance|5 chars or fewer/i, `>> FAIL: relocated-reserved-base: "${input}": message should quote the governance phrase, got: ${r.message}`);
@@ -364,10 +364,10 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
   // own remediation only makes sense for inputs whose digit count is already
   // compliant. Verify with the ordering test's original motivating input.
   test("orders the trailing-digits rule BEFORE the hyphen-base rule", () => {
-    const r = classifyRegistrability("my-app-1");
+    const r = classifyRegistrability("my-app-1", "poprules-startingPrice");
     assert.strictEqual(r.rule, "trailing-digits",
       `>> FAIL: ordering: expected trailing-digits to win over hyphen-base for "my-app-1", got ${r.rule}`);
-    const msg = formatUnregistrableReason({ label: "my-app-1", registrability: r, existingOwner: null, selfAddress: "0xaaa" });
+    const msg = formatUnregistrableReason({ label: "my-app-1", registrability: r, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     // The old hyphen-base-style suggestions ("my-app1", "my-app-pr1") both
     // still have exactly 1 trailing digit — they must NOT be offered, since
     // they'd be refused again on the next attempt.
@@ -376,7 +376,7 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
     const bulletMatches = [...msg.matchAll(/- ([a-z0-9-]+)\.dot/g)].map((m) => m[1]);
     assert.ok(bulletMatches.length > 0, `>> FAIL: ordering: no alternatives found in message: ${msg}`);
     for (const alt of bulletMatches) {
-      assert.strictEqual(classifyRegistrability(alt).registrable, true, `>> FAIL: ordering: offered alternative "${alt}" is not itself registrable on the next attempt.`);
+      assert.strictEqual(classifyRegistrability(alt, "poprules-startingPrice").registrable, true, `>> FAIL: ordering: offered alternative "${alt}" is not itself registrable on the next attempt.`);
     }
   });
 
@@ -389,14 +389,14 @@ describe("PopRules-derived rules relocated from validateDomainLabel to classifyR
       "palacehub-9999", "e2esmoke26652530002-83abbd6", "a12345", "foo123",
     ];
     for (const input of inputs) {
-      const alternatives = buildLabelAlternatives(input);
+      const alternatives = buildLabelAlternatives(input, "poprules-startingPrice");
       assert.ok(alternatives.length > 0, `>> FAIL: buildLabelAlternatives-invariant: "${input}" produced zero alternatives — the NoStatus fallback should always survive.`);
       for (const alt of alternatives) {
         assert.doesNotThrow(
           () => validateDomainLabel(alt.label),
           `>> FAIL: buildLabelAlternatives-invariant: candidate "${alt.label}" (suggested for "${input}") does not itself pass validateDomainLabel.`,
         );
-        assert.strictEqual(classifyRegistrability(alt.label).registrable, true,
+        assert.strictEqual(classifyRegistrability(alt.label, "poprules-startingPrice").registrable, true,
           `>> FAIL: buildLabelAlternatives-invariant: candidate "${alt.label}" (suggested for "${input}") is not itself registrable.`);
       }
     }
@@ -662,7 +662,7 @@ describe("countTrailingDigits", () => {
 describe("classifyRegistrability (#1185)", () => {
   test("accepts labels that satisfy every PopRules rule", () => {
     for (const l of ["mysitedemo00", "palacehub00", "test-app00", "testapp12"]) {
-      const r = classifyRegistrability(l);
+      const r = classifyRegistrability(l, "poprules-startingPrice");
       assert.strictEqual(r.registrable, true,
         `>> FAIL: classifyRegistrability: registrable label rejected: ${l} classified as ${JSON.stringify(r)}`);
     }
@@ -670,7 +670,7 @@ describe("classifyRegistrability (#1185)", () => {
 
   test("flags 1 or 3+ trailing digits before any other rule", () => {
     for (const l of ["mysite123", "my-app-1", "dim2"]) {
-      const r = classifyRegistrability(l);
+      const r = classifyRegistrability(l, "poprules-startingPrice");
       assert.strictEqual(r.registrable, false, `>> FAIL: classifyRegistrability: ${l}: expected non-registrable`);
       assert.strictEqual(r.rule, "trailing-digits",
         `>> FAIL: classifyRegistrability: ${l}: expected rule trailing-digits, got ${r.rule} (precedence bug: trailing-digits must win over hyphen-base and reserved-base)`);
@@ -678,13 +678,13 @@ describe("classifyRegistrability (#1185)", () => {
   });
 
   test("flags a hyphen-terminated base only when digits are compliant", () => {
-    const r = classifyRegistrability("palacehub-33");
+    const r = classifyRegistrability("palacehub-33", "poprules-startingPrice");
     assert.strictEqual(r.rule, "hyphen-base",
       `>> FAIL: classifyRegistrability: palacehub-33: expected hyphen-base, got ${r.rule}`);
   });
 
   test("flags a short base", () => {
-    const r = classifyRegistrability("game");
+    const r = classifyRegistrability("game", "poprules-startingPrice");
     assert.strictEqual(r.rule, "reserved-base",
       `>> FAIL: classifyRegistrability: game: expected reserved-base, got ${r.rule}`);
     assert.match(r.message, /base name is 4 chars/i,
@@ -704,7 +704,7 @@ describe("formatUnregistrableReason (#1185)", () => {
   };
 
   test("unregistered: names the dotns-cli route", () => {
-    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa" });
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.match(m, /not registered/i, `>> FAIL: formatUnregistrableReason: unregistered message must say so; got: ${m}`);
     assert.match(m, /dotns register domain -n game --governance/,
       `>> FAIL: formatUnregistrableReason: must give the exact dotns-cli command; got: ${m}`);
@@ -713,7 +713,7 @@ describe("formatUnregistrableReason (#1185)", () => {
   });
 
   test("owned by another account: tells the operator to deploy with that account", () => {
-    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: "0xbbb", selfAddress: "0xaaa" });
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: "0xbbb", selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatUnregistrableReason: must name the owner; got: ${m}`);
     assert.match(m, /--mnemonic/, `>> FAIL: formatUnregistrableReason: must offer the owning-signer route; got: ${m}`);
     assert.doesNotMatch(m, /dotns register domain/,
@@ -721,7 +721,7 @@ describe("formatUnregistrableReason (#1185)", () => {
   });
 
   test("keeps the phrasing telemetry classifies as a user error", () => {
-    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa" });
+    const m = formatUnregistrableReason({ label: "game", registrability: R, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(isExpectedError(m), true,
       `>> FAIL: formatUnregistrableReason: message would be classified as a non-user error and would raise a bug-report prompt; got: ${m}`);
   });
@@ -737,7 +737,7 @@ describe("decideRegistrabilityOutcome (#1185)", () => {
   const nr = { registrable: false, rule: "reserved-base", message: "Base name is 4 chars; …" };
 
   test("proceeds when the signer owns the name", () => {
-    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xaaa", selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xaaa", selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.canProceed, true,
       ">> FAIL: decideRegistrabilityOutcome: the owner of a reserved name must be allowed to update its content");
     assert.strictEqual(d.plannedAction, "already-owned-by-us",
@@ -745,7 +745,7 @@ describe("decideRegistrabilityOutcome (#1185)", () => {
   });
 
   test("aborts when unregistered", () => {
-    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: null, selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.canProceed, false,
       ">> FAIL: decideRegistrabilityOutcome: bulletin-deploy cannot register a reserved name; must abort");
     assert.match(d.reason, /dotns register domain/,
@@ -753,14 +753,14 @@ describe("decideRegistrabilityOutcome (#1185)", () => {
   });
 
   test("aborts when owned by another account", () => {
-    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xbbb", selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "game", registrability: nr, existingOwner: "0xbbb", selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.canProceed, false,
       ">> FAIL: decideRegistrabilityOutcome: must not attempt to write content to someone else's name");
     assert.match(d.reason, /0xbbb/, `>> FAIL: decideRegistrabilityOutcome: abort reason must name the owner; got: ${d.reason}`);
   });
 
   test("does not short-circuit a registrable label", () => {
-    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.canProceed, true,
       ">> FAIL: decideRegistrabilityOutcome: a registrable label must fall through to the normal register path");
     assert.notStrictEqual(d.plannedAction, "abort",
@@ -775,13 +775,13 @@ describe("decideRegistrabilityOutcome (#1185)", () => {
   // phone-signature planner branches on "register"). This is the assertion
   // that discriminates the two.
   test("a registrable, UNOWNED label plans register — never already-owned-by-us", () => {
-    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: null, selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.plannedAction, "register",
       `>> FAIL: decideRegistrabilityOutcome: a registrable label nobody owns must plan "register"; got "${d.plannedAction}" — reporting already-owned-by-us here would tell a caller to skip registering a name that does not exist`);
   });
 
   test("ownership wins over registrability when the signer owns a registrable label", () => {
-    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: "0xaaa", selfAddress: "0xaaa" });
+    const d = decideRegistrabilityOutcome({ label: "mysitedemo00", registrability: { registrable: true }, existingOwner: "0xaaa", selfAddress: "0xaaa", profile: "poprules-startingPrice" });
     assert.strictEqual(d.plannedAction, "already-owned-by-us",
       `>> FAIL: decideRegistrabilityOutcome: a registrable label the signer already owns must plan already-owned-by-us (skip register, go to setContenthash); got "${d.plannedAction}"`);
   });
@@ -1458,6 +1458,16 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(classifyErrorKind("WebSocket to wss://asset-hub-paseo.dotters.network closed before response"), "connection");
   });
 
+  // Generated by the producer, not typed out, so the rule and the message
+  // cannot drift apart while still agreeing with each other.
+  test("naming.short_names_closed: shortNamesClosedReason's message", () => {
+    assert.strictEqual(classifyErrorKind(shortNamesClosedReason("hodlem", 6, "paseo", "paseo-next-v2")), "naming.short_names_closed");
+  });
+
+  test("naming.soulbound: soulboundTransferReason's message", () => {
+    assert.strictEqual(classifyErrorKind(soulboundTransferReason("giftbox", "dot")), "naming.soulbound");
+  });
+
   test("connection: WS halt", () => {
     assert.strictEqual(classifyErrorKind("WS halt from onStatusChanged"), "connection");
   });
@@ -1706,7 +1716,7 @@ describe("classifyErrorKind", () => {
   test("naming.contract_unavailable: 'No contract deployed at' wrapper message (hasCode=false)", () => {
     assert.strictEqual(
       classifyErrorKind(
-        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. Check environments.json / --contract config for this network.",
+        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2).",
       ),
       "naming.contract_unavailable",
     );
@@ -2176,6 +2186,53 @@ describe("withSpan error attribute propagation", () => {
     // the function returns cleanly without throwing.
     const result = await withSpan("deploy.dotns.finalize-registration", "2a-iv. finalize-registration", {}, () => "ok");
     assert.strictEqual(result, "ok");
+  });
+});
+
+// A wrong contract address is the operator's mistake only when it came from
+// their config. A stale address in the config we ship is a fleet-wide tool
+// failure and must stay on the health dashboards.
+describe("a missing contract is classified by WHOSE config is wrong", () => {
+  const body = (env) => `No contract deployed at 0xabc (POP_RULES) env=${env} — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code.`;
+  const from = (origin) => ` This address came from ${origin}.`;
+
+  test("an address from the operator's own file is user error, not a sad deploy", () => {
+    const msg = body("gamingnet") + from("/home/ops/envs.json (environment gamingnet)");
+    assert.equal(classifyDeployError(msg), "user",
+      ">> FAIL: an operator's own wrong address counted against tool health");
+  });
+
+  test("an address from the config we ship stays visible as a tool failure", () => {
+    const msg = body("paseo-next-v2") + from("assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2)");
+    assert.equal(classifyDeployError(msg), "unknown",
+      ">> FAIL: a stale address in our own shipped config was blamed on the operator and filtered off the dashboards");
+    assert.equal(isExpectedError(msg), false,
+      ">> FAIL: a stale shipped address was marked expected, hiding it from every widget filtering NOT deploy.expected:true");
+  });
+
+  test("an address from the built-in fallback also stays visible", () => {
+    const msg = body("paseo-next-v2") + from("the built-in fallback for paseo-next-v2");
+    assert.equal(classifyDeployError(msg), "unknown",
+      ">> FAIL: a bad fallback address was blamed on the operator");
+  });
+
+  test("no stated origin stays visible rather than assumed to be the operator's", () => {
+    assert.equal(classifyDeployError(body("gamingnet")), "unknown",
+      ">> FAIL: an address with no known origin was assumed to be the operator's mistake");
+  });
+
+  test("an unverifiable address follows the same rule", () => {
+    const unverifiable = "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.";
+    assert.equal(classifyDeployError(unverifiable + from("/home/ops/envs.json (environment paseo-next-v2)")), "user",
+      ">> FAIL: unverifiable address: an operator's own wrong address counted against tool health");
+    assert.equal(classifyDeployError(unverifiable + from("assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2)")), "unknown",
+      ">> FAIL: unverifiable address: an address from the config we ship was blamed on the operator");
+  });
+
+  test("an unrecognised DotNS generation is environment, not unknown", () => {
+    const msg = "Could not determine the DotNS ABI profile: contract code is present at POP_RULES, but neither pricingVersion() (v0.5.8-rc1) nor startingPrice() (poprules-startingPrice) answered.";
+    assert.equal(classifyDeployError(msg), "environment",
+      ">> FAIL: an unsupported chain generation counted as a tool failure");
   });
 });
 
@@ -4020,7 +4077,32 @@ describe("DotNS initial state", () => {
         "ownerOf",
         [123n],
       ),
-      /No contract deployed at.*Check environments\.json/,
+      // This stub passes no contractSources, so the tail is the built-in default.
+      /No contract deployed at.*built-in default address/,
+    );
+  });
+
+  test("contractCall (strict) names the address's recorded source when one exists", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.evmAddress = "0x1111111111111111111111111111111111111111";
+    d._environmentId = "gamingnet";
+    d._contracts = { ...d._contracts, POP_RULES: "0x2222222222222222222222222222222222222222" };
+    d._contractSources = { POP_RULES: "/home/ops/envs.json (environment gamingnet)" };
+    d.clientWrapper = {
+      performDryRunCall: async () => ({
+        result: { isOk: true, value: { data: "0x" } },
+        gasConsumed: { referenceTime: 1n, proofSize: 2n },
+        gasRequired: { referenceTime: 3n, proofSize: 4n },
+        storageDeposit: { value: 0n },
+      }),
+      hasContractCode: async () => false,
+    };
+    const abi = [{ type: "function", name: "ownerOf", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ name: "", type: "address" }] }];
+    await assert.rejects(
+      () => d.contractCall("0x2222222222222222222222222222222222222222", abi, "ownerOf", [123n]),
+      /No contract deployed at.*\(POP_RULES\).*This address came from \/home\/ops\/envs\.json \(environment gamingnet\)/,
     );
   });
 
@@ -4655,10 +4737,11 @@ describe("DotNS ABI-profile-aware registration", () => {
 // classifier tests can't, since they call classifyProtocolVersion directly
 // and never touch detectProtocolVersion's plumbing.
 // ---------------------------------------------------------------------------
+const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
+const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", args: [] });
+const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("poprules-startingPrice").popRulesAbi, functionName: "startingPrice", args: [] });
+
 test("detectProtocolVersion passes hasContractCode's result through to classifyProtocolVersion unflattened (null stays null)", async () => {
-  const POP_RULES_ADDR = "0xPOPRULESADDRESS0000000000000000000000";
-  const PRICING_VERSION_CALLDATA = encodeFunctionData({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", args: [] });
-  const STARTING_PRICE_CALLDATA = encodeFunctionData({ abi: getAdapter("poprules-startingPrice").popRulesAbi, functionName: "startingPrice", args: [] });
   const PROBE_REVERTS = { result: { isOk: false, value: { data: "0x" } } };
 
   const d = new DotNS();
@@ -4687,6 +4770,106 @@ test("detectProtocolVersion passes hasContractCode's result through to classifyP
       return true;
     },
   );
+});
+
+// detectProtocolVersion + protocolVersion(). The probes cannot tell v0.6.0,
+// v0.7.0 and v0.8.0 apart, so a declared release is read alongside them. They
+// stay the authority: a declaration can lag the deployed code.
+describe("detectProtocolVersion reads the declared DotNS release", () => {
+  const REGISTRY_ADDR = "0xREGISTRYADDRESS0000000000000000000000";
+  const POP_CONTROLLER_ADDR = "0xPOPCONTROLLER00000000000000000000000";
+  const PROTOCOL_VERSION_ABI = [
+    { inputs: [], name: "protocolVersion", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
+  ];
+  const PROTOCOL_VERSION_CALLDATA = encodeFunctionData({ abi: PROTOCOL_VERSION_ABI, functionName: "protocolVersion", args: [] });
+  const ANSWERS = { result: { isOk: true, value: { data: encodeFunctionResult({ abi: getAdapter("v0.5.8-rc1").popRulesAbi, functionName: "pricingVersion", result: 2n }) } } };
+  const REVERTS = { result: { isOk: false, value: { data: "0x", flags: 1n } } };
+  const declares = (semver) => ({ result: { isOk: true, value: { data: encodeFunctionResult({ abi: PROTOCOL_VERSION_ABI, functionName: "protocolVersion", result: semver }) } } });
+
+  // `probes` picks which generation the capability probes report:
+  //   "v0.6.0"  — pricingVersion + isPopIssued answer
+  //   "old"     — startingPrice answers instead (poprules-startingPrice)
+  //   "none"    — everything reverts, the unclassifiable chain
+  function makeDotNS({ declared, probes = "v0.6.0", hasCode = true }) {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d._environmentId = "paseo-next-v2";
+    d["_contracts"] = { ...d["_contracts"], POP_RULES: POP_RULES_ADDR, DOTNS_PROTOCOL_REGISTRY: REGISTRY_ADDR, DOTNS_POP_CONTROLLER: POP_CONTROLLER_ADDR };
+    d.clientWrapper = {
+      hasContractCode: async () => hasCode,
+      performDryRunCall: async (_signer, addr, _value, encodedData) => {
+        if (encodedData === PROTOCOL_VERSION_CALLDATA && addr === REGISTRY_ADDR) return declared === null ? REVERTS : declares(declared);
+        if (probes === "none") return REVERTS;
+        if (encodedData === PRICING_VERSION_CALLDATA) return probes === "v0.6.0" ? ANSWERS : REVERTS;
+        if (encodedData === STARTING_PRICE_CALLDATA) return probes === "old" ? ANSWERS : REVERTS;
+        if (addr === POP_CONTROLLER_ADDR) return probes === "v0.6.0" ? ANSWERS : REVERTS;
+        throw new Error(`unexpected encodedData in protocol-detect stub: ${encodedData}`);
+      },
+    };
+    return d;
+  }
+
+  async function captureLogs(fn) {
+    const lines = [];
+    const original = console.log;
+    console.log = (...args) => lines.push(args.join(" "));
+    try { await fn(); } finally { console.log = original; }
+    return lines.join("\n");
+  }
+
+  test("a declared release is reported alongside the profile, without warning at the verified ceiling", async () => {
+    const d = makeDotNS({ declared: "0.8.0" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0");
+    assert.match(logs, /declares DotNS 0\.8\.0/, ">> FAIL: the declared release is the only signal that a generation rollout happened — the profile alone cannot show it");
+    assert.doesNotMatch(logs, /WARNING/, ">> FAIL: warning on the newest verified release would train everyone to ignore it");
+  });
+
+  test("no declaration leaves the log exactly as it was before this change", async () => {
+    const d = makeDotNS({ declared: null });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0");
+    assert.doesNotMatch(logs, /declares DotNS/, ">> FAIL: a pre-v0.8.0 chain must not grow a line about a release it never declared");
+  });
+
+  test("a release newer than anything diffed against this client warns", async () => {
+    const d = makeDotNS({ declared: "0.9.0" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0", ">> FAIL: still deploy — refusing an unknown generation would strand every user the day dotns tags one");
+    assert.match(logs, /WARNING/, ">> FAIL: an undiffed generation must be loud; this warning is what v0.7.0 and v0.8.0 were missing");
+  });
+
+  test("a declaration that disagrees with the probes is reported, and the probes win", async () => {
+    // A half-applied upgrade: the registry carries protocolVersion() while
+    // PopRules still probes as an older generation.
+    const d = makeDotNS({ declared: "0.8.0", probes: "old" });
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "poprules-startingPrice", ">> FAIL: the probes read the deployed ABI; a declaration is written last in an upgrade and can lag it");
+    assert.match(logs, /NOTE:.*declares DotNS 0\.8\.0/, ">> FAIL: a chain claiming one generation while running another must say so");
+  });
+
+  test("a declaration cannot rescue a chain the probes cannot classify", async () => {
+    const d = makeDotNS({ declared: "0.8.0", probes: "none" });
+    await assert.rejects(() => d["detectProtocolVersion"](), /Could not determine the DotNS ABI profile/, ">> FAIL: an unrecognised PopRules ABI must still abort — a declared release says nothing about the shape of a contract that answered none of its probes");
+  });
+
+  test("an RPC failure reading the release does not abort a connect the probes can classify", async () => {
+    const d = makeDotNS({ declared: "0.8.0" });
+    const inner = d.clientWrapper.performDryRunCall;
+    d.clientWrapper.performDryRunCall = async (signer, addr, value, encodedData) => {
+      if (encodedData === PROTOCOL_VERSION_CALLDATA) throw new Error("WS disconnected");
+      return inner(signer, addr, value, encodedData);
+    };
+    const logs = await captureLogs(() => d["detectProtocolVersion"]());
+    assert.equal(d["_protocolVersion"], "v0.6.0", ">> FAIL: the probes answered, so the connect must still classify");
+    assert.doesNotMatch(logs, /declares DotNS/, ">> FAIL: a read that never completed must not be reported as a declaration");
+  });
+
+  test("a declaration cannot mask a wrong POP_RULES address", async () => {
+    const d = makeDotNS({ declared: "0.8.0", probes: "none", hasCode: false });
+    await assert.rejects(() => d["detectProtocolVersion"](), /No contract deployed/, ">> FAIL: a misconfigured address is a config error, not something a working registry on the same chain gets to paper over");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -4735,39 +4918,39 @@ describe("waitForCommitmentAge expiry guard", () => {
 describe("classifyDotnsLabel", () => {
   // From dotns contracts/pop/PopRules.sol:316-344.
   test("baselength <= 5 returns Reserved (governance)", () => {
-    assert.strictEqual(classifyDotnsLabel("abc").status, ProofOfPersonhoodStatus.Reserved);        // 3 chars base
-    assert.strictEqual(classifyDotnsLabel("rc4i").status, ProofOfPersonhoodStatus.Reserved);       // 4-char base
-    assert.strictEqual(classifyDotnsLabel("rc4i00").status, ProofOfPersonhoodStatus.Reserved);     // 4-char base + 2 digits (still <=5)
-    assert.strictEqual(classifyDotnsLabel("abcde").status, ProofOfPersonhoodStatus.Reserved);      // 5-char base, no trailing
-    assert.strictEqual(classifyDotnsLabel("abcde00").status, ProofOfPersonhoodStatus.Reserved);    // 5-char base + 2 digits
+    assert.strictEqual(classifyDotnsLabel("abc", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);        // 3 chars base
+    assert.strictEqual(classifyDotnsLabel("rc4i", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);       // 4-char base
+    assert.strictEqual(classifyDotnsLabel("rc4i00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);     // 4-char base + 2 digits (still <=5)
+    assert.strictEqual(classifyDotnsLabel("abcde", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);      // 5-char base, no trailing
+    assert.strictEqual(classifyDotnsLabel("abcde00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);    // 5-char base + 2 digits
   });
 
   test("baselength 6-8 with 2 trailing digits → PopLite", () => {
-    assert.strictEqual(classifyDotnsLabel("rc6path00").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite); // base 7, td 2
-    assert.strictEqual(classifyDotnsLabel("abcdef00").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite);  // base 6, td 2
-    assert.strictEqual(classifyDotnsLabel("abcdefgh00").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite);// base 8, td 2
+    assert.strictEqual(classifyDotnsLabel("rc6path00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite); // base 7, td 2
+    assert.strictEqual(classifyDotnsLabel("abcdef00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite);  // base 6, td 2
+    assert.strictEqual(classifyDotnsLabel("abcdefgh00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.ProofOfPersonhoodLite);// base 8, td 2
   });
 
   test("baselength 6-8 with 0 trailing digits → PopFull; 1 trailing digit → Reserved", () => {
-    assert.strictEqual(classifyDotnsLabel("rc6path").status, ProofOfPersonhoodStatus.ProofOfPersonhoodFull);  // base 7, td 0
-    assert.strictEqual(classifyDotnsLabel("rc6path0").status, ProofOfPersonhoodStatus.Reserved);              // base 7, td 1 → Reserved (1 digit invalid)
-    assert.strictEqual(classifyDotnsLabel("rc6path1").status, ProofOfPersonhoodStatus.Reserved);              // base 7, td 1 → Reserved
+    assert.strictEqual(classifyDotnsLabel("rc6path", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.ProofOfPersonhoodFull);  // base 7, td 0
+    assert.strictEqual(classifyDotnsLabel("rc6path0", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);              // base 7, td 1 → Reserved (1 digit invalid)
+    assert.strictEqual(classifyDotnsLabel("rc6path1", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);              // base 7, td 1 → Reserved
   });
 
   test("baselength >= 9 with 2 trailing digits → NoStatus", () => {
-    assert.strictEqual(classifyDotnsLabel("rcsixdirskvc00").status, ProofOfPersonhoodStatus.NoStatus);  // base 12, td 2
-    assert.strictEqual(classifyDotnsLabel("productivity-test-bd-rc6-dir00").status, ProofOfPersonhoodStatus.NoStatus); // base 28, td 2
+    assert.strictEqual(classifyDotnsLabel("rcsixdirskvc00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.NoStatus);  // base 12, td 2
+    assert.strictEqual(classifyDotnsLabel("productivity-test-bd-rc6-dir00", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.NoStatus); // base 28, td 2
   });
 
   test("baselength >= 9 with 0 trailing digits → NoStatus; 1 trailing digit → Reserved", () => {
-    assert.strictEqual(classifyDotnsLabel("productivity").status, ProofOfPersonhoodStatus.NoStatus);  // base 12, td 0 → NoStatus
-    assert.strictEqual(classifyDotnsLabel("web3summit").status, ProofOfPersonhoodStatus.NoStatus);    // base 10, td 0 → NoStatus
-    assert.strictEqual(classifyDotnsLabel("productivity0").status, ProofOfPersonhoodStatus.Reserved); // base 12, td 1 → Reserved (1 digit invalid)
+    assert.strictEqual(classifyDotnsLabel("productivity", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.NoStatus);  // base 12, td 0 → NoStatus
+    assert.strictEqual(classifyDotnsLabel("web3summit", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.NoStatus);    // base 10, td 0 → NoStatus
+    assert.strictEqual(classifyDotnsLabel("productivity0", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved); // base 12, td 1 → Reserved (1 digit invalid)
   });
 
   test("more than 2 trailing digits → Reserved (maximum 2 digit suffix)", () => {
-    assert.strictEqual(classifyDotnsLabel("rc6path000").status, ProofOfPersonhoodStatus.Reserved);
-    assert.strictEqual(classifyDotnsLabel("rc6path12345").status, ProofOfPersonhoodStatus.Reserved);
+    assert.strictEqual(classifyDotnsLabel("rc6path000", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);
+    assert.strictEqual(classifyDotnsLabel("rc6path12345", DEFAULT_TLD, "poprules-startingPrice").status, ProofOfPersonhoodStatus.Reserved);
   });
 
   // Regression guard for issue #118: the classifier's `.message` is surfaced
@@ -4782,7 +4965,7 @@ describe("classifyDotnsLabel", () => {
   // digit-count refusal message uses) — the factual first half (base length +
   // governance reservation) is unchanged.
   test("short-base message names the base length and offers a concrete, input-derived remediation (regression #118, flipped in #1189)", () => {
-    const r = classifyDotnsLabel("rc4i00"); // base 4, trailing 2 → Reserved
+    const r = classifyDotnsLabel("rc4i00", DEFAULT_TLD, "poprules-startingPrice"); // base 4, trailing 2 → Reserved
     assert.strictEqual(r.status, ProofOfPersonhoodStatus.Reserved);
     assert.match(r.message, /base name/i);
     assert.match(r.message, /4 chars/i); // states the actual base length it computed
@@ -4792,7 +4975,7 @@ describe("classifyDotnsLabel", () => {
   });
 
   test("too-many-trailing-digits message names the 2-digit cap (regression #118)", () => {
-    const r = classifyDotnsLabel("mylabel12345"); // trailing 5 → Reserved
+    const r = classifyDotnsLabel("mylabel12345", DEFAULT_TLD, "poprules-startingPrice"); // trailing 5 → Reserved
     assert.strictEqual(r.status, ProofOfPersonhoodStatus.Reserved);
     assert.match(r.message, /2 trailing digits|at most 2|most 2/i);
   });
@@ -4920,6 +5103,12 @@ describe("DotNS.preflight", () => {
       // register (issue #884). Default to the live paseo-next-v2 value (10 ether)
       // so the fee floor matches the historical bufferedRentNative behaviour.
       if (fn === "startingPrice") return overrides.startingPrice ?? (10n * 10n ** 18n);
+      // Omit the override to leave the read failing, which is the "unknown" case
+      // preflight must treat as not-blocking.
+      if (fn === "shortNamesEnabled") {
+        if (overrides.shortNamesEnabled === undefined) throw new Error("shortNamesEnabled unavailable");
+        return overrides.shortNamesEnabled;
+      }
       throw new Error(`unexpected contractCall in stub: ${fn}`);
     };
     // readFreeBalance → bigint plancks. Default well above any threshold so
@@ -5067,6 +5256,102 @@ describe("DotNS.preflight", () => {
     assert.match(r.reason, /e2efull\.dot requires ProofOfPersonhoodFull/i);
     assert.match(r.reason, /NoStatus-compatible label/i);
     assert.match(r.reason, /github\.com\/paritytech\/dotns/i);
+  });
+
+  // PopRules gates short names twice: the personhood tier, which the classifier
+  // models, and shortNamesEnabled, which ignores personhood entirely.
+  test("preflight blocks a 6-8 base when shortNamesEnabled is off, even for a Full signer", async () => {
+    const d = stubDotns({ userStatus: Full, isTestnet: true, shortNamesEnabled: false });
+
+    const r = await d.preflight("e2efull");
+
+    assert.strictEqual(r.canProceed, false, ">> FAIL: shortNamesEnabled:false must block the 6-8 band; the chain reverts with 'Short names are not for sale'");
+    assert.strictEqual(r.plannedAction, "abort");
+    assert.match(r.reason, /short names are not on sale/i, `>> FAIL: reason must name the closed band; got: ${r.reason}`);
+    assert.doesNotMatch(r.reason, /requires ProofOfPersonhood|get verified|personhood faucet/i,
+      ">> FAIL: a closed band is not a personhood problem, so the reason must not send the reader to get verified when verification cannot unblock them");
+    assert.match(r.reason, /e2efullxx00\.dot/, ">> FAIL: reason should offer a 9+ character alternative the signer can actually register");
+  });
+
+  test("preflight leaves a 9+ base alone when shortNamesEnabled is off", async () => {
+    const d = stubDotns({ userStatus: NoStatus, isTestnet: true, shortNamesEnabled: false, checkOwnership: { owned: false, owner: null } });
+
+    const r = await d.preflight("mainnet-long-label00");
+
+    assert.strictEqual(r.canProceed, true, ">> FAIL: shortNamesEnabled only gates baseLength 6-8; a 9+ base is always open");
+  });
+
+  // A read that never completed must not be reported as "the band is open", and
+  // a decode that is not a boolean must not be reported as "the band is shut".
+  test("shortNamesEnabled rethrows a connection failure instead of degrading to unknown", async () => {
+    const d = stubDotns({ userStatus: Full, isTestnet: true });
+    d.contractCall = async (_c, _a, fn) => {
+      if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
+      if (fn === "startingPrice") return 10n * 10n ** 18n;
+      if (fn === "shortNamesEnabled") throw new Error("WS halt: socket closed");
+      throw new Error(`unexpected ${fn}`);
+    };
+    await assert.rejects(() => d.preflight("e2efull"), /WS halt|socket closed/,
+      ">> FAIL: a read that never completed is not evidence about the flag. isBaseNameReserved rethrows these same patterns; swallowing them here hides the real fault behind a later, unrelated error");
+  });
+
+  test("shortNamesEnabled treats a non-boolean decode as unknown, never as off", async () => {
+    const d = stubDotns({ userStatus: Full, isTestnet: true, shortNamesEnabled: "0x" });
+    const r = await d.preflight("e2efull");
+    assert.strictEqual(r.canProceed, true,
+      ">> FAIL: an unexpected decode shape must not close the band. `value === true` would cache it as false and shut a band that is open");
+  });
+
+  for (const [label, base, blocked] of [["e2efiv", 6, true], ["e2efullx", 8, true], ["e2efullxx", 9, false]]) {
+    test(`shortNamesEnabled band boundary: ${base}-char base is ${blocked ? "blocked" : "allowed"} when the flag is off`, async () => {
+      const d = stubDotns({ userStatus: Full, isTestnet: true, shortNamesEnabled: false });
+      const r = await d.preflight(label);
+      assert.strictEqual(r.canProceed, !blocked,
+        `>> FAIL: baseLength ${base} must be ${blocked ? "inside" : "outside"} the gated band; the contract rule is baseLength >= 9 is always open`);
+    });
+  }
+
+  test("shortNamesEnabled emits its telemetry attribute on every outcome, including unknown", async () => {
+    // Without the "unknown" value a silent read failure is indistinguishable
+    // from an open band in Sentry.
+    const root = { attrs: new Map(), setAttribute(k, v) { this.attrs.set(k, v); } };
+    const seen = [];
+    for (const overrides of [{ shortNamesEnabled: false }, { shortNamesEnabled: true }, {}]) {
+      root.attrs.clear();
+      __setDeployRootSpanForTest(root);
+      try {
+        await stubDotns({ userStatus: Full, isTestnet: true, ...overrides }).preflight("e2efull");
+      } finally {
+        __setDeployRootSpanForTest(null);
+      }
+      seen.push(root.attrs.get("deploy.dotns.short_names_enabled"));
+    }
+    assert.deepStrictEqual(seen, ["false", "true", "unknown"],
+      `>> FAIL: every outcome must land in telemetry; got ${JSON.stringify(seen)}`);
+  });
+
+  test("the shortNamesEnabled seam keeps the personhood branch reachable on a closed band", async () => {
+    // S-REPROVE needs a 6-8 char label to force canRegister(Full, NoStatus) = false,
+    // and the short-names gate runs first. Without the seam it aborts before the
+    // personhood branch; with it pinned open, the branch is reached.
+    const gated = await stubDotns({ userStatus: NoStatus, isTestnet: true, shortNamesEnabled: false }).preflight("e2efull");
+    assert.match(gated.reason, /short names are not on sale/i, ">> FAIL: with the band closed the gate must fire first");
+
+    const d = stubDotns({ userStatus: NoStatus, isTestnet: true, shortNamesEnabled: false });
+    d.__setShortNamesEnabledForTest(true);
+    const r = await d.preflight("e2efull");
+    assert.match(r.reason, /requires ProofOfPersonhoodFull/i,
+      ">> FAIL: the seam must override the chain read so the personhood branch is reachable; this is what S-REPROVE relies on");
+  });
+
+  test("preflight treats an unreadable shortNamesEnabled as unknown, not off", async () => {
+    // No shortNamesEnabled override, so the stub throws: an older deployment
+    // reverts on the accessor and a transient RPC failure looks identical.
+    const d = stubDotns({ userStatus: Full, isTestnet: true });
+
+    const r = await d.preflight("e2efull");
+
+    assert.strictEqual(r.canProceed, true, ">> FAIL: a failed read must not block. Treating it as false would close the band on every chain whose accessor reverts, and on any RPC blip");
   });
 
   test("preflight allows already-owned names without requiring a PoP upgrade", async () => {
@@ -5683,7 +5968,7 @@ describe("assertSubdomainOwnerMatchesSigner (issue #562)", () => {
 // ---------------------------------------------------------------------------
 describe("formatSubdomainParentError (#1185, bulletin #1380)", () => {
   test("unregistered, non-registrable parent: names it and teaches the dotns-cli route", () => {
-    const m = formatSubdomainParentError("app.game.dot", "game", null, "0xaaa");
+    const m = formatSubdomainParentError("app.game.dot", "game", null, "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
     assert.match(m, /parent game\.dot is not registered/,
       `>> FAIL: formatSubdomainParentError: must say the parent is not registered; got: ${m}`);
     assert.match(m, /dotns register domain -n game --governance/,
@@ -5691,7 +5976,7 @@ describe("formatSubdomainParentError (#1185, bulletin #1380)", () => {
   });
 
   test("owned by another account: names the owner AND a transfer remedy that actually works, does NOT suggest registering", () => {
-    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa");
+    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
     assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must name the owner; got: ${m}`);
     assert.doesNotMatch(m, /dotns register domain/,
       `>> FAIL: formatSubdomainParentError: an already-owned parent must NOT suggest registering it; got: ${m}`);
@@ -5709,13 +5994,13 @@ describe("formatSubdomainParentError (#1185, bulletin #1380)", () => {
     // The deploy.ts call site passes `preflight.evmAddress ?? ""` — guard
     // against selfAddress being unresolved so the message never renders a
     // command with a missing --to value.
-    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "");
+    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "", DEFAULT_TLD, "poprules-startingPrice");
     assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must still name the owner; got: ${m}`);
     assert.doesNotMatch(m, /--to\b/, `>> FAIL: formatSubdomainParentError: must not render a --to flag with no address to give it; got: ${m}`);
   });
 
   test("unregistered, registrable parent: now names the register-by-deploying remedy (bulletin #1380)", () => {
-    const m = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa");
+    const m = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
     assert.match(m, /parent mysitedemo00\.dot is owned by no one, not by this signer/,
       `>> FAIL: formatSubdomainParentError: a registrable, unregistered parent must keep the original refusal sentence (telemetry's naming.subdomain_orphan classifier keys on it); got: ${m}`);
     assert.doesNotMatch(m, /dotns register domain/,
@@ -5727,7 +6012,7 @@ describe("formatSubdomainParentError (#1185, bulletin #1380)", () => {
   });
 
   test("tld=paseo: transfer remedy uses the resolved tld, not a hardcoded .dot", () => {
-    const m = formatSubdomainParentError("app.game.paseo", "game", "0xbbb", "0xaaa", "paseo");
+    const m = formatSubdomainParentError("app.game.paseo", "game", "0xbbb", "0xaaa", "paseo", "poprules-startingPrice");
     assert.match(m, /parent game\.paseo is owned by 0xbbb/i,
       `>> FAIL: formatSubdomainParentError tld=paseo: must use .paseo, not .dot; got: ${m}`);
     assert.match(m, /transfer game\.paseo --to 0xaaa --mnemonic/,
@@ -5735,8 +6020,8 @@ describe("formatSubdomainParentError (#1185, bulletin #1380)", () => {
   });
 
   test("naming.subdomain_orphan classifier still matches both unregistered and owned-by-other messages (bulletin #1380 must not weaken telemetry)", () => {
-    const unregistered = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa");
-    const ownedByOther = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa");
+    const unregistered = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
+    const ownedByOther = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa", DEFAULT_TLD, "poprules-startingPrice");
     assert.strictEqual(classifyErrorKind(unregistered), 'naming.subdomain_orphan',
       `>> FAIL: formatSubdomainParentError: unregistered-parent message must still classify as naming.subdomain_orphan; got kind for: ${unregistered}`);
     assert.strictEqual(classifyErrorKind(ownedByOther), 'naming.subdomain_orphan',
@@ -8586,6 +8871,31 @@ describe("estimateUploadBytes", () => {
 // MNEMONIC env-var fallback.
 // ---------------------------------------------------------------------------
 describe("resolveDotnsConnectOptions (#209)", () => {
+  // The seam between describeContractSources and the error messages. Each half is
+  // tested on its own; if contractSources stops being forwarded here the map
+  // arrives empty and every error silently reports "built-in default address"
+  // instead of the real origin, which is wrong rather than broken.
+  test("contractSources forwards on both the external-signer and mnemonic branches", () => {
+    const sources = { POP_RULES: "/home/ops/envs.json (environment gamingnet)" };
+    const ext = resolveDotnsConnectOptions(
+      { signer: {}, signerAddress: "5Foo" },
+      undefined, undefined, { POP_RULES: "0x" + "1".repeat(40) }, undefined, "gamingnet", undefined, undefined, undefined, sources,
+    );
+    assert.deepStrictEqual(ext.contractSources, sources,
+      ">> FAIL: the external-signer branch must forward contractSources, or a phone/session deploy loses every address origin");
+    const mnem = resolveDotnsConnectOptions(
+      { mnemonic: "bottom drive obey ..." },
+      undefined, undefined, { POP_RULES: "0x" + "1".repeat(40) }, undefined, "gamingnet", undefined, undefined, undefined, sources,
+    );
+    assert.deepStrictEqual(mnem.contractSources, sources,
+      ">> FAIL: the mnemonic branch must forward contractSources");
+  });
+
+  test("contractSources is omitted when empty, like every other optional tail", () => {
+    const r = resolveDotnsConnectOptions({ mnemonic: "m" }, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {});
+    assert.ok(!("contractSources" in r), ">> FAIL: an empty map must not be sent, so DotNS keeps its own default");
+  });
+
   test("external signer wins; mnemonic + derivationPath are not forwarded", () => {
     const fakeSigner = { kind: "fake-signer" };
     const r = resolveDotnsConnectOptions({
@@ -8940,7 +9250,7 @@ describe("parseDomainName", () => {
     const input = "tick3t-tb-ui-improvements-v400.dot";
     const result = parseDomainName(input);
     assert.strictEqual(result.fullName, input, `>> FAIL: parseDomainName-relocated: "${input}" must survive parse intact (no rewrite, no refusal) — the property moved to preflight.`);
-    const r = classifyRegistrability(result.label);
+    const r = classifyRegistrability(result.label, "poprules-startingPrice");
     assert.strictEqual(r.registrable, false, `>> FAIL: parseDomainName-relocated: "${input}": classifyRegistrability should still flag it`);
     assert.strictEqual(r.rule, "trailing-digits", `>> FAIL: parseDomainName-relocated: "${input}": expected rule trailing-digits, got ${r.rule}`);
   });
@@ -8953,7 +9263,7 @@ describe("parseDomainName", () => {
     const input = "my-sub00.parent-app999.dot";
     const result = parseDomainName(input);
     assert.strictEqual(result.fullName, input, `>> FAIL: parseDomainName-relocated: "${input}" must survive parse intact.`);
-    const r = classifyRegistrability(result.parentLabel);
+    const r = classifyRegistrability(result.parentLabel, "poprules-startingPrice");
     assert.strictEqual(r.registrable, false, `>> FAIL: parseDomainName-relocated: parent "${result.parentLabel}": classifyRegistrability should flag it`);
     assert.strictEqual(r.rule, "trailing-digits", `>> FAIL: parseDomainName-relocated: parent "${result.parentLabel}": expected rule trailing-digits, got ${r.rule}`);
   });
@@ -8976,7 +9286,7 @@ describe("parseDomainName", () => {
         `>> FAIL: parseDomainName-1185-repro: "${input}" must round-trip to itself exactly.`);
       assert.notStrictEqual(result.fullName, oldRewrittenFullName,
         `>> FAIL: parseDomainName-1185-repro: "${input}" must not resolve to the old silently-rewritten name "${oldRewrittenFullName}".`);
-      assert.strictEqual(classifyRegistrability(result.label).registrable, false,
+      assert.strictEqual(classifyRegistrability(result.label, "poprules-startingPrice").registrable, false,
         `>> FAIL: parseDomainName-1185-repro: "${input}": classifyRegistrability should flag this label as non-registrable`);
     }
   });
@@ -9005,14 +9315,14 @@ describe("parseDomainName", () => {
     const r = parseDomainName("app.staging999.dot");
     assert.strictEqual(r.fullName, "app.staging999.dot",
       ">> FAIL: parseDomainName-no-bleed: parse must succeed unchanged post-#1185.");
-    const parentRegistrability = classifyRegistrability(r.parentLabel);
+    const parentRegistrability = classifyRegistrability(r.parentLabel, "poprules-startingPrice");
     assert.strictEqual(parentRegistrability.registrable, false,
       ">> FAIL: parseDomainName-no-bleed: classifyRegistrability must flag the PARENT (not exempt like the sublabel).");
     assert.strictEqual(parentRegistrability.rule, "trailing-digits",
       `>> FAIL: parseDomainName-no-bleed: expected rule trailing-digits for the parent, got ${parentRegistrability.rule}`);
     // Sanity: a compliant parent alongside the same sublabel shape is registrable.
     const compliant = parseDomainName("app.staging00.dot");
-    assert.strictEqual(classifyRegistrability(compliant.parentLabel).registrable, true,
+    assert.strictEqual(classifyRegistrability(compliant.parentLabel, "poprules-startingPrice").registrable, true,
       ">> FAIL: parseDomainName-no-bleed: a compliant parent (0/2 trailing digits) must be registrable.");
   });
 
@@ -14131,7 +14441,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
 
   function assertNoStatusLabel(label) {
     assert.strictEqual(
-      classifyDotnsLabel(label).status,
+      classifyDotnsLabel(label, DEFAULT_TLD, "poprules-startingPrice").status,
       ProofOfPersonhoodStatus.NoStatus,
       `${label}.dot must classify as NoStatus on DotNS`,
     );

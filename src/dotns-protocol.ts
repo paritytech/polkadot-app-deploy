@@ -115,6 +115,50 @@ export const DOTNS_ABI_PROFILES: Record<DotnsAbiProfile, DotnsAbiProfileInfo> = 
   },
 };
 
+/**
+ * Newest DotNS release whose ABI has been diffed against what this client
+ * calls. Every release from v0.6.0 through this one is the `v0.6.0` profile:
+ * PopRules is byte-identical across them and the registration tuple is
+ * unchanged, and the two differences that do exist (the `persist` field on
+ * setSubnodeOwner, then its controller-only gate) have their own probes.
+ *
+ * Raise it only after re-running that diff. A new generation needing its own
+ * profile also needs a release range here — this mapping is keyed by release,
+ * so adding to DotnsAbiProfile alone will not fail the build the way
+ * DOTNS_ABI_PROFILES and classifyLabelStatus do.
+ */
+export const HIGHEST_VERIFIED_DOTNS_RELEASE = "0.8.0";
+
+/** A usable `protocolVersion()` answer. */
+export interface DeclaredProtocolVersion {
+  raw: string;
+  profile: DotnsAbiProfile;
+  aboveVerifiedCeiling: boolean;
+}
+
+/**
+ * Classify DotnsProtocolRegistry.protocolVersion(), added in DotNS v0.8.0.
+ * `null` means the probes have to decide instead: no such function below
+ * v0.8.0, an empty string until an owner declares one, or junk.
+ *
+ * Junk is reachable — setProtocolVersion only requires a leading digit and
+ * `[a-zA-Z0-9.-]`, leaving full semver validation to the tooling, so "0.8",
+ * "9abc" and "0.8.0.1" all store. The pre-release suffix is dropped because a
+ * deploy declares the rc tag before the owner re-declares the final one and
+ * both are the same ABI.
+ */
+export function classifyDeclaredProtocolVersion(raw: string | null | undefined): DeclaredProtocolVersion | null {
+  if (!raw) return null;
+  const parts = raw.split("-")[0].split(".").slice(0, 3);
+  if (parts.length < 2 || !parts.every((part) => /^\d+$/.test(part))) return null;
+  return {
+    raw,
+    profile: "v0.6.0",
+    // Numeric collation, so 0.10.0 sorts above 0.8.0 rather than below it.
+    aboveVerifiedCeiling: parts.join(".").localeCompare(HIGHEST_VERIFIED_DOTNS_RELEASE, undefined, { numeric: true }) > 0,
+  };
+}
+
 /** Inputs to classifyProtocolVersion — the live dry-run results from connect(). */
 export interface DotnsProtocolProbe {
   /**
@@ -207,7 +251,9 @@ export function classifyProtocolVersion(probe: DotnsProtocolProbe): DotnsProtoco
     return {
       profile: null,
       reason:
-        "No contract deployed at this address — could not detect the DotNS ABI profile because no contract code was found here. Check environments.json / --contract config for this network.",
+        // No config pointer here: this function has no environment context, so it
+        // cannot know which file holds the address. The caller appends that.
+        "No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here.",
     };
   }
   if (pricingVersionOk) return { profile: isPopIssuedOk === true ? "v0.6.0" : "v0.5.8-rc1" };

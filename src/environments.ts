@@ -6,7 +6,7 @@
 
 import * as fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { NonRetryableError } from "./errors.js";
+import { NonRetryableError, SHIPPED_CONFIG_ORIGIN, FALLBACK_CONFIG_ORIGIN } from "./errors.js";
 import embeddedEnvironments from "../assets/environments.json" with { type: "json" };
 
 export const DEFAULT_ENV_ID = "paseo-next-v2";
@@ -101,6 +101,14 @@ export type EnvironmentsSource =
 export interface LoadResult {
   doc: EnvironmentsDoc;
   source: EnvironmentsSource;
+  /** Set when source is "file": the path that was read. */
+  userFilePath?: string;
+  /**
+   * Set when source is "file": per environment id, the contract keys that file
+   * actually declared. The merge is key-by-key, so every other key in the
+   * resolved map still came from the shipped config.
+   */
+  userFileContractKeys?: Record<string, string[]>;
 }
 
 export interface LoadOptions {
@@ -209,15 +217,48 @@ export function isValidContractAddress(addr: unknown): boolean {
 export function validateContractAddresses(
   contracts: Record<string, string>,
   envId: string,
+  sources?: Record<string, string>,
 ): void {
   for (const [name, addr] of Object.entries(contracts)) {
     if (!isValidContractAddress(addr)) {
       throw new Error(
         `Invalid contract address for ${name} in environment ${envId}: ${addr}. ` +
-          `Check assets/environments.json against https://github.com/paritytech/dotns#deployments`,
+          (sources?.[name]
+            ? `This address came from ${sources[name]}.`
+            : `Check assets/environments.json against https://github.com/paritytech/dotns#deployments`),
       );
     }
   }
+}
+
+// Where each contract address came from, as a phrase an error message can end
+// with. A wrong address means something different depending on whether we
+// shipped it, the operator's file declared it, or a flag supplied it, and the
+// message has to name the right one or it sends the reader somewhere with
+// nothing to fix. Keys absent from both maps are not listed: DotNS falls back
+// to its built-in defaults for those and says so itself.
+export function describeContractSources(
+  envContracts: Record<string, string>,
+  cliContracts: Record<string, string> | undefined,
+  source: string | undefined,
+  userFilePath: string | undefined,
+  envId: string | undefined,
+  userFileKeys: readonly string[] | undefined,
+): Record<string, string> {
+  const env = envId ?? "unknown";
+  const shippedOrigin =
+    source === "hardcoded-fallback" ? `${FALLBACK_CONFIG_ORIGIN} ${env}`
+    : `${SHIPPED_CONFIG_ORIGIN} (environment ${env})`;
+  const fileOrigin = userFilePath ? `${userFilePath} (environment ${env})` : null;
+  // A user file overriding one address keeps the rest from the shipped config,
+  // so only the keys it declared may be attributed to it.
+  const declared = new Set(userFileKeys ?? []);
+  const out: Record<string, string> = {};
+  for (const key of Object.keys(envContracts)) {
+    out[key] = fileOrigin && declared.has(key) ? fileOrigin : shippedOrigin;
+  }
+  for (const [key, addr] of Object.entries(cliContracts ?? {})) out[key] = `the --contract flag or contracts option (${key}=${addr})`;
+  return out;
 }
 
 function isValidDoc(value: unknown): value is EnvironmentsDoc {
@@ -330,6 +371,12 @@ export async function loadEnvironments(opts: LoadOptions = {}): Promise<LoadResu
       ? userDoc as Partial<EnvironmentsDoc>
       : {};
     const merged = deepMergeEnvironments(baseDoc, partial);
+    // mergeById takes the first entry for a duplicated id, so the key list must
+    // too, including when that entry declares no contracts at all.
+    const userFileContractKeys: Record<string, string[]> = Object.create(null);
+    for (const e of partial.environments ?? []) {
+      if (e?.id && !(e.id in userFileContractKeys)) userFileContractKeys[e.id] = Object.keys(e.contracts ?? {});
+    }
     warn(
       `polkadot-app-deploy: Using user-supplied environment file "${userFilePath}" — ` +
         `values are NOT validated against chain; you own correctness.`,
@@ -338,13 +385,13 @@ export async function loadEnvironments(opts: LoadOptions = {}): Promise<LoadResu
     for (const env of merged.environments) {
       if (env.contracts && Object.keys(env.contracts).length > 0) {
         try {
-          validateContractAddresses(env.contracts, env.id);
+          validateContractAddresses(env.contracts, env.id, describeContractSources(env.contracts, undefined, "file", userFilePath, env.id, userFileContractKeys[env.id] ?? []));
         } catch (err) {
           warn(`polkadot-app-deploy: Warning: ${(err as Error)?.message ?? err}`);
         }
       }
     }
-    return { doc: merged, source: "file" };
+    return { doc: merged, source: "file", userFilePath, userFileContractKeys };
   }
 
   // ---- Standard bundled path -----------------------------------------------

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { classifyProtocolVersion, getAdapter, DOTNS_ABI_PROFILES } from "../dist/dotns-protocol.js";
+import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, DOTNS_ABI_PROFILES } from "../dist/dotns-protocol.js";
 
 test("classifyProtocolVersion: pricingVersion present => v0.5.8-rc1", () => {
   assert.equal(
@@ -20,7 +20,10 @@ test("classifyProtocolVersion: no contract code is NOT a profile verdict", () =>
   const r = classifyProtocolVersion({ hasCode: false, pricingVersionOk: false, startingPriceOk: false });
   assert.equal(r.profile, null);
   assert.match(r.reason, /no contract (code|deployed)/i);
-  assert.match(r.reason, /Check environments\.json \/ --contract config for this network/, "config-error guidance must survive the move from the call site");
+  // The config pointer belongs to the caller, which knows where the address came
+  // from. Naming a file here produced two contradictory instructions in one
+  // message for an environment that file never contained.
+  assert.doesNotMatch(r.reason, /Check environments\.json/, "a pure classifier must not name a config file it cannot know is relevant");
 });
 
 test("classifyProtocolVersion: hasCode===false wins even if a probe happens to answer", () => {
@@ -209,4 +212,55 @@ test("DOTNS_ABI_PROFILES: v0.5.8-rc1 carries the introducing upstream tag verbat
   assert.equal(info.introducedAt, "v0.5.8-rc1");
   assert.equal(info.abiPackage, "dotns-abis-v0.5.8-rc1.zip");
   assert.equal(info.discriminator, "pricingVersion");
+});
+
+// classifyDeclaredProtocolVersion. setProtocolVersion only requires a leading
+// digit and [a-zA-Z0-9.-], so every malformed case below is reachable.
+
+test("classifyDeclaredProtocolVersion: a declared release is the v0.6.0 profile, with the raw string kept", () => {
+  const d = classifyDeclaredProtocolVersion("0.8.0");
+  assert.equal(d.profile, "v0.6.0");
+  assert.equal(d.raw, "0.8.0", ">> FAIL: the exact string the chain returned must survive for the log line");
+});
+
+test("classifyDeclaredProtocolVersion: the ceiling is the boundary, and it is strictly-greater", () => {
+  const [major, minor, patch] = HIGHEST_VERIFIED_DOTNS_RELEASE.split(".").map(Number);
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor}.${patch}`).aboveVerifiedCeiling, false, ">> FAIL: the ceiling itself is verified, warning on it would train everyone to ignore the warning");
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor}.${patch + 1}`).aboveVerifiedCeiling, true, ">> FAIL: a generation nobody has diffed must be flagged, that warning is the point of reading the version at all");
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor + 1}.0`).aboveVerifiedCeiling, true);
+  assert.equal(classifyDeclaredProtocolVersion(`${major + 1}.0.0`).aboveVerifiedCeiling, true);
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor + 2}.0`).aboveVerifiedCeiling, true, ">> FAIL: a two-digit minor must not sort below a one-digit one");
+  assert.equal(classifyDeclaredProtocolVersion("0.10.0").aboveVerifiedCeiling, true, ">> FAIL: 0.10.0 is newer than 0.8.0 — plain string compare puts it below");
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor}.${patch + 1}`).profile, "v0.6.0", ">> FAIL: still classify — the probes would reach the same answer, so refusing one buys nothing");
+});
+
+test("classifyDeclaredProtocolVersion: a pre-release is the same release as its final tag", () => {
+  // Both spellings are live states of one release: a deploy declares the rc
+  // tag, the owner re-declares the final one.
+  const [major, minor, patch] = HIGHEST_VERIFIED_DOTNS_RELEASE.split(".").map(Number);
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor}.${patch}-rc.1`).aboveVerifiedCeiling, false);
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor}.${patch + 1}-rc.1`).aboveVerifiedCeiling, true, ">> FAIL: an rc of an undiffed release is still undiffed");
+  assert.equal(classifyDeclaredProtocolVersion("0.8.0-rc.1").raw, "0.8.0-rc.1");
+});
+
+test("classifyDeclaredProtocolVersion: empty means never declared, not a version", () => {
+  assert.equal(classifyDeclaredProtocolVersion(""), null);
+});
+
+test("classifyDeclaredProtocolVersion: absent means the chain has no such function", () => {
+  assert.equal(classifyDeclaredProtocolVersion(null), null);
+  assert.equal(classifyDeclaredProtocolVersion(undefined), null);
+});
+
+test("classifyDeclaredProtocolVersion: junk the chain accepts does not parse into a release", () => {
+  assert.equal(classifyDeclaredProtocolVersion("9abc"), null, ">> FAIL: a leading digit is all the contract requires, so this reaches us");
+  assert.equal(classifyDeclaredProtocolVersion("1"), null, ">> FAIL: a bare major names no release to compare against");
+  assert.equal(classifyDeclaredProtocolVersion("0.x.0"), null);
+  assert.equal(classifyDeclaredProtocolVersion("0..0"), null);
+});
+
+test("classifyDeclaredProtocolVersion: a missing patch defaults to 0, extra components are ignored", () => {
+  const [major, minor, patch] = HIGHEST_VERIFIED_DOTNS_RELEASE.split(".").map(Number);
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor}.${patch}.1`).aboveVerifiedCeiling, false, ">> FAIL: a fourth component must not read as a newer release");
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor + 1}`).aboveVerifiedCeiling, true, ">> FAIL: two components is a release, with the patch defaulting to 0");
 });

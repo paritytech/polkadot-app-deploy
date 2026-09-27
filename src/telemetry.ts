@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import pkg from "../package.json";
+import { SHIPPED_CONFIG_ORIGIN, FALLBACK_CONFIG_ORIGIN } from "./errors.js";
 import { maybeWriteMemoryReport, sampleFromBytes, type MemorySampleMb, type DeployContextForReport, type MemoryReport } from "./memory-report.js";
 import { writeRunState } from "./run-state.js";
 import type { CodePath } from "./code-paths.js";
@@ -406,20 +407,39 @@ export function getDeployAttributes(domain: string): Record<string, string | num
   return attrs;
 }
 
+const CONTRACT_ADDRESS_FAILURE = /no contract deployed at|invalid contract address for|contract call returned empty data/i;
+
+// Read from the same constants describeContractSources formats, so a reword
+// there cannot leave this matching a string nobody produces any more.
+function cameFromOurConfig(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return lower.includes(`came from ${SHIPPED_CONFIG_ORIGIN.toLowerCase()}`)
+    || lower.includes(`came from ${FALLBACK_CONFIG_ORIGIN.toLowerCase()}`);
+}
+
+// "cannot register it" (#1185): formatUnregistrableReason's distinctive
+// phrase, common to all three classifyRegistrability rules (trailing-digits,
+// hyphen-base, reserved-base) and both ownership branches. Without it, the
+// trailing-digits variant has no other matching pattern here and would
+// fall through to a bug-report prompt for a plain operator naming mistake.
+const GENERIC_USER_ERROR = /personhood|owned by|owner mismatch|reserved for original|invalid domain label|not authorized for bulletin|insufficient balance|insufficient funds|quota exhausted|insufficient .* authorization|bip39 mnemonic|ipfs cli not installed|base name is \d+ chars|cannot register it|NameNotAvailable|name must be lowercase/i;
+
 export function isExpectedError(msg: string): boolean {
-  // "cannot register it" (#1185): formatUnregistrableReason's distinctive
-  // phrase, common to all three classifyRegistrability rules (trailing-digits,
-  // hyphen-base, reserved-base) and both ownership branches. Without it, the
-  // trailing-digits variant has no other matching pattern here and would
-  // fall through to a bug-report prompt for a plain operator naming mistake.
-  return /personhood|owned by|owner mismatch|reserved for original|invalid domain label|not authorized for bulletin|insufficient balance|insufficient funds|quota exhausted|insufficient .* authorization|bip39 mnemonic|ipfs cli not installed|base name is \d+ chars|cannot register it|NameNotAvailable|name must be lowercase/i.test(msg);
+  if (GENERIC_USER_ERROR.test(msg)) return true;
+  // A wrong contract address is the operator's only when it came from their own
+  // file or --contract. A bad address in a config we ship is our failure and
+  // stays visible; with no stated origin we cannot tell, so it stays visible too.
+  if (CONTRACT_ADDRESS_FAILURE.test(msg)) {
+    return /this address came from/i.test(msg) && !cameFromOurConfig(msg);
+  }
+  return false;
 }
 
 export type DeployErrorCategory = 'user' | 'environment' | 'internal' | 'unknown';
 
 export function classifyDeployError(msg: string): DeployErrorCategory {
   if (isExpectedError(msg)) return 'user';
-  if (/chunk.*failed after.*retr|tx dropped from best chain|timed out after \d+s waiting for block|Contract reverted|Contract execution would revert|dotns register failed|All promises were rejected|"type"\s*:\s*"Invalid"|Commitment still too new|not finalised after \d+s|chain may have (dropped|evicted)|ReviveApi.*timed out|ReviveApi.*returned empty result|\b(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|Revive\.call|Utility\.batch_all) timed out after \d+ms|transaction watcher silent for/i.test(msg)) return 'environment';
+  if (/chunk.*failed after.*retr|tx dropped from best chain|timed out after \d+s waiting for block|Contract reverted|Contract execution would revert|dotns register failed|All promises were rejected|"type"\s*:\s*"Invalid"|Commitment still too new|not finalised after \d+s|chain may have (dropped|evicted)|ReviveApi.*timed out|ReviveApi.*returned empty result|\b(?:commit|register|setSubnodeOwner|setResolver|setContenthash|setText|Revive\.call|Utility\.batch_all) timed out after \d+ms|transaction watcher silent for|could not determine the DotNS ABI profile/i.test(msg)) return 'environment';
   if (/javascript heap out of memory|allocation failed.*heap|External signer mode is not supported with dotns-cli/i.test(msg)) return 'internal';
   return 'unknown';
 }
@@ -462,6 +482,8 @@ export function computeDeployOutcome(
 //   dotns.abi_decode_empty          — raw ABI decode of zero/empty ("0x") data outside the DotNS-guard wrapper path
 //   naming.already_owned           — domain is already owned by a different EVM address
 //   naming.governance_reserved     — label DotNS naming rules forbid registering (Reserved/trailing-digit/hyphen-base), decided by ownership in preflight (#1185)
+//   naming.short_names_closed      short base refused because PopRules.shortNamesEnabled is off. Not a personhood problem; only the PopRules owner can open the band
+//   naming.soulbound               — name was issued through the PoP gateway and is permanently non-transferable (DotnsRegistrar.isSoulbound, v0.6.0+)
 //   naming.subdomain_orphan        — subdomain parent is owned by a different address
 //   verify.contenthash_mismatch    — post-deploy on-chain contenthash differs from what was written
 //   verify.dagpb_not_finalised     — DAG-PB root not finalised; chain may have dropped the extrinsic
@@ -493,6 +515,8 @@ export type DeployErrorKind =
   | 'dotns.abi_decode_empty'
   | 'naming.already_owned'
   | 'naming.governance_reserved'
+  | 'naming.short_names_closed'
+  | 'naming.soulbound'
   | 'naming.subdomain_orphan'
   | 'verify.contenthash_mismatch'
   | 'verify.dagpb_not_finalised'
@@ -545,6 +569,9 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // shows up in the data later, widening this is a one-line change with evidence
   // behind it; over-matching now would be invisible.
   [/^aborted by user\b/i, 'user.aborted'],
+  // Ahead of the generic contract-revert rule: a soulbound refusal is a
+  // permanent naming fact, not a transient chain error.
+  [/is soulbound and cannot be transferred/i, 'naming.soulbound'],
   [/Contract reverted|Contract execution would revert|revert(?:ed|ing)?\s*\(flags=[0-9]+\)|"type"\s*:\s*"ContractReverted"/i, 'contract-revert'],
   [/timed out after \d+s waiting for block|Transaction not included after \d+s|Transaction did not settle within|Commitment still too new after \d+s/i, 'chain-timeout'],
   [/\bstale\b.*nonce|nonce.*\bstale\b|"type"\s*:\s*"(?:Future|Stale)"|Invalid::Future|tx rejected by pool/i, 'nonce-stale'],
@@ -554,6 +581,10 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // src/deploy.ts truncate the inner chain error at 100 chars.
   [/BadProof/i, 'chain.bad_proof'],
   [/heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i, 'connection'],
+  // Our preflight wording and the chain's own revert. Kept separate from
+  // pop_required: grouping them would hide a config change behind a label the
+  // user can act on.
+  [/short names are not on sale on|Short names are not for sale/i, 'naming.short_names_closed'],
   [/requires ProofOfPersonhood(?:Full|Lite|Light),\s*but this signer is NoStatus/i, 'naming.pop_required'],
   [/requires NoStatus,\s*but this signer is ProofOfPersonhood/i, 'naming.nostatus_required'],
   [/Cannot decode zero data.*with ABI parameters/i, 'dotns.abi_decode_empty'],

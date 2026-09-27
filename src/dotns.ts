@@ -28,7 +28,7 @@ import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
-import { classifyProtocolVersion, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
+import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
 
 /** One step in the phone-signature plan fired at preflight. */
@@ -52,6 +52,8 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   contracts?: Record<string, string>;
   /** Optional environment ID (e.g. "paseo-next-v2"). Used in shell command examples in error messages. */
   environmentId?: string;
+  /** Per-contract origin phrases from describeContractSources, named in address errors. */
+  contractSources?: Record<string, string>;
   /** Optional PoP self-serve config resolved from environments.json. Gates state-aware and generic testnet guidance blocks. */
   popSelfServe?: PopSelfServeConfig | null;
   /** Optional override for the storage deposit required for a fresh TLD register(). Loaded from environments.json per-env. */
@@ -641,12 +643,11 @@ export const DEFAULT_MNEMONIC: string = "bottom drive obey lake curtain smoke ba
 // required, never a process-wide default that a concurrent caller could flip).
 export const DEFAULT_TLD: string = "dot";
 
-// The default profile every classifyLabelStatus/classifyRegistrability/
-// classifyDotnsLabel/buildLabelAlternatives/formatUnregistrableReason/
-// decideRegistrabilityOutcome call falls back to when no profile is passed —
-// so every existing call/test built before profile-awareness existed keeps
-// its exact prior verdict, byte-for-byte. Also DotNS's own pre-connect()
-// default (see _protocolVersion's own comment).
+// The DotNS class's pre-connect() profile default (_protocolVersion below),
+// which connect()'s live probe overwrites. The classification exports
+// (classifyLabelStatus, classifyRegistrability, classifyDotnsLabel, ...) take
+// `profile` as a REQUIRED argument and never fall back to this: an implicit
+// default there went stale once newer profile generations rolled out (#1419).
 export const DEFAULT_DOTNS_PROFILE: DotnsAbiProfile = "poprules-startingPrice";
 
 // Every TLD DotNS has ever minted names under. Used only by parseDomainName's
@@ -929,6 +930,7 @@ const DOTNS_REGISTRAR_ABI = [
 const DOTNS_REGISTRAR_TRANSFER_ABI = [
   ...DOTNS_REGISTRAR_ABI,
   { inputs: [{ name: "from", type: "address" }, { name: "to", type: "address" }, { name: "tokenId", type: "uint256" }], name: "transferFrom", outputs: [], stateMutability: "payable", type: "function" },
+  { inputs: [{ name: "tokenId", type: "uint256" }], name: "isSoulbound", outputs: [{ name: "", type: "bool" }], stateMutability: "view", type: "function" },
 ] as const;
 
 const POP_RULES_ABI = [
@@ -938,6 +940,10 @@ const POP_RULES_ABI = [
   { inputs: [{ name: "name", type: "string" }, { name: "userAddress", type: "address" }], name: "priceWithoutCheck", outputs: [{ name: "metadata", type: "tuple", components: [{ name: "price", type: "uint256" }, { name: "status", type: "uint8" }, { name: "userStatus", type: "uint8" }, { name: "message", type: "string" }] }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "name", type: "string" }], name: "isBaseNameReserved", outputs: [{ name: "isReserved", type: "bool" }, { name: "reservationOwner", type: "address" }, { name: "expiryTimestamp", type: "uint64" }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "name", type: "string" }, { name: "from", type: "address" }, { name: "to", type: "address" }], name: "transferFloor", outputs: [{ name: "", type: "uint256" }], stateMutability: "view", type: "function" },
+  // Auto-getter for PopRules' `bool public shortNamesEnabled`. Older deployments
+  // predate it and revert on this call, which readShortNamesEnabled reports as
+  // unknown rather than off.
+  { inputs: [], name: "shortNamesEnabled", outputs: [{ name: "", type: "bool" }], stateMutability: "view", type: "function" },
   // No startingPrice here: it exists only on the poprules-startingPrice
   // generation, so it belongs to that profile's OLD_POP_RULES_ABI.
 ] as const;
@@ -1023,6 +1029,8 @@ const DOTNS_CONTENT_RESOLVER_ABI = [
 const DOTNS_PROTOCOL_REGISTRY_ABI = [
   { inputs: [], name: "tld", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
   { inputs: [], name: "tldNode", outputs: [{ name: "", type: "bytes32" }], stateMutability: "view", type: "function" },
+  // v0.8.0 and up; reverts below it, empty until a release is declared.
+  { inputs: [], name: "protocolVersion", outputs: [{ name: "", type: "string" }], stateMutability: "view", type: "function" },
 ] as const;
 
 const DOTNS_TEXT_RESOLVER_ABI = [
@@ -1363,9 +1371,8 @@ const LITE_USERNAME_RE = /^([a-z]+)\.(\d{2})$/;
 // calls this for its status/baseLength/trailingDigits rather than
 // re-deriving them, so the branch logic has one source of truth.
 //
-// `profile` defaults to "poprules-startingPrice" so every existing call site
-// this function had before v0.6.0 existed — including every test that
-// doesn't pass a profile — keeps its EXACT prior verdict, byte-for-byte.
+// `profile` is required, with no default: an implicit generation went stale
+// once v0.6.0 rolled out, so every caller names the one it means (#1419).
 // poprules-startingPrice and v0.5.8-rc1 share one branch below (their
 // PopRules digit-stripping behaviour is unchanged); only v0.6.0 gets new
 // semantics.
@@ -1402,7 +1409,7 @@ const TRAILING_DIGIT_COUNT_GATE_APPLIES: Record<DotnsAbiProfile, boolean> = {
 // check in `default`), not a silent fall-through into whichever branch
 // happens to be last — the same discipline dotns-protocol.ts's ADAPTERS
 // Record already applies to adapter selection.
-function classifyLabelStatus(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): { status: number; trailingDigits: number; baseLength: number } {
+function classifyLabelStatus(label: string, profile: DotnsAbiProfile): { status: number; trailingDigits: number; baseLength: number } {
   const trailingDigits = countTrailingDigits(label);
   switch (profile) {
     case "v0.6.0": {
@@ -1422,18 +1429,11 @@ function classifyLabelStatus(label: string, profile: DotnsAbiProfile = DEFAULT_D
       // rule and telemetry both read it), just no longer used to DECIDE
       // status here.
       //
-      // NOT modelled here (out of scope for this classifier): `_requireShortNamesOpen`
-      // additionally gates the 6-8 band on an owner-settable `shortNamesEnabled`
-      // flag — `require(shortNamesEnabled || baseLength >= 9, "Short names
-      // are not for sale")`. A signer holding PopFull/PopLite is therefore
-      // NOT guaranteed to register a 6-8 char name; this preflight only
-      // reports the personhood-tier requirement, not whether short names are
-      // currently on sale at all. Reading that flag would need a new
-      // on-chain call this classifier doesn't make. Two things a reader must
-      // not assume: that the flag is off (or on) anywhere in particular —
-      // run tools/probe-dotns-v060.mjs, do not trust a date in a comment —
-      // and that a failed read means `false`; on older deployments the
-      // accessor reverts outright, which is "unknown", not "off".
+      // `_requireShortNamesOpen` gates base lengths below nine on an
+      // owner-settable `shortNamesEnabled`, independently of personhood, so a
+      // PopFull/PopLite signer is still not guaranteed a short name. This
+      // function answers the personhood tier only; the flag is read where a
+      // connection exists, in preflight and register.
       const lite = LITE_USERNAME_RE.exec(label);
       const baseLength = lite ? lite[1].length : label.length;
       return { status: classifyByLadder(baseLength, lite !== null), trailingDigits, baseLength };
@@ -1490,7 +1490,7 @@ export interface DomainLabelAlternative {
 // Personhood tier it needs. Never returns a candidate that is itself Reserved
 // or otherwise invalid; the NoStatus fallback (c) always survives because it's
 // engineered to be 9+ chars with exactly 2 trailing digits.
-export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): DomainLabelAlternative[] {
+export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile): DomainLabelAlternative[] {
   const trailingRun = label.slice(label.length - countTrailingDigits(label));
   const base = stripTrailingDigits(label);
   // Preserve the operator's own digits: last 2 of the original run if it's
@@ -1547,7 +1547,7 @@ export type Registrability =
 // already compliant (mirrors #1189's ordering decision for the same reason).
 // Reuses classifyLabelStatus for baseLength/trailingDigits so the thresholds
 // can't drift from classifyDotnsLabel's.
-export function classifyRegistrability(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): Registrability {
+export function classifyRegistrability(label: string, profile: DotnsAbiProfile): Registrability {
   const { trailingDigits, baseLength } = classifyLabelStatus(label, profile);
 
   // v0.6.0 (PopRules._classifyValidatedName, read from source) DOES NOT gate
@@ -1611,9 +1611,9 @@ export function formatUnregistrableReason(args: {
   existingOwner: string | null;   // lowercased H160, or null when unregistered
   selfAddress: string;            // lowercased H160 of the signer
   tld?: string;
-  profile?: DotnsAbiProfile;
+  profile: DotnsAbiProfile;
 }): string {
-  const { label, registrability, existingOwner, tld = DEFAULT_TLD, profile = DEFAULT_DOTNS_PROFILE } = args;
+  const { label, registrability, existingOwner, tld = DEFAULT_TLD, profile } = args;
   const alternatives = buildLabelAlternatives(label, profile);
   const alternativesBlock = alternatives.length > 0
     ? `\n\nAlternatively, use a name you can register yourself:\n${formatAlternativesList(alternatives, tld)}`
@@ -1650,9 +1650,9 @@ export function decideRegistrabilityOutcome(args: {
   existingOwner: string | null;
   selfAddress: string;
   tld?: string;
-  profile?: DotnsAbiProfile;
+  profile: DotnsAbiProfile;
 }): { canProceed: boolean; plannedAction: "already-owned-by-us" | "register" | "abort"; reason?: string } {
-  const { label, registrability, existingOwner, selfAddress, tld = DEFAULT_TLD, profile = DEFAULT_DOTNS_PROFILE } = args;
+  const { label, registrability, existingOwner, selfAddress, tld = DEFAULT_TLD, profile } = args;
   // Ownership is checked FIRST and reported distinctly from registrability.
   // These two must not be collapsed into one branch: `plannedAction` is a
   // load-bearing string elsewhere (src/deploy.ts reads "already-owned-by-us"
@@ -1729,7 +1729,7 @@ export function isCommitmentTimingBarerevert(msg: string): boolean {
 //   PopFull required: userStatus must be PopFull
 //   PopLite required: userStatus in { PopLite, PopFull }
 //   NoStatus required: any user tier may register
-export function classifyDotnsLabel(label: string, tld: string = DEFAULT_TLD, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): { status: number; message: string } {
+export function classifyDotnsLabel(label: string, tld: string, profile: DotnsAbiProfile): { status: number; message: string } {
   // Status/baseLength/trailingDigits all come from the single shared
   // classifier — this function only turns that decision into a message.
   const { status, trailingDigits, baseLength } = classifyLabelStatus(label, profile);
@@ -1801,6 +1801,26 @@ export function canRegister(requiredStatus: number, userStatus: number): boolean
 function exampleNoStatusLabel(label: string, tld: string = DEFAULT_TLD): string {
   const base = stripTrailingDigits(label).replace(/[^a-z0-9-]/g, "x");
   return `${noStatusFallbackBase(base)}.${tld}`;
+}
+
+// A read that never completed, as opposed to one that completed and said no.
+// Preflight's chain reads rethrow on these rather than falling back to a
+// default: network noise is not evidence about the chain's state.
+const READ_NEVER_COMPLETED_RE = /timed out after \d+ms|heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i;
+
+// PopRules closes every base length below nine unless shortNamesEnabled is on.
+// Below six is already Reserved and refused earlier, so six to eight is the only
+// range this gate decides.
+function isShortNameBand(baseLength: number): boolean {
+  return baseLength >= 6 && baseLength <= 8;
+}
+
+export function shortNamesClosedReason(label: string, baseLength: number, tld: string, environmentId: string | null | undefined): string {
+  return `${label}.${tld} has a ${baseLength}-character base and short names are not on sale on ${environmentId ?? "this environment"}. PopRules.shortNamesEnabled is off, which closes the 6 to 8 character band to every signer, whatever their personhood status. Use a base of 9 characters or more, for example ${exampleNoStatusLabel(label, tld)}.`;
+}
+
+export function soulboundTransferReason(label: string, tld: string): string {
+  return `${label}.${tld} is soulbound and cannot be transferred. It was issued through the PoP gateway, which binds a name to the account that received it. Nothing clears the flag, so no account can move this name at any point in the future.`;
 }
 
 // #paseo-tld: `tld` selects which suffix is THIS environment's own — it must
@@ -2567,6 +2587,7 @@ export class DotNS {
   private _isPhoneSigner = false;
   private _localMnemonic: string | null = null;
   private _contracts: typeof CONTRACTS & { DOTNS_PROTOCOL_REGISTRY?: string; DOTNS_POP_CONTROLLER?: string } = CONTRACTS;
+  private _contractSources: Record<string, string> = {};
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
   private _environmentId: string | null = null;
   private _popSelfServe: PopSelfServeConfig | null = null;
@@ -2601,6 +2622,8 @@ export class DotNS {
   // or a previous connection's stale verdict — see the reset next to
   // detectProtocolVersion() in connect().
   private _subnodeOwnerShape: "legacy" | "v07" | null = "legacy";
+  // null is unread; "unknown" is a completed read with no usable answer.
+  private _shortNamesEnabled: boolean | "unknown" | null = null;
   private _onPhoneSigningRequired: ((label: string) => void) | undefined = undefined;
   private _confirmPhoneReady: ((ctx: { label: string; attempt: number; total: number; approvalBudgetMs: number; reason?: "resign" | "silence" }) => Promise<void>) | undefined = undefined;
   /** Total phone-signature count for this DotNS session (drives the `total` field passed to confirmPhoneReady). */
@@ -2653,6 +2676,11 @@ export class DotNS {
   /** bulletin-deploy #1435 test-only: pin the setSubnodeOwner shape cache directly ("legacy", "v07", or null to force resolveSubnodeOwnerShape to re-probe), bypassing the live dry-run probe — for unit tests that stub the probe or exercise the fallback/caching logic itself. */
   __setSubnodeOwnerShapeForTest(shape: "legacy" | "v07" | null): void {
     this._subnodeOwnerShape = shape;
+  }
+
+  /** Test-only: pin the cached PopRules.shortNamesEnabled value so a scenario can reach the personhood branch for a 6-8 char label on a chain where the band is closed. */
+  __setShortNamesEnabledForTest(value: boolean | "unknown" | null): void {
+    this._shortNamesEnabled = value;
   }
 
   __setProtocolVersionForTest(profile: DotnsAbiProfile): void {
@@ -2737,9 +2765,10 @@ export class DotNS {
     if (options.contracts && Object.keys(options.contracts).length > 0) {
       // Validate early — before any chain calls — so a stale environments.json
       // surfaces a clear error rather than a confusing RPC revert.
-      validateContractAddresses(options.contracts, options.environmentId ?? "unknown");
+      validateContractAddresses(options.contracts, options.environmentId ?? "unknown", options.contractSources);
       this._contracts = { ...CONTRACTS, ...options.contracts } as typeof CONTRACTS & { DOTNS_PROTOCOL_REGISTRY?: string };
     }
+    this._contractSources = options.contractSources ?? {};
     if (options.environmentId) {
       this._environmentId = options.environmentId;
     }
@@ -2852,6 +2881,7 @@ export class DotNS {
       // previous connect() (possibly to a different chain) must never be
       // reused.
       this._subnodeOwnerShape = null;
+      this._shortNamesEnabled = null;
       // Optional pin (e.g. environments.json's per-env `dotnsProtocol`):
       // ASSERTED against the live probe, never obeyed over it. A pin that
       // silently overrode the probe would recreate exactly the failure this
@@ -3186,7 +3216,8 @@ export class DotNS {
   }
 
   /**
-   * Low-level dry-run read against DotnsProtocolRegistry (tld() / tldNode()).
+   * Low-level dry-run read against DotnsProtocolRegistry (tld() / tldNode() /
+   * protocolVersion()).
    * Deliberately does NOT reuse contractCall/contractCallNullable: both of
    * those throw on a revert or on empty data, which would make "contract
    * doesn't support this function yet" indistinguishable from "the RPC call
@@ -3202,7 +3233,7 @@ export class DotNS {
    *     "pre-#218", silently defaulting to the wrong TLD on a live env with
    *     no revert and no error — the worst failure mode in this whole change.
    */
-  private async dryRunRegistryString(functionName: "tld" | "tldNode"): Promise<RegistryDryRunResult<string>> {
+  private async dryRunRegistryString(functionName: "tld" | "tldNode" | "protocolVersion"): Promise<RegistryDryRunResult<string>> {
     this.ensureConnected();
     if (!this.clientWrapper) throw new Error(`DotNS registry read (${functionName}): polkadot-api client not available`);
     const registryAddress = this._contracts.DOTNS_PROTOCOL_REGISTRY;
@@ -3257,10 +3288,14 @@ export class DotNS {
    *
    * A fourth probe (isPopIssued, against DOTNS_POP_CONTROLLER — see
    * DotnsProtocolProbe.isPopIssuedOk's own comment) runs in the SAME
-   * Promise.all as the other three: pricingVersionOk answering true on
-   * either v0.5.8-rc1 or v0.6.0 is the common case once v0.6.0 is live
-   * everywhere, so gating isPopIssued behind pricingVersionOk resolving
-   * first would cost every such connect() an extra serialized round-trip.
+   * Promise.all as the other three: gating it behind pricingVersionOk
+   * resolving first would just add a serialized round-trip for no benefit
+   * — worse as v0.6.0 spreads (#1410), since that "no benefit" case becomes
+   * the common one. The discarded-probe cost does NOT self-liquidate the
+   * moment v0.6.0 ships: it persists on every environment still running an
+   * older generation (dotns-protocol.ts's profile comment owns per-generation
+   * status — this one does not restate it). Parallel regardless: one
+   * discarded read beats a serialized round-trip on every connect.
    * classifyProtocolVersion only actually consults isPopIssuedOk when
    * pricingVersionOk is true, so running it unconditionally costs nothing
    * when pricingVersionOk turns out false. The probe is skipped entirely
@@ -3277,13 +3312,17 @@ export class DotNS {
     // hasCodeResult === false (in the classifier) and never from a silent
     // probe. Awaiting the code-presence read first would cost connect() an
     // extra RTT layer on every deploy for nothing.
-    const [hasCodeResult, pricingVersionOk, startingPriceOk, isPopIssuedOk] = await Promise.all([
+    const [hasCodeResult, pricingVersionOk, startingPriceOk, isPopIssuedOk, declaredResult] = await Promise.all([
       this.clientWrapper!.hasContractCode(popRulesAddress),
       this.probeViewFunctionOk(popRulesAddress, getAdapter("v0.5.8-rc1").popRulesAbi, "pricingVersion", []),
       this.probeViewFunctionOk(popRulesAddress, getAdapter("poprules-startingPrice").popRulesAbi, "startingPrice", []),
       popControllerAddress
         ? this.probeViewFunctionOk(popControllerAddress, POP_CONTROLLER_PROBE_ABI, "isPopIssued", [PROTOCOL_PROBE_LABEL])
         : Promise.resolve(null),
+      // Informational, so an RPC failure must not fail a connect the probes
+      // can classify. Caught here, not in dryRunRegistryString, which
+      // propagates on purpose for tld() — swallowing there picks a wrong TLD.
+      this.dryRunRegistryString("protocolVersion").catch((): RegistryDryRunResult<string> => ({ ok: false })),
     ]);
     const classification = classifyProtocolVersion({ hasCode: hasCodeResult, pricingVersionOk, startingPriceOk, isPopIssuedOk });
     if (classification.profile === null) {
@@ -3293,13 +3332,24 @@ export class DotNS {
       // which deployment failed to classify. The reason text itself —
       // including which case it is and any code-presence caveat — comes
       // entirely from classifyProtocolVersion.
-      throw new Error(`${env} (${dotnsContractName(popRulesAddress, this._contracts)} ${popRulesAddress}): ${classification.reason}`);
+      throw new Error(`${env} (${dotnsContractName(popRulesAddress, this._contracts)} ${popRulesAddress}): ${classification.reason}${hasCodeResult === true ? "" : this.contractSourceHint("POP_RULES")}`);
     }
     const profile = classification.profile;
+    const declared = classifyDeclaredProtocolVersion(declaredResult.ok ? declaredResult.value : null);
     this._protocolVersion = profile;
     this._adapter = getAdapter(profile);
     setDeployAttribute("deploy.dotns.protocol_version", profile);
-    console.log(`   DotNS ABI profile ${profile} detected on ${env}`);
+    // The probes cannot tell v0.6.0, v0.7.0 and v0.8.0 apart, so this is the
+    // only field that shows a generation rollout.
+    console.log(`   DotNS ABI profile ${profile} detected on ${env}${declared ? ` (declares DotNS ${declared.raw})` : ""}`);
+    // An upgrade declares last, so an aborted one leaves the old value
+    // standing. A declaration can lag the deployed code, never lead it.
+    if (declared && declared.profile !== profile) {
+      console.log(`   NOTE: ${env} declares DotNS ${declared.raw}, which is the ${declared.profile} profile, but the probes detect ${profile}. Using ${profile}: the probes read the ABI that is actually deployed.`);
+    }
+    if (declared?.aboveVerifiedCeiling) {
+      console.log(`   WARNING: ${env} declares DotNS ${declared.raw}, newer than ${HIGHEST_VERIFIED_DOTNS_RELEASE} — the newest release whose ABI has been checked against this client. Continuing on the ${profile} profile, which is correct only if that release changed nothing polkadot-app-deploy calls. Re-run the upstream ABI diff.`);
+    }
     // See this method's own doc comment above for why the isPopIssuedOk-null
     // fallback (no configured DOTNS_POP_CONTROLLER) is safe — v0.5.8-rc1 and
     // v0.6.0 share an identical registration/ABI adapter, so this only
@@ -3307,6 +3357,13 @@ export class DotNS {
     if (profile === "v0.5.8-rc1" && pricingVersionOk && isPopIssuedOk === null) {
       console.log(`   NOTE: could not confirm whether ${env} is v0.5.8-rc1 or v0.6.0 — DOTNS_POP_CONTROLLER has no configured address here, so the isPopIssued discriminator probe was never attempted. Defaulting to v0.5.8-rc1 label semantics (registration itself is unaffected: both profiles share an identical ABI/adapter).`);
     }
+  }
+
+  // Ends an address error with where that address came from. A key with no
+  // recorded source fell through to the defaults compiled into this module.
+  private contractSourceHint(name: string): string {
+    const src = this._contractSources[name];
+    return src ? ` This address came from ${src}.` : ` No environment or --contract supplied ${name}, so this is the built-in default address.`;
   }
 
   async contractCall(contractAddress: string, contractAbi: readonly any[], functionName: string, args: any[] = []): Promise<any> {
@@ -3347,12 +3404,12 @@ export class DotNS {
       const env = this._environmentId ?? "(unset)";
       if (hasCode === false) {
         throw new Error(
-          `No contract deployed at ${contractAddress} (${name}) env=${env} — the dry-run call to ${functionName} returned empty success data, which on pallet-revive means the target address has no contract code. Check environments.json / --contract config for this network.`,
+          `No contract deployed at ${contractAddress} (${name}) env=${env} — the dry-run call to ${functionName} returned empty success data, which on pallet-revive means the target address has no contract code.${this.contractSourceHint(name)}`,
         );
       }
       if (hasCode === null) {
         throw new Error(
-          `Contract call returned empty data — contract=${name} (${contractAddress}) env=${env} functionName=${functionName}. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.`,
+          `Contract call returned empty data — contract=${name} (${contractAddress}) env=${env} functionName=${functionName}. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.${this.contractSourceHint(name)}`,
         );
       }
       throw new Error(
@@ -3572,6 +3629,49 @@ export class DotNS {
     return { authorised: owner !== null && owner.toLowerCase() === account.toLowerCase(), owner };
   }
 
+  /**
+   * PopRules gates short names with `require(shortNamesEnabled || baseLength >= 9)`,
+   * independently of personhood.
+   *
+   * `null` means no usable answer and must never be read as "off". Only a decoded
+   * `false` closes the band; refusing a name the chain would accept is worse than
+   * letting the chain refuse it.
+   */
+  private async readShortNamesEnabled(): Promise<boolean | null> {
+    if (this._shortNamesEnabled === null) {
+      try {
+        const value = await withTimeout(
+          this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "shortNamesEnabled", []),
+          30000,
+          "shortNamesEnabled",
+        );
+        this._shortNamesEnabled = typeof value === "boolean" ? value : "unknown";
+      } catch (e: any) {
+        if (READ_NEVER_COMPLETED_RE.test(e?.message ?? String(e))) throw e;
+        // Completed and gave nothing decodable: a fixed property of this
+        // deployment, so cache it rather than re-fetch per label.
+        this._shortNamesEnabled = "unknown";
+      }
+    }
+    setDeployAttribute("deploy.dotns.short_names_enabled", String(this._shortNamesEnabled));
+    return this._shortNamesEnabled === "unknown" ? null : this._shortNamesEnabled;
+  }
+
+  /** False when the registrar gave no usable answer, including one too old to
+   *  have the function at all: let the chain refuse rather than guess. A read
+   *  that never completed propagates, so a network blip is not "not soulbound". */
+  private async readIsSoulbound(tokenId: bigint): Promise<boolean> {
+    try {
+      return (await withTimeout(
+        this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_TRANSFER_ABI, "isSoulbound", [tokenId]),
+        30000, "isSoulbound",
+      )) === true;
+    } catch (e: any) {
+      if (READ_NEVER_COMPLETED_RE.test(e?.message ?? String(e))) throw e;
+      return false;
+    }
+  }
+
   /** Live transfer-fee quote. transferFloor is a pure PopRules view — it
    *  classifies the label and reads both tiers, so it works BEFORE the name is
    *  registered (unlike quoteTransferFee, which reverts on an unregistered token). */
@@ -3603,6 +3703,11 @@ export class DotNS {
     }
     if (owner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
       throw new Error(`Cannot transfer ${validated}.${this._tld}: it is owned by ${owner}, not the worker ${this.evmAddress}.`);
+    }
+    // _quoteTransferFee reverts on a soulbound name (NameSoulbound), so this
+    // has to sit before the quote below, not just before transferFrom.
+    if (await this.readIsSoulbound(tokenId)) {
+      throw new NonRetryableError(soulboundTransferReason(validated, this._tld));
     }
     const { feeWei, feeNative } = await this.quoteTransferFloorNative(validated, this.evmAddress!, toH160);
     const txRes = await this.contractTransaction(
@@ -4778,7 +4883,7 @@ export class DotNS {
             return await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "isBaseNameReserved", [baseName]), 30000, "isBaseNameReserved") as [boolean, string, bigint];
           } catch (e: any) {
             const msg = e?.message ?? String(e);
-            if (/timed out after \d+ms|heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i.test(msg)) {
+            if (READ_NEVER_COMPLETED_RE.test(msg)) {
               throw e;
             }
             return [false, zeroAddress, 0n];
@@ -4882,6 +4987,18 @@ export class DotNS {
       }
 
       const targetPopStatus = userStatus;
+
+      // Before the personhood check: a shut band is not a personhood problem, and
+      // that branch would tell the caller to get verified, which cannot help.
+      if (isShortNameBand(baselength) && (await this.readShortNamesEnabled()) === false) {
+        return {
+          label: validated, classification, userStatus, trailingDigits, baselength,
+          isAvailable: true, existingOwner: null, isBaseNameReserved: isReserved, reservationOwner,
+          isTestnet, canProceed: false,
+          reason: shortNamesClosedReason(validated, baselength, this._tld, this._environmentId),
+          plannedAction: "abort", needsPopUpgrade: false, targetPopStatus, signerFreeBalance,
+        };
+      }
 
       if (!canRegister(classification.status, userStatus)) {
         // When the signer has NoStatus and the env supports the personhood bootstrap
@@ -5078,6 +5195,12 @@ export class DotNS {
       if (!registrability.registrable) {
         const decision = decideRegistrabilityOutcome({ label, registrability, existingOwner: null, selfAddress: this.evmAddress!.toLowerCase(), tld: this._tld, profile: this._protocolVersion });
         throw new NonRetryableError(decision.reason!);
+      }
+
+      // Same gate as preflight, for library callers that skip it.
+      const registerBaseLength = classifyLabelStatus(label, this._protocolVersion).baseLength;
+      if (isShortNameBand(registerBaseLength) && (await this.readShortNamesEnabled()) === false) {
+        throw new NonRetryableError(shortNamesClosedReason(label, registerBaseLength, this._tld, this._environmentId));
       }
 
       const isTestnet = await this.isTestnet();

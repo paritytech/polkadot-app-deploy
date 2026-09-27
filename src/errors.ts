@@ -10,3 +10,8 @@ export class NonRetryableError extends Error {
 }
 
 export const EXIT_CODE_NO_RETRY = 78;
+
+/** How describeContractSources names an address that came from a config we
+ *  ship. Shared so the classifier cannot drift from the wording it matches. */
+export const SHIPPED_CONFIG_ORIGIN = "assets/environments.json shipped with polkadot-app-deploy";
+export const FALLBACK_CONFIG_ORIGIN = "the built-in fallback for";

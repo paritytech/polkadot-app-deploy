@@ -91,6 +91,11 @@ describe("S-REPROVE — auto-reprove on bound-likely-stale", { skip: !ENABLED },
         // canRegister(Full, NoStatus) = false → !canRegister = true → auto-reprove fires.
         // "reprove" (7 chars) is Full-class; >=9-char base names are NoStatus under
         // PopRules and would NOT require reprove, so they cannot exercise this branch.
+        // PopRules.shortNamesEnabled is off on paseo-next-v2, and preflight checks
+        // it before the personhood branch for any 6-8 char base, since reproving
+        // cannot open a closed band. Pin it open here so the 7-char label below
+        // still reaches the branch this scenario exists to exercise.
+        dotns.__setShortNamesEnabledForTest(true);
         const label = sanitizeDomainLabel("reprove");
 
         // preflight() calls _preflightInternal(label, false).

@@ -253,6 +253,34 @@ describe("e2e-failure: assertDeploySucceeded", () => {
       },
     );
   });
+
+  test("a Kubo leg that never ran Kubo fails, even with nothing on stderr", () => {
+    const prev = process.env.E2E_MERKLE;
+    const ranJs = { code: 0, stdout: "   Merkleizing (JS): /tmp/fixture", stderr: "" };
+    try {
+      process.env.E2E_MERKLE = "kubo";
+      assert.throws(() => assertDeploySucceeded(ranJs, { scenario: "S1" }),
+        /^Error: >> FAIL: S1 deploy: Kubo leg never ran the Kubo merkleizer/);
+      assertDeploySucceeded({ code: 0, stdout: "   Merkleizing (Kubo): /tmp/fixture", stderr: "" }, { scenario: "S1" });
+      process.env.E2E_MERKLE = "js";
+      assertDeploySucceeded(ranJs, { scenario: "S1" });
+    } finally {
+      if (prev === undefined) delete process.env.E2E_MERKLE; else process.env.E2E_MERKLE = prev;
+    }
+  });
+
+  test("a Kubo leg that fell back to JS fails even on exit 0", () => {
+    const prev = process.env.E2E_MERKLE;
+    const fellBack = { code: 0, stdout: "ok", stderr: "   Kubo merkleize failed, falling back to JS: no IPFS repo found" };
+    try {
+      process.env.E2E_MERKLE = "kubo";
+      assert.throws(() => assertDeploySucceeded(fellBack, { scenario: "S1" }), /^Error: >> FAIL: S1 deploy: Kubo leg fell back to the JS merkleizer/);
+      process.env.E2E_MERKLE = "js";
+      assertDeploySucceeded(fellBack, { scenario: "S1" });
+    } finally {
+      if (prev === undefined) delete process.env.E2E_MERKLE; else process.env.E2E_MERKLE = prev;
+    }
+  });
 });
 
 describe("e2e-failure: assertStdoutMatches", () => {

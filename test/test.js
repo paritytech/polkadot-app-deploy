@@ -609,6 +609,62 @@ describe("pickFreshRunLabel (test/e2e.test.js) — sanitization-stable fresh lab
       ">> FAIL: pickFreshRunLabel-fix: NoStatus branch (signerPopStatus < 2) must be unaffected by the buildFreshLabelFromTag fix",
     );
   });
+
+  // #274 (mirror of bulletin #1589): S-INC-CROSSLABEL built labelA/labelB from
+  // pickFreshRunLabel("e2exlbla") and pickFreshRunLabel("e2exlblb") with no
+  // merkle discriminator. Both derive from RUN_TAG (`${GITHUB_RUN_ID}-${sha7}`),
+  // which is identical for the js and kubo matrix legs of one workflow run, so
+  // the two legs picked the SAME labels and whichever leg deployed second
+  // found label B already deployed. The fix folds MERKLE ("js"/"kubo") into
+  // both prefixes before handing them to pickFreshRunLabel. Pin the property
+  // directly against buildFreshLabelFromTag (PoP-Full path) and
+  // noStatusRunLabel (NoStatus path) so a future revert to a bare prefix is
+  // caught here, not by a red nightly.
+  test("#274: folding MERKLE into the prefix keeps js/kubo legs' labels distinct under the SAME RUN_TAG (both PoP paths)", () => {
+    const tag = "26855501122-2994449"; // same all-digit-sha edge case as above
+
+    // Build both legs' labels from ONE closure per (path, base-prefix) pair,
+    // instead of hand-concatenating "js"/"kubo" onto each prefix 8 separate
+    // times — that duplication is exactly the typo hazard a discriminator
+    // fix like this one needs to avoid (e.g. "e2exlblakubo" silently
+    // diverging from "e2exlblbkubo"'s prefix).
+    const legLabels = (build) => ({ js: build("js"), kubo: build("kubo") });
+    const popFullLabelA = legLabels((leg) => buildFreshLabelFromTag(`e2exlbla${leg}`, tag));
+    const popFullLabelB = legLabels((leg) => buildFreshLabelFromTag(`e2exlblb${leg}`, tag));
+    const noStatusLabelA = legLabels((leg) => noStatusRunLabel(`e2exlbla${leg}`));
+    const noStatusLabelB = legLabels((leg) => noStatusRunLabel(`e2exlblb${leg}`));
+
+    assert.notEqual(popFullLabelA.js, popFullLabelA.kubo,
+      ">> FAIL: crosslabel-leg-collision: label A must differ between js and kubo legs sharing the same RUN_TAG (PoP-Full path)");
+    assert.notEqual(popFullLabelB.js, popFullLabelB.kubo,
+      ">> FAIL: crosslabel-leg-collision: label B must differ between js and kubo legs sharing the same RUN_TAG (PoP-Full path)");
+    assert.notEqual(noStatusLabelA.js, noStatusLabelA.kubo,
+      ">> FAIL: crosslabel-leg-collision: label A must differ between js and kubo legs (NoStatus path)");
+    assert.notEqual(noStatusLabelB.js, noStatusLabelB.kubo,
+      ">> FAIL: crosslabel-leg-collision: label B must differ between js and kubo legs (NoStatus path)");
+
+    // Label A and label B must also still differ from each other WITHIN a
+    // single merkle leg — the merkle discriminator must not collapse the
+    // pre-existing A-vs-B distinction the scenario also depends on.
+    assert.notEqual(popFullLabelA.js, popFullLabelB.js,
+      ">> FAIL: crosslabel-leg-collision: label A and label B must differ within the js leg (PoP-Full path)");
+    assert.notEqual(popFullLabelA.kubo, popFullLabelB.kubo,
+      ">> FAIL: crosslabel-leg-collision: label A and label B must differ within the kubo leg (PoP-Full path)");
+    assert.notEqual(noStatusLabelA.js, noStatusLabelB.js,
+      ">> FAIL: crosslabel-leg-collision: label A and label B must differ within the js leg (NoStatus path)");
+    assert.notEqual(noStatusLabelA.kubo, noStatusLabelB.kubo,
+      ">> FAIL: crosslabel-leg-collision: label A and label B must differ within the kubo leg (NoStatus path)");
+
+    const allLabels = [popFullLabelA, popFullLabelB, noStatusLabelA, noStatusLabelB].flatMap((o) => [o.js, o.kubo]);
+    for (const label of allLabels) {
+      assert.ok(label.length >= 6,
+        `>> FAIL: crosslabel-leg-collision: generated label "${label}" is shorter than the 6-char DotNS base-name floor.`);
+      assert.ok([0, 2].includes(countTrailingDigits(label)),
+        `>> FAIL: crosslabel-leg-collision: generated label "${label}" must have 0 or 2 trailing digits per the DotNS naming rule, got ${countTrailingDigits(label)}.`);
+      assert.equal(sanitizeDomainLabel(label), label,
+        `>> FAIL: crosslabel-leg-collision: sanitizeDomainLabel(label) is not stable/idempotent for "${label}".`);
+    }
+  });
 });
 
 // S-V060-UNBLOCK label builders (test/e2e.test.js, bulletin #1423/#1410) —
@@ -16818,6 +16874,15 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     for (const label of ["e2e-fresh25829471478abcdef0x00", "e2e-s525829471478abcdef0x00"]) {
       assertNoStatusLabel(sanitizeDomainLabel(label));
     }
+  });
+
+  test("#274: S-INC-CROSSLABEL folds MERKLE into both fresh-label prefixes (call-site regression guard)", () => {
+    const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    assert.match(
+      e2e,
+      /describe\("S-INC-CROSSLABEL[\s\S]{0,1200}const labelA = pickFreshRunLabel\(`e2exlbla\$\{MERKLE\}`\);[\s\S]{0,200}const labelB = pickFreshRunLabel\(`e2exlblb\$\{MERKLE\}`\);/,
+      ">> FAIL: crosslabel-leg-collision: S-INC-CROSSLABEL must fold MERKLE into both labelA's and labelB's prefix so the js and kubo matrix legs (which share RUN_TAG) can't pick the same fresh label.",
+    );
   });
 
   test("select-env defaults to paseo-next-v2 as the primary environment", () => {

@@ -310,6 +310,13 @@ export function pickFreshRunLabel(prefix) {
   if (signerPopStatus < 2) return noStatusRunLabel(prefix);
   return buildFreshLabelFromTag(prefix, RUN_TAG);
 }
+// Note (#274, mirror of bulletin #1589): pickFreshRunLabel's entropy
+// (RUN_TAG/RUN_TOKEN) is shared by every matrix leg of one workflow run — a
+// fixed `prefix` alone does NOT distinguish legs. Fine for scenarios that
+// don't care (or want convergence, like S1-SMOKE). If a new scenario asserts
+// something leg-specific (e.g. a first-deploy check) under a job whose legs
+// vary MERKLE/SIGNER, fold that discriminator into the caller's own prefix —
+// see S-INC-CROSSLABEL.
 
 // Idempotency helper for the S-TRANSFER* scenarios (bulletin #1364/#1334). The
 // release retry wrapper (tools/release-retry-wrapper.mjs) re-runs this whole
@@ -1320,8 +1327,17 @@ describe("e2e", { skip: !ENABLED }, () => {
   // Spec: port of bulletin #1571/#1387.
   describe("S-INC-CROSSLABEL — cross-label dedup with no previous manifest", { skip: SCENARIO !== "s-inc-crosslabel" }, () => {
     test(`second label's first-ever deploy still skips section-1 chunks uploaded under the first label`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
-      const labelA = pickFreshRunLabel("e2exlbla");
-      const labelB = pickFreshRunLabel("e2exlblb");
+      // #274 (mirror of bulletin #1589): labelA/labelB used to be
+      // pickFreshRunLabel("e2exlbla")/("e2exlblb") with no merkle
+      // discriminator. Both derive from RUN_TAG (`${GITHUB_RUN_ID}-${sha7}`),
+      // which is identical for the js and kubo matrix legs of one workflow
+      // run, so the two legs picked the SAME labels and whichever leg
+      // deployed second found label B already deployed. Folding MERKLE
+      // ("js"/"kubo", always letter-terminated) into the prefix makes the two
+      // legs' labels distinct while keeping the shared RUN_TAG entropy that
+      // makes each leg's own labels distinct run-to-run.
+      const labelA = pickFreshRunLabel(`e2exlbla${MERKLE}`);
+      const labelB = pickFreshRunLabel(`e2exlblb${MERKLE}`);
       const tld = await resolveE2eTld();
       const fixA = fs.mkdtempSync(path.join(os.tmpdir(), "e2exlbl-A-"));
       const fixB = fs.mkdtempSync(path.join(os.tmpdir(), "e2exlbl-B-"));

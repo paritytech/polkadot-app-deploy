@@ -2433,9 +2433,92 @@ jobs:
           PAD_ENV: ${{ matrix.env }}
         run: node run-s-ext.mjs
 
+  nightly-s-reserved-invariant:
+    name: Nightly S-RESERVED-INVARIANT base names <=5 chars stay Reserved (${{ matrix.env }})
+    # Port of bulletin-deploy #1423/#1410. UNGATED (unlike S-V060-UNBLOCK,
+    # which is dispatch-only and gated on DotNS ABI profile v0.6.0): this
+    # scenario guards the OPPOSITE failure — that the v0.6.0 naming change
+    # did not accidentally make a governance-reserved name self-registrable
+    # — and that invariant holds on every profile, so it runs in normal
+    # nightly coverage on every env, every night. Deploys to a fixed,
+    # never-registrable label ("web3"): the DotNS preflight abort throws
+    # before any chunk upload or registration transaction is attempted, so
+    # it never contends for a nonce or a shared domain with any other leg —
+    # no scenario-ordering dependency needed (no `needs:` on another
+    # nightly-s* job), and no poolIndex pin required.
+    needs: [build-nightly, select-env, ensure-e2e-authorized]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-reserved-invariant')))
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # env fans out on schedule, single-env on release/dispatch (see select-env).
+        env: ${{ fromJSON(needs.select-env.outputs.healthy_envs) }}
+    env:
+      DEPLOY_TAG: ${{ needs.build-nightly.outputs.deploy-tag }}
+      BULLETIN_DEPLOY_VERSION: ${{ needs.build-nightly.outputs.test-version }}
+      BULLETIN_DEPLOY_REF: ${{ needs.build-nightly.outputs.polkadot-app-deploy-ref }}
+      MNEMONIC: ${{ secrets.DOTNS_MNEMONIC || 'bottom drive obey lake curtain smoke basket hold race lonely fit walk' }}
+      SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: paritytech/polkadot-app-deploy
+          ref: ${{ env.BULLETIN_DEPLOY_REF || '' }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: Build polkadot-app-deploy from source
+        if: env.BULLETIN_DEPLOY_REF != ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Install polkadot-app-deploy from npm
+        if: env.BULLETIN_DEPLOY_REF == ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
+      - name: Run S-RESERVED-INVARIANT scenario (one retry on transient testnet failures)
+        # retry_on_exit_code: 75 matches every sibling nightly-s* leg's convention
+        # (release-retry-wrapper.mjs re-exits 75 for failures it classifies as
+        # transient). Deliberately NOT adding an explicit retry_on: any here,
+        # matching the source job's own note (bulletin #1410): retry_on_exit_code
+        # gates on the exact exit code regardless of retry_on's value, so a
+        # genuine timeout (the wrapped process never reports 75 when killed)
+        # still won't retry on ANY of these sibling legs, not just this one.
+        # Closing that gap repo-wide is a separate, out-of-scope follow-up.
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        env:
+          E2E: "1"
+          E2E_SCENARIO: s-reserved-invariant
+          E2E_SIGNER: pool
+          E2E_MERKLE: js
+          PAD_ENV: ${{ matrix.env }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_SHA: ${{ github.sha }}
+        with:
+          timeout_minutes: 10
+          max_attempts: 2
+          retry_wait_seconds: 30
+          retry_on_exit_code: 75
+          command: node tools/release-retry-wrapper.mjs node --test test/e2e.test.js
+
   nightly-report:
     name: Nightly E2E Report
-    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
+    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-s-reserved-invariant, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2544,6 +2627,7 @@ jobs:
           NIGHTLY_S_CAR:          ${{ needs.nightly-s-car.result }}
           NIGHTLY_S_INC:          ${{ needs.nightly-s-inc.result }}
           NIGHTLY_S_EXT_SIGNER:   ${{ needs.nightly-s-ext-signer.result }}
+          NIGHTLY_S_RESERVED_INVARIANT: ${{ needs.nightly-s-reserved-invariant.result }}
           NIGHTLY_TELEMETRY:      ${{ needs.nightly-verify-telemetry.result }}
           NIGHTLY_POOL_DIST:      ${{ needs.nightly-verify-pool-distribution.result }}
           NIGHTLY_PR_COVERAGE:    ${{ needs.nightly-pr-coverage.result }}
@@ -2633,6 +2717,7 @@ jobs:
             echo "| S-CAR --input-car deploy | $(emoji "$NIGHTLY_S_CAR") |"
             echo "| S-INC scenarios (5 legs: s-inc js/kubo, roundtrip, portability, asset-rotation) | $(emoji "$NIGHTLY_S_INC") |"
             echo "| S-ext-signer external PolkadotSigner | $(emoji "$NIGHTLY_S_EXT_SIGNER") |"
+            echo "| S-RESERVED-INVARIANT base names <=5 chars stay Reserved | $(emoji "$NIGHTLY_S_RESERVED_INVARIANT") |"
             echo "| Telemetry assertions | $(emoji "$NIGHTLY_TELEMETRY") |"
             echo "| Pool selection distribution | $(emoji "$NIGHTLY_POOL_DIST") |"
             echo "| Nightly @ HEAD PR-coverage (11 legs) | $(emoji "$NIGHTLY_PR_COVERAGE") |"

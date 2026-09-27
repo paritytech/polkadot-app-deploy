@@ -2482,4 +2482,67 @@ describe("e2e", { skip: !ENABLED }, () => {
       await runV060UnblockCase(t, buildOneTrailingDigitLabel);
     });
   });
+
+  // S-RESERVED-INVARIANT — bulletin #1423/#1410. The invariant Deliverable-1
+  // does NOT change: base names of 5 chars or fewer stay Reserved
+  // (governance-only, never self-registrable) on EVERY DotNS generation, old
+  // and v0.6.0 alike. UNGATED — runs on every environment, every night,
+  // regardless of which profile is live, because it guards the opposite
+  // failure from S-V060-UNBLOCK: that the v0.6.0 naming change did not
+  // accidentally make a governance-reserved name self-registrable. "web3" is
+  // Reserved on both generations already (test/test.js's S-V060-UNBLOCK
+  // label-builder describe block pins the classifyDotnsLabel side of this),
+  // but for a DIFFERENT reason per generation: old profiles via the
+  // independent 1-trailing-digit rule, v0.6.0 via base length alone (4 <= 5)
+  // — this scenario doesn't care WHICH reason fired, only that the refusal
+  // happened, non-retryably, before any chain write.
+  describe("S-RESERVED-INVARIANT — base names <=5 chars stay Reserved on every DotNS generation (#1410)", { skip: SCENARIO !== "s-reserved-invariant" }, () => {
+    test('deploy to a governance-reserved label ("web3") is refused non-retryably, before any registration tx', { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      const tld = await resolveE2eTld();
+      const label = "web3";
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      try {
+        const { code, stdout, stderr } = await runBulletinDeploy({
+          args: buildArgs(fixtureDir, `${label}.${tld}`),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        const combined = `${stdout}\n${stderr}`;
+
+        if (code !== 78) {
+          failWith({
+            scenario: "S-RESERVED-INVARIANT",
+            message: `expected EXIT_CODE_NO_RETRY (78) for governance-reserved label "${label}.${tld}", got ${code}`,
+            context: combined,
+            keywords: ["Error", "Reserved", "governance", "requires"],
+            hint: "base names <=5 chars are reserved for governance on every DotNS generation (classifyRegistrability's reserved-base rule, or the old profiles' trailing-digit rule) — this must never become registrable.",
+          });
+        }
+
+        assertStdoutMatches(combined, new RegExp(`DotNS: ${label}\\.${tld} requires Reserved\\b`), {
+          scenario: "S-RESERVED-INVARIANT",
+          what: "preflight must classify the label Reserved on every DotNS generation",
+          hint: "deploy.ts logs 'DotNS: <label>.<tld> requires <Status>' via popStatusName(classification.status) — Reserved must hold regardless of which profile is live.",
+        });
+
+        assert.match(
+          combined,
+          /reserves base names of 5 chars or fewer for governance|trailing digit/i,
+          `>> FAIL: S-RESERVED-INVARIANT: refusal reason must cite the governance-reserved rule (base length on v0.6.0, or the trailing-digit count on older profiles) — seen tail: ${combined.slice(-500)}`,
+        );
+
+        // "Cost nothing": the DotNS preflight abort throws BEFORE the Storage
+        // phase begins (deploy.ts), so no chunk upload or registration
+        // transaction is ever attempted. Belt-and-suspenders check on the
+        // observable output, in case that ordering ever regresses silently.
+        for (const marker of ["Status: Registering", "Commitment", "Storage\n" + "=".repeat(60)]) {
+          assert.ok(
+            !combined.includes(marker),
+            `>> FAIL: S-RESERVED-INVARIANT: output contains "${marker}" — a registration/storage step must never run for a governance-reserved label (this scenario must cost nothing).`,
+          );
+        }
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+      }
+    });
+  });
 });

@@ -1712,7 +1712,7 @@ describe("classifyErrorKind", () => {
   test("naming.contract_unavailable: 'No contract deployed at' wrapper message (hasCode=false)", () => {
     assert.strictEqual(
       classifyErrorKind(
-        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. Check environments.json / --contract config for this network.",
+        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2).",
       ),
       "naming.contract_unavailable",
     );
@@ -4026,7 +4026,32 @@ describe("DotNS initial state", () => {
         "ownerOf",
         [123n],
       ),
-      /No contract deployed at.*Check environments\.json/,
+      // This stub passes no contractSources, so the tail is the built-in default.
+      /No contract deployed at.*built-in default address/,
+    );
+  });
+
+  test("contractCall (strict) names the address's recorded source when one exists", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.evmAddress = "0x1111111111111111111111111111111111111111";
+    d._environmentId = "gamingnet";
+    d._contracts = { ...d._contracts, POP_RULES: "0x2222222222222222222222222222222222222222" };
+    d._contractSources = { POP_RULES: "/home/ops/envs.json (environment gamingnet)" };
+    d.clientWrapper = {
+      performDryRunCall: async () => ({
+        result: { isOk: true, value: { data: "0x" } },
+        gasConsumed: { referenceTime: 1n, proofSize: 2n },
+        gasRequired: { referenceTime: 3n, proofSize: 4n },
+        storageDeposit: { value: 0n },
+      }),
+      hasContractCode: async () => false,
+    };
+    const abi = [{ type: "function", name: "ownerOf", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ name: "", type: "address" }] }];
+    await assert.rejects(
+      () => d.contractCall("0x2222222222222222222222222222222222222222", abi, "ownerOf", [123n]),
+      /No contract deployed at.*\(POP_RULES\).*This address came from \/home\/ops\/envs\.json \(environment gamingnet\)/,
     );
   });
 
@@ -8694,6 +8719,31 @@ describe("estimateUploadBytes", () => {
 // MNEMONIC env-var fallback.
 // ---------------------------------------------------------------------------
 describe("resolveDotnsConnectOptions (#209)", () => {
+  // The seam between describeContractSources and the error messages. Each half is
+  // tested on its own; if contractSources stops being forwarded here the map
+  // arrives empty and every error silently reports "built-in default address"
+  // instead of the real origin, which is wrong rather than broken.
+  test("contractSources forwards on both the external-signer and mnemonic branches", () => {
+    const sources = { POP_RULES: "/home/ops/envs.json (environment gamingnet)" };
+    const ext = resolveDotnsConnectOptions(
+      { signer: {}, signerAddress: "5Foo" },
+      undefined, undefined, { POP_RULES: "0x" + "1".repeat(40) }, undefined, "gamingnet", undefined, undefined, undefined, sources,
+    );
+    assert.deepStrictEqual(ext.contractSources, sources,
+      ">> FAIL: the external-signer branch must forward contractSources, or a phone/session deploy loses every address origin");
+    const mnem = resolveDotnsConnectOptions(
+      { mnemonic: "bottom drive obey ..." },
+      undefined, undefined, { POP_RULES: "0x" + "1".repeat(40) }, undefined, "gamingnet", undefined, undefined, undefined, sources,
+    );
+    assert.deepStrictEqual(mnem.contractSources, sources,
+      ">> FAIL: the mnemonic branch must forward contractSources");
+  });
+
+  test("contractSources is omitted when empty, like every other optional tail", () => {
+    const r = resolveDotnsConnectOptions({ mnemonic: "m" }, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {});
+    assert.ok(!("contractSources" in r), ">> FAIL: an empty map must not be sent, so DotNS keeps its own default");
+  });
+
   test("external signer wins; mnemonic + derivationPath are not forwarded", () => {
     const fakeSigner = { kind: "fake-signer" };
     const r = resolveDotnsConnectOptions({

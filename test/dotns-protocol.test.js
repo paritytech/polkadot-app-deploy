@@ -20,7 +20,10 @@ test("classifyProtocolVersion: no contract code is NOT a profile verdict", () =>
   const r = classifyProtocolVersion({ hasCode: false, pricingVersionOk: false, startingPriceOk: false });
   assert.equal(r.profile, null);
   assert.match(r.reason, /no contract (code|deployed)/i);
-  assert.match(r.reason, /Check environments\.json \/ --contract config for this network/, "config-error guidance must survive the move from the call site");
+  // The config pointer belongs to the caller, which knows where the address came
+  // from. Naming a file here produced two contradictory instructions in one
+  // message for an environment that file never contained.
+  assert.doesNotMatch(r.reason, /Check environments\.json/, "a pure classifier must not name a config file it cannot know is relevant");
 });
 
 test("classifyProtocolVersion: hasCode===false wins even if a probe happens to answer", () => {

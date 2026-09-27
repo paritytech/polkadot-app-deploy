@@ -15,6 +15,7 @@ import {
   DEFAULT_ENV_ID,
   isValidContractAddress,
   validateContractAddresses,
+  describeContractSources,
 } from "../dist/environments.js";
 import * as publicApi from "../dist/index.js";
 import { NonRetryableError } from "../dist/errors.js";
@@ -733,5 +734,40 @@ describe("deepMergeEnvironments — by-id merge semantics", () => {
 
   test("deepMergeEnvironments is exported from the package root", () => {
     assert.equal(publicApi.deepMergeEnvironments, deepMergeEnvironments);
+  });
+});
+
+// A contract-missing error that points at assets/environments.json is a dead end
+// for an environment that file never contained. A wrong address means something
+// different depending on who supplied it, and the error has to name that source.
+describe("describeContractSources", () => {
+  const env = { POP_RULES: "0x" + "1".repeat(40), DOTNS_REGISTRY: "0x" + "2".repeat(40) };
+
+  test("names the shipped file for a bundled environment", () => {
+    const r = describeContractSources(env, undefined, "bundled", undefined, "paseo-next-v2");
+    assert.match(r.POP_RULES, /assets\/environments\.json shipped with polkadot-app-deploy \(environment paseo-next-v2\)/);
+  });
+
+  test("names the operator's file, with its path, for --environment-file", () => {
+    const r = describeContractSources(env, undefined, "file", "/home/ops/envs.json", "gamingnet");
+    assert.equal(r.POP_RULES, "/home/ops/envs.json (environment gamingnet)",
+      ">> FAIL: an environment that never appears in assets/environments.json must be attributed to the file that declared it");
+  });
+
+  test("a --contract override wins over the environment's own entry", () => {
+    const r = describeContractSources(env, { POP_RULES: "0x" + "9".repeat(40) }, "bundled", undefined, "custom");
+    assert.match(r.POP_RULES, /--contract flag or contracts option \(POP_RULES=0x9+\)/);
+    assert.match(r.DOTNS_REGISTRY, /assets\/environments\.json/, "keys not overridden keep the environment's source");
+  });
+
+  test("names the hardcoded fallback when no environments file loaded at all", () => {
+    assert.match(describeContractSources(env, undefined, "hardcoded-fallback", undefined, "paseo-next-v2").POP_RULES, /built-in fallback for paseo-next-v2/);
+  });
+
+  test("validateContractAddresses names the source when given one", () => {
+    assert.throws(
+      () => validateContractAddresses({ POP_RULES: "0xdeadbeef" }, "gamingnet", { POP_RULES: "/home/ops/envs.json (environment gamingnet)" }),
+      /This address came from \/home\/ops\/envs\.json/,
+    );
   });
 });

@@ -207,7 +207,9 @@ export function classifyProtocolVersion(probe: DotnsProtocolProbe): DotnsProtoco
     return {
       profile: null,
       reason:
-        "No contract deployed at this address — could not detect the DotNS ABI profile because no contract code was found here. Check environments.json / --contract config for this network.",
+        // No config pointer here: this function has no environment context, so it
+        // cannot know which file holds the address. The caller appends that.
+        "No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here.",
     };
   }
   if (pricingVersionOk) return { profile: isPopIssuedOk === true ? "v0.6.0" : "v0.5.8-rc1" };

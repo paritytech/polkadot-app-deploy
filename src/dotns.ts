@@ -52,6 +52,8 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   contracts?: Record<string, string>;
   /** Optional environment ID (e.g. "paseo-next-v2"). Used in shell command examples in error messages. */
   environmentId?: string;
+  /** Per-contract origin phrases from describeContractSources, named in address errors. */
+  contractSources?: Record<string, string>;
   /** Optional PoP self-serve config resolved from environments.json. Gates state-aware and generic testnet guidance blocks. */
   popSelfServe?: PopSelfServeConfig | null;
   /** Optional override for the storage deposit required for a fresh TLD register(). Loaded from environments.json per-env. */
@@ -2580,6 +2582,7 @@ export class DotNS {
   private _isPhoneSigner = false;
   private _localMnemonic: string | null = null;
   private _contracts: typeof CONTRACTS & { DOTNS_PROTOCOL_REGISTRY?: string; DOTNS_POP_CONTROLLER?: string } = CONTRACTS;
+  private _contractSources: Record<string, string> = {};
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
   private _environmentId: string | null = null;
   private _popSelfServe: PopSelfServeConfig | null = null;
@@ -2757,9 +2760,10 @@ export class DotNS {
     if (options.contracts && Object.keys(options.contracts).length > 0) {
       // Validate early — before any chain calls — so a stale environments.json
       // surfaces a clear error rather than a confusing RPC revert.
-      validateContractAddresses(options.contracts, options.environmentId ?? "unknown");
+      validateContractAddresses(options.contracts, options.environmentId ?? "unknown", options.contractSources);
       this._contracts = { ...CONTRACTS, ...options.contracts } as typeof CONTRACTS & { DOTNS_PROTOCOL_REGISTRY?: string };
     }
+    this._contractSources = options.contractSources ?? {};
     if (options.environmentId) {
       this._environmentId = options.environmentId;
     }
@@ -3314,7 +3318,7 @@ export class DotNS {
       // which deployment failed to classify. The reason text itself —
       // including which case it is and any code-presence caveat — comes
       // entirely from classifyProtocolVersion.
-      throw new Error(`${env} (${dotnsContractName(popRulesAddress, this._contracts)} ${popRulesAddress}): ${classification.reason}`);
+      throw new Error(`${env} (${dotnsContractName(popRulesAddress, this._contracts)} ${popRulesAddress}): ${classification.reason}${hasCodeResult === true ? "" : this.contractSourceHint("POP_RULES")}`);
     }
     const profile = classification.profile;
     this._protocolVersion = profile;
@@ -3328,6 +3332,13 @@ export class DotNS {
     if (profile === "v0.5.8-rc1" && pricingVersionOk && isPopIssuedOk === null) {
       console.log(`   NOTE: could not confirm whether ${env} is v0.5.8-rc1 or v0.6.0 — DOTNS_POP_CONTROLLER has no configured address here, so the isPopIssued discriminator probe was never attempted. Defaulting to v0.5.8-rc1 label semantics (registration itself is unaffected: both profiles share an identical ABI/adapter).`);
     }
+  }
+
+  // Ends an address error with where that address came from. A key with no
+  // recorded source fell through to the defaults compiled into this module.
+  private contractSourceHint(name: string): string {
+    const src = this._contractSources[name];
+    return src ? ` This address came from ${src}.` : ` No environment or --contract supplied ${name}, so this is the built-in default address.`;
   }
 
   async contractCall(contractAddress: string, contractAbi: readonly any[], functionName: string, args: any[] = []): Promise<any> {
@@ -3368,12 +3379,12 @@ export class DotNS {
       const env = this._environmentId ?? "(unset)";
       if (hasCode === false) {
         throw new Error(
-          `No contract deployed at ${contractAddress} (${name}) env=${env} — the dry-run call to ${functionName} returned empty success data, which on pallet-revive means the target address has no contract code. Check environments.json / --contract config for this network.`,
+          `No contract deployed at ${contractAddress} (${name}) env=${env} — the dry-run call to ${functionName} returned empty success data, which on pallet-revive means the target address has no contract code.${this.contractSourceHint(name)}`,
         );
       }
       if (hasCode === null) {
         throw new Error(
-          `Contract call returned empty data — contract=${name} (${contractAddress}) env=${env} functionName=${functionName}. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.`,
+          `Contract call returned empty data — contract=${name} (${contractAddress}) env=${env} functionName=${functionName}. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.${this.contractSourceHint(name)}`,
         );
       }
       throw new Error(

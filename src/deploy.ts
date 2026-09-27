@@ -31,7 +31,7 @@ import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
-import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
+import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { setDeployContext as setBugReportContext } from "./bug-report.js";
 import { getPolkadotSigner } from "polkadot-api/signer";
@@ -2673,6 +2673,7 @@ export function resolveDotnsConnectOptions(
   popSelfServe?: PopSelfServeConfig | null,
   registerStorageDeposit?: bigint,
   tld?: string,
+  contractSources?: Record<string, string>,
 ): Pick<
   DotNSConnectOptions,
   | "signer"
@@ -2687,19 +2688,21 @@ export function resolveDotnsConnectOptions(
   | "popSelfServe"
   | "registerStorageDeposit"
   | "tld"
+  | "contractSources"
 > {
   const tail = assetHubEndpoints && assetHubEndpoints.length > 0 ? { assetHubEndpoints } : {};
   const mappingTail = autoAccountMapping ? { autoAccountMapping } : {};
   const contractsTail = contracts && Object.keys(contracts).length > 0 ? { contracts } : {};
+  const sourcesTail = contractSources && Object.keys(contractSources).length > 0 ? { contractSources } : {};
   const ratioTail = nativeToEthRatio ? { nativeToEthRatio } : {};
   const envTail = environmentId ? { environmentId } : {};
   const popTail = popSelfServe !== undefined ? { popSelfServe } : {};
   const storageTail = registerStorageDeposit !== undefined ? { registerStorageDeposit } : {};
   const tldTail = tld !== undefined ? { tld } : {};
   if (options.signer && options.signerAddress) {
-    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
+    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
   }
-  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
+  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
 }
 
 // Upper-bound estimate of how many bytes this deploy will push to Bulletin.
@@ -2954,6 +2957,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   let envBulletin: string[] = [DEFAULT_BULLETIN_RPC];
   let envAssetHub: string[] | undefined;
   let envSource: string | undefined;
+  let envUserFilePath: string | undefined;
   let envNetwork: string | undefined;
   let envName: string | undefined;
   let envIpfs: string | undefined;
@@ -2979,11 +2983,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
     envAssetHub = options.assetHubEndpoints;
   } else {
     try {
-      const { doc, source } = await loadEnvironments();
+      const { doc, source, userFilePath } = await loadEnvironments();
       const resolved = resolveEndpoints(doc, envId);
       envBulletin = resolved.bulletin;
       envAssetHub = options.assetHubEndpoints ?? resolved.assetHub;
       envSource = source;
+      envUserFilePath = userFilePath;
       envNetwork = resolved.network;
       envName = resolved.envName;
       envIpfs = resolved.ipfs;
@@ -3003,6 +3008,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   }
   // CLI/library-supplied contract addresses win over the env's map. The `custom`
   // env intentionally ships no addresses, so they must be provided this way.
+  const contractSources = describeContractSources(envContracts, options.contracts, envSource, envUserFilePath, envId);
   if (options.contracts && Object.keys(options.contracts).length > 0) {
     envContracts = { ...envContracts, ...options.contracts };
   }
@@ -3263,7 +3269,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
 
       const preflight = new DotNS();
-      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld));
+      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources));
       // connect() now guarantees the account is mapped before returning — no
       // post-connect mapping wait needed here. See DotNS.connect() in dotns.ts.
       // Adopt the authoritative, chain-resolved TLD for everything downstream
@@ -3576,7 +3582,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             try { owner.destroy(); } catch { /* best-effort */ }
           };
           await ownerDotns.connect({
-            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld),
+            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources),
             confirmPhoneReady: options.confirmPhoneReady,
             phoneSigner: true, // owner path is always a real phone/session signer
           });
@@ -3591,7 +3597,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
         const dotns = new DotNS();
         await dotns.connect({
-          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld),
+          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources),
           confirmPhoneReady: options.confirmPhoneReady,
           // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
           // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.

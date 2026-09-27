@@ -2500,73 +2500,121 @@ jobs:
 
           cat /tmp/report-body.md >> "$GITHUB_STEP_SUMMARY"
 
-      # workflow_dispatch runs are manual — skip auto-issue for those (maintainer
-      # is already watching). schedule + release get an issue because failures
-      # there indicate drift nobody was watching for. `needs.*.result` values
-      # of 'failure' or 'cancelled' both indicate a broken run; 'skipped'
-      # (e.g. build-nightly failed upstream) also surfaces through build-nightly.
-      - name: Open failure issue
-        if: >
-          (github.event_name == 'schedule' || github.event_name == 'release') &&
-          (needs.build-nightly.result == 'failure'
-            || needs.ensure-e2e-authorized.result == 'failure'
-            || needs.nightly-s1-pool.result == 'failure'
-            || needs.nightly-s1-direct.result == 'failure'
-            || needs.nightly-s2-fresh.result == 'failure'
-            || needs.nightly-s3.result == 'failure'
-            || needs.nightly-s5.result == 'failure'
-            || needs.nightly-s6.result == 'failure'
-            || needs.nightly-s8.result == 'failure'
-            || needs.nightly-s9.result == 'failure'
-            || needs.nightly-s-grandpa-reupload.result == 'failure'
-            || needs.nightly-s-mortality.result == 'failure'
-            || needs.nightly-s-reprove.result == 'failure'
-            || needs.nightly-s-car.result == 'failure'
-            || needs.nightly-s-inc.result == 'failure'
-            || needs.nightly-s-ext-signer.result == 'failure'
-            || needs.nightly-verify-telemetry.result == 'failure'
-            || needs.nightly-verify-pool-distribution.result == 'failure'
-            || needs.nightly-pr-coverage.result == 'failure'
-            || needs.nightly-code-path-coverage.result == 'failure'
-            || needs.build-nightly.result == 'cancelled'
-            || needs.ensure-e2e-authorized.result == 'cancelled'
-            || needs.nightly-s1-pool.result == 'cancelled'
-            || needs.nightly-s1-direct.result == 'cancelled'
-            || needs.nightly-s2-fresh.result == 'cancelled'
-            || needs.nightly-s3.result == 'cancelled'
-            || needs.nightly-s5.result == 'cancelled'
-            || needs.nightly-s6.result == 'cancelled'
-            || needs.nightly-s8.result == 'cancelled'
-            || needs.nightly-s9.result == 'cancelled'
-            || needs.nightly-s-grandpa-reupload.result == 'cancelled'
-            || needs.nightly-s-mortality.result == 'cancelled'
-            || needs.nightly-s-reprove.result == 'cancelled'
-            || needs.nightly-s-car.result == 'cancelled'
-            || needs.nightly-s-inc.result == 'cancelled'
-            || needs.nightly-s-ext-signer.result == 'cancelled'
-            || needs.nightly-verify-telemetry.result == 'cancelled'
-            || needs.nightly-verify-pool-distribution.result == 'cancelled'
-            || needs.nightly-pr-coverage.result == 'cancelled'
-            || needs.nightly-code-path-coverage.result == 'cancelled')
+      - name: Resolve the failure-issue title
+        # The title below is free text — decorative, for humans reading the
+        # issue list. It is NOT the dedup key. Open and Note both match the
+        # issue on DEDUP_LABEL, computed further down. Reword TITLE freely;
+        # do not let dedup logic creep back onto it. (port of bulletin #1512,
+        # #1523, #1536, adapted: the twin has only two tiers — release and
+        # nightly — not bulletin's release/stable/head three, because the
+        # twin's schedule trigger always source-builds main HEAD, never
+        # tests a published @latest on a cron.)
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'release')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.build-nightly.outputs.deploy-tag }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
           VERSION: ${{ needs.build-nightly.outputs.test-version }}
+        run: |
+          # Key the title's date on the RUN's own created_at rather than wall
+          # clock at the moment this step executes (port of bulletin #1516).
+          # GitHub sets a run's created_at once, when the run is first
+          # created, and it does not change across run_attempts — unlike a
+          # bare `date -u`, which a re-run crossing 00:00 UTC after attempt 1
+          # would evaluate to a different day, missing the issue attempt 1
+          # filed and filing a duplicate instead. This is a separate call
+          # from the "Fetch per-leg job results" step's
+          # /actions/runs/{run_id}/jobs calls — that endpoint lists jobs, and
+          # a job's own created_at reflects when that job's latest attempt
+          # was queued, not the run's.
+          # Falls back to wall clock if the API cannot be reached. This step
+          # runs on every scheduled and release run, green or red, and the
+          # step after it refuses to file the failure issue without the
+          # title this one exports — so letting a transient 5xx kill the
+          # step would trade a duplicate issue for no issue at all on a
+          # night that had real failures.
+          RUN_CREATED_AT=$(curl -fsSL --max-time 30 \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPO/actions/runs/$GITHUB_RUN_ID" | jq -r '.created_at' || true)
+          if [ -z "$RUN_CREATED_AT" ] || [ "$RUN_CREATED_AT" = "null" ]; then
+            echo "::warning::could not read the run's created_at — falling back to wall clock for the issue-title date"
+            TODAY=$(date -u +%Y-%m-%d)
+          else
+            TODAY=$(date -u -d "$RUN_CREATED_AT" +%Y-%m-%d)
+          fi
+
+          # Each branch also sets DEDUP_KEY — the identity that must stay
+          # constant across this run's own attempts/re-triggers, but change
+          # from one genuinely distinct occurrence to the next. For release
+          # that's the version, not the date: a UTC day can see multiple RC
+          # prereleases (successive rc.N bumps, each firing this workflow on
+          # `release: prereleased`), and keying on TODAY would wrongly
+          # collapse their distinct failures onto one issue. For nightly,
+          # one run per day is the natural unit, so TODAY is right. Do NOT
+          # key on run_id instead: a scheduled run that gets manually
+          # re-triggered becomes a new run with a new run_id, and it must
+          # still dedupe onto the same issue.
+          if [ "$EVENT" = release ]; then
+            TIER=release
+            VERSION_LABEL="${VERSION:-${RELEASE_TAG#v}}"
+            TITLE="Release E2E failure: $VERSION_LABEL"
+            DEDUP_KEY="$VERSION_LABEL"
+          else
+            TIER=nightly
+            VERSION_LABEL="${VERSION:-main@${GITHUB_SHA:0:7} (source build)}"
+            TITLE="Nightly E2E failure: ${TODAY}"
+            DEDUP_KEY="$TODAY"
+          fi
+
+          # GitHub label names cap at 50 chars, and the issues-list `labels=`
+          # query param below uses a comma to AND multiple labels together —
+          # strip commas so an unexpected one in DEDUP_KEY can't be misread
+          # as a label separator.
+          DEDUP_LABEL="nightly-dedup:${TIER}:${DEDUP_KEY//,/}"
+          DEDUP_LABEL="${DEDUP_LABEL:0:50}"
+
+          {
+            echo "ISSUE_TITLE=$TITLE"
+            echo "TIER=$TIER"
+            echo "TODAY=$TODAY"
+            echo "VERSION_LABEL=$VERSION_LABEL"
+            echo "DEDUP_LABEL=$DEDUP_LABEL"
+          } >> "$GITHUB_ENV"
+
+      # workflow_dispatch runs are manual — skip auto-issue for those (maintainer
+      # is already watching). schedule + release get an issue because failures
+      # there indicate drift nobody was watching for. `contains(needs.*.result, …)`
+      # checks every job in this job's needs: list, so adding/removing a
+      # scenario job here can never silently stop reporting it (port of
+      # bulletin #1512's /simplify pass — the twin's own hand-listed
+      # condition was missing nightly-s7, the same bug class).
+      - name: Open failure issue
+        # always(): without a status function GitHub adds success(), so a
+        # failed Resolve/Fetch step would skip this and a total outage would
+        # file nothing.
+        if: >
+          always() &&
+          (github.event_name == 'schedule' || github.event_name == 'release') &&
+          (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
         run: |
-          TODAY=$(date -u +%Y-%m-%d)
-          VERSION_LABEL="${VERSION:-latest stable}"
-
-          case "$TAG" in
-            e2e-ci-release)
-              TITLE="Release E2E failure: $VERSION_LABEL"
+          # Unset means the Resolve step failed. Stop rather than file a
+          # titleless issue that no later run can find.
+          TITLE="${ISSUE_TITLE:?Resolve step did not set ISSUE_TITLE}"
+          case "$TIER" in
+            release)
               CONTEXT="Post-release validation failed for \`$VERSION_LABEL\`. The version has already been published to npm; decide whether to yank (\`npm deprecate\`), fix-forward, or investigate before users hit it."
               ;;
             *)
-              TITLE="Nightly E2E failure: ${TODAY}"
-              CONTEXT="Nightly E2E workflow failed on ${TODAY}."
+              CONTEXT="Nightly E2E against main HEAD failed on ${TODAY}."
               ;;
           esac
 
@@ -2584,33 +2632,98 @@ jobs:
           # Use curl (always present on runner) rather than gh CLI, which is
           # absent on ubuntu-latest runners and silently fails with exit 127.
           BODY=$(cat /tmp/issue-body.md)
-          # Dedup: this report job re-runs on every run_attempt, so re-running a
-          # failed nightly used to open a SECOND identical issue (attempt 1 +
-          # attempt 2 → two "Nightly E2E failure: <date>"). Find an existing OPEN
-          # issue with this exact title; if present, comment the re-run link
-          # instead of creating a duplicate. (has(pull_request) filters out PRs,
-          # which the issues endpoint also returns.)
-          EXISTING=$(curl -fsSL \
+          DEDUP_LABEL="${DEDUP_LABEL:?Resolve step did not set DEDUP_LABEL}"
+          # Dedup: this report job re-runs on every run_attempt, so
+          # re-running a failed nightly used to open a SECOND identical
+          # issue. Find an existing OPEN issue carrying this run's
+          # DEDUP_LABEL — a structured (tier, date/version) key the Resolve
+          # step computed and already ensured exists as a label — rather
+          # than matching the rendered title, so a title reword can't break
+          # dedup. (has(pull_request) filters out PRs, which the issues
+          # endpoint also returns.)
+          EXISTING=$(curl -fsSL --max-time 30 -G \
             -H "Authorization: bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "$API_URL/repos/$REPO/issues?state=open&per_page=100" \
-            | jq -r --arg t "$TITLE" 'map(select(.title == $t and (has("pull_request") | not))) | (.[0].number // empty)')
+            --data-urlencode "labels=$DEDUP_LABEL" \
+            --data-urlencode "state=open" \
+            --data-urlencode "per_page=100" \
+            "$API_URL/repos/$REPO/issues" \
+            | jq -r 'map(select(has("pull_request") | not)) | (.[0].number // empty)')
           if [ -n "$EXISTING" ]; then
-            echo "Existing open issue #$EXISTING titled \"$TITLE\" — commenting instead of duplicating."
-            curl -fsSL \
+            echo "Existing open issue #$EXISTING labelled \"$DEDUP_LABEL\" — commenting instead of duplicating."
+            curl -fsSL --max-time 30 \
               -X POST \
               -H "Authorization: bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "$API_URL/repos/$REPO/issues/$EXISTING/comments" \
               -d "$(jq -n --arg body "Re-run also failed: $RUN_URL" '{body: $body}')"
           else
-            curl -fsSL \
+            # Create the dedup label just before the issue that has to carry
+            # it, rather than on every run: the lookup above is safe against
+            # a label that does not exist yet (the issues list returns an
+            # empty array, not an error), and a re-run that finds an
+            # existing issue is by definition looking at one that already
+            # carries the label. `|| true` tolerates the "already exists"
+            # 422 — the label outlives the run, so every attempt after the
+            # first on a given key is a 422.
+            curl -fsSL --max-time 30 -o /dev/null \
+              -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/labels" \
+              -d "$(jq -n --arg name "$DEDUP_LABEL" '{name: $name, color: "ededed", description: "Nightly/release failure-issue dedup key — do not remove from an open nightly-report issue."}')" \
+              || true
+            curl -fsSL --max-time 30 \
               -X POST \
               -H "Authorization: bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "$API_URL/repos/$REPO/issues" \
-              -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" '{title: $title, body: $body}')"
+              -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" --arg label "$DEDUP_LABEL" '{title: $title, body: $body, labels: [$label]}')"
           fi
+
+      - name: Note a green re-run on the day's failure issue
+        # Comment, do not close: a leg that passed on re-run still failed once.
+        # continue-on-error: a failed lookup shows as a failed step without turning a green run red.
+        if: >
+          always() &&
+          github.run_attempt > 1 &&
+          (github.event_name == 'schedule' || github.event_name == 'release') &&
+          !contains(needs.*.result, 'failure') &&
+          !contains(needs.*.result, 'cancelled')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          # No ISSUE_TITLE reference here on purpose — this step doesn't
+          # need the title, only the dedup label, which keeps it decoupled
+          # from any future title reword.
+          DEDUP_LABEL="${DEDUP_LABEL:?Resolve step did not set DEDUP_LABEL}"
+          # Same DEDUP_LABEL query as "Open failure issue" — the two must
+          # agree on identity or this step can fail to find what that one
+          # filed.
+          EXISTING=$(curl -fsSL --max-time 30 -G \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            --data-urlencode "labels=$DEDUP_LABEL" \
+            --data-urlencode "state=open" \
+            --data-urlencode "per_page=100" \
+            "$API_URL/repos/$REPO/issues" \
+            | jq -r 'map(select(has("pull_request") | not)) | (.[0].number // empty)')
+          if [ -z "$EXISTING" ]; then
+            echo "No open issue labelled \"$DEDUP_LABEL\", nothing to annotate."
+            exit 0
+          fi
+          echo "Run is green, annotating #$EXISTING."
+          curl -fsSL --max-time 30 \
+            -X POST \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPO/issues/$EXISTING/comments" \
+            -d "$(jq -n --arg body "Re-run passed (attempt ${GITHUB_RUN_ATTEMPT}): $RUN_URL. The matrix is green now. The failure above still happened; close this once it is explained or fixed." '{body: $body}')"
 
   # ---- Post-nightly Sentry assertion harness (#181 Proposal 1) -----------
 

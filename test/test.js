@@ -22589,10 +22589,168 @@ describe("e2e.yml: prerequisites job wiring (ensure-e2e-authorized)", () => {
     const needsMatch = reportBlock.match(/needs:\s*\[([^\]]*)\]/);
     assert.ok(needsMatch && needsMatch[1].split(",").map((s) => s.trim()).includes("ensure-e2e-authorized"),
       ">> FAIL: e2e-prereq-wiring: nightly-report must needs: ensure-e2e-authorized so a prereq failure is reflected in the nightly report.");
-    assert.match(reportBlock, /needs\.ensure-e2e-authorized\.result == 'failure'/,
-      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must treat a prerequisites failure as a failure condition, not silently omit it.");
-    assert.match(reportBlock, /needs\.ensure-e2e-authorized\.result == 'cancelled'/,
-      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must treat a prerequisites cancellation as a failure condition too.");
+    // The 'Open failure issue' step's condition is now generic —
+    // contains(needs.*.result, 'failure'/'cancelled') — rather than a
+    // hand-listed OR chain (port of bulletin #1512's /simplify pass: the
+    // hand-listed form here was missing nightly-s7, so a solo S7 failure
+    // filed nothing). Being generic over needs.*.result means it
+    // automatically covers ensure-e2e-authorized (and every other needs:
+    // entry) without having to name it, so the invariant this test protects
+    // is "the step reads needs.*.result generically", not "the step names
+    // ensure-e2e-authorized specifically".
+    assert.match(reportBlock, /- name: Open failure issue[\s\S]*?contains\(needs\.\*\.result,\s*'failure'\)/,
+      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must gate on contains(needs.*.result, 'failure'), which covers ensure-e2e-authorized (and every needs: entry) generically.");
+    assert.match(reportBlock, /- name: Open failure issue[\s\S]*?contains\(needs\.\*\.result,\s*'cancelled'\)/,
+      ">> FAIL: e2e-prereq-wiring: the 'Open failure issue' step must gate on contains(needs.*.result, 'cancelled') too.");
+  });
+
+  // Port of bulletin #1516/#1523: the failure-issue title used to be built
+  // from `date -u` evaluated when the "Resolve the failure-issue title" step
+  // RUNS, not when the run started. A re-run's report step can execute on
+  // the far side of 00:00 UTC from attempt 1's — same run, different TODAY —
+  // so attempt 2 computes a title attempt 1's issue doesn't have: "Open
+  // failure issue" then files a duplicate instead of matching, and the
+  // "Note a green re-run" step finds no issue with that title and prints
+  // "nothing to annotate", leaving attempt 1's issue unannotated. The fix
+  // keys TODAY on the run's `created_at`, which GitHub sets once when the
+  // run is first created and does not change across run_attempts.
+  test(".github/workflows/e2e.yml: nightly-report failure-issue title keys off the run's created_at, not report-time wall clock (port of bulletin #1516/#1523)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const resolveStep = report.split(/\n(?= {6}- )/).find((step) => /- name: Resolve the failure-issue title$/m.test(step));
+    assert.ok(resolveStep, ">> FAIL: nightly-report: the Resolve the failure-issue title step must exist");
+
+    // TODAY must be derived from the run's created_at, with wall clock
+    // reachable ONLY through the empty/null guard.
+    assert.match(
+      resolveStep,
+      /if \[ -z "\$RUN_CREATED_AT" \][\s\S]*?TODAY=\$\(date -u \+%Y-%m-%d\)[\s\S]*?else[\s\S]*?TODAY=\$\(date -u -d "\$RUN_CREATED_AT" \+%Y-%m-%d\)/,
+      ">> FAIL: nightly-report: TODAY must come from the run's created_at, which is stable across every run_attempt, and reach bare wall-clock `date -u +%Y-%m-%d` only inside the guard for an unreadable created_at",
+    );
+
+    // The fetch must not be able to kill the step.
+    assert.match(
+      resolveStep,
+      /\|\| true\)/,
+      ">> FAIL: nightly-report: the created_at fetch must tolerate failure (`|| true`) so an API blip degrades to wall clock instead of killing the step and suppressing the failure issue",
+    );
+
+    // RUN_CREATED_AT has to come from a fetch of the RUN object itself (GET
+    // /actions/runs/{run_id}) in THIS step — distinct from the "Fetch
+    // per-leg job results" step's /actions/runs/{run_id}/jobs calls, whose
+    // per-job listing has no run-level created_at field.
+    const runUrls = [...resolveStep.matchAll(/actions\/runs\/[^"\n]*"/g)].map((m) => m[0]);
+    assert.ok(
+      runUrls.some((u) => !u.includes("/jobs")),
+      ">> FAIL: nightly-report: expected a GET to /actions/runs/{run_id} (the run object, for its created_at) in the Resolve step",
+    );
+  });
+
+  // Port of bulletin #1532/#1536: "Open failure issue" and "Note a green
+  // re-run" both used to dedup on the exact rendered TITLE string, so any
+  // cosmetic reword of the title silently broke dedup and filed a
+  // duplicate. The fix: the Resolve step computes a structured dedup label
+  // from (tier, date) — or (tier, version) for the release tier, where a
+  // UTC day can see multiple RC prereleases and date alone would wrongly
+  // collapse distinct release versions onto one issue — and both consumers
+  // filter on that label instead of the title. Adapted from bulletin's
+  // 3-tier (release/stable/head) version to the twin's 2-tier
+  // (release/nightly) model: the twin's schedule trigger always
+  // source-builds main HEAD, so there is no separate @latest-tested tier.
+  test(".github/workflows/e2e.yml: nightly-report failure-issue dedup keys on a structured label, not the title (port of bulletin #1532/#1536)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const steps = report.split(/\n(?= {6}- )/);
+    const resolveStep = steps.find((step) => /- name: Resolve the failure-issue title$/m.test(step));
+    const openStep = steps.find((step) => /- name: Open failure issue$/m.test(step));
+    const noteStep = steps.find((step) => /- name: Note a green re-run/.test(step));
+    assert.ok(resolveStep, ">> FAIL: nightly-report: the Resolve the failure-issue title step must exist");
+    assert.ok(openStep, ">> FAIL: nightly-report: the Open failure issue step must exist");
+    assert.ok(noteStep, ">> FAIL: nightly-report: the Note a green re-run step must exist");
+
+    assert.match(
+      resolveStep,
+      /echo "DEDUP_LABEL=\$DEDUP_LABEL"[\s\S]*?>> "\$GITHUB_ENV"/,
+      ">> FAIL: nightly-report Resolve step: must export DEDUP_LABEL via GITHUB_ENV so both consumers read the same value",
+    );
+
+    const dedupLabelLine = (resolveStep.match(/^\s*DEDUP_LABEL=.*$/m) ?? [""])[0];
+    assert.ok(dedupLabelLine, ">> FAIL: nightly-report Resolve step: expected a DEDUP_LABEL=... assignment");
+    assert.doesNotMatch(
+      dedupLabelLine,
+      /\$(\{)?(ISSUE_)?TITLE/,
+      ">> FAIL: nightly-report Resolve step: DEDUP_LABEL must not be derived from the title — that recouples identity to prose",
+    );
+    assert.doesNotMatch(
+      resolveStep.slice(resolveStep.indexOf("DEDUP_LABEL=")),
+      /GITHUB_RUN_ID/,
+      ">> FAIL: nightly-report Resolve step: DEDUP_LABEL must not key on run_id — a manually re-triggered scheduled run gets a new run_id but must still dedupe onto the same day's issue",
+    );
+
+    // Release tier must key on version, not date. Nightly tier keys on
+    // TODAY (the twin has no separate stable tier — see test header).
+    const dedupBlock = resolveStep.slice(resolveStep.indexOf('if [ "$EVENT" = release ]'), resolveStep.indexOf("DEDUP_LABEL="));
+    assert.match(
+      dedupBlock,
+      /TIER=release[\s\S]*?DEDUP_KEY="\$VERSION_LABEL"/,
+      ">> FAIL: nightly-report Resolve step: the release tier must key its dedup identity on VERSION_LABEL, not TODAY — same-day RC prereleases would otherwise collapse onto one issue",
+    );
+    assert.match(
+      dedupBlock,
+      /TIER=nightly[\s\S]*?DEDUP_KEY="\$TODAY"/,
+      ">> FAIL: nightly-report Resolve step: the nightly tier must key its dedup identity on TODAY",
+    );
+
+    // The label has to be created before the issue that carries it, and in
+    // the step that files that issue — not in Resolve, which also runs on
+    // green nightlies and would mint an unused label every day.
+    assert.match(
+      openStep,
+      /\/repos\/\$REPO\/labels/,
+      ">> FAIL: nightly-report Open failure issue: must create the dedup label before filing the issue that carries it",
+    );
+    assert.doesNotMatch(
+      resolveStep,
+      /\/repos\/\$REPO\/labels/,
+      ">> FAIL: nightly-report Resolve step: must NOT pre-create the dedup label — it runs on green runs too and would mint an unused label per day",
+    );
+
+    // Neither consumer may dedup on the title string any more.
+    for (const [name, step] of [["Open failure issue", openStep], ["Note a green re-run", noteStep]]) {
+      assert.doesNotMatch(
+        step,
+        /\.title == \$t/,
+        `>> FAIL: nightly-report ${name}: must not dedup on .title == $t — a title reword must not affect dedup`,
+      );
+      assert.match(
+        step,
+        /labels=\$\{?DEDUP_LABEL\}?/,
+        `>> FAIL: nightly-report ${name}: must filter the issues query on the DEDUP_LABEL label`,
+      );
+    }
+
+    const openLabelExpr = (openStep.match(/labels=\$\{?DEDUP_LABEL\}?/) ?? [])[0];
+    const noteLabelExpr = (noteStep.match(/labels=\$\{?DEDUP_LABEL\}?/) ?? [])[0];
+    assert.ok(openLabelExpr, ">> FAIL: nightly-report Open failure issue: no labels=$DEDUP_LABEL query found");
+    assert.strictEqual(
+      openLabelExpr, noteLabelExpr,
+      `>> FAIL: nightly-report: Open failure issue (${openLabelExpr}) and Note a green re-run (${noteLabelExpr}) must query the identical label expression, or the two consumers can disagree on identity`,
+    );
+  });
+
+  // Port of bulletin #1512: the report job comments "Re-run also failed" on
+  // a second failing attempt but used to say nothing when one passed.
+  test(".github/workflows/e2e.yml: nightly-report notes a green re-run on the day's failure issue (port of bulletin #1512)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const noteStep = report.split(/\n(?= {6}- )/).find((step) => /- name: Note a green re-run/.test(step));
+    assert.ok(noteStep, ">> FAIL: nightly-report: the Note a green re-run step must exist");
+    assert.match(noteStep, /github\.run_attempt > 1/,
+      ">> FAIL: nightly-report Note step: must only fire on a re-run (run_attempt > 1), not attempt 1 of a green run");
+    assert.match(noteStep, /!contains\(needs\.\*\.result, 'failure'\)/,
+      ">> FAIL: nightly-report Note step: must require no failures among needs.*.result");
+    assert.match(noteStep, /continue-on-error: true/,
+      ">> FAIL: nightly-report Note step: must continue-on-error so a failed lookup can't turn a green run red");
   });
 
   // The dangling-needs walk mandated by the task brief: parse the YAML,

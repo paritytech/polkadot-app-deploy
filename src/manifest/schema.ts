@@ -6,6 +6,11 @@
  * module stays free of the polkadot-api dep. Authoritative ownership and
  * eligibility checks happen at publish-time preflight in
  * [`publish.ts`](./publish.ts).
+ *
+ * Subname depth is not checked here (bulletin-deploy #1449, folded into
+ * #1443): `parseDomainName` accepts any depth, so this validator has
+ * nothing to mirror — it never had an opinion on depth beyond ordinary
+ * domain shape. DOMAIN_RE's `(\.LABEL)*` already accepts arbitrary depth.
  */
 
 import type {

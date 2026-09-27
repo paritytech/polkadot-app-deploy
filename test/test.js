@@ -19,6 +19,7 @@ import * as os from "os";
 import { execSync } from "node:child_process";
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
+import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError } from "../dist/dotns.js";
 import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
@@ -5665,15 +5666,22 @@ describe("assertSubdomainOwnerMatchesSigner (issue #562)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// formatSubdomainParentError — subdomain parent ownership message (#1185)
+// formatSubdomainParentError — subdomain parent ownership message (#1185, bulletin #1380)
 //
 // Task 7 of the #1185 plan. Today an unregistered reserved parent yields
 // "parent game.dot is owned by no one, not by this signer" — awkward, and
 // silent about the only route forward. When the parent is non-registrable
 // per classifyRegistrability AND unowned, the message must additionally
 // teach the dotns-cli whitelisted-registration route.
+//
+// bulletin #1380 (issue #1062): recurring on a consumer's per-branch preview
+// deploys — the refusal was correct but silent about the remedy for the
+// other two states too. Both the "unregistered, registrable parent" and
+// "owned by another account" branches now name a concrete, verified next
+// step (see the doc comment on formatSubdomainParentError in src/deploy.ts
+// for how each was verified).
 // ---------------------------------------------------------------------------
-describe("formatSubdomainParentError (#1185)", () => {
+describe("formatSubdomainParentError (#1185, bulletin #1380)", () => {
   test("unregistered, non-registrable parent: names it and teaches the dotns-cli route", () => {
     const m = formatSubdomainParentError("app.game.dot", "game", null, "0xaaa");
     assert.match(m, /parent game\.dot is not registered/,
@@ -5682,18 +5690,57 @@ describe("formatSubdomainParentError (#1185)", () => {
       `>> FAIL: formatSubdomainParentError: must give the exact dotns-cli command; got: ${m}`);
   });
 
-  test("owned by another account: still names the owner, does NOT suggest registering", () => {
+  test("owned by another account: names the owner AND a transfer remedy that actually works, does NOT suggest registering", () => {
     const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa");
     assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must name the owner; got: ${m}`);
     assert.doesNotMatch(m, /dotns register domain/,
       `>> FAIL: formatSubdomainParentError: an already-owned parent must NOT suggest registering it; got: ${m}`);
+    // bulletin #1380: must name a concrete next step — the transfer command run
+    // BY the current owner (0xbbb), handing to this signer (0xaaa). runTransfer
+    // (src/commands/transfer.ts) always signs as `opts.mnemonic ??
+    // DEFAULT_MNEMONIC` — never from a session — so a hint without --mnemonic
+    // would connect as Alice's dev key and fail on-chain unless the real owner
+    // happens to be Alice. The command must include it.
+    assert.match(m, /transfer game\.dot --to 0xaaa --mnemonic/,
+      `>> FAIL: formatSubdomainParentError: must give a transfer command that includes --mnemonic — without it, runTransfer signs as DEFAULT_MNEMONIC (Alice) instead of the real owner and the transfer fails on-chain; got: ${m}`);
   });
 
-  test("unregistered, registrable parent: unchanged pre-#1185 message (no dotns-cli line)", () => {
+  test("owned by another account, empty selfAddress: no dangling --to, still refuses", () => {
+    // The deploy.ts call site passes `preflight.evmAddress ?? ""` — guard
+    // against selfAddress being unresolved so the message never renders a
+    // command with a missing --to value.
+    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "");
+    assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must still name the owner; got: ${m}`);
+    assert.doesNotMatch(m, /--to\b/, `>> FAIL: formatSubdomainParentError: must not render a --to flag with no address to give it; got: ${m}`);
+  });
+
+  test("unregistered, registrable parent: now names the register-by-deploying remedy (bulletin #1380)", () => {
     const m = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa");
     assert.match(m, /parent mysitedemo00\.dot is owned by no one, not by this signer/,
-      `>> FAIL: formatSubdomainParentError: a registrable, unregistered parent must keep the original message; got: ${m}`);
-    assert.doesNotMatch(m, /dotns register domain/, `>> FAIL: formatSubdomainParentError: must not add unnecessary registration advice; got: ${m}`);
+      `>> FAIL: formatSubdomainParentError: a registrable, unregistered parent must keep the original refusal sentence (telemetry's naming.subdomain_orphan classifier keys on it); got: ${m}`);
+    assert.doesNotMatch(m, /dotns register domain/,
+      `>> FAIL: formatSubdomainParentError: a registrable parent is not governance-reserved, must not point at the dotns-cli whitelisted route; got: ${m}`);
+    // This CLI has no register-only command — deploying the parent directly
+    // IS the registration path. Verify the exact command is offered.
+    assert.match(m, /polkadot-app-deploy <build-dir> mysitedemo00\.dot/,
+      `>> FAIL: formatSubdomainParentError: must give the exact register-the-parent command; got: ${m}`);
+  });
+
+  test("tld=paseo: transfer remedy uses the resolved tld, not a hardcoded .dot", () => {
+    const m = formatSubdomainParentError("app.game.paseo", "game", "0xbbb", "0xaaa", "paseo");
+    assert.match(m, /parent game\.paseo is owned by 0xbbb/i,
+      `>> FAIL: formatSubdomainParentError tld=paseo: must use .paseo, not .dot; got: ${m}`);
+    assert.match(m, /transfer game\.paseo --to 0xaaa --mnemonic/,
+      `>> FAIL: formatSubdomainParentError tld=paseo: transfer remedy must use .paseo, not .dot; got: ${m}`);
+  });
+
+  test("naming.subdomain_orphan classifier still matches both unregistered and owned-by-other messages (bulletin #1380 must not weaken telemetry)", () => {
+    const unregistered = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa");
+    const ownedByOther = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa");
+    assert.strictEqual(classifyErrorKind(unregistered), 'naming.subdomain_orphan',
+      `>> FAIL: formatSubdomainParentError: unregistered-parent message must still classify as naming.subdomain_orphan; got kind for: ${unregistered}`);
+    assert.strictEqual(classifyErrorKind(ownedByOther), 'naming.subdomain_orphan',
+      `>> FAIL: formatSubdomainParentError: owned-by-other-parent message must still classify as naming.subdomain_orphan; got kind for: ${ownedByOther}`);
   });
 });
 
@@ -8834,8 +8881,43 @@ describe("parseDomainName", () => {
     assert.throws(() => parseDomainName("sub.ab.dot"), /must be 3-63 chars/);
   });
 
-  test("rejects more than one level of subdomains", () => {
-    assert.throws(() => parseDomainName("a.b.c.dot"), /only one level/);
+  // Replaces the former "rejects more than one level of subdomains" test
+  // (bulletin-deploy #1443): that limit was ours, not the protocol's. The
+  // registry's setSubnodeOwner validates the sub-label and parent path with
+  // DIFFERENT rules — require(subLabel.isSingleLabel()) but
+  // require(parentLabel.isNamePath()) — deliberately: the sub-label must be
+  // single, the parent may be an arbitrarily deep dotted path, resolved
+  // recursively on-chain by _parentNamehash. DotNS's own v0.7.0 README
+  // documents this as intended: "A subname ... can in turn carry subnames,
+  // so the registry is the place the name hierarchy actually lives." The
+  // first label is always the sublabel; every label after it is the parent
+  // path, joined with dots.
+  test("parses a nested (depth-2) subname: first label is the sublabel, the rest join into the parent path", () => {
+    const result = parseDomainName("worker.app.supafaust.dot");
+    assert.deepStrictEqual(result, {
+      isSubdomain: true,
+      label: "worker.app.supafaust",
+      sublabel: "worker",
+      parentLabel: "app.supafaust",
+      fullName: "worker.app.supafaust.dot",
+    });
+  });
+
+  // Subname depth is OBSERVED, not gated (bulletin-deploy #1449, folded into
+  // #1443): parseDomainName accepts any depth — there is no cap and no
+  // override flag. A caller (src/deploy.ts) that wants a heads-up on
+  // unusually deep nesting prints an informational NOTE and records a
+  // telemetry attribute after parsing; the parser itself stays pure and
+  // never refuses on depth grounds.
+  test("parses an arbitrarily deep nested subname (4+ labels before the tld) — no depth cap", () => {
+    const result = parseDomainName("www.blog.staff.example.dot");
+    assert.deepStrictEqual(result, {
+      isSubdomain: true,
+      label: "www.blog.staff.example",
+      sublabel: "www",
+      parentLabel: "blog.staff.example",
+      fullName: "www.blog.staff.example.dot",
+    }, ">> FAIL: subname depth: a 4-label name must parse — there is no depth cap");
   });
 
   test("rejects invalid characters in subdomain", () => {
@@ -16467,6 +16549,64 @@ describe("telemetry coverage source scans — deploy.ts (issue #419)", () => {
       deploySrc.includes("assertSubdomainOwnerMatchesSigner("),
       "deploy.ts preflight branch must call assertSubdomainOwnerMatchesSigner to guard orphan-owned subnames"
     );
+  });
+
+  // bulletin-deploy #1449 (folded into #1443): depth is observed, not
+  // gated — parseDomainName never refuses, so this attribute plus the
+  // console NOTE right below are the entire replacement signal.
+  test("deploy.ts: deploy.dotns.subname_levels is set after deploy.subdomain, for every subname deploy", () => {
+    const subIdx = deploySrc.indexOf(`setDeployAttribute("deploy.subdomain",`);
+    const levelsIdx = deploySrc.indexOf(`setDeployAttribute("deploy.dotns.subname_levels",`);
+    assert.ok(subIdx !== -1, "deploy.subdomain attribute call must exist");
+    assert.ok(levelsIdx !== -1, "deploy.dotns.subname_levels attribute call must exist");
+    assert.ok(levelsIdx > subIdx, "deploy.dotns.subname_levels must appear after deploy.subdomain in source");
+  });
+
+  test("deploy.ts: deploy.dotns.subname_levels is passed as a raw number, not String()-wrapped", () => {
+    const levelsIdx = deploySrc.indexOf(`setDeployAttribute("deploy.dotns.subname_levels",`);
+    assert.ok(levelsIdx !== -1, "deploy.dotns.subname_levels attribute call must exist");
+    const callSite = deploySrc.slice(levelsIdx, levelsIdx + 200);
+    assert.doesNotMatch(callSite, /String\(/,
+      ">> FAIL: deploy.dotns.subname_levels: numeric span attributes must be raw numbers, not String()-wrapped, or sum()/avg() break in Sentry");
+  });
+
+  test("deploy.ts: the subname-nesting NOTE fires right after the parseDomainName call, only when the parent path itself has a dot", () => {
+    const parseIdx = deploySrc.indexOf("parseDomainName(domainName, envTld)");
+    const noteIdx = deploySrc.indexOf("NOTE:", parseIdx);
+    assert.ok(parseIdx !== -1, "the pre-connect parseDomainName(domainName, envTld) call must exist");
+    assert.ok(noteIdx !== -1, "a NOTE: console line must follow the parse call");
+    const conditionSlice = deploySrc.slice(parseIdx, noteIdx);
+    assert.match(conditionSlice, /parsed\?\.isSubdomain && parsed\.parentLabel!\.includes\("\."\)/,
+      ">> FAIL: subname-nesting NOTE: must gate on isSubdomain + parentLabel containing a dot (more than 2 labels before the tld), not fire for an ordinary single-level subname");
+  });
+});
+
+describe("deploy.ts: subname-nesting NOTE/telemetry logic (bulletin #1449) is correct for nested vs. plain vs. top-level", () => {
+  // Exercises the EXACT expressions deploy.ts uses (parsed.isSubdomain,
+  // parsed.parentLabel.includes("."), subnameNestingLevels(1 + parentLabel
+  // split length)) against parseDomainName's real output, so this is a
+  // faithful proxy for "the NOTE fires for a nested name and not a plain
+  // one" without needing a live chain to actually run deploy().
+  test("an ordinary depth-1 subname (single-label parent) does NOT trip the NOTE condition", () => {
+    const parsed = parseDomainName("worker.app.dot");
+    assert.equal(parsed.isSubdomain, true);
+    assert.equal(parsed.parentLabel.includes("."), false,
+      ">> FAIL: subname-nesting NOTE: a single-label parent ('app') must not look nested");
+  });
+
+  test("a depth-2 nested subname (dotted parent) DOES trip the NOTE condition, with the right level count", () => {
+    const parsed = parseDomainName("worker.app.supafaust.dot");
+    assert.equal(parsed.isSubdomain, true);
+    assert.equal(parsed.parentLabel.includes("."), true,
+      ">> FAIL: subname-nesting NOTE: a dotted parent ('app.supafaust') must look nested");
+    const levels = subnameNestingLevels(1 + parsed.parentLabel.split(".").length);
+    assert.equal(levels, 2, ">> FAIL: subname-nesting NOTE: worker.app.supafaust.dot is 3 labels before the tld, i.e. 2 levels of nesting");
+  });
+
+  test("a top-level (non-subdomain) name never trips the NOTE condition", () => {
+    const parsed = parseDomainName("demoapp.dot");
+    assert.equal(parsed.isSubdomain, false);
+    assert.equal(parsed.parentLabel, null);
   });
 });
 

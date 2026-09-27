@@ -74,47 +74,85 @@ for (const tld of ["dot", "paseo"]) {
   });
 }
 
-// Guard test: the whole class of bug was a SECOND node-derivation path in
-// src/dotns.ts that hardcoded a TLD's namehash as a 32-byte hex literal (the
-// old `DOT_NODE` constant) instead of deriving it from the active tld at call
-// time, then hand-rolled `keccak256(concatHex([DOT_NODE, labelhash]))` to
-// build the ERC-721 node/tokenId. Note: src/dotns.ts legitimately contains
-// OTHER 32-byte hex literals unrelated to this bug (e.g. PERSONHOOD_CONTEXT, a
-// fixed precompile-call context) — a bare "any 64-hex-char literal" grep
-// would false-positive on those. So this guard targets the actual mechanism
-// instead of literal shape alone:
-//   (a) a *_NODE-named constant hardcoded to a 32-byte hex literal (the exact
-//       shape DOT_NODE had), and
-//   (b) `concatHex(` reappearing at all — computeDomainTokenId no longer
-//       needs it after the fix (it now delegates to namehash()), so its
-//       reappearance in this file is the manual-node-concat mechanism coming
-//       back, and
-//   (c) a 32-byte hex literal passed directly into keccak256(...) — an
-//       inlined reintroduction that skips a separate named constant.
-test("guard: src/dotns.ts must not hardcode a namehash-of-a-TLD constant reachable from tokenId/node derivation", () => {
+// Guard test (bulletin-deploy #1304): the whitelist-based guard this replaces
+// enumerated the four shapes the ssoqedtuwf incident actually took (a
+// hardcoded *_NODE hex constant, `concatHex(` reappearing, an inlined 32-byte
+// hex literal in keccak256(...), or a literal ".dot" in a namehash()
+// template). That only catches a NEW bad derivation if it happens to repeat
+// an old mistake — a site written as `namehash(\`${x}.${someParam}\`)` with a
+// stale local, a shadowed variable, or a wrongly-defaulted argument passes
+// every one of those clauses, because none of them assert *how* the TLD
+// reached the template.
+//
+// This guard is strictly stronger: it doesn't enumerate bad shapes at all. It
+// asserts there is exactly ONE place in src/dotns.ts that calls viem's
+// namehash(), and that it is inside the ensNode() primitive every
+// node/tokenId derivation (computeDomainNode, computeDomainTokenId,
+// computeSubnodeIds, checkTldNodeConsistency) is required to go through. A
+// second derivation path — whatever shape it takes, including one that has
+// never been seen before — cannot exist without adding a second textual
+// `namehash(` call, which this test forbids outright.
+//
+// It still catches every one of the four original incident shapes: (a)/(c) a
+// hardcoded node constant or an inlined hex literal fed into keccak256(...)
+// bypass namehash() entirely, so they're covered by the concatHex/keccak256
+// clauses kept below (constructing a node WITHOUT calling namehash() at all
+// is the other half of the bug class this file must forbid); (b) concatHex(
+// reappearing is the same manual-node-concat mechanism; (d) a literal ".dot"
+// inside a namehash() template would itself BE a second `namehash(` call site
+// (since it can't be the sole one inside ensNode, whose argument is a
+// parameter, not a literal), so it is caught by the call-count check alone.
+test("guard: namehash( is called from exactly one place in src/dotns.ts — the sole node-derivation primitive", () => {
   const srcPath = fileURLToPath(new URL("../src/dotns.ts", import.meta.url));
   const src = readFileSync(srcPath, "utf8");
-  const offenders = [];
 
+  // Strip comments and string/template literal bodies before counting, so
+  // prose that mentions "namehash(" (comments, error-message text) can't
+  // masquerade as — or hide — a real call site. Order matters: strip block
+  // comments, then backtick/double-quote string bodies, THEN line comments —
+  // a `//` inside a quoted URL must be neutralized by the string strip
+  // *before* the line-comment regex runs. Single-quoted strings are
+  // deliberately NOT stripped: this file has none, only prose apostrophes
+  // ("don't", "it's") in comments.
+  const codeOnly = src
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/`(?:[^`\\]|\\.)*`/g, "``")
+    .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+    .replace(/\/\/.*$/gm, "");
+
+  const callSites = [...codeOnly.matchAll(/\bnamehash\(/g)];
+  assert.equal(
+    callSites.length,
+    1,
+    `>> FAIL: guard namehash chokepoint: found ${callSites.length} real call site(s) of namehash( in src/dotns.ts (expected exactly 1) — every node/tokenId derivation must go through the single ensNode() primitive; a second call site means a second, independently-writable derivation path exists again, which is the exact bug class that reverted after an 11 PAS mint had already succeeded`,
+  );
+
+  assert.match(
+    src,
+    /function ensNode\(fullName: string\): `0x\$\{string\}` \{\s*return namehash\(fullName\);\s*\}/,
+    ">> FAIL: guard namehash chokepoint: the sole namehash( call must live inside the ensNode() primitive with this exact shape — if this fails, ensNode was renamed/reshaped without updating this pin",
+  );
+
+  // Keep the original guard's coverage of the two ways a node can be built
+  // WITHOUT ever calling namehash() at all: a hardcoded *_NODE hex constant,
+  // or a hand-rolled concatHex(...)/keccak256(...) reconstruction.
+  const offenders = [];
   const nodeConstRe = /const\s+(\w*[Nn]ode\w*)\s*(?::\s*`[^`]*`)?\s*=\s*"(0x[0-9a-fA-F]{64})"/g;
   let m;
   while ((m = nodeConstRe.exec(src)) !== null) {
     offenders.push(`hardcoded *_NODE constant reintroduced: ${m[1]} = ${m[2]}`);
   }
-
   if (/\bconcatHex\s*\(/.test(src)) {
     offenders.push("concatHex(...) reappeared in src/dotns.ts — this is the manual node-concat mechanism the fix removed");
   }
-
   const inlineRe = /keccak256\([^)]*0x[0-9a-fA-F]{64}[^)]*\)/g;
   while ((m = inlineRe.exec(src)) !== null) {
     offenders.push(`32-byte hex literal inlined directly into keccak256(...): ${m[0].slice(0, 80)}`);
   }
-
   assert.deepEqual(
     offenders,
     [],
-    `>> FAIL: guard hardcoded TLD node: ${JSON.stringify(offenders)} — a namehash-of-a-TLD constant (like the old DOT_NODE) must never be hardcoded; derive it from the active tld via namehash(tld) at call time instead`,
+    `>> FAIL: guard hardcoded TLD node: ${JSON.stringify(offenders)} — a namehash-of-a-TLD constant (like the old DOT_NODE) must never be hardcoded; derive it from the active tld via ensNode() at call time instead`,
   );
 });
 

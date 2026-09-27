@@ -111,6 +111,13 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   dotnsProtocol?: DotnsAbiProfile;
 }
 export interface OwnershipResult { owned: boolean; owner: string | null; }
+// Verdict from DotNS.checkNodeAuthorization: `authorised` is the actual
+// write-permission verdict (registry isAuthorised(node, account), or a
+// owner()-equality fallback — see that method's doc comment), `owner` is the
+// node's current owner as read from the registry, kept for informative
+// messaging even when it isn't the thing that decided the verdict (e.g. an
+// operator-for-all delegate is authorised without being the owner).
+export interface AuthorizationResult { authorised: boolean; owner: string | null; }
 
 export const TX_KIND_HASH = "hash" as const;
 export const TX_KIND_NONCE_ADVANCED = "nonce-advanced" as const;
@@ -709,14 +716,28 @@ export function resolveTldFromRegistryResult(result: RegistryDryRunResult<string
   return normalizeOnChainTld(result.value);
 }
 
-// Pure consistency check for the tldNode() safety net: our own namehash(tld)
+// bulletin-deploy #1304: the ONLY place in this file that calls viem's
+// namehash() directly. Every node/tokenId derivation below — computeDomainNode,
+// computeDomainTokenId, computeSubnodeIds, and the tldNode() consistency check
+// right below — goes through this one primitive. That is what the guard test
+// in test/dotns-token-id.test.js pins: it asserts `namehash(` occurs in this
+// file exactly once, right here. A whitelist of previously-seen bad shapes
+// only catches a NEW bad derivation if it happens to repeat an old mistake;
+// routing every site through a single function makes a second, differently-
+// wrong derivation impossible to write in the first place — there is nowhere
+// else to write it.
+function ensNode(fullName: string): `0x${string}` {
+  return namehash(fullName);
+}
+
+// Pure consistency check for the tldNode() safety net: our own ensNode(tld)
 // must agree with the contract's tldNode(), or every node this run computes
 // targets the wrong on-chain record — a silent, total-corruption bug class.
 // `result.ok === false` means the registry doesn't support tldNode() (pre-#218)
 // or none is configured — nothing to check, not a failure.
 export function checkTldNodeConsistency(tld: string, result: RegistryDryRunResult<string>): void {
   if (!result.ok) return;
-  const localNode = namehash(tld).toLowerCase();
+  const localNode = ensNode(tld).toLowerCase();
   const onChainNode = result.value.toLowerCase();
   if (localNode !== onChainNode) {
     throw new Error(
@@ -960,6 +981,17 @@ const DOTNS_REGISTRY_ABI = [
   { inputs: [{ name: "node", type: "bytes32" }, { name: "newResolver", type: "address" }], name: "setResolver", outputs: [], stateMutability: "nonpayable", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }], name: "owner", outputs: [{ name: "", type: "address" }], stateMutability: "view", type: "function" },
   { inputs: [{ name: "node", type: "bytes32" }], name: "resolver", outputs: [{ name: "", type: "address" }], stateMutability: "view", type: "function" },
+  // bulletin-deploy #1435-adjacent: DotnsRegistry.isAuthorised(node, account) —
+  // verified against upstream IDotnsRegistry.sol at v0.7.0. The contract's own
+  // doc comment calls this "the canonical authorisation check the registry
+  // enforces on owner-gated entry points" and "the single source of truth"
+  // _authorised/isAuthorised both delegate to: a non-zero stored subnode owner
+  // must equal account; otherwise, for a tokenised node, the registrar's
+  // ERC-721 owner, an operator-for-all delegate, or a single-token approval
+  // all qualify. Strictly wider than a raw owner()-equality test. See
+  // checkNodeAuthorization below, which prefers this and falls back to
+  // owner()-equality only when this accessor is absent (a bare revert).
+  { inputs: [{ name: "node", type: "bytes32" }, { name: "account", type: "address" }], name: "isAuthorised", outputs: [{ name: "authorisedFlag", type: "bool" }], stateMutability: "view", type: "function" },
 ] as const;
 
 // v0.7+ `setSubnodeOwner` — same 4 fields plus a trailing `persist: bool`.
@@ -1212,8 +1244,34 @@ export function convertWeiToNative(weiValue: bigint): bigint { return weiValue /
 // namehash("ssoqedtuwf.paseo"), but the post-register ownerOf lookup queried
 // namehash("ssoqedtuwf.dot") (the old hardcoded node) and reverted with
 // ERC721NonexistentToken — after the 11 PAS mint succeeded.
+// bulletin-deploy #1304 follow-up: routed through the shared ensNode()
+// primitive (see the comment above ensNode, near checkTldNodeConsistency) so
+// there's exactly one derivation to keep correct, not two.
+export function computeDomainNode(label: string, tld: string = DEFAULT_TLD): `0x${string}` {
+  return ensNode(`${label}.${tld}`);
+}
+
 export function computeDomainTokenId(label: string, tld: string = DEFAULT_TLD): bigint {
-  return BigInt(namehash(`${label}.${tld}`));
+  return BigInt(computeDomainNode(label, tld));
+}
+
+// Same rationale as computeDomainTokenId above: transferSubname,
+// registerSubdomain, and checkSubdomainOwnership each hand-derived the
+// sublabel.parentLabel.tld node and the parentLabel.tld node independently —
+// three copies of the exact identifier derivation whose divergence (a
+// hardcoded TLD vs. the templated `this._tld`) is what minted
+// "ssoqedtuwf.paseo" but then looked up "ssoqedtuwf.dot" and reverted after
+// the mint had already succeeded. Route every subname node computation
+// through computeDomainNode (itself built on the single ensNode() primitive)
+// so there is exactly one derivation to keep correct. subnode is expressed as
+// computeDomainNode of the compound "sublabel.parentLabel" label — identical
+// bytes to hashing the three-part string directly, one fewer place that could
+// diverge from computeDomainNode's own convention.
+export function computeSubnodeIds(sublabel: string, parentLabel: string, tld: string = DEFAULT_TLD): { parentNode: `0x${string}`; subnode: `0x${string}` } {
+  return {
+    parentNode: computeDomainNode(parentLabel, tld),
+    subnode: computeDomainNode(`${sublabel}.${parentLabel}`, tld),
+  };
 }
 
 // Shared by transferName and transferSubname (and the CLI's own --to
@@ -1774,19 +1832,37 @@ export function parseDomainName(input: string, tld: string = DEFAULT_TLD): Parse
     const sanitized = validateDomainLabel(parts[0]);
     return { isSubdomain: false, label: sanitized, sublabel: null, parentLabel: null, fullName: `${sanitized}.${tld}` };
   }
-  if (parts.length === 2) {
-    // Sublabel is a user-defined subdomain leaf, not a DotNS-registered name;
-    // parent IS the registered name. Both are now bare calls — validateDomainLabel
-    // no longer takes an options param (#1185): it never applied a digit-count
-    // or Reserved rule to a sublabel in the first place (those rules only ever
-    // gated the checkReserved/skipSanitize branches, both deleted), so dropping
-    // the options changes nothing for either side of a subdomain.
-    const sanitizedSub = validateDomainLabel(parts[0]);
-    const sanitizedParent = validateDomainLabel(parts[1]);
-    const fullLabel = `${sanitizedSub}.${sanitizedParent}`;
-    return { isSubdomain: true, label: fullLabel, sublabel: sanitizedSub, parentLabel: sanitizedParent, fullName: `${fullLabel}.${tld}` };
-  }
-  throw new Error(`Invalid domain: only one level of subdomains supported (got ${parts.length} labels)`);
+  // N >= 2 labels: a nested subname (bulletin-deploy #1443). The registry's
+  // own setSubnodeOwner validates the two halves with DIFFERENT rules —
+  // require(subLabel.isSingleLabel()) but require(parentLabel.isNamePath()) —
+  // deliberately: the sub-label being written must be a single label, but the
+  // parent it hangs off may itself be a dotted path ("app.supafaust"),
+  // resolved recursively on-chain by _parentNamehash. So the FIRST label is
+  // always the sublabel and every label AFTER it is the parent path, joined
+  // with dots — not just the second-to-last split this used to cap at (one
+  // level of subdomain only). This is not new protocol surface: DotNS's own
+  // README (v0.7.0) documents "a subname ... can in turn carry subnames, so
+  // the registry is the place the name hierarchy actually lives" — nested
+  // subnames are intended, not merely tolerated.
+  //
+  // Depth is unbounded here (bulletin-deploy #1449, folded into #1443's final
+  // shape) — no refusal, no override flag. A caller that wants a heads-up on
+  // unusually deep nesting gets one from src/deploy.ts (console notice +
+  // telemetry attribute) after this function returns; parseDomainName itself
+  // stays pure and always succeeds for a well-formed path, regardless of how
+  // many labels deep it goes.
+  const restParts = parts.slice(1);
+  // Each label is validated individually via validateDomainLabel (no options
+  // param, per #1185 — see the comment on the depth-2 branch this replaces),
+  // matching the registry's own per-label _isDnsLabel check inside
+  // isNamePath (<=63 octets, lowercase/digit/hyphen charset, no leading or
+  // trailing hyphen) — the one bound upstream itself enforces on a nested
+  // path, and the only length-shaped check bulletin-deploy needs to add on
+  // top, since upstream imposes no whole-name or label-count bound of its own.
+  const sanitizedSub = validateDomainLabel(parts[0]);
+  const sanitizedParent = restParts.map((p) => validateDomainLabel(p)).join(".");
+  const fullLabel = `${sanitizedSub}.${sanitizedParent}`;
+  return { isSubdomain: true, label: fullLabel, sublabel: sanitizedSub, parentLabel: sanitizedParent, fullName: `${fullLabel}.${tld}` };
 }
 
 export function parseProofOfPersonhoodStatus(status: string): number {
@@ -3414,6 +3490,88 @@ export class DotNS {
     } catch { return { owned: false, owner: null }; }
   }
 
+  /**
+   * Raw probe for DotnsRegistry.isAuthorised(node, account) — returns the
+   * decoded bool when the accessor exists, or `null` when it is absent from
+   * this registry deployment (a bare selector-not-found revert). Shares the
+   * bare-revert-vs-real-revert discrimination (isBareRevertResult) with
+   * resolveSubnodeOwnerShape's v0.7 shape probe: a revert WITH data means the
+   * function exists and the on-chain call itself is a normal view read that
+   * should never revert for a real reason (see _isAuthorised in
+   * DotnsRegistry.sol — it only ever returns a bool), so that branch
+   * propagates as an unexpected failure rather than being folded into
+   * "absent".
+   */
+  private async probeIsAuthorised(node: string, account: string): Promise<boolean | null> {
+    this.ensureConnected();
+    if (!this.clientWrapper) throw new Error("probeIsAuthorised: polkadot-api client not available");
+    const contractAddress = this._contracts.DOTNS_REGISTRY;
+    const isAuthorisedAbi: readonly any[] = DOTNS_REGISTRY_ABI;
+    const isAuthorisedArgs: any[] = [node, account];
+    const encodedCallData = encodeFunctionData({ abi: isAuthorisedAbi, functionName: "isAuthorised", args: isAuthorisedArgs });
+    const callResult = await this.clientWrapper.performDryRunCall(this.substrateAddress!, contractAddress, 0n, encodedCallData);
+    if (callResult.result.isOk) {
+      const rawData: string = callResult.result.value.data ?? "0x";
+      if (rawData.length > 2) {
+        return decodeFunctionResult({ abi: DOTNS_REGISTRY_ABI, functionName: "isAuthorised", data: rawData as `0x${string}` }) as boolean;
+      }
+      // Unexpected empty success from a contract we know has code (the
+      // parallel owner() read in checkNodeAuthorization succeeds against the
+      // same address) — treat like "accessor not available" rather than
+      // guessing at a decoded value.
+      return null;
+    }
+    const errorData = callResult.result.value;
+    const revertData: string | undefined = errorData?.data;
+    const revertFlags: bigint | undefined = errorData?.flags;
+    if (isBareRevertResult(revertData, revertFlags)) return null;
+    throw new Error(formatContractDryRunFailure({
+      revertData,
+      revertFlags,
+      gasConsumed: callResult.gasConsumed,
+      gasRequired: callResult.gasRequired,
+      storageDeposit: callResult.storageDeposit?.value,
+    }, {
+      contractAddress,
+      functionName: "isAuthorised",
+      signerSubstrateAddress: this.substrateAddress!,
+      signerEvmAddress: this.evmAddress ?? undefined,
+      value: 0n,
+      encodedData: encodedCallData,
+      args: [node, account],
+      contracts: this._contracts,
+    }));
+  }
+
+  /**
+   * Ask the registry who may write `node`, per DotnsRegistry.isAuthorised —
+   * the contract's own "single source of truth" for owner-gated entry points
+   * (setSubnodeOwner, setSubnodeResolver, setResolver): a non-zero stored
+   * subnode owner must equal `account`; otherwise, for a tokenised node, the
+   * registrar's ERC-721 owner, an operator-for-all delegate, or a
+   * single-token approval all qualify. Strictly wider than a raw
+   * owner()-equality test, which refuses an approved/operator delegate the
+   * chain would accept.
+   *
+   * Falls back to owner()-equality when isAuthorised is absent from this
+   * registry deployment (a bare revert on the probe) so a missing accessor
+   * never turns into a refusal. `owner` is always the node's registry-read
+   * owner (for informative messaging), independent of which path decided
+   * `authorised`.
+   */
+  async checkNodeAuthorization(node: string, account: string): Promise<AuthorizationResult> {
+    this.ensureConnected();
+    const owner = (await withTimeout(
+      this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [node]),
+      30000, "owner",
+    )) as string | null;
+    const authorised = await this.probeIsAuthorised(node, account);
+    if (authorised !== null) return { authorised, owner };
+    // isAuthorised absent on this registry deployment — fall back to the
+    // pre-existing ownership-equality check rather than refusing outright.
+    return { authorised: owner !== null && owner.toLowerCase() === account.toLowerCase(), owner };
+  }
+
   /** Live transfer-fee quote. transferFloor is a pure PopRules view — it
    *  classifies the label and reads both tiers, so it works BEFORE the name is
    *  registered (unlike quoteTransferFee, which reverts on an unregistered token). */
@@ -3574,24 +3732,23 @@ export class DotNS {
     this.ensureConnected();
     const fullName = `${sublabel}.${parentLabel}.${this._tld}`;
     assertNotZeroRecipient(toH160, fullName);
-    const parentNode = namehash(`${parentLabel}.${this._tld}`);
-    const subnode = namehash(fullName);
+    const { parentNode, subnode } = computeSubnodeIds(sublabel, parentLabel, this._tld);
 
-    // Only the parent owner may reassign a subname. Check parent ownership up
-    // front so the failure is actionable rather than a bare registry revert.
-    const parentOwner = (await withTimeout(
-      this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [parentNode]),
-      30000, "owner",
-    )) as string | null;
+    // Only an account the registry deems authorised over the parent node may
+    // reassign a subname — checked via isAuthorised(parentNode, account), the
+    // same rule setSubnodeOwner itself enforces (owner, operator-for-all, or
+    // single-token approval; see checkNodeAuthorization). Check up front so
+    // the failure is actionable rather than a bare registry revert.
+    const { authorised: parentAuthorised, owner: parentOwner } = await this.checkNodeAuthorization(parentNode, this.evmAddress!);
     if (!parentOwner || parentOwner === zeroAddress) {
       throw new Error(`Cannot transfer ${fullName}: parent ${parentLabel}.${this._tld} is not registered.`);
     }
-    if (parentOwner.toLowerCase() !== this.evmAddress!.toLowerCase()) {
+    if (!parentAuthorised) {
       throw new Error(
         `Cannot transfer ${fullName}: it is a subname, which only the owner of the parent ` +
-        `${parentLabel}.${this._tld} can reassign (subnames are not transferable tokens). Parent is owned ` +
-        `by ${parentOwner}, but the signer is ${this.evmAddress}. Sign as the parent owner ` +
-        `(e.g. pass its --mnemonic).`,
+        `${parentLabel}.${this._tld} (or an account it has approved) can reassign (subnames are not ` +
+        `transferable tokens). Parent is owned by ${parentOwner}, but the signer is ${this.evmAddress} ` +
+        `and is not approved. Sign as the parent owner, or as an approved account (e.g. pass its --mnemonic).`,
       );
     }
 
@@ -3657,7 +3814,7 @@ export class DotNS {
     // contractCall on DOTNS_REGISTRY.owner(node). This is only needed for
     // subdomain deploys which are a minority path.
     if (!this.clientWrapper) return { owned: false, owner: null };
-    const node = namehash(`${sublabel}.${parentLabel}.${this._tld}`);
+    const { subnode: node } = computeSubnodeIds(sublabel, parentLabel, this._tld);
     try {
       const owner = await withTimeout(this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [node]), 30000, "owner");
       if (!owner || owner === zeroAddress) return { owned: false, owner: null };
@@ -3670,8 +3827,7 @@ export class DotNS {
     return withSpan("deploy.dotns.register-subdomain", `2a. register ${sublabel}.${parentLabel}.${this._tld}`, {}, async () => {
       this.ensureConnected();
       console.log(`\n   Registering subdomain ${sublabel}.${parentLabel}.${this._tld}...`);
-      const parentNode = namehash(`${parentLabel}.${this._tld}`);
-      const subnodeNode = namehash(`${sublabel}.${parentLabel}.${this._tld}`);
+      const { parentNode, subnode: subnodeNode } = computeSubnodeIds(sublabel, parentLabel, this._tld);
       const subnodeRecord = { parentNode, subLabel: sublabel, parentLabel, owner: this.evmAddress! };
 
       // verifyEffect: mirrors setContenthash/setTextRecord. Guards the nonce-advance
@@ -3852,7 +4008,7 @@ export class DotNS {
       {},
       async () => {
         this.ensureConnected();
-        const node = namehash(`${domainName}.${this._tld}`);
+        const node = computeDomainNode(domainName, this._tld);
         const expectedContenthash = contenthashHex.toLowerCase();
 
         let contenthashSkipped = false;
@@ -3935,7 +4091,7 @@ export class DotNS {
   async setContenthash(domainName: string, contenthashHex: string, opts: { feeAsset?: "pgas" } = {}): Promise<{ node: string }> {
     return withSpan("deploy.dotns.set-contenthash", "2b. set-contenthash", {}, async () => {
       this.ensureConnected();
-      const node = namehash(`${domainName}.${this._tld}`);
+      const node = computeDomainNode(domainName, this._tld);
       // Decode the contenthash hex to the IPFS CID string the CLI expects.
       let ipfsCid: string | null = null;
       if (contenthashHex && contenthashHex !== "0x") {
@@ -4078,7 +4234,7 @@ export class DotNS {
    */
   async ensureContentResolver(domainName: string): Promise<{ changed: boolean }> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.${this._tld}`);
+    const node = computeDomainNode(domainName, this._tld);
     const target = this._contracts.DOTNS_CONTENT_RESOLVER;
     let current: unknown = null;
     try {
@@ -4112,7 +4268,7 @@ export class DotNS {
   /** Read a text record off `DOTNS_CONTENT_RESOLVER`. Returns `""` when unset. */
   async getTextRecord(domainName: string, key: string): Promise<string> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.${this._tld}`);
+    const node = computeDomainNode(domainName, this._tld);
     // #1060: an unset key legitimately returns empty `0x` — contractCallNullable
     // (not the throwing contractCall) so this keeps the "" contract the doc above
     // promises instead of throwing.
@@ -4133,7 +4289,7 @@ export class DotNS {
     return withSpan("deploy.dotns.set-text", `2c. set-text ${key}`, {}, async () => {
       this.ensureConnected();
       console.log(`   Setting text[${key}]: ${value}`);
-      const node = namehash(`${domainName}.${this._tld}`);
+      const node = computeDomainNode(domainName, this._tld);
 
       // Pre-check: skip the tx if already set to the same value (mirrors
       // setContenthash's pre-check above). Reuses getTextRecord, which
@@ -4236,7 +4392,7 @@ export class DotNS {
     }
     return withSpan("deploy.dotns.set-text-batch", `2c. set-text batch (${entries.length})`, {}, async () => {
       this.ensureConnected();
-      const node = namehash(`${domainName}.${this._tld}`);
+      const node = computeDomainNode(domainName, this._tld);
       const calls = entries.map((e) => {
         console.log(`   Setting text[${e.key}]: ${e.value}`);
         return {
@@ -4294,7 +4450,7 @@ export class DotNS {
 
   async getContenthash(domainName: string): Promise<string> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.${this._tld}`);
+    const node = computeDomainNode(domainName, this._tld);
     // #1060: a first-time deploy (no contenthash ever set) legitimately reads
     // back empty `0x` here. getContenthash has callers with no try/catch around
     // this call (verifyEffect's poll loop and the final read-back in

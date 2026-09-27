@@ -14278,16 +14278,21 @@ describe("paseo-next-v2 E2E harness wiring", () => {
   test("custom-env verification helper forwards nativeToEthRatio", () => {
     const verifyHelper = fs.readFileSync("test/helpers/e2e-verify.js", "utf-8");
     assert.ok(
-      /nativeToEthRatio:\s*resolved\.nativeToEthRatio/.test(verifyHelper),
-      "test/helpers/e2e-verify.js must pass nativeToEthRatio through when env-specific DotNS reads are requested",
+      /dotnsConnectOptions/.test(verifyHelper),
+      "test/helpers/e2e-verify.js must take its DotNS connect options from the shared env helper, which forwards nativeToEthRatio",
     );
   });
 
   test("custom-env E2E writer paths forward env-specific DotNS options in both connect sites", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /async function resolveDotnsEnvConnectOptions\(\)[\s\S]{0,500}nativeToEthRatio:\s*resolved\.nativeToEthRatio/.test(e2e),
-      "test/e2e.test.js must define a shared env-connect helper that forwards nativeToEthRatio",
+      /dotnsConnectOptions:\s*\{[\s\S]{0,500}nativeToEthRatio:\s*resolved\.nativeToEthRatio/.test(envHelper),
+      "test/helpers/e2e-env.js must build the DotNS connect options and forward nativeToEthRatio",
+    );
+    assert.ok(
+      /async function resolveE2eTld\(\)\s*\{\s*return \(await resolveE2eEnv\(/.test(e2e),
+      "test/e2e.test.js must resolve the TLD through the shared env helper, not a literal fallback",
     );
     const helperCalls = e2e.match(/resolveDotnsEnvConnectOptions\(\)/g) ?? [];
     assert.ok(
@@ -14310,9 +14315,10 @@ describe("paseo-next-v2 E2E harness wiring", () => {
 
   test("custom-env roundtrip tests derive the gateway from environments.json", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /async function resolveE2eGateway\(\)[\s\S]{0,400}env\?\.ipfs/.test(e2e),
-      "test/e2e.test.js must derive the gateway from the selected PAD_ENV ipfs endpoint",
+      /gateway:\s*resolved\.ipfs/.test(envHelper),
+      "test/helpers/e2e-env.js must derive the gateway from the resolved environment's ipfs endpoint",
     );
     assert.ok(
       /const gateway = await resolveE2eGateway\(\)/.test(e2e),
@@ -14322,9 +14328,10 @@ describe("paseo-next-v2 E2E harness wiring", () => {
 
   test("S8 fault proxy follows the selected env and preserves env-aware CLI args", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /async function resolveE2eBulletinRpc\(\)[\s\S]{0,220}resolveEndpoints\(doc, PAD_ENV\)\.bulletin\[0\]/.test(e2e),
-      "S8 must resolve the fault-proxy upstream from environments.json when PAD_ENV is set",
+      /bulletin:\s*resolved\.bulletin\[0\]/.test(envHelper),
+      "S8 must resolve the fault-proxy upstream from environments.json, not a hardcoded endpoint",
     );
     assert.ok(
       /startFaultProxy\(\{[\s\S]{0,220}mode: "once"[\s\S]{0,220}upstream: await resolveE2eBulletinRpc\(\)/.test(e2e),
@@ -14460,8 +14467,8 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.doesNotMatch(sExt, /require\.resolve\("bulletin-deploy"\)/, "S-ext must not use CJS require.resolve on the ESM/export-mapped package");
 
     const s7Script = fs.readFileSync("scripts/e2e-sigint-scenario.mjs", "utf-8");
-    assert.match(s7Script, /const envFlag = PAD_ENV \? \["--env", PAD_ENV\] : \[\]/, "S7 harness must forward PAD_ENV to both deploy invocations");
-    assert.match(s7Script, /const LABEL = process\.env\.LABEL \?\? \(PAD_ENV === "paseo-next-v2" \? "e2epoolns01" : "e2epool"\)/, "S7 harness must default to the v2 NoStatus pool label");
+    assert.match(s7Script, /const envFlag = \["--env", ENV_ID\]/, "S7 harness must forward the resolved env to both deploy invocations");
+    assert.match(s7Script, /const LABEL = process\.env\.LABEL \?\? \(ENV_ID === "paseo-next-v2" \? "e2epoolns01" : "e2epool"\)/, "S7 harness must default to the v2 NoStatus pool label");
     // e2eownedns03, not e2eownedns02: the Asset Hub re-genesis emptied the
     // .paseo namespace and a third party squatted e2eownedns02.paseo before
     // this fixture was re-provisioned (verified live via checkOwnership).

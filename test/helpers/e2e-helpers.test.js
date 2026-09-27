@@ -7,7 +7,8 @@ import { mutateFixture } from "./e2e-fixture.js";
 import { runBulletinDeploy } from "./e2e-cli.js";
 import { classifyFixtureState } from "./e2e-failure.js";
 import { buildManifestSidecar, buildPvmAppManifest } from "./e2e-manifest-fixture.js";
-import { preflightProductConfig } from "@parity/polkadot-app-deploy";
+import { resolveE2eEnv, resolveE2eEnvId } from "./e2e-env.js";
+import { preflightProductConfig, DEFAULT_ENV_ID } from "@parity/polkadot-app-deploy";
 
 describe("mutateFixture", () => {
   test("copies fixture to a fresh tempdir and injects runTag into index.html", async () => {
@@ -393,5 +394,44 @@ describe("buildManifestSidecar: App v2 PolkaVM executable", () => {
       fs.rmSync(sidecarDir, { recursive: true, force: true });
       fs.rmSync(buildDir, { recursive: true, force: true });
     }
+  });
+});
+
+// A run with no PAD_ENV is a DEFAULT_ENV_ID run: deploy() resolves
+// `options.env ?? DEFAULT_ENV_ID`, so the TLD, gateway, Bulletin endpoint and
+// DotNS contracts the harness reads must come from that same env.
+describe("resolveE2eEnv", () => {
+  test("no PAD_ENV resolves the env the CLI itself would pick", () => {
+    for (const unset of [null, undefined, ""]) {
+      assert.equal(resolveE2eEnvId(unset), DEFAULT_ENV_ID,
+        `>> FAIL: resolveE2eEnv: ${JSON.stringify(unset)} must resolve to DEFAULT_ENV_ID, the env deploy() falls back to`);
+    }
+  });
+
+  test("an explicit env is used as given", () => {
+    assert.equal(resolveE2eEnvId("devnet"), "devnet",
+      ">> FAIL: resolveE2eEnv: an explicit PAD_ENV must win over the default");
+  });
+
+  test("the unset path and the explicit default path describe the same chain", async () => {
+    const implicit = await resolveE2eEnv(null);
+    const explicit = await resolveE2eEnv(DEFAULT_ENV_ID);
+    assert.deepEqual(implicit, explicit,
+      ">> FAIL: resolveE2eEnv: the no-env path diverged from DEFAULT_ENV_ID, so the harness reads a different chain than the deploy writes");
+  });
+
+  test("resolves per-environment values rather than a fixed literal", async () => {
+    const dflt = await resolveE2eEnv(null);
+    const devnet = await resolveE2eEnv("devnet");
+    for (const key of ["tld", "bulletin", "gateway"]) {
+      assert.notEqual(dflt[key], devnet[key],
+        `>> FAIL: resolveE2eEnv: ${key} is identical across two environments, so it is not being read from environments.json`);
+    }
+    assert.equal(dflt.dotnsConnectOptions.rpc, dflt.dotnsConnectOptions.assetHubEndpoints[0],
+      ">> FAIL: resolveE2eEnv: the DotNS rpc must be the resolved env's own Asset Hub, not a legacy default");
+    assert.ok(dflt.dotnsConnectOptions.nativeToEthRatio,
+      ">> FAIL: resolveE2eEnv: nativeToEthRatio must be forwarded; DotNS prices the register deposit with it");
+    assert.ok(dflt.dotnsConnectOptions.contracts,
+      ">> FAIL: resolveE2eEnv: the default env configures contracts; dropping them falls back to DotNS's hardcoded pre-redeploy addresses");
   });
 });

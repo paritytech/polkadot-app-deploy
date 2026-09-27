@@ -71,6 +71,24 @@ const DOMAIN_RE = new RegExp(`^${LABEL}(\\.${LABEL})*\\.${TLD_FRAGMENT}$`, "i");
 // LABEL above, anchored to the whole key.
 const PRODUCT_LABEL_RE = new RegExp(`^${LABEL}$`);
 
+// #1487: the top-level `ProductConfig` shape, per src/manifest/types.ts.
+// Unlike an unrecognised icon.format or trustedProducts grant value — which
+// the RFC requires a *reader* (validateRootManifest) to tolerate for
+// forward-compat (RFC lines 464, 492-494) — there is no such requirement for
+// an unrecognised top-level key on the *author-facing* config. Keeping this
+// permissive let a typo'd or unsupported key (e.g. #1484's `trustedProducts`
+// mistake) deploy green while the field was silently dropped. Deliberately
+// scoped to validateProductConfig only: validateRootManifest stays as
+// tolerant of unknown top-level manifest fields as it already is.
+const PRODUCT_CONFIG_TOP_LEVEL_FIELDS = [
+  "domain",
+  "displayName",
+  "description",
+  "icon",
+  "executables",
+  "trustedProducts",
+] as const;
+
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -494,6 +512,9 @@ export function validateProductConfig(input: unknown): ValidationResult<ProductC
   if (!isPlainObject(input)) {
     return { ok: false, errors: ["product config must be an object (did you forget `export default`?)"] };
   }
+  errors.push(
+    ...rejectUnknownFields(input, PRODUCT_CONFIG_TOP_LEVEL_FIELDS, "product config "),
+  );
   if (!isNonEmptyString(input.domain) || !DOMAIN_RE.test(input.domain)) {
     errors.push(
       "product config domain must be a non-empty dotNS name ending in a TLD of 2 or more letters (e.g. 'myapp.dot')",

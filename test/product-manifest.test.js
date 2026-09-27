@@ -108,6 +108,42 @@ describe("validateRootManifest", () => {
     assert.equal(result.ok, false);
   });
 
+  // #1487 regression guard: the fix for #1487 only adds an unknown-top-level-field
+  // check to validateProductConfig. These two cases are the RFC-protected
+  // leniency validateRootManifest must keep even after that change — RFC
+  // lines 464/492: "Two things are exempt and MUST NOT fail validation: an
+  // unrecognised grant value in trustedProducts" (icon.format's own RFC-464
+  // exemption is a separate, pre-existing gap — see PR description).
+  test("tolerates an unrecognised trustedProducts grant value (RFC line 492 — read side must not fail)", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: "png" },
+      trustedProducts: { dim2: ["context", "some-future-grant"] },
+    });
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest unrecognised-grant-tolerated: a Host MUST ignore an unrecognised trustedProducts grant value and keep validating, per RFC line 492; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("tolerates a TLD-suffixed trustedProducts key (RFC line 494 — entry is inert, not invalid)", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: "png" },
+      trustedProducts: { "dim2.paseo": ["context"] },
+    });
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest tld-suffixed-key-inert: a TLD-suffixed trustedProducts key resolves to a name that does not exist and must be inert, not a validation error, per RFC line 494; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
   test("rejects non-object inputs", () => {
     assert.equal(validateRootManifest(null).ok, false);
     assert.equal(validateRootManifest("string").ok, false);
@@ -412,6 +448,102 @@ describe("validateProductConfig", () => {
   test("accepts a full four-variant config", () => {
     const result = validateProductConfig(VALID_CONFIG);
     assert.equal(result.ok, true);
+  });
+
+  // #1487: an unknown top-level field must be reported, not silently
+  // dropped — a typo'd or unsupported key deploys green today and the
+  // field simply never reaches chain (this is how #1484 presented).
+  test("rejects an unknown top-level field", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, banana: "oops" });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig unknown-top-level-field: a config carrying an unrecognised top-level key must not validate silently",
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'banana'")),
+      `>> FAIL: validateProductConfig unknown-top-level-field: expected an error naming the offending field 'banana'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("rejects a misspelled known field ('trustedProduct' singular) as unknown — the exact #1484 failure mode", () => {
+    const { trustedProducts, ...rest } = VALID_CONFIG;
+    const result = validateProductConfig({
+      ...rest,
+      trustedProduct: { dim2: ["context"] },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig typo-top-level-field: a typo'd field name (trustedProduct vs trustedProducts) must be reported, not silently ignored",
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'trustedProduct'")),
+      `>> FAIL: validateProductConfig typo-top-level-field: expected an error naming the typo'd field 'trustedProduct'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("reports every unknown top-level field, not just the first", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      banana: "oops",
+      kiwi: "also oops",
+    });
+    assert.equal(result.ok, false, ">> FAIL: validateProductConfig multiple-unknown-top-level-fields: expected rejection");
+    assert.ok(
+      result.errors.some((e) => e.includes("'banana'")) &&
+        result.errors.some((e) => e.includes("'kiwi'")),
+      `>> FAIL: validateProductConfig multiple-unknown-top-level-fields: expected an error naming each offending field; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // A typo on a REQUIRED field is the case that compounds: the key is
+  // unknown AND the field it was meant to be is now missing, so the operator
+  // gets both messages. Worth pinning because the order matters — the
+  // unknown-field check runs first, so the actionable "you wrote 'domian'"
+  // leads and the generic "domain must be…" trails. The two tests above only
+  // typo an optional field, where the second message never fires.
+  test("a typo on a required field reports both the unknown key and the missing field", () => {
+    const { domain, ...rest } = VALID_CONFIG;
+    const result = validateProductConfig({ ...rest, domian: "myapp.dot" });
+    assert.equal(result.ok, false, ">> FAIL: validateProductConfig required-field-typo: expected rejection");
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'domian'")),
+      `>> FAIL: validateProductConfig required-field-typo: expected an error naming the typo'd key 'domian'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("domain must be")),
+      `>> FAIL: validateProductConfig required-field-typo: expected the missing-required-field error alongside the unknown-key one, so the operator sees what the key should have been; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // Regression guard: the new top-level-field check must not interfere with
+  // the pre-existing, RFC-required strictness *within* known fields on this
+  // (publish) side — icon.format (RFC line 337) and a trustedProducts grant
+  // value (RFC line 338) both still MUST fail validation here, same as
+  // before #1487.
+  test("still rejects an unrecognised icon.format (RFC line 337 — strict on the publishing side, unchanged)", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      icon: { path: "./icon.png", format: "webp" },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig icon-format-still-strict: publish-side icon.format strictness must be unaffected by the #1487 top-level-field fix",
+    );
+  });
+
+  test("still rejects an unrecognised trustedProducts grant value (RFC line 338 — strict on the publishing side, unchanged)", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["some-future-grant"] },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig grant-value-still-strict: publish-side trustedProducts grant strictness must be unaffected by the #1487 top-level-field fix",
+    );
   });
 
   // The read-side tolerance for an unrecognised icon.format does not extend

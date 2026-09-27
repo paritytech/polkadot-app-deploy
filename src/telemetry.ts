@@ -487,7 +487,7 @@ export function computeDeployOutcome(
 //   connection                     — WS disconnect, heartbeat timeout, ChainHead disjointed
 //   naming.pop_required            — label requires ProofOfPersonhoodFull but signer is NoStatus
 //   naming.nostatus_required       — label requires NoStatus but signer has ProofOfPersonhood
-//   naming.contract_unavailable    — DotNS contract ABI call returned zero data (contract not deployed or wrong address)
+//   naming.contract_unavailable    — no contract at the probed address: an ABI call returned zero data, classifyProtocolVersion's hasCode===false, or the environment config carries a wrong/absent address
 //   dotns.abi_decode_empty          — raw ABI decode of zero/empty ("0x") data outside the DotNS-guard wrapper path
 //   naming.already_owned           — domain is already owned by a different EVM address
 //   naming.governance_reserved     — label DotNS naming rules forbid registering (Reserved/trailing-digit/hyphen-base), decided by ownership in preflight (#1185)
@@ -622,7 +622,10 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // an actionable wrapper instead of letting the raw viem message above reach a
   // caller. Same failure family (a DotNS contract read came back empty) — classify
   // it the same way instead of letting it fall into 'unknown'.
-  [/No contract deployed at .+ returned empty success data/i, 'naming.contract_unavailable'],
+  //
+  // Phrase alone: classifyProtocolVersion (src/dotns-protocol.ts) throws it with
+  // a different ending (#272). Those two are its only producers in src/.
+  [/No contract deployed at /i, 'naming.contract_unavailable'],
   [/Contract call returned empty data — contract=/i, 'naming.contract_unavailable'],
   // Same failure family caught one step earlier: the environment config carries
   // a zero/absent address, so the call is refused before it is made rather than

@@ -11783,6 +11783,97 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     assert.match(report, /nightly-pr-coverage/, "nightly-report needs: must include nightly-pr-coverage");
   });
 
+  // ---- release gate installs the published tarball, not a tag source-build
+  // (issue #270). nightly-pr-coverage used to always self-checkout + `npm ci`
+  // (triggering the prepare/build script) and drive test/e2e.test.js against
+  // the local source-built bin/polkadot-app-deploy — on a release run this
+  // validated the tagged source tree, never the bytes `npm install` actually
+  // gives consumers. Every other nightly scenario job (nightly-s8, nightly-s9,
+  // etc.) already branches on build-nightly's test-version/ref outputs via a
+  // BULLETIN_DEPLOY_REF/BULLETIN_DEPLOY_VERSION job-level env + a source-build
+  // step gated on BULLETIN_DEPLOY_REF != '' vs. an npm-install step gated on
+  // BULLETIN_DEPLOY_REF == ''; this job now follows the exact same convention.
+
+  test(".github/workflows/e2e.yml: nightly-pr-coverage wires BULLETIN_DEPLOY_REF/VERSION from build-nightly outputs", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const job = jobBlock(e2e, "nightly-pr-coverage");
+    assert.ok(job, "nightly-pr-coverage job must exist");
+
+    assert.match(
+      job,
+      /^ {6}BULLETIN_DEPLOY_VERSION:\s*\$\{\{\s*needs\.build-nightly\.outputs\.test-version\s*\}\}/m,
+      "nightly-pr-coverage's job-level env must set BULLETIN_DEPLOY_VERSION from build-nightly's test-version output",
+    );
+    assert.match(
+      job,
+      /^ {6}BULLETIN_DEPLOY_REF:\s*\$\{\{\s*needs\.build-nightly\.outputs\.polkadot-app-deploy-ref\s*\}\}/m,
+      "nightly-pr-coverage's job-level env must set BULLETIN_DEPLOY_REF from build-nightly's polkadot-app-deploy-ref output",
+    );
+
+    // DEPLOY_TAG must also come from build-nightly's resolved output (which is
+    // "e2e-ci-release" on a release run) rather than a hardcoded "nightly"
+    // string that would mislabel deploy spans/telemetry during a release gate.
+    assert.match(
+      job,
+      /^ {6}DEPLOY_TAG:\s*\$\{\{\s*needs\.build-nightly\.outputs\.deploy-tag\s*\}\}/m,
+      "nightly-pr-coverage's job-level env must set DEPLOY_TAG from build-nightly's deploy-tag output, not hardcode e2e-ci-nightly",
+    );
+    assert.doesNotMatch(job, /DEPLOY_TAG:\s*e2e-ci-nightly\b/, "nightly-pr-coverage must not hardcode DEPLOY_TAG=e2e-ci-nightly");
+  });
+
+  test(".github/workflows/e2e.yml: nightly-pr-coverage installs the published RC from npm on release, not a source build", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const job = jobBlock(e2e, "nightly-pr-coverage");
+    assert.ok(job, "nightly-pr-coverage job must exist");
+
+    // The source-build step must now be gated off (skipped on release/pinned
+    // dispatch), matching the convention every sibling nightly-s* job uses.
+    assert.match(
+      job,
+      /- name: Build polkadot-app-deploy from source\s*\n\s*if:\s*env\.BULLETIN_DEPLOY_REF\s*!=\s*''/,
+      "nightly-pr-coverage must gate its source-build step on BULLETIN_DEPLOY_REF != ''",
+    );
+
+    // The install-from-npm step must be gated on the complementary condition,
+    // resolve V from BULLETIN_DEPLOY_VERSION (falling back to latest only for
+    // an unpinned workflow_dispatch — never silently on a release run, since
+    // build-nightly always resolves a concrete version for the release event),
+    // and must not silently no-op.
+    assert.match(
+      job,
+      /- name: Install polkadot-app-deploy from npm\s*\n\s*if:\s*env\.BULLETIN_DEPLOY_REF\s*==\s*''/,
+      "nightly-pr-coverage must gate its npm-install step on BULLETIN_DEPLOY_REF == ''",
+    );
+    assert.match(
+      job,
+      /V="\$\{BULLETIN_DEPLOY_VERSION:-latest\}"/,
+      "nightly-pr-coverage's install step must resolve V from BULLETIN_DEPLOY_VERSION",
+    );
+    assert.match(
+      job,
+      /npm install --no-save "@parity\/polkadot-app-deploy@\$\{V\}" ws/,
+      "nightly-pr-coverage must npm-install @parity/polkadot-app-deploy at the resolved version",
+    );
+
+    // The test driver (test/e2e.test.js) and bin/polkadot-app-deploy resolve
+    // imports from ../dist — the installed package's dist must be symlinked
+    // in so those imports run against the published tarball, not local source.
+    assert.match(
+      job,
+      /ln -sf node_modules\/@parity\/polkadot-app-deploy\/dist dist/,
+      "nightly-pr-coverage's install step must symlink the npm-installed package's dist/ over the local one",
+    );
+
+    // Job name must report the tested version rather than a blanket "@ HEAD"
+    // once a release/pinned-dispatch run is actually installing from npm.
+    assert.match(
+      job,
+      /^ {4}name:\s*Nightly @ \$\{\{\s*needs\.build-nightly\.outputs\.test-version\s*\|\|\s*'HEAD'\s*\}\}/m,
+      "nightly-pr-coverage's job name must reflect the tested version, falling back to 'HEAD'",
+    );
+    assert.doesNotMatch(job, /^ {4}name:\s*Nightly @ HEAD\b/m, "nightly-pr-coverage must not hardcode 'Nightly @ HEAD' in its job name");
+  });
+
   // ---- publish-wait gate (issue #23) -------------------------------------
   // build-nightly must wait for publish.yml to complete BEFORE polling npm.
   // Without this gate, the 10-min npm poll races the human approval in the

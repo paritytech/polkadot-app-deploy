@@ -977,7 +977,11 @@ jobs:
   # docs-internal/superpowers/specs/2026-05-22-ci-restructure-design.md.
 
   nightly-pr-coverage:
-    name: Nightly @ HEAD · ${{ matrix.scenario }} ${{ matrix.signer }}/${{ matrix.merkle }}
+    # Reports the actual tested version instead of a blanket "@ HEAD" now that
+    # a release/pinned-dispatch run installs @parity/polkadot-app-deploy from
+    # npm below (issue #270) rather than always building the checkout.
+    # Mirrors bulletin-deploy's identical nightly-pr-coverage job name.
+    name: Nightly @ ${{ needs.build-nightly.outputs.test-version || 'HEAD' }} · ${{ matrix.scenario }} ${{ matrix.signer }}/${{ matrix.merkle }}
     # Waits for the full Alice-pool nonce chain (s1-pool→s5→s6→s-ext-signer).
     # E2E_POOL_LABEL (below) uses a dedicated domain (e2eprpool01) to avoid domain
     # contention with nightly-s1-pool on e2epoolns01.dot. But the pool accounts all
@@ -994,11 +998,17 @@ jobs:
       (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      DEPLOY_TAG: ${{ needs.build-nightly.outputs.deploy-tag }}
+      BULLETIN_DEPLOY_VERSION: ${{ needs.build-nightly.outputs.test-version }}
+      BULLETIN_DEPLOY_REF: ${{ needs.build-nightly.outputs.polkadot-app-deploy-ref }}
     strategy:
       fail-fast: false
       matrix:
-        # No env fan-out here: nightly-pr-coverage tests HEAD source code rather
-        # than the deployed reusable-workflow artifact. Mixing a free env dimension
+        # No env fan-out here: nightly-pr-coverage tests bin/polkadot-app-deploy
+        # directly (source-built on schedule/unpinned dispatch, npm-installed on
+        # release/pinned dispatch — see BULLETIN_DEPLOY_REF below) rather than
+        # the deployed reusable-workflow artifact. Mixing a free env dimension
         # with the include list would produce additive (not cartesian) expansion —
         # GitHub appends include entries that share no keys with the free dimension
         # instead of merging them. Single-env (selected_env) is correct for this job.
@@ -1040,7 +1050,18 @@ jobs:
           # anywhere before this leg.
           - { scenario: s-transfer-subname,       signer: pool,   merkle: js,   poolIndex: 11 }
     steps:
+      # BULLETIN_DEPLOY_REF is only ever github.sha (schedule / unpinned
+      # dispatch) or empty (release / pinned dispatch — see build-nightly's
+      # version-resolution step). An empty `ref:` input is treated by
+      # actions/checkout the same as omitting it, i.e. the triggering commit —
+      # same as the bare checkout this replaces — so this is a no-op on the
+      # source-build path and only changes behavior on the npm-install path
+      # below, where the checkout is still needed for this repo's own test
+      # files and the local ./.github/actions/npm-retry composite action.
       - uses: actions/checkout@v6
+        with:
+          repository: paritytech/polkadot-app-deploy
+          ref: ${{ env.BULLETIN_DEPLOY_REF || '' }}
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
@@ -1072,10 +1093,32 @@ jobs:
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo'
         run: ipfs init
-      - name: npm ci
+      - name: Build polkadot-app-deploy from source
+        if: env.BULLETIN_DEPLOY_REF != ''
         uses: ./.github/actions/npm-retry
         with:
           run: npm ci
+      # On release (and a pinned workflow_dispatch), build-nightly resolves
+      # test-version to the RC being gated and this leg must exercise the
+      # published tarball's bytes, not a source build of the tag (issue #270 —
+      # the gate was validating source, not what `npm install` actually gives
+      # consumers). Mirrors nightly-s8/nightly-s9's identical install step.
+      - name: Install polkadot-app-deploy from npm
+        if: env.BULLETIN_DEPLOY_REF == ''
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            V="${BULLETIN_DEPLOY_VERSION:-latest}"
+            # ws is a runtime dependency of the published package, but the
+            # npm-install path needs it resolvable at the top level for
+            # test/helpers/ws-fault-proxy.mjs's bare `import "ws"` — same
+            # precaution nightly-s8/nightly-s9 take.
+            npm install --no-save "@parity/polkadot-app-deploy@${V}" ws
+            # test/e2e.test.js's helpers and bin/polkadot-app-deploy itself
+            # resolve relative imports from ../dist — symlink the installed
+            # package's dist so those imports run against the published
+            # tarball instead of a local build (there is none on this path).
+            ln -sf node_modules/@parity/polkadot-app-deploy/dist dist
       - name: Run scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -1084,7 +1127,6 @@ jobs:
           E2E_SIGNER: ${{ matrix.signer }}
           E2E_MERKLE: ${{ matrix.merkle }}
           PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
-          DEPLOY_TAG: e2e-ci-nightly
           SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
           # Dedicated pool fixture domain — avoids nonce contention with nightly-s1-pool
           # on e2epoolns01.dot. First run registers e2eprpool01.dot automatically.

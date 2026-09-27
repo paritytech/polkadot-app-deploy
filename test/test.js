@@ -30,7 +30,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingTransactions, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
@@ -8500,6 +8500,73 @@ describe("remaining quota helpers", () => {
     assert.strictEqual(remainingTransactions(exhausted), 0n,
       ">> FAIL: remainingTransactions: an over-consumed allowance must report 0, never a negative number");
   });
+
+  test("remainingStoreBytes subtracts STORE bytes used, ignoring the renew counter", () => {
+    const auth = {
+      expiration: 10, transactionsAllowance: 10, transactionsUsed: 0,
+      bytesAllowance: 1_000n, bytesUsed: 400n, bytesPermanentUsed: 900n,
+    };
+    assert.strictEqual(remainingStoreBytes(auth), 600n,
+      ">> FAIL: remainingStoreBytes: must report bytesAllowance - bytesUsed (the priority-boost-relevant STORE counter), ignoring bytesPermanentUsed entirely — that's remainingRenewBytes' job");
+  });
+
+  test("remainingStoreBytes clamps at zero instead of reporting a negative budget", () => {
+    const over = {
+      expiration: 10, transactionsAllowance: 10, transactionsUsed: 0,
+      bytesAllowance: 100n, bytesUsed: 250n, bytesPermanentUsed: 0n,
+    };
+    assert.strictEqual(remainingStoreBytes(over), 0n,
+      ">> FAIL: remainingStoreBytes: store bytes can legitimately exceed the allowance (the pallet saturates, never gates) — must report 0, never negative");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// quotaHeadroomDimensions — bulletin #1547: which quota dimension(s) of `auth`
+// fall short of a caller's stated needs. Distinct from isAuthorizationSufficient
+// (expiry-only, unchanged) — this only compares quota, and callers must confirm
+// existence + non-expiry separately first.
+// ---------------------------------------------------------------------------
+describe("quotaHeadroomDimensions (bulletin #1547)", () => {
+  function mkAuth({ txsAllowance = 1000, txsUsed = 0, bytesAllowance = 100_000_000n, bytesUsed = 0n } = {}) {
+    return {
+      expiration: 999_999, transactionsAllowance: txsAllowance, transactionsUsed: txsUsed,
+      bytesAllowance, bytesUsed, bytesPermanentUsed: 0n,
+    };
+  }
+
+  test("fully sufficient auth (plenty of both) reports no exhausted dimensions", () => {
+    const auth = mkAuth();
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 5, bytes: 1_000n }), [],
+      ">> FAIL: quotaHeadroomDimensions: an account with far more than needed in both dimensions must report empty");
+  });
+
+  test("transactions below needs is flagged, bytes untouched", () => {
+    const auth = mkAuth({ txsAllowance: 10, txsUsed: 9 }); // 1 left
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 5 }), ["transactions"],
+      ">> FAIL: quotaHeadroomDimensions: 1 remaining tx against a need of 5 must flag 'transactions'");
+  });
+
+  test("bytes below needs is flagged only when needs.bytes is provided", () => {
+    const auth = mkAuth({ bytesAllowance: 1_000n, bytesUsed: 900n }); // 100 left
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1, bytes: 500n }), ["bytes"],
+      ">> FAIL: quotaHeadroomDimensions: 100 remaining store bytes against a need of 500 must flag 'bytes'");
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1 }), [],
+      ">> FAIL: quotaHeadroomDimensions: omitting needs.bytes must skip the bytes check entirely, not treat it as a need of 0");
+  });
+
+  test("both dimensions below needs are both flagged", () => {
+    const auth = mkAuth({ txsAllowance: 10, txsUsed: 10, bytesAllowance: 1_000n, bytesUsed: 1_000n });
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth, { transactions: 1, bytes: 1n }), ["transactions", "bytes"],
+      ">> FAIL: quotaHeadroomDimensions: an account exhausted on both counters must report both dimensions");
+  });
+
+  test("DEFAULT_AUTHORIZATION_NEEDS is small enough that a fresh 1000tx/100MB grant clears it", () => {
+    const auth = mkAuth();
+    assert.deepStrictEqual(quotaHeadroomDimensions(auth), [],
+      ">> FAIL: DEFAULT_AUTHORIZATION_NEEDS must not falsely flag a freshly-granted, fully-unused authorization");
+    assert.deepStrictEqual(DEFAULT_AUTHORIZATION_NEEDS, { transactions: 1 },
+      ">> FAIL: DEFAULT_AUTHORIZATION_NEEDS must stay a small, documented constant (regression pin — a silent bump here changes every pre-chunking call site's behavior)");
+  });
 });
 
 describe("fetchPoolAuthorizations reads authorization state through the runtime API", () => {
@@ -8566,6 +8633,63 @@ describe("ensureAuthorized quota awareness", () => {
       /cannot grant it/,
       "should throw mainnet error when auth is expired",
     );
+  });
+
+  // bulletin #1547 (check/warn half only): an unexpired-but-quota-low account is a
+  // DIFFERENT, softer condition than missing/expired — the chain never gates `store` on
+  // quota. polkadot-app-deploy never self-authorizes, so unlike bulletin-deploy there is
+  // no testnet top-up branch here at all: every quota-exhausted-but-unexpired account
+  // gets the same result — warn via the return value, never throw, never grant.
+  test("unexpired but quota-exhausted → returns quotaExhausted:true naming the dimension, and does NOT throw", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 10, txsUsed: 10 }); // 0 left, unexpired
+    const api = buildApi({ auth }); // no tx.* stub at all — a grant-path bug would crash on missing tx.*
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 5 } });
+    assert.deepStrictEqual(result, { quotaExhausted: true, dimensions: ["transactions"] },
+      ">> FAIL: bulletin #1547: an exhausted, unexpired account must report quotaExhausted:true naming the dimension, and must NOT throw");
+  });
+
+  test("never grants: an api stub with no tx.* at all must not be touched for a quota-exhausted account", async () => {
+    _resetTestnetCacheForTests();
+    // Deliberately no `tx` property anywhere on this stub. If ensureAuthorized ever tried
+    // to sign+submit an authorize_account extrinsic (the bulletin-deploy behavior this
+    // port explicitly excludes), it would throw a TypeError reading api.tx.* — this test
+    // pins that it never reaches for it.
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1, txsUsed: 1, bytesAllowance: 10n, bytesUsed: 10n });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 5, bytes: 100n } });
+    assert.strictEqual(result.quotaExhausted, true);
+    assert.deepStrictEqual(result.dimensions.sort(), ["bytes", "transactions"],
+      ">> FAIL: bulletin #1547: both dimensions exhausted must both be reported");
+  });
+
+  test("sufficient quota (needs met) → returns quotaExhausted:false", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1000, txsUsed: 0 });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test", { needs: { transactions: 500 } });
+    assert.deepStrictEqual(result, { quotaExhausted: false, dimensions: [] },
+      ">> FAIL: bulletin #1547: a fully-sufficient account must report quotaExhausted:false");
+  });
+
+  test("default needs (no opts.needs passed) does not flag a freshly-granted account", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 1000, txsUsed: 0 });
+    const api = buildApi({ auth });
+    const result = await ensureAuthorized(api, ADDRESS, "test"); // no needs at all — exercises DEFAULT_AUTHORIZATION_NEEDS
+    assert.deepStrictEqual(result, { quotaExhausted: false, dimensions: [] });
+  });
+
+  test("precheckedAuth skips the read entirely", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK + 100, txsAllowance: 10, txsUsed: 10 });
+    const api = { ...authApi(async () => { throw new Error("must not read — precheckedAuth was supplied"); }) };
+    const result = await ensureAuthorized(api, ADDRESS, "test", {
+      needs: { transactions: 1 },
+      precheckedAuth: { auth: { expiration: MOCK_BLOCK + 100, transactionsAllowance: 10, transactionsUsed: 10, bytesAllowance: 100n, bytesUsed: 0n, bytesPermanentUsed: 0n }, currentBlock: MOCK_BLOCK },
+    });
+    assert.deepStrictEqual(result, { quotaExhausted: true, dimensions: ["transactions"] },
+      ">> FAIL: bulletin #1547: precheckedAuth must be used directly instead of re-reading via the api");
   });
 });
 
@@ -9488,6 +9612,71 @@ function connectionErrorSubscribable() {
 const stubSigner = {};
 const STUB_SS58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
 const ONE_BYTE_CHUNK = new Uint8Array([0x42]);
+
+// ---------------------------------------------------------------------------
+// storeChunkedContent's quota-exhausted warning (bulletin #1547, check/warn
+// half only). polkadot-app-deploy never self-authorizes Bulletin storage, so
+// unlike bulletin-deploy there is no telemetry/re-grant path here — just a
+// console.warn and a guaranteed non-throw.
+// ---------------------------------------------------------------------------
+describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/warn half)", () => {
+  function authStubApi(authFields) {
+    return {
+      query: { System: { Number: { getValue: async () => 1000 } } },
+      ...authApi(async () => runtimeAuth({ expiresAt: 9_999_999, ...authFields }), { can_store: async () => true }),
+      tx: {
+        TransactionStorage: {
+          store_with_cid_config: () => ({
+            signSubmitAndWatch: (_signer, _opts) => normalSubscribable(),
+          }),
+        },
+      },
+    };
+  }
+
+  test("quota-exhausted, unexpired account → warns, does NOT throw", async () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      // txsAllowance:1/txsUsed:1 → 0 remaining, unexpired → quota-only exhaustion (transactions).
+      const api = authStubApi({ txsAllowance: 1, txsUsed: 1, bytesAllowance: 100_000_000n, bytesUsed: 0n });
+      await storeChunkedContent([ONE_BYTE_CHUNK], {
+        client: { destroy() {} },
+        unsafeApi: api,
+        signer: stubSigner,
+        ss58: STUB_SS58,
+        fetchNonce: async () => 100,
+      });
+      assert.ok(warnings.some(w => /exhausted/i.test(w)),
+        ">> FAIL: bulletin #1547: a one-line warning naming the exhausted allowance must be printed");
+      assert.ok(!warnings.some(w => /granting|granted|signAndSubmit/i.test(w)),
+        ">> FAIL: bulletin #1547 (check/warn half only): the warning must not claim or perform any re-authorization");
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+
+  test("sufficient quota → no warning, deploy proceeds silently on the auth front", async () => {
+    const savedWarn = console.warn;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      const api = authStubApi({ txsAllowance: 1000, txsUsed: 0, bytesAllowance: 100_000_000n, bytesUsed: 0n });
+      await storeChunkedContent([ONE_BYTE_CHUNK], {
+        client: { destroy() {} },
+        unsafeApi: api,
+        signer: stubSigner,
+        ss58: STUB_SS58,
+        fetchNonce: async () => 100,
+      });
+      assert.ok(!warnings.some(w => /exhausted/i.test(w)),
+        ">> FAIL: bulletin #1547: a fully-sufficient account must not print an exhausted-quota warning");
+    } finally {
+      console.warn = savedWarn;
+    }
+  });
+});
 
 describe("watchTransaction found:false handling", () => {
   test("normal success: reconnect NOT called", async () => {

@@ -159,10 +159,53 @@ export function remainingTransactions(auth: BulletinAuthorization): bigint {
   return left > 0 ? BigInt(left) : 0n;
 }
 
+// Bytes headroom on the STORE side (`bytes_used`) — the counter bulletin #1547 cares
+// about for the AllowanceBasedPriority boost, as opposed to remainingRenewBytes' PERMANENT
+// side (the only counter with a hard cap; see its comment above). Store bytes are
+// documented as saturating, never gating: this is a priority signal only, same status
+// as remainingTransactions. Clamped at 0 — a reporting input, never a negative budget.
+export function remainingStoreBytes(auth: BulletinAuthorization): bigint {
+  const left = auth.bytesAllowance - auth.bytesUsed;
+  return left > 0n ? left : 0n;
+}
+
+// What a caller needs from an authorization to keep its full priority (bulletin #1547):
+// one entry per chunk it is about to submit (`transactions`), and optionally the total
+// bytes it expects to store (`bytes`, omitted when the caller doesn't know it yet — see
+// DEFAULT_AUTHORIZATION_NEEDS).
+export interface AuthorizationNeeds {
+  transactions: number;
+  bytes?: bigint;
+}
+
+// "Sensible documented default" (bulletin #1547) for callers that check quota before they
+// know the real workload — the 3 provider-connect call sites in deploy.ts, and any external
+// caller of ensureAuthorized that doesn't pass `needs`. Deliberately small (below every real
+// grant size) so it only trips on an account that is ACTUALLY out of quota (0 remaining),
+// not one that merely has less than a fresh grant. storeChunkedContent — the only place that
+// knows the true chunk count — passes the real figures instead once chunking has happened.
+export const DEFAULT_AUTHORIZATION_NEEDS: AuthorizationNeeds = { transactions: 1 };
+
+// Which quota dimension(s) of `auth` fall short of `needs` (bulletin #1547). Callers must
+// confirm `auth` exists and is unexpired first (isAuthorizationSufficient) — this only
+// compares quota, not existence/expiry. Bytes are only checked when `needs.bytes` is provided.
+export function quotaHeadroomDimensions(
+  auth: BulletinAuthorization,
+  needs: AuthorizationNeeds = DEFAULT_AUTHORIZATION_NEEDS,
+): Array<"transactions" | "bytes"> {
+  const dims: Array<"transactions" | "bytes"> = [];
+  if (remainingTransactions(auth) < BigInt(needs.transactions)) dims.push("transactions");
+  if (needs.bytes != null && remainingStoreBytes(auth) < needs.bytes) dims.push("bytes");
+  return dims;
+}
+
 // True when `auth` exists and has not expired relative to `currentBlock` (also
 // takes a PoolAuthorization — same `expiration` field). A fresh read is always
 // active, so the expiry test is for cached/lagging ones; #1059's reauthorization
-// window generalizes it over a future deadline.
+// window generalizes it over a future deadline. Deliberately expiry-only: an
+// unexpired-but-quota-exhausted account is still "sufficient" here — the chain
+// never gates `store` on quota, only priority — so quota is checked separately
+// via quotaHeadroomDimensions (bulletin #1547), not folded into this predicate.
 export function isAuthorizationSufficient(
   auth: { expiration: number } | null | undefined,
   currentBlock: number,
@@ -233,9 +276,13 @@ export interface SelectionResult {
 }
 
 export function selectAccount(authorizations: PoolAuthorization[], random: () => number = Math.random, pinnedIndex?: number): SelectionResult {
-  // Uniform random selection over all accounts. ensureAuthorized() tops up the
-  // selected account immediately after this returns, so neither expired auths
-  // nor low quota are filtering concerns — they self-heal on every selection.
+  // Uniform random selection over all accounts. ensureAuthorized() runs immediately after
+  // this returns and throws if the selected account's authorization is missing/expired
+  // (polkadot-app-deploy never self-authorizes — see isAutoReauthorizeAllowed's comment
+  // above). An unexpired account with exhausted transaction/byte quota is NOT a filtering
+  // concern here either: it can still store, just loses the priority boost —
+  // storeChunkedContent's own check (bulletin #1547) warns on that separately, once the
+  // real chunk count is known. Quota is no longer purely self-healing filler either way.
   // Deterministic "best by transactions" was removed (#662) because it funneled
   // every deploy to one account, collapsing the effective pool to one.
   if (pinnedIndex != null) {
@@ -321,29 +368,55 @@ function clampU32(n: bigint, name: string): number {
   return Number(n);
 }
 
+export interface EnsureAuthorizedResult {
+  quotaExhausted: boolean;
+  dimensions: Array<"transactions" | "bytes">;
+}
+
 export async function ensureAuthorized(
   api: any,
   address: string,
   label?: string,
-): Promise<void> {
-  const [auth, currentBlock] = await Promise.all([
-    readAccountAuthorization(api, address),
-    api.query.System.Number.getValue(),
-  ]);
-  if (isAuthorizationSufficient(auth, currentBlock)) return;
+  // bulletin #1547 (check/warn half only): `needs` is what THIS caller is about to ask
+  // of the authorization — storeChunkedContent passes the real chunk count/bytes once
+  // known; every other caller omits it and gets DEFAULT_AUTHORIZATION_NEEDS, which only
+  // trips on an account that is genuinely down to 0 remaining quota. `precheckedAuth`
+  // lets a caller that already read the account's authorization + current block moments
+  // earlier (storeChunkedContent's own hard-gate read) hand them in instead of paying a
+  // second, redundant RPC round trip.
+  opts: { needs?: AuthorizationNeeds; precheckedAuth?: { auth: BulletinAuthorization | null; currentBlock: number } } = {},
+): Promise<EnsureAuthorizedResult> {
+  const [auth, currentBlock] = opts.precheckedAuth
+    ? [opts.precheckedAuth.auth, opts.precheckedAuth.currentBlock]
+    : await Promise.all([
+        readAccountAuthorization(api, address),
+        api.query.System.Number.getValue(),
+      ]);
 
-  const isTestnet = await detectTestnet(api);
-  const who = `${label ?? "account"} (${address.slice(0, 8)}...)`;
-  if (isTestnet) {
+  if (!isAuthorizationSufficient(auth, currentBlock)) {
+    const isTestnet = await detectTestnet(api);
+    const who = `${label ?? "account"} (${address.slice(0, 8)}...)`;
+    if (isTestnet) {
+      throw new Error(
+        `Bulletin storage account ${who} is not authorized (or its authorization expired). ` +
+        `polkadot-app-deploy no longer self-authorizes on the Bulletin chain — request authorization for this account from the chain's authorizer (testnet faucet / personhood / pool bootstrap), then retry.`,
+      );
+    }
     throw new Error(
-      `Bulletin storage account ${who} is not authorized (or its authorization expired). ` +
-      `polkadot-app-deploy no longer self-authorizes on the Bulletin chain — request authorization for this account from the chain's authorizer (testnet faucet / personhood / pool bootstrap), then retry.`,
+      `Bulletin storage account ${who} is not authorized to store. ` +
+      `On production the storage account must already carry its own authorization/allowance — polkadot-app-deploy cannot grant it.`,
     );
   }
-  throw new Error(
-    `Bulletin storage account ${who} is not authorized to store. ` +
-    `On production the storage account must already carry its own authorization/allowance — polkadot-app-deploy cannot grant it.`,
-  );
+
+  // bulletin #1547 (check/warn half only): existence+expiry alone doesn't mean full
+  // priority — an unexpired account can still be out of transaction/byte quota, which
+  // drops it behind accounts that have headroom (never a store failure, only a priority
+  // loss — see quotaHeadroomDimensions' comment). Unlike bulletin-deploy, polkadot-app-deploy
+  // never self-authorizes Bulletin storage (see isAutoReauthorizeAllowed's comment above),
+  // so this never re-grants — it only reports the shortfall for the caller to warn on.
+  const needs = opts.needs ?? DEFAULT_AUTHORIZATION_NEEDS;
+  const dimensions = quotaHeadroomDimensions(auth as BulletinAuthorization, needs);
+  return { quotaExhausted: dimensions.length > 0, dimensions };
 }
 
 // #1054: pre-fund each pool leg's //deploy/N account on the env's Asset Hub so

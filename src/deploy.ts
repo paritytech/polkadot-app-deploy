@@ -1025,8 +1025,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   // existence + non-expiry ONLY — we do NOT gate on the txs/bytes allowance
   // counters. The Bulletin `store` extrinsic uses soft limits, so an authorized,
   // unexpired account stores fine even with exhausted/zeroed quota counters
-  // (the allowance fields are no longer the gate). Deploy no longer
-  // self-authorizes (#745); fail fast if there is no active authorization —
+  // (the allowance fields are no longer the gate; an exhausted-but-unexpired
+  // account is warned about below — bulletin #1547 — not blocked). Deploy no
+  // longer self-authorizes (#745); fail fast if there is no active authorization —
   // it must be granted out-of-band (testnet faucet / personhood / pool bootstrap).
   //
   // Arm order matters: the raw papi read can throw *synchronously* on a destroyed
@@ -1051,6 +1052,25 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   const sufficient = isAuthorizationSufficient(uploadAuth, currentBlockNum);
   if (!sufficient) {
     throw new NonRetryableError(`Account ${ss58} has no active Bulletin authorization (missing or expired). Request authorization on-chain (testnet faucet / personhood / pool bootstrap), then retry.`);
+  }
+
+  // bulletin #1547 (check/warn half only): existence+expiry alone doesn't mean full
+  // priority — an unexpired account can still be out of transaction/byte quota, which
+  // drops it behind accounts that have headroom (never a store failure, only a priority
+  // loss; see quotaHeadroomDimensions' comment in pool.ts). Now that chunks are known,
+  // size the real need (one tx per chunk; total bytes as an upper bound) and warn.
+  // polkadot-app-deploy never self-authorizes Bulletin storage, so unlike bulletin-deploy
+  // this never re-grants — reuses uploadAuth/currentBlockNum read just above instead of a
+  // second RPC round trip.
+  const authResult = await ensureAuthorized(unsafeApi, ss58 as string, "storage account", {
+    needs: { transactions: chunks.length, bytes: BigInt(totalBytes) },
+    precheckedAuth: { auth: uploadAuth, currentBlock: currentBlockNum },
+  });
+  if (authResult.quotaExhausted) {
+    console.warn(
+      `   Warning: Bulletin storage account ${ss58}'s allowance is exhausted (${authResult.dimensions.join("/")}). ` +
+      `polkadot-app-deploy does not auto-reauthorize, so uploads are BEST EFFORT — queued behind accounts that still have quota.`,
+    );
   }
 
   let reconnectionsUsed = 0;

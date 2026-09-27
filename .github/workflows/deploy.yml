@@ -12,6 +12,11 @@ on:
         description: 'Name of the build artifact to download'
         required: true
         type: string
+      build-dir:
+        description: 'Directory the build artifact is downloaded into, relative to the caller repo root (default: build). With a polkadot-app-deploy.config.*, set it to the path the app executable names (e.g. dist) so the manifest publish reuses the deployed CID.'
+        required: false
+        type: string
+        default: 'build'
       skip-cache:
         description: 'Skip deployment cache and force redeploy'
         type: boolean
@@ -109,15 +114,49 @@ jobs:
         with:
           node-version: '22'
 
+      # The CLI finds polkadot-app-deploy.config.* by walking up from the build
+      # dir, so the caller's repo must be on disk. It must precede the artifact
+      # download: checkout defaults to clean: true and would remove the
+      # untracked build dir.
+      - name: Checkout caller repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # An empty string skips the default and would unpack the artifact over the checkout.
+      - name: Reject an empty build-dir
+        if: inputs.build-dir == ''
+        run: |
+          echo "::error::build-dir was passed as an empty string. Omit it to use the default, or give it a directory."
+          exit 1
+
       - name: Download build artifact
         uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.artifact-name }}
-          path: build
+          path: ${{ inputs.build-dir }}
 
       - name: Compute build hash
         id: hash
-        run: echo "hash=$(find build -type f -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        env:
+          BUILD_DIR: ${{ inputs.build-dir }}
+        run: |
+          # polkadot-app-deploy.config.* drives the manifest publish and the CLI
+          # finds it by walking up from BUILD_DIR, so it usually sits outside the
+          # build output. Without it in the key, editing only the config hits the
+          # cache, skips the deploy step, and the manifest is never republished.
+          configs=""
+          dir="$BUILD_DIR"
+          while :; do
+            for name in polkadot-app-deploy.config.ts polkadot-app-deploy.config.js polkadot-app-deploy.config.mjs; do
+              [ -f "$dir/$name" ] && configs="$configs $dir/$name"
+            done
+            [ "$dir" = "." ] && break
+            parent=$(dirname "$dir")
+            [ "$parent" = "$dir" ] && break
+            dir="$parent"
+          done
+          echo "hash=$( { find "$BUILD_DIR" -type f -exec sha256sum {} \; ; [ -n "$configs" ] && sha256sum $configs; } | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Check deployment cache
         id: cache
@@ -252,6 +291,10 @@ jobs:
         id: deploy
         if: steps.cache.outputs.cache-hit != 'true'
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        # build-dir reaches the script as an environment variable: interpolated into
+        # the script text, a quote in it would run as shell in this job.
+        env:
+          BUILD_DIR: ${{ inputs.build-dir }}
         with:
           timeout_minutes: 15
           max_attempts: ${{ inputs.max-retries }}
@@ -301,9 +344,9 @@ jobs:
             # Default callers (max-retries: 1) run the deploy directly so there
             # are no wrapper stderr-capture or exit-75 classification side-effects.
             if [ "${{ inputs.max-retries }}" -gt 1 ] && [ -n "$RELEASE_RETRY_WRAPPER" ]; then
-              node "$RELEASE_RETRY_WRAPPER" "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" 'build' '${{ inputs.dotns-domain }}'
+              node "$RELEASE_RETRY_WRAPPER" "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" "$BUILD_DIR" '${{ inputs.dotns-domain }}'
             else
-              "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" 'build' '${{ inputs.dotns-domain }}'
+              "$BULLETIN_DEPLOY_BIN" "${FLAGS[@]}" "$BUILD_DIR" '${{ inputs.dotns-domain }}'
             fi
 
       - name: Validate deployment outputs

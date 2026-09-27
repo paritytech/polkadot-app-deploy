@@ -567,6 +567,10 @@ try {
         console.error(`Manifest publish failed: ${err?.message ?? err}`);
         process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
       }
+    } else if (!loaded && !flags.noManifest) {
+      // Only the walk-up can come back empty: an explicit --config that is
+      // missing throws out of tryLoadProductConfig rather than returning null.
+      console.log(`No product config found from ${buildDirAbs} upward; content deployed, no manifest published.`);
     }
     // No config (or --no-manifest) → the contenthash-only deploy above is the whole job; nothing else to do.
   }

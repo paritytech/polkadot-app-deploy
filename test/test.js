@@ -23034,6 +23034,56 @@ describe("DeployResult.browserUrl (#1157)", () => {
   });
 });
 
+// The config is only discoverable if the caller's repo is on disk at the
+// workspace root, and the artifact must land where the config points (#1418).
+describe(".github/workflows/deploy.yml: checks out the caller repo so its product manifest is found (#1418)", () => {
+  test("checks out the caller repo at the root before the artifact download", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const checkoutStep = wf.split(/\n(?= {6}- )/).find((step) => /- name: Checkout caller repository$/m.test(step));
+    assert.ok(checkoutStep, ">> FAIL: deploy.yml: the caller checkout step must exist");
+    // No repository:/path: — either one moves the config outside the walk-up.
+    assert.doesNotMatch(checkoutStep, /^ {10}(repository|path):/m,
+      ">> FAIL: deploy.yml: the caller checkout must not set repository: or path:, or the config leaves the walk-up path");
+    const checkout = wf.indexOf("- name: Checkout caller repository");
+    const download = wf.indexOf("- name: Download build artifact");
+    assert.ok(checkout > -1 && download > checkout,
+      ">> FAIL: deploy.yml: the caller checkout must precede the artifact download, or checkout's git clean removes it");
+    assert.match(wf, /^ {6}build-dir:\n {8}description:/m, ">> FAIL: deploy.yml: build-dir input must exist");
+    assert.match(wf, /path: \$\{\{ inputs\.build-dir \}\}/,
+      ">> FAIL: deploy.yml: the artifact must download into inputs.build-dir");
+    // The cache key must track the directory actually deployed.
+    const hashStep = wf.split(/\n(?= {6}- )/).find((step) => /- name: Compute build hash$/m.test(step));
+    assert.match(hashStep, /BUILD_DIR: \$\{\{ inputs\.build-dir \}\}/,
+      ">> FAIL: deploy.yml: the build hash must be computed over inputs.build-dir, not a literal directory");
+    // The manifest is republished only when the deploy step runs, and that step is
+    // skipped on a cache hit. A config-only edit must therefore change the key.
+    assert.match(hashStep, /polkadot-app-deploy\.config\.ts/,
+      ">> FAIL: deploy.yml: the build hash must cover polkadot-app-deploy.config.*, or editing only the config hits the cache and the manifest is never republished");
+    // A caller-controlled input in script text is a shell injection in the job
+    // that exports the deploy mnemonic. Scan the script bodies themselves: the
+    // deploy step is a `command:` block on nick-fields/retry, not a `run:`, so a
+    // line-scoped `run:` check cannot see where injection would happen.
+    const lines = wf.split("\n");
+    const scripts = [];
+    for (let i = 0; i < lines.length; i++) {
+      const open = lines[i].match(/^( +)(?:run|command): \|-?\s*$/);
+      if (!open) continue;
+      const indent = open[1].length;
+      const body = [];
+      while (++i < lines.length) {
+        const line = lines[i];
+        if (line.trim() !== "" && (line.length - line.trimStart().length) <= indent) { i--; break; }
+        body.push(line);
+      }
+      scripts.push(body.join("\n"));
+    }
+    assert.ok(scripts.length >= 2, `>> FAIL: deploy.yml: expected to find the run/command script bodies, found ${scripts.length}`);
+    const injected = scripts.filter((body) => body.includes("${{ inputs.build-dir }}"));
+    assert.deepStrictEqual(injected.map((b) => b.trim().split("\n")[0]), [],
+      ">> FAIL: deploy.yml: build-dir must reach scripts through env:, never interpolated into a run:/command: body");
+  });
+});
+
 // import { shouldEmit } from "../tools/cache-savings-totals.mjs";
 
 describe.skip("shouldEmit (cache-savings-totals DSN gate)", () => { // skipped in public snapshot: tool not shipped
@@ -24440,6 +24490,73 @@ describe("shouldPublishManifest — --no-manifest / --content-only (#1163)", () 
       ">> FAIL: shouldPublishManifest: with no config discovered, manifest publishing must stay skipped (legacy contenthash-only path)");
     assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: true }), false,
       ">> FAIL: shouldPublishManifest: with no config discovered AND --no-manifest set, manifest publishing must stay skipped");
+  });
+});
+
+// The reusable workflow downloads only the build artifact, so the caller's
+// config is on disk only if their repo is checked out at the workspace root (#1418).
+describe("product config discovery in the reusable-workflow layout (#1418)", () => {
+  const CONFIG = (domain) => `export default {
+  domain: '${domain}',
+  displayName: 'Demo',
+  description: 'Fixture for #1418.',
+  icon: { path: './icon.png', format: 'png' },
+  executables: [{ kind: 'app', path: './build', appVersion: [0, 1, 0] }],
+};
+`;
+
+  // A fresh dir per case: tryLoadProductConfig import()s the config, and Node
+  // caches ES modules by path, so a reused dir would serve the previous body.
+  let seq = 0;
+  function workspace({ repo = {}, artifact = {}, buildDir = "build" }) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `pad-1418-${seq++}-`));
+    for (const [rel, body] of Object.entries(repo)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), body);
+    }
+    const bd = path.join(root, buildDir);
+    fs.mkdirSync(bd, { recursive: true });
+    fs.writeFileSync(path.join(bd, "index.html"), "<h1>site</h1>");
+    for (const [rel, body] of Object.entries(artifact)) {
+      fs.mkdirSync(path.dirname(path.join(bd, rel)), { recursive: true });
+      fs.writeFileSync(path.join(bd, rel), body);
+    }
+    return { root, bd };
+  }
+  const find = async (bd) => {
+    const { tryLoadProductConfig } = await import("../dist/index.js");
+    return tryLoadProductConfig({ cwd: path.resolve(bd), walkUp: true });
+  };
+
+  test("no caller checkout: the config is not on disk, so the manifest is silently skipped", async () => {
+    const { bd } = workspace({});
+    const loaded = await find(bd);
+    assert.strictEqual(shouldPublishManifest({ configFound: !!loaded, noManifest: false }), false,
+      ">> FAIL: #1418 fixture: with no caller checkout there is no config to find; this pins the bug the workflow change fixes");
+  });
+
+  test("caller checked out at the workspace root: the config is found and the manifest publishes", async () => {
+    const { bd } = workspace({ repo: { "polkadot-app-deploy.config.ts": CONFIG("demo.dot"), "icon.png": "x" } });
+    const loaded = await find(bd);
+    assert.ok(loaded, ">> FAIL: #1418: a root config must be found by walking up from the build dir");
+    assert.strictEqual(shouldPublishManifest({ configFound: !!loaded, noManifest: false }), true,
+      ">> FAIL: #1418: a discovered config must trigger the manifest publish");
+  });
+
+  test("a build-dir other than build/ still reaches a root config", async () => {
+    const { bd } = workspace({ repo: { "polkadot-app-deploy.config.ts": CONFIG("demo.dot"), "icon.png": "x" }, buildDir: "out" });
+    assert.ok(await find(bd),
+      ">> FAIL: #1418: build-dir must not break the walk-up, or callers that build to out/ or dist/ stay broken");
+  });
+
+  test("a config inside the artifact wins over one at the repo root", async () => {
+    const { bd } = workspace({
+      repo: { "polkadot-app-deploy.config.ts": CONFIG("stale.dot"), "icon.png": "x" },
+      artifact: { "polkadot-app-deploy.config.ts": CONFIG("generated.dot"), "icon.png": "x" },
+    });
+    const loaded = await find(bd);
+    assert.equal(loaded?.config?.domain, "generated.dot",
+      ">> FAIL: #1418: the walk-up must stop at the build dir, or a caller that generates a per-domain config into its artifact would deploy against a stale root config");
   });
 });
 

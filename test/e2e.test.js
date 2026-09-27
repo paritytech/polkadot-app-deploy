@@ -1655,6 +1655,7 @@ describe("e2e", { skip: !ENABLED }, () => {
 
     test("stale chain_getFinalizedHead does not trigger re-upload; deploy exits 0", { timeout: DEPLOY_TIMEOUT_MS + STALE_DURATION_MS + 60_000 }, async () => {
       const rpc = await resolveE2eBulletinRpc();
+      const proxyStartedAt = Date.now();
       const proxy = await startFaultProxy({
         mode: "stale-finalized-head",
         staleDurationMs: STALE_DURATION_MS,
@@ -1694,10 +1695,34 @@ describe("e2e", { skip: !ENABLED }, () => {
           });
         }
 
+        // A 0 here has three different causes that the count alone cannot
+        // tell apart: the client never asked for a finalised head, it asked
+        // after the stale window had closed, or it asked over a channel this
+        // proxy cannot see (a chainHead_* subscription rather than the legacy
+        // method, or a different endpoint). Dump what the proxy observed so
+        // the next occurrence answers that instead of prompting more theory.
+        //
+        // One theory already tested and rejected upstream (bulletin #1449):
+        // content-addressed chunk reuse making Phase B upload nothing.
+        // Re-running against a chain that already held identical chunks did
+        // NOT reproduce it, so the fixture is deliberately left unsalted.
+        const seenMethods = Object.entries(proxy.stats.methodCounts ?? {})
+          .sort((a, b) => b[1] - a[1]).slice(0, 12)
+          .map(([m, n]) => `${m}x${n}`).join(", ") || "(none)";
+        const windowInfo = proxy.stats.staleWindowOpenedAt
+          ? `stale window opened +${proxy.stats.staleWindowOpenedAt - proxyStartedAt}ms after proxy start`
+          : "stale window never opened (no finalised-head response passed through)";
         assert.ok(
           proxy.stats.dropsInjected >= 1,
-          `>> FAIL: S-GRANDPA-REUPLOAD: proxy intercepted ${proxy.stats.dropsInjected} chain_getFinalizedHead responses; ` +
-            "expected ≥ 1 — if 0, the GRANDPA probe never called chain_getFinalizedHead (path may have been skipped)",
+          `>> FAIL: S-GRANDPA-REUPLOAD: proxy intercepted ${proxy.stats.dropsInjected} chain_getFinalizedHead responses; expected >= 1.\n` +
+            `  chain_getFinalizedHead requests seen by proxy: ${proxy.stats.finalizedHeadRequests}\n` +
+            `  ...answered after the window closed: ${proxy.stats.finalizedHeadOutsideWindow}\n` +
+            `  ${windowInfo}\n` +
+            `  proxy connections: ${proxy.stats.connections}\n` +
+            `  methods through the proxy: ${seenMethods}\n` +
+            `  How to read it: requests=0 WITH chainHead_* present means the client used the subscription path and this ` +
+            `proxy never sees the probe. requests>0 with outsideWindow>0 means the probe ran after the window. ` +
+            `requests=0 with no chainHead_* means the probe never ran — check whether Phase B uploaded any chunks.`,
         );
 
         const combined = result.stdout + result.stderr;

@@ -46,7 +46,22 @@ export async function startFaultProxy(opts = {}) {
   const port = server.address().port;
 
   // Stats observable by the test for assertions.
-  const stats = { connections: 0, dropsInjected: 0, upstreamErrors: 0 };
+  // methodCounts records every JSON-RPC method the client sent through this
+  // proxy. When an injection count comes back 0, the question is always the
+  // same: did the client never ask, ask outside the fault window, or ask over
+  // a channel this proxy does not see (a chainHead_* subscription rather than
+  // the legacy method, or a different endpoint entirely)? Without this the
+  // three are indistinguishable and the failure reads as "probe skipped",
+  // which is a guess. staleWindowOpenedAt/ClosedAt bound the window in the
+  // same clock the caller can compare against its own log timestamps.
+  const stats = {
+    connections: 0, dropsInjected: 0, upstreamErrors: 0,
+    methodCounts: Object.create(null),
+    finalizedHeadRequests: 0,
+    finalizedHeadOutsideWindow: 0,
+    staleWindowOpenedAt: null,
+    staleWindowClosedAt: null,
+  };
   const liveSockets = new Set();
   // Global drop budget — `once` means ONE drop across the whole proxy
   // lifetime, not one per connection. Without this, every PAPI reconnect
@@ -118,10 +133,12 @@ try { clientWs.terminate(); } catch { /* socket already gone */ }
     // \"[object Blob]\" is not valid JSON".
     const pendingClientFrames = [];
     clientWs.on("message", (data, isBinary) => {
-      if (mode === "stale-finalized-head" && !isBinary) {
+      if (!isBinary) {
         try {
           const msg = JSON.parse(data.toString());
-          if (msg.method === "chain_getFinalizedHead" && msg.id != null) {
+          if (msg.method) stats.methodCounts[msg.method] = (stats.methodCounts[msg.method] ?? 0) + 1;
+          if (mode === "stale-finalized-head" && msg.method === "chain_getFinalizedHead" && msg.id != null) {
+            stats.finalizedHeadRequests += 1;
             pendingFinalizedHeadIds.add(String(msg.id));
           }
         } catch { /* not JSON */ }
@@ -139,11 +156,18 @@ try { clientWs.terminate(); } catch { /* socket already gone */ }
           const msg = JSON.parse(data.toString());
           const msgId = msg.id != null ? String(msg.id) : null;
           const inWindow = !staleWindowStart || Date.now() - staleWindowStart < staleDurationMs;
+          if (msgId && pendingFinalizedHeadIds.has(msgId) && !inWindow) {
+            stats.finalizedHeadOutsideWindow += 1;
+            if (stats.staleWindowClosedAt === null && staleWindowStart !== null) {
+              stats.staleWindowClosedAt = staleWindowStart + staleDurationMs;
+            }
+          }
           if (msgId && pendingFinalizedHeadIds.has(msgId) && inWindow) {
             pendingFinalizedHeadIds.delete(msgId);
             if (!staleHash && msg.result) {
               staleHash = msg.result;
               staleWindowStart = Date.now();
+              stats.staleWindowOpenedAt = staleWindowStart;
             }
             if (staleHash) {
               stats.dropsInjected += 1;

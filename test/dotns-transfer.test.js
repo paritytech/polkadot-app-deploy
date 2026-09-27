@@ -20,17 +20,12 @@ const ADDR_OWNER = "0x2222222222222222222222222222222222222222";
 const ADDR_OPERATOR = "0x8888888888888888888888888888888888888888";
 const ADDR_STRANGER = "0x7777777777777777777777777777777777777777";
 
-// Canonical raw shapes ReviveClientWrapper.performDryRunCall resolves to —
-// shared by the isAuthorised probe stubs below and the setSubnodeOwner
-// shape-probe stubs further down.
-function bareRevertAuthProbeResult() {
-  return {
-    gasConsumed: { referenceTime: 0n, proofSize: 0n },
-    gasRequired: { referenceTime: 0n, proofSize: 0n },
-    storageDeposit: { value: 0n },
-    result: { isOk: false, isErr: true, value: { data: "0x", flags: 1n } },
-  };
-}
+// /simplify: reuses bareRevertProbeResult (defined further down, alongside
+// the setSubnodeOwner shape-probe stubs it was originally written for) — the
+// isAuthorised probe's bare-revert shape is byte-identical, since both are
+// just "this selector doesn't exist on this registry deployment" reads via
+// the same ReviveClientWrapper.performDryRunCall.
+//
 // Encodes a bare ABI bool return (32-byte word, low byte 0/1) — matches what
 // DotnsRegistry.isAuthorised actually returns on success.
 function encodedBoolProbeResult(value) {
@@ -170,7 +165,7 @@ function stubSubname({ parentOwner, evmAddress, currentSubOwner, afterOwner, txH
   // owner()-equality behaviour these tests already pin via
   // contractCallNullable below. Tests that want isAuthorised itself
   // consulted override this with their own clientWrapper.
-  d.clientWrapper = { performDryRunCall: async () => bareRevertAuthProbeResult() };
+  d.clientWrapper = { performDryRunCall: async () => bareRevertProbeResult() };
   let ownerCalls = 0;
   d.__nullableCalls = [];
   d.contractCallNullable = async (_addr, _abi, fn, args) => {
@@ -367,7 +362,7 @@ function stubNodeAuthProbe({ owner, isAuthorisedResult, bareRevert = false }) {
   d.clientWrapper = {
     performDryRunCall: async () => {
       probeCalls += 1;
-      return bareRevert ? bareRevertAuthProbeResult() : encodedBoolProbeResult(isAuthorisedResult);
+      return bareRevert ? bareRevertProbeResult() : encodedBoolProbeResult(isAuthorisedResult);
     },
   };
   return { d, getProbeCalls: () => probeCalls };
@@ -597,7 +592,7 @@ function stubSubnameForShapeProbe({
   let probeCalls = 0;
   d.clientWrapper = {
     performDryRunCall: async (_origin, _addr, _value, encodedData) => {
-      if (encodedData.slice(0, 10) === IS_AUTHORISED_SELECTOR) return bareRevertAuthProbeResult();
+      if (encodedData.slice(0, 10) === IS_AUTHORISED_SELECTOR) return bareRevertProbeResult();
       probeCalls += 1;
       return probeDryRunCall(encodedData);
     },
@@ -779,7 +774,7 @@ test("setSubnodeOwner shape cache is shared across call sites: registerSubdomain
   d.clientWrapper = {
     client: { query: { Timestamp: { Now: { getValue: async () => 1_000_000n } } } },
     performDryRunCall: async (_origin, _addr, _value, encodedData) => {
-      if (encodedData.slice(0, 10) === IS_AUTHORISED_SELECTOR) return bareRevertAuthProbeResult();
+      if (encodedData.slice(0, 10) === IS_AUTHORISED_SELECTOR) return bareRevertProbeResult();
       probeCalls += 1;
       return bareRevertProbeResult();
     },

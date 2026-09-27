@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { execSync } from "child_process";
 import { CLI_NAME } from "./cli-name.js";
+import { resolveEffectiveMnemonic } from "./mnemonic.js";
 import { hasPersistedSession, STALE_SESSION_MESSAGE, DOT_DAPP_ID, DOT_PRODUCT_ID, getPeopleChainEndpoints } from "./auth-config.js";
 import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
@@ -37,6 +38,7 @@ import { setDeployContext as setBugReportContext } from "./bug-report.js";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { mnemonicToEntropy, entropyToMiniSecret, ss58Address } from "@polkadot-labs/hdkd-helpers";
+import { deriveProductSigner } from "./product-account.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { CarReader } from "@ipld/car/reader";
 import {
@@ -674,9 +676,9 @@ export function chooseSignerInput(opts: {
 // Gates both the up-front "phone ready" banner and the per-step "check your phone"
 // reminder — they must agree, so they read the same predicate.
 export function isPhoneSignerActive(
-  options: Pick<DeployOptions, "signer" | "signerAddress" | "transferTo">,
+  options: Pick<DeployOptions, "signer" | "signerAddress" | "transferTo" | "localSigner">,
 ): boolean {
-  return !!(options.signer && options.signerAddress && !options.transferTo);
+  return !!(options.signer && options.signerAddress && !options.transferTo && !options.localSigner);
 }
 
 /**
@@ -2840,6 +2842,20 @@ export interface DeployOptions {
   mnemonic?: string;
   /** Optional derivation path applied to the mnemonic (e.g. "//deploy/3"). Defaults to "" (root key). */
   derivationPath?: string;
+  /**
+   * Deploy as this product's derived account (RFC-0022 host derivation,
+   * index 0) instead of the mnemonic's root account, so the deployed name is
+   * owned by the account a host hands the product at runtime. Needs a
+   * mnemonic; mutually exclusive with suri, derivationPath, and signer.
+   * CLI: --product-name <name>
+   */
+  productName?: string;
+  /**
+   * Internal: the injected signer signs locally in-process, so no phone
+   * ceremony gates its signatures. Set by the productName resolution;
+   * genuine QR/mobile injected signers leave it unset.
+   */
+  localSigner?: boolean;
   /** Pre-built signer — skips mnemonic derivation. Use for QR/mobile signing. */
   signer?: PolkadotSigner;
   /** SS58 address for the signer (required when signer is provided). */
@@ -3289,6 +3305,27 @@ export async function deploy(content: DeployContent, domainName: string | null =
     throw new NonRetryableError("Pass either a mnemonic or an external signer, not both — they identify the signing account and only one can win.");
   }
   bulletinNetwork = undefined; // bulletin #1362/#1095: reset per-deploy; set from the resolved env below
+  // Product-name deploys resolve to an injected signer up front: the product
+  // account derived from the mnemonic per RFC-0022 signs storage and DotNS
+  // alike, so the deployed name is owned by the very account a host hands the
+  // product at runtime. Resolved here, before signer-choice, so the rest of
+  // the pipeline sees a plain injected signer and needs no product awareness.
+  if (options.productName) {
+    if (options.signer || options.signerAddress || options.suri || options.derivationPath) {
+      throw new NonRetryableError("--product-name derives the signer itself; it cannot be combined with --suri, --derivation-path, or an external signer.");
+    }
+    const productMnemonic = resolveEffectiveMnemonic({
+      flagMnemonic: options.mnemonic,
+      envMnemonic: process.env.MNEMONIC,
+      envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
+    });
+    if (!productMnemonic) {
+      throw new NonRetryableError("--product-name needs a mnemonic (--mnemonic or the MNEMONIC env var) to derive the product account from.");
+    }
+    const product = deriveProductSigner(productMnemonic, options.productName);
+    console.log(`   Product deployer: ${product.ss58} (product ${product.productName}, index 0)`);
+    options = { ...options, signer: product.signer, signerAddress: product.ss58, mnemonic: undefined, localSigner: true };
+  }
   // Resolve the target environment. options.bulletinEndpoints / assetHubEndpoints
   // bypass the loader for tests and library callers.
   const envId = options.env ?? DEFAULT_ENV_ID;

@@ -202,7 +202,15 @@ export function renderSummary(s: IncrementalStats): string {
       if (s.probeFailedMetadata > 0) reasons.push("metadata_error");
       probeFailedStr = `, ${s.probeFailed} probe-failed (${reasons.join(", ")})`;
     }
-    lines.push(`  Probed:        ${s.probedTotal} chunks  →  ${s.probePresent} on chain, ${s.probeAbsent} absent${probeFailedStr}`);
+    // #1011: probedTotal/probePresent/probeAbsent come from Phase A's section-1
+    // probe only (probeResultsForStats in deploy.ts omits sections 0/2, which
+    // Phase A never probes) — label it so it stops silently contradicting the
+    // Upload line below, which combines both phases. Suffixed AFTER the
+    // existing count/absent text, never between "Probed" and its colon or
+    // between the colon and the number: test/e2e.test.js parses live stdout
+    // with /Probed:\s+(\d+)\s+chunks/ (plus a negative lookahead for "0 chunks"
+    // right after "Probed:"), with no end-of-line anchor.
+    lines.push(`  Probed:        ${s.probedTotal} chunks  →  ${s.probePresent} on chain, ${s.probeAbsent} absent${probeFailedStr} (Phase A only)`);
   }
 
   if (s.recycledCids > 0 && s.manifestSource === "embedded") {
@@ -219,12 +227,16 @@ export function renderSummary(s: IncrementalStats): string {
   // Sections line.
   lines.push(`  CAR sections:  manifest ${fmtKb(s.section0Bytes)} KB · stable ${fmtMb(s.section1Bytes)} MB · volatile ${fmtMb(s.section2Bytes)} MB`);
 
-  // Upload line.
+  // Upload line. #1011: chunksUploaded/bytesUploaded combine BOTH phases
+  // (Phase A's section-1 uploads plus Phase B's manifest/volatile uploads) —
+  // labeled "(A+B combined)" right after the chunk count, before the optional
+  // "(vs ... if full deploy)" clause, for the same live-stdout-parsing reason
+  // as the Probed line above.
   if (s.chunksUploaded > 0) {
     if (s.bytesSkipped > 0) {
-      lines.push(`  Upload:        ${fmtMb(s.bytesUploaded)} MB across ${s.chunksUploaded} chunks (vs ${fmtMb(s.carBytes)} MB if full deploy)`);
+      lines.push(`  Upload:        ${fmtMb(s.bytesUploaded)} MB across ${s.chunksUploaded} chunks (A+B combined) (vs ${fmtMb(s.carBytes)} MB if full deploy)`);
     } else {
-      lines.push(`  Upload:        ${fmtMb(s.bytesUploaded)} MB across ${s.chunksUploaded} chunks`);
+      lines.push(`  Upload:        ${fmtMb(s.bytesUploaded)} MB across ${s.chunksUploaded} chunks (A+B combined)`);
     }
   }
 

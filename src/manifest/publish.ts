@@ -136,7 +136,14 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
 
   const iconAbs = path.resolve(configDir, config.icon.path);
   const iconBytes = await readFileOrThrow(iconAbs, "icon");
-  console.log(`\nManifest publish — ${config.domain}`);
+  // #1011: banner the manifest-publish phase like Storage/DotNS/Preflight, so
+  // it reads as a clearly delimited section instead of a single unbannered
+  // line. The "Manifest publish — <domain>" text itself is unchanged (still
+  // grepped by test/e2e.test.js's icon-CID hint, see below).
+  const banner = "=".repeat(60);
+  console.log("\n" + banner);
+  console.log(`Manifest publish — ${config.domain}`);
+  console.log(banner);
   console.log(`  Loaded config: ${sourcePath}`);
   console.log(`  Uploading icon (${iconBytes.length} B)…`);
 

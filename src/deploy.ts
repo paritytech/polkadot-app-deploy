@@ -1244,7 +1244,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       if (trustedCids?.has(cidStr)) {
         stored[i] = { cid, len: chunks[i].length, viaFallback: true };
         trustedCount++;
-        trustedIndices.push(i);
+        trustedIndices.push(i + 1);
       } else if (skipCids?.has(cidStr)) {
         skipCidsCandidates.push({ index: i, cid });
       }
@@ -1354,7 +1354,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         const nonce = assignedNonces.get(i)!;
         const isRetry = uploadEmittedIndices.has(i);
         if (!isRetry) { uploadEmittedIndices.add(i); uploadEmitted++; }
-        console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
+        console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i + 1} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
         return storeChunk(unsafeApi, signer as PolkadotSigner, chunkData, nonce, ss58 as string, { fetchNonce: fetchNonceOverride });
       });
 
@@ -1393,7 +1393,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           for (const idx of batchIndices) {
             const chunkNonce = assignedNonces.get(idx);
             if (chunkNonce !== undefined && chunkNonce < currentNonce && stored[idx] === null) {
-              console.log(`   Chunk ${idx}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
+              console.log(`   Chunk ${idx + 1}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
               stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
               nonceAdvanceIndices.add(idx);
               assignedNonces.delete(idx);
@@ -1423,7 +1423,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           probeFailedCids.has(failCid.toString()) &&
           fail.error?.message?.includes("isValid:false")
         ) {
-          console.log(`   Chunk ${fail.index}: isValid:false but CID was probe-failed — treating as already on chain`);
+          console.log(`   Chunk ${fail.index + 1}: isValid:false but CID was probe-failed — treating as already on chain`);
           captureWarning("isValid:false treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
           stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
           continue;
@@ -1431,13 +1431,13 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         captureWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
         const isExpiryFailure = fail.error?.message?.includes("isValid:false");
         if (isExpiryFailure) {
-          console.log(`   Chunk ${fail.index}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
+          console.log(`   Chunk ${fail.index + 1}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
         }
         let retried = false;
         for (let attempt = 1; attempt <= MAX_CHUNK_RETRIES; attempt++) {
           recordRecoveryAndCheckBudget("chunk_retry");
           const retryDelay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
-          console.log(`   Retrying chunk ${fail.index} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
+          console.log(`   Retrying chunk ${fail.index + 1} (attempt ${attempt}/${MAX_CHUNK_RETRIES}) in ${(retryDelay / 1000).toFixed(0)}s...`);
           await new Promise(r => setTimeout(r, retryDelay));
           // If this was a connection error, reconnect before retrying.
           // Use doReconnectAndRebase so that a pool account rotation (new ss58)
@@ -1469,7 +1469,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             // the comparison is not meaningful until the new account actually
             // advances its nonce (#951).
             if (reconcileTimedOutChunk({ originalNonce, currentNonce, nonceHeuristicValid: !perRetryChanged, cidPresentAtBest })) {
-              console.log(`   Chunk ${fail.index}: reconcile found it already included (nonce ${originalNonce}→${currentNonce}${cidPresentAtBest ? ", CID present at best-block" : ""}) — skipping resubmit`);
+              console.log(`   Chunk ${fail.index + 1}: reconcile found it already included (nonce ${originalNonce}→${currentNonce}${cidPresentAtBest ? ", CID present at best-block" : ""}) — skipping resubmit`);
               stored[fail.index] = { cid: createCID(fail.chunkData, CID_CONFIG.codec, 0x12), len: fail.chunkData.length, viaFallback: true };
               nonceAdvanceIndices.add(fail.index);
               assignedNonces.delete(fail.index);
@@ -1487,7 +1487,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             const heightBefore = await getBestBlockNumber(client);
             const heightAfter = await waitForChainLiveness(client, heightBefore, CHUNK_LIVENESS_MAX_WAIT_MS);
             if (heightBefore != null && heightAfter != null && heightAfter <= heightBefore) {
-              console.log(`   Chunk ${fail.index}: chain still frozen at block ${heightBefore} after ${(CHUNK_LIVENESS_MAX_WAIT_MS / 1000).toFixed(0)}s wait — resubmitting anyway`);
+              console.log(`   Chunk ${fail.index + 1}: chain still frozen at block ${heightBefore} after ${(CHUNK_LIVENESS_MAX_WAIT_MS / 1000).toFixed(0)}s wait — resubmitting anyway`);
             }
             const retryNonce = originalNonce ?? currentNonce;
             const result = await storeChunk(unsafeApi, signer as PolkadotSigner, fail.chunkData, retryNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
@@ -1505,7 +1505,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               probeFailedCids.has(failCid.toString()) &&
               e?.message?.includes("isValid:false")
             ) {
-              console.log(`   Chunk ${fail.index}: retry isValid:false but CID was probe-failed — treating as already on chain`);
+              console.log(`   Chunk ${fail.index + 1}: retry isValid:false but CID was probe-failed — treating as already on chain`);
               captureWarning("isValid:false retry treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
               stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
               assignedNonces.delete(fail.index);
@@ -1527,7 +1527,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           if (isConnectionError(fail.error) && reconnectionsUsed >= MAX_RECONNECTIONS) {
             throw new Error(`Connection lost and max reconnections (${MAX_RECONNECTIONS}) exhausted`);
           }
-          throw new Error(`Chunk ${fail.index} failed after ${MAX_CHUNK_RETRIES} retries: ${fail.error?.message?.slice(0, 100)}`);
+          throw new Error(`Chunk ${fail.index + 1} failed after ${MAX_CHUNK_RETRIES} retries: ${fail.error?.message?.slice(0, 100)}`);
         }
       }
       b += batchSize;
@@ -1559,7 +1559,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       for (const m of missingResults) {
         const idx = cidToIndex.get(m.cid)!;
         for (let attempt = 1; attempt <= MAX_REPROBE_RETRIES; attempt++) {
-          console.log(`   Nonce-collision re-upload: chunk ${idx} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
+          console.log(`   Nonce-collision re-upload: chunk ${idx + 1} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
           try {
             const freshNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
             const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
@@ -1575,7 +1575,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
             }
             if (attempt === MAX_REPROBE_RETRIES) {
-              throw new Error(`Nonce-collision re-upload of chunk ${idx} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
+              throw new Error(`Nonce-collision re-upload of chunk ${idx + 1} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
             }
           }
         }
@@ -1585,10 +1585,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
 
     setDeployAttribute("deploy.pool.account", truncateAddress(ss58) as string);
 
-    const submittedCount = stored.filter((s): s is StoredChunk => !!s && !s.viaFallback).length;
-    console.log(submittedCount === 0
-      ? `\n   All ${chunks.length} chunks already on chain — nothing submitted`
-      : `\n   All ${chunks.length} chunks included in block`);
+    console.log("\n   " + formatUploadInclusionLine(chunks.length, uploadTotal));
 
     // Verify chunk integrity before building DAG
     console.log(`   Verifying chunk integrity...`);
@@ -1600,7 +1597,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     for (let i = 0; i < chunks.length; i++) {
       const expectedCid = createCID(chunks[i], CID_CONFIG.codec, 0x12);
       if (verifiedStored[i].cid.toString() !== expectedCid.toString()) {
-        throw new Error(`Chunk verification failed: chunk ${i} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
+        throw new Error(`Chunk verification failed: chunk ${i + 1} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
       }
     }
     console.log(`   All ${chunks.length} chunks verified ✓`);
@@ -2129,6 +2126,52 @@ export function applyManifestFetchAttributes(fetched: { source: string; attempts
   setDeployAttribute("deploy.manifest.bytes_downloaded", String(fetched.bytesDownloaded ?? 0));
 }
 
+// #1011: given the section-1 CIDs Phase A is considering and the set of CIDs the
+// previous manifest vouches for, report how many are new (toCheck), how many are
+// trusted (deduped — a trusted CID repeated in section 1 counts once), and how
+// many are plain duplicates (repeat occurrences of ANY CID, trusted or not),
+// reported separately rather than folded into "trusted".
+//
+// Deduping before counting trusted/toCheck is deliberate: the naive formula
+// `toCheck = uniqueCount - phaseAUploadCids.filter(c => trustedCids.has(c)).length`
+// (counting trusted occurrences over the RAW, non-deduped list) goes negative
+// whenever a trusted CID repeats, and — the bug this replaces — the previous
+// `phaseAUploadCids.length - new Set(phaseAUploadCids).size` formula counted
+// PLAIN DUPLICATES (of any CID, trusted or not) as "trusted from prev manifest",
+// which is how a first deploy (no previous manifest at all) could print a
+// nonzero trusted count purely from a repeated CID in section 1.
+//
+// Exported for unit tests.
+export function computePhaseACounts(
+  uploadCids: string[],
+  trustedCids: Set<string>,
+): { toCheck: number; trusted: number; duplicates: number } {
+  const uniqueCids = [...new Set(uploadCids)];
+  const trusted = uniqueCids.filter((c) => trustedCids.has(c)).length;
+  const toCheck = uniqueCids.length - trusted;
+  const duplicates = uploadCids.length - uniqueCids.length;
+  return { toCheck, trusted, duplicates };
+}
+
+// #1011: `submittedCount` (stored entries where !viaFallback) undercounts real
+// submissions — viaFallback is ALSO set for chunks that genuinely were submitted
+// this run via the nonce-advance heuristic, the timed-out-reconcile path, and the
+// isValid:false probe-failed backstop (none of those are "already on chain from
+// before this call"). `uploadTotal` is captured once, before the submission loop
+// starts, as the count of chunks NOT already resolved by the incremental-cache
+// pre-pass (trustedCids/skipCids) — i.e. the chunks this call actually drove
+// through submission-or-confirmation, whichever path they took. That is the
+// correct "submitted and included" count; `totalChunks - uploadTotal` is the
+// correct "already on chain [before this call]" count.
+//
+// Exported for unit tests.
+export function formatUploadInclusionLine(totalChunks: number, uploadTotal: number): string {
+  if (uploadTotal === 0) {
+    return `All ${totalChunks} chunks already on chain — nothing submitted`;
+  }
+  return `${uploadTotal} submitted and included, ${totalChunks - uploadTotal} already on chain`;
+}
+
 // Incremental upload v2 flow. Wraps the existing storeDirectory pipeline with:
 //  - previous-manifest fetch via the Bulletin gateway
 //  - placeholder/finalise embedded-manifest dance around the merkleize
@@ -2252,6 +2295,15 @@ export async function storeDirectoryV2(
   // on chain at prev-deploy finalisation; trust them without re-probing.
   // Safety: end-of-Phase-B GRANDPA probe re-verifies all chunks at finalised head,
   // so a "trusted but evicted" chunk gets caught and re-uploaded there.
+  //
+  // #1011 invariant (cross-referenced with src/incremental-stats.ts's Manifest
+  // line): trustedCidsA stays empty whenever prevManifest is absent, which is
+  // exactly when computeStats/renderSummary reports manifestSource === "none"
+  // ("first deploy (no previous manifest)" or another none-reason). That keeps
+  // computePhaseACounts(phaseAUploadCids, trustedCidsA).trusted === 0 on every
+  // such deploy — the "first deploy" line and a nonzero Phase A trusted count
+  // can never both print. If you change how trustedCidsA is populated, or add
+  // a new manifestSource variant, re-check that this stays true.
   const trustedCidsA = new Set<string>();
   if (prevManifest?.chunks) {
     for (const cid of Object.keys(prevManifest.chunks)) {
@@ -2264,6 +2316,13 @@ export async function storeDirectoryV2(
   const skipCidsA = new Set<string>(phaseAUploadCids);
   const probeFailedCidsA = new Set<string>();
   const hasNewChunks = phaseAUploadCids.some(c => !trustedCidsA.has(c));
+  // #1011: computePhaseACounts scopes trusted/toCheck/duplicates to
+  // phaseAUploadCids specifically (deduped before counting), fixing the bug
+  // where a first deploy (no previous manifest) could print a nonzero
+  // "trusted from prev manifest" count purely from a duplicate CID in
+  // section 1 — see the console.log lines below and computePhaseACounts'
+  // own doc comment.
+  const phaseACounts = computePhaseACounts(phaseAUploadCids, trustedCidsA);
   setDeployAttribute("deploy.phase_a.chunks_trusted", trustedCidsA.size);
 
   // 5. Phase A upload — submits absent chunks; skips present ones via internal probe.
@@ -2280,15 +2339,21 @@ export async function storeDirectoryV2(
   const carMbA = String(Math.round((phaseA.carBytes.length / 1024 / 1024) * 100) / 100);
   let phaseALiveProvider: ExistingProvider = provider;
   let phaseASkipProbeResults = new Map<string, true | false | null>();
+  console.log("\n   Phase A (stable section):");
+  // Printed once regardless of branch below — duplicate CIDs in section 1 are
+  // a property of phaseAUploadCids itself, not of whether any chunk needs
+  // uploading (#1011 /simplify: was copy-pasted into both branches).
+  if (phaseACounts.duplicates > 0) {
+    console.log(`   Phase A: ${phaseACounts.duplicates} duplicate chunk CID(s) in section 1 (deduped, not double-counted)`);
+  }
   if (!hasNewChunks) {
     // All section-1 chunks trusted from prev manifest — skip storeChunkedContent entirely.
-    console.log(`   Phase A: nothing to upload (all ${phaseAUploadCids.length} section-1 chunks trusted from prev manifest)`);
+    console.log(`   Phase A: nothing to upload (all ${phaseACounts.trusted} section-1 chunks trusted from prev manifest)`);
     phaseASkipProbeResults = new Map(phaseAUploadCids.map(c => [c, true as true]));
     // phaseALiveProvider stays as provider (no extrinsics submitted yet; Phase B will populate its own)
   } else {
-    const trustedCount = phaseAUploadCids.length - skipCidsA.size;
-    if (trustedCount > 0) {
-      console.log(`   Phase A: ${skipCidsA.size} new chunks to upload, ${trustedCount} trusted from prev manifest`);
+    if (phaseACounts.trusted > 0) {
+      console.log(`   Phase A: ${phaseACounts.toCheck} chunks to check/upload, ${phaseACounts.trusted} trusted from prev manifest`);
     }
     await withSpan("deploy.chunk-upload", "1b. chunk-upload (phase A)", {
       "deploy.chunks.total": phaseAUploadChunks.length,
@@ -2448,6 +2513,7 @@ export async function storeDirectoryV2(
 
   // 9. Phase B upload — submits only the chunks that actually changed
   // (typically just the chunk(s) covering the manifest file).
+  console.log("\n   Phase B (full CAR):");
   const carMbB = String(Math.round((phaseB.carBytes.length / 1024 / 1024) * 100) / 100);
   const newPhaseBChunks = carChunkCidsB.filter((c) => !trustedCidsB.has(c)).length;
   const phaseBResult = await withSpan("deploy.chunk-upload", "1d. chunk-upload (phase B)", {

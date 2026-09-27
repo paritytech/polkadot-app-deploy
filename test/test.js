@@ -38,7 +38,7 @@ import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCh
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
-import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache } from "../dist/deploy.js";
+import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache, computePhaseACounts, formatUploadInclusionLine } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
 import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
 import * as nodeCrypto from "node:crypto";
@@ -13977,10 +13977,13 @@ describe("incremental-stats v3 summary", () => {
 
   test("storeChunkedContent emits monotonic upload indices [K/U] (#511 regression guard)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // Upload batch line uses uploadEmitted/uploadTotal (not i+1/chunks.length)
-    // so progress is monotonic when trusted/skipped chunks live interleaved
-    // with uploaded ones in CAR position order.
-    assert.match(src, /\[\$\{uploadEmitted\}\/\$\{uploadTotal\}\] chunk \$\{i\}/);
+    // Upload batch line uses uploadEmitted/uploadTotal (not chunks.length) for
+    // the [K/U] progress counter, so progress is monotonic when trusted/skipped
+    // chunks live interleaved with uploaded ones in CAR position order. The
+    // per-chunk index shown alongside it is 1-based (#1011) — see the
+    // "ONE 1-based convention" test below for why.
+    assert.match(src, /\[\$\{uploadEmitted\}\/\$\{uploadTotal\}\] chunk \$\{i \+ 1\}/,
+      ">> FAIL: #511 guard: the batch line's [K/U] counter (uploadEmitted/uploadTotal) must stay monotonic and distinct from the 1-based chunk index shown alongside it");
     // Trusted summary collapses per-chunk lines into one row listing indices.
     assert.match(src, /Trusted: \$\{trustedCount\} chunks skipped without re-probe \(chunks /);
   });
@@ -13996,22 +13999,53 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: #932 guard: must check uploadEmittedIndices.has(i) before incrementing uploadEmitted");
   });
 
-  test("storeChunkedContent chunk-index display is 0-based everywhere (no batch/retry off-by-one)", () => {
+  // #1011: this test used to protect "0-based everywhere" — a single shared
+  // convention across every chunk-index display site. That convention flipped
+  // to 1-based (issue #1011's own triage: "label chunks 1-based everywhere a
+  // user sees them"), because the missing-positions error (a few lines below
+  // this whole block) and the structured captureWarning({chunkIndex: ...})
+  // payloads were ALREADY 1-based — "0-based everywhere" was never actually
+  // true of the whole function, which is exactly the "chunk numbers are all
+  // over the place" bug #1011 reports. This test now protects the SAME
+  // property (one shared convention, so the same chunk never shows under two
+  // different numbers across batch/retry/nonce-collision/verify-mismatch
+  // lines) in its corrected 1-based form.
+  test("storeChunkedContent chunk-index display is ONE 1-based convention everywhere (#1011 — no mixed bases)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // The batch upload line shows `chunk ${i}` (0-based). The retry / consumed /
-    // nonce-collision re-upload / verify-mismatch lines must use the SAME 0-based
-    // index — NOT `${fail.index + 1}` / `${idx + 1}` / `${i + 1}`. Otherwise the
-    // same chunk shows under two numbers (a retrying chunk N looked like a phantom
-    // "chunk N+1" colliding with the trusted chunk N+1). The [K/U] progress
-    // counter is a count and legitimately stays 1-based.
-    assert.match(src, /chunk \$\{i\}/,
-      ">> FAIL: chunk-numbering: the batch upload line must display the 0-based chunk index `chunk ${i}`");
-    assert.doesNotMatch(src, /chunk \$\{fail\.index \+ 1\}/,
-      ">> FAIL: chunk-numbering: retry/consumed lines must use 0-based `${fail.index}`, not `${fail.index + 1}` (off-by-one vs the batch line)");
-    assert.doesNotMatch(src, /chunk \$\{idx \+ 1\}/,
-      ">> FAIL: chunk-numbering: nonce-collision re-upload lines must use 0-based `${idx}`, not `${idx + 1}`");
-    assert.doesNotMatch(src, /chunk \$\{i \+ 1\} CID mismatch/,
-      ">> FAIL: chunk-numbering: the verify-mismatch error must use 0-based `${i}`, not `${i + 1}`");
+    assert.match(src, /chunk \$\{i \+ 1\} —/,
+      ">> FAIL: chunk-numbering: the batch upload line must display the 1-based chunk index `chunk ${i + 1}`");
+    assert.match(src, /Chunk \$\{idx \+ 1\}: nonce/,
+      ">> FAIL: chunk-numbering: the nonce-consumed heuristic line must use 1-based `${idx + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: isValid:false but CID was probe-failed/,
+      ">> FAIL: chunk-numbering: the isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: tx rejected/,
+      ">> FAIL: chunk-numbering: the mortal-expiry note must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Retrying chunk \$\{fail\.index \+ 1\} \(attempt/,
+      ">> FAIL: chunk-numbering: the retry-progress line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: reconcile found it already included/,
+      ">> FAIL: chunk-numbering: the reconcile-found line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: chain still frozen/,
+      ">> FAIL: chunk-numbering: the frozen-chain-wait line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: retry isValid:false/,
+      ">> FAIL: chunk-numbering: the retry isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\} failed after \$\{MAX_CHUNK_RETRIES\} retries/,
+      ">> FAIL: chunk-numbering: the final chunk-failure throw must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Nonce-collision re-upload: chunk \$\{idx \+ 1\} \(attempt/,
+      ">> FAIL: chunk-numbering: the nonce-collision re-upload progress line must use 1-based `${idx + 1}`");
+    assert.match(src, /Nonce-collision re-upload of chunk \$\{idx \+ 1\} failed/,
+      ">> FAIL: chunk-numbering: the nonce-collision re-upload failure throw must use 1-based `${idx + 1}`");
+    assert.match(src, /chunk \$\{i \+ 1\} CID mismatch/,
+      ">> FAIL: chunk-numbering: the verify-mismatch error must use 1-based `${i + 1}`, matching the missing-positions error which was already 1-based");
+    assert.match(src, /trustedIndices\.push\(i \+ 1\)/,
+      ">> FAIL: chunk-numbering: trustedIndices must push 1-based (i + 1), matching every other display site");
+  });
+
+  test("storeDirectoryV2 prints 'Phase A (stable section):' / 'Phase B (full CAR):' headers (#1011)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.match(src, /Phase A \(stable section\):/,
+      ">> FAIL: chunk-numbering: storeDirectoryV2 must print a 'Phase A (stable section):' header before the Phase A upload block");
+    assert.match(src, /Phase B \(full CAR\):/,
+      ">> FAIL: chunk-numbering: storeDirectoryV2 must print a 'Phase B (full CAR):' header before the Phase B upload block");
   });
 
   test("owned-name update preflight announces the owner phone signature; header drops the transfer claim (#60 regression guard)", () => {
@@ -14048,6 +14082,39 @@ describe("incremental-stats v3 summary", () => {
     };
     const out = renderSummary(stats);
     assert.match(out, /Upload:.*3 chunks/);
+  });
+
+  test("renderSummary labels Probed as Phase-A-only and Upload as A+B combined (#1011)", () => {
+    // #1011: Probed: (probedTotal/probePresent/probeAbsent) is populated ONLY from
+    // Phase A's section-1 probe (probeResultsForStats in deploy.ts omits sections
+    // 0/2, which Phase A never probes) while Upload: (chunksUploaded/bytesUploaded)
+    // combines BOTH phases — the exact "9 / 10 / 13 contradict each other" report.
+    // Labeling them removes the ambiguity without changing either figure.
+    const stats = {
+      manifestSource: "embedded", manifestFetchAttempts: 1, manifestBytes: 27_000,
+      framework: null,
+      filesTotal: 76, filesStable: 75, filesVolatile: 1,
+      probedTotal: 13, probePresent: 10, probeAbsent: 0, probeFailed: 3,
+      probeFailedRpc: 3, probeFailedDecode: 0, probeFailedMetadata: 0,
+      recycledCids: 0, retentionPeriodBlocks: 100800,
+      bytesProbePresent: 9_300_000, bytesProbeAbsent: 0,
+      bytesSkipped: 9_300_000, bytesUploaded: 1_500_000,
+      chunksTotal: 13, chunksUploaded: 3, chunksSkipped: 10,
+      carBytes: 10_300_000,
+      section0Bytes: 27_000, section1Bytes: 9_312_991, section2Bytes: 1_458_630,
+      estimatedSecondsSaved: 35,
+      tier2VerifiedCount: 0, tier2FallbackCount: 0, tier2InconclusiveCount: 0,
+    };
+    const out = renderSummary(stats);
+    // test/e2e.test.js parses live stdout with /Probed:\s+(\d+)\s+chunks/ and
+    // /Upload:\s+([\d.]+)\s+MB\s+across\s+(\d+)\s+chunks/ (no end anchor) — the
+    // phase label must come AFTER the number, never between "Probed"/"Upload"
+    // and the colon or between the colon and the number, or it silently breaks
+    // the live E2E harness's parsing.
+    assert.match(out, /Probed:\s+13 chunks.*\(Phase A only\)/,
+      ">> FAIL: renderSummary: Probed line must be suffixed '(Phase A only)' after the existing count/absent text");
+    assert.match(out, /Upload:\s+[\d.]+ MB across 3 chunks \(A\+B combined\)/,
+      ">> FAIL: renderSummary: Upload line must be suffixed '(A+B combined)' right after the chunk count");
   });
 
   test("probeResultsForStats omits non-probed Phase A chunks (#513 — no fabricated rpc_error)", () => {
@@ -19619,6 +19686,75 @@ describe("dotns.ts: finalisation poll prints only when chain time advances", () 
     assert.ok(
       /Awaiting finalization/.test(src),
       "dotns.ts: 'Awaiting finalization' log message must still exist"
+    );
+  });
+});
+
+test("publishManifest prints a 60-char '=' banner titled 'Manifest publish — <domain>' (#1011)", () => {
+  const src = fs.readFileSync("src/manifest/publish.ts", "utf8");
+  assert.match(src, /const banner = "=".repeat\(60\);\s*\n\s*console\.log\("\\n" \+ banner\);\s*\n\s*console\.log\(`Manifest publish — \$\{config\.domain\}`\);\s*\n\s*console\.log\(banner\);/,
+    ">> FAIL: publish.ts: manifest phase must print the same 60-char '=' banner style as Storage/DotNS/Preflight, titled 'Manifest publish — <domain>'");
+});
+
+describe("computePhaseACounts (#1011)", () => {
+  test("first deploy (no trusted CIDs) reports everything as toCheck, zero trusted", () => {
+    const counts = computePhaseACounts(["cidA", "cidB", "cidC"], new Set());
+    assert.deepEqual(counts, { toCheck: 3, trusted: 0, duplicates: 0 },
+      ">> FAIL: computePhaseACounts: first deploy: trusted must be 0 when trustedCids is empty");
+  });
+
+  test("all trusted: toCheck is 0, trusted equals the unique count", () => {
+    const counts = computePhaseACounts(["cidA", "cidB"], new Set(["cidA", "cidB"]));
+    assert.deepEqual(counts, { toCheck: 0, trusted: 2, duplicates: 0 },
+      ">> FAIL: computePhaseACounts: all-trusted: toCheck must be 0 and trusted must equal the unique CID count");
+  });
+
+  test("duplicate untrusted CID is not miscounted as trusted (the #1011 bug shape)", () => {
+    // Old buggy formula: trustedCount = uploadCids.length - new Set(uploadCids).size
+    // = 4 - 3 = 1, reporting 1 "trusted from prev manifest" chunk that was never in
+    // any previous manifest — it was just a duplicate CID within this section.
+    const counts = computePhaseACounts(["cidA", "cidA", "cidB", "cidC"], new Set());
+    assert.deepEqual(counts, { toCheck: 3, trusted: 0, duplicates: 1 },
+      ">> FAIL: computePhaseACounts: a duplicate of an UNTRUSTED CID must count as a duplicate, never as trusted");
+  });
+
+  test("duplicate TRUSTED CID is counted once in trusted, once in duplicates (not double-counted as trusted)", () => {
+    const counts = computePhaseACounts(["cidA", "cidA", "cidB"], new Set(["cidA"]));
+    assert.deepEqual(counts, { toCheck: 1, trusted: 1, duplicates: 1 },
+      ">> FAIL: computePhaseACounts: a trusted CID appearing twice must count as ONE trusted chunk plus one duplicate, not two trusted (this is the edge case where toCheck = uniqueSize - occurrences would go negative)");
+  });
+
+  test("first deploy with duplicate CIDs never reports a nonzero trusted count (contradiction guard)", () => {
+    // This is the literal #1011 report: a FIRST deploy printed "1 trusted from prev
+    // manifest" purely because of a duplicate CID, with no previous manifest at all.
+    const counts = computePhaseACounts(["cidX", "cidX", "cidY"], new Set());
+    assert.equal(counts.trusted, 0,
+      ">> FAIL: computePhaseACounts: a first deploy (empty trustedCids set) must never report trusted > 0, regardless of duplicate CIDs in section 1");
+  });
+});
+
+describe("formatUploadInclusionLine (#1011)", () => {
+  test("nothing submitted: uploadTotal 0", () => {
+    assert.equal(
+      formatUploadInclusionLine(13, 0),
+      "All 13 chunks already on chain — nothing submitted",
+      ">> FAIL: formatUploadInclusionLine: uploadTotal=0 must print the existing 'nothing submitted' wording"
+    );
+  });
+
+  test("partial: some submitted, some already on chain", () => {
+    assert.equal(
+      formatUploadInclusionLine(13, 3),
+      "3 submitted and included, 10 already on chain",
+      ">> FAIL: formatUploadInclusionLine: must report uploadTotal as submitted and (total - uploadTotal) as already on chain"
+    );
+  });
+
+  test("everything submitted: no chunks were already known present", () => {
+    assert.equal(
+      formatUploadInclusionLine(5, 5),
+      "5 submitted and included, 0 already on chain",
+      ">> FAIL: formatUploadInclusionLine: uploadTotal == totalChunks must report 0 already-on-chain, not skip the line"
     );
   });
 });

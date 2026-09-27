@@ -1645,6 +1645,30 @@ export function computeStorageCid(chunks: Uint8Array[]): string {
   return createCID(dagBytes, 0x70, hashCode).toString();
 }
 
+/**
+ * Should a storeDirectoryV2 call use the incremental (chunk-dedup) upload
+ * path and embed a .bulletin-deploy/manifest.json cache manifest?
+ *
+ * False for encrypted deploys (existing behavior: encryption breaks
+ * chunk-level dedup) and for mainnet deploys: retention makes a cache stale
+ * on arrival at mainnet's low deploy cadence, and a production name should
+ * not carry build-cache artifacts. Exact `=== "mainnet"` check on purpose —
+ * an env-less deploy (`network: undefined`, bare --rpc) or one whose
+ * resolved env declares no network keeps the historical incremental
+ * behavior; only an env that explicitly declares itself mainnet loses the
+ * cache.
+ *
+ * Not yet wired into storeDirectoryV2 or deploy() — the twin has no mainnet
+ * env configured today, so there is nothing to gate on yet. Ported as a
+ * standalone pure predicate so the shape stays in sync with upstream for
+ * when a mainnet env lands; the wiring (StoreDirectoryOptions.network, the
+ * storeDirectoryV2 early-return gate, and the deploy() call-site restructure)
+ * is deferred.
+ */
+export function usesIncrementalCache(opts: { network?: string; password?: string }): boolean {
+  return opts.network !== "mainnet" && !opts.password;
+}
+
 export interface StoreDirectoryOptions {
   provider?: ExistingProvider;
   password?: string;

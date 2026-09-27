@@ -38,7 +38,7 @@ import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCh
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
-import { buildFilesMap, detectFramework, applyManifestFetchAttributes } from "../dist/deploy.js";
+import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
 import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag } from "./e2e.test.js";
 import * as nodeCrypto from "node:crypto";
@@ -13038,6 +13038,49 @@ describe("detectFramework", () => {
   test("detectFramework takes only a directory path", () => {
     assert.equal(detectFramework.length, 1,
       ">> FAIL: detectFramework must stay a pure function of the deployed directory only (C1) — a second parameter would invite reading prevManifest here, which C1 forbids");
+  });
+});
+
+// Bulletin #1550/#1566: a mainnet deploy should upload full content and
+// stop — no incremental (chunk-dedup) upload, no embedded
+// .bulletin-deploy/manifest.json cache manifest. Retention makes the cache
+// stale on arrival at mainnet's low deploy cadence, and a production name
+// should not carry build-cache artifacts. Exact `=== "mainnet"` check on
+// purpose: an env-less deploy or one whose resolved env declares no network
+// keeps the historical incremental behaviour.
+//
+// Ported as a standalone pure predicate only — not yet wired into
+// storeDirectoryV2 or deploy() — the twin has no mainnet env configured
+// today, so there is nothing to gate on yet.
+describe("usesIncrementalCache", () => {
+  test("mainnet network disables incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "mainnet" }), false,
+      ">> FAIL: usesIncrementalCache: mainnet must disable the incremental cache");
+  });
+
+  test("testnet network keeps incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "testnet" }), true,
+      ">> FAIL: usesIncrementalCache: testnet must keep the incremental cache");
+  });
+
+  test("undefined network keeps incremental cache (bare --rpc deploy)", () => {
+    assert.equal(usesIncrementalCache({}), true,
+      ">> FAIL: usesIncrementalCache: an env-less deploy must keep the incremental cache");
+  });
+
+  test("unknown network (env resolved, no declared network) keeps incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "unknown" }), true,
+      ">> FAIL: usesIncrementalCache: an 'unknown' sentinel is not mainnet and must keep the cache");
+  });
+
+  test("password disables incremental cache regardless of network", () => {
+    assert.equal(usesIncrementalCache({ network: "testnet", password: "secret" }), false,
+      ">> FAIL: usesIncrementalCache: an encrypted deploy must disable the incremental cache even off mainnet");
+  });
+
+  test("mainnet + password together still disables incremental cache", () => {
+    assert.equal(usesIncrementalCache({ network: "mainnet", password: "secret" }), false,
+      ">> FAIL: usesIncrementalCache: mainnet+password combined must not re-enable the cache");
   });
 });
 

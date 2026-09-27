@@ -282,7 +282,32 @@ describe("validateExecutableManifest — worker", () => {
       entrypoint: "index.js", includes: { chat: false, pocket: false },
     });
     assert.equal(result.ok, false);
-    assert.ok(result.errors.some(e => e.includes("at least one of chat / pocket")));
+    assert.ok(result.errors.some(e => e.includes("at least one of chat / pocket / funding")));
+  });
+
+  test("accepts a worker whose only ceiling is funding", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: false, pocket: false, funding: true },
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("accepts a worker record published before funding existed", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: false, pocket: true },
+    });
+    assert.equal(result.ok, true);
+  });
+
+  test("rejects a non-boolean funding ceiling", () => {
+    const result = validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0],
+      entrypoint: "index.js", includes: { chat: true, pocket: false, funding: "yes" },
+    });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some(e => e.includes("includes.funding")));
   });
 
   test("rejects worker entrypoint with leading slash", () => {

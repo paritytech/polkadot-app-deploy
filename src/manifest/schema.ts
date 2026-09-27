@@ -283,8 +283,13 @@ function validateWorkerFields(input: Record<string, unknown>, p: string): string
   const inc = input.includes;
   if (typeof inc.chat !== "boolean") errors.push(`${p}includes.chat must be a boolean`);
   if (typeof inc.pocket !== "boolean") errors.push(`${p}includes.pocket must be a boolean`);
-  if (inc.chat === false && inc.pocket === false) {
-    errors.push(`${p}includes must have at least one of chat / pocket = true`);
+  // Absent is legal and means false; present-but-not-a-boolean is not, because
+  // a ceiling that cannot be read reliably must not resolve at all.
+  if (inc.funding !== undefined && typeof inc.funding !== "boolean") {
+    errors.push(`${p}includes.funding must be a boolean when present`);
+  }
+  if (inc.chat === false && inc.pocket === false && inc.funding !== true) {
+    errors.push(`${p}includes must have at least one of chat / pocket / funding = true`);
   }
   return errors;
 }

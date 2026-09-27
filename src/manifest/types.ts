@@ -109,6 +109,7 @@ export interface FundingManifest extends CommonExecutableFieldsV1 {
 export interface WorkerIncludes {
   chat: boolean;
   pocket: boolean;
+  funding?: boolean;
 }
 
 export interface WorkerManifest extends CommonExecutableFieldsV1 {

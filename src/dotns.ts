@@ -643,12 +643,11 @@ export const DEFAULT_MNEMONIC: string = "bottom drive obey lake curtain smoke ba
 // required, never a process-wide default that a concurrent caller could flip).
 export const DEFAULT_TLD: string = "dot";
 
-// The default profile every classifyLabelStatus/classifyRegistrability/
-// classifyDotnsLabel/buildLabelAlternatives/formatUnregistrableReason/
-// decideRegistrabilityOutcome call falls back to when no profile is passed —
-// so every existing call/test built before profile-awareness existed keeps
-// its exact prior verdict, byte-for-byte. Also DotNS's own pre-connect()
-// default (see _protocolVersion's own comment).
+// The DotNS class's pre-connect() profile default (_protocolVersion below),
+// which connect()'s live probe overwrites. The classification exports
+// (classifyLabelStatus, classifyRegistrability, classifyDotnsLabel, ...) take
+// `profile` as a REQUIRED argument and never fall back to this: an implicit
+// default there went stale once newer profile generations rolled out (#1419).
 export const DEFAULT_DOTNS_PROFILE: DotnsAbiProfile = "poprules-startingPrice";
 
 // Every TLD DotNS has ever minted names under. Used only by parseDomainName's
@@ -1372,9 +1371,8 @@ const LITE_USERNAME_RE = /^([a-z]+)\.(\d{2})$/;
 // calls this for its status/baseLength/trailingDigits rather than
 // re-deriving them, so the branch logic has one source of truth.
 //
-// `profile` defaults to "poprules-startingPrice" so every existing call site
-// this function had before v0.6.0 existed — including every test that
-// doesn't pass a profile — keeps its EXACT prior verdict, byte-for-byte.
+// `profile` is required, with no default: an implicit generation went stale
+// once v0.6.0 rolled out, so every caller names the one it means (#1419).
 // poprules-startingPrice and v0.5.8-rc1 share one branch below (their
 // PopRules digit-stripping behaviour is unchanged); only v0.6.0 gets new
 // semantics.
@@ -1411,7 +1409,7 @@ const TRAILING_DIGIT_COUNT_GATE_APPLIES: Record<DotnsAbiProfile, boolean> = {
 // check in `default`), not a silent fall-through into whichever branch
 // happens to be last — the same discipline dotns-protocol.ts's ADAPTERS
 // Record already applies to adapter selection.
-function classifyLabelStatus(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): { status: number; trailingDigits: number; baseLength: number } {
+function classifyLabelStatus(label: string, profile: DotnsAbiProfile): { status: number; trailingDigits: number; baseLength: number } {
   const trailingDigits = countTrailingDigits(label);
   switch (profile) {
     case "v0.6.0": {
@@ -1492,7 +1490,7 @@ export interface DomainLabelAlternative {
 // Personhood tier it needs. Never returns a candidate that is itself Reserved
 // or otherwise invalid; the NoStatus fallback (c) always survives because it's
 // engineered to be 9+ chars with exactly 2 trailing digits.
-export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): DomainLabelAlternative[] {
+export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile): DomainLabelAlternative[] {
   const trailingRun = label.slice(label.length - countTrailingDigits(label));
   const base = stripTrailingDigits(label);
   // Preserve the operator's own digits: last 2 of the original run if it's
@@ -1549,7 +1547,7 @@ export type Registrability =
 // already compliant (mirrors #1189's ordering decision for the same reason).
 // Reuses classifyLabelStatus for baseLength/trailingDigits so the thresholds
 // can't drift from classifyDotnsLabel's.
-export function classifyRegistrability(label: string, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): Registrability {
+export function classifyRegistrability(label: string, profile: DotnsAbiProfile): Registrability {
   const { trailingDigits, baseLength } = classifyLabelStatus(label, profile);
 
   // v0.6.0 (PopRules._classifyValidatedName, read from source) DOES NOT gate
@@ -1613,9 +1611,9 @@ export function formatUnregistrableReason(args: {
   existingOwner: string | null;   // lowercased H160, or null when unregistered
   selfAddress: string;            // lowercased H160 of the signer
   tld?: string;
-  profile?: DotnsAbiProfile;
+  profile: DotnsAbiProfile;
 }): string {
-  const { label, registrability, existingOwner, tld = DEFAULT_TLD, profile = DEFAULT_DOTNS_PROFILE } = args;
+  const { label, registrability, existingOwner, tld = DEFAULT_TLD, profile } = args;
   const alternatives = buildLabelAlternatives(label, profile);
   const alternativesBlock = alternatives.length > 0
     ? `\n\nAlternatively, use a name you can register yourself:\n${formatAlternativesList(alternatives, tld)}`
@@ -1652,9 +1650,9 @@ export function decideRegistrabilityOutcome(args: {
   existingOwner: string | null;
   selfAddress: string;
   tld?: string;
-  profile?: DotnsAbiProfile;
+  profile: DotnsAbiProfile;
 }): { canProceed: boolean; plannedAction: "already-owned-by-us" | "register" | "abort"; reason?: string } {
-  const { label, registrability, existingOwner, selfAddress, tld = DEFAULT_TLD, profile = DEFAULT_DOTNS_PROFILE } = args;
+  const { label, registrability, existingOwner, selfAddress, tld = DEFAULT_TLD, profile } = args;
   // Ownership is checked FIRST and reported distinctly from registrability.
   // These two must not be collapsed into one branch: `plannedAction` is a
   // load-bearing string elsewhere (src/deploy.ts reads "already-owned-by-us"
@@ -1731,7 +1729,7 @@ export function isCommitmentTimingBarerevert(msg: string): boolean {
 //   PopFull required: userStatus must be PopFull
 //   PopLite required: userStatus in { PopLite, PopFull }
 //   NoStatus required: any user tier may register
-export function classifyDotnsLabel(label: string, tld: string = DEFAULT_TLD, profile: DotnsAbiProfile = DEFAULT_DOTNS_PROFILE): { status: number; message: string } {
+export function classifyDotnsLabel(label: string, tld: string, profile: DotnsAbiProfile): { status: number; message: string } {
   // Status/baseLength/trailingDigits all come from the single shared
   // classifier — this function only turns that decision into a message.
   const { status, trailingDigits, baseLength } = classifyLabelStatus(label, profile);

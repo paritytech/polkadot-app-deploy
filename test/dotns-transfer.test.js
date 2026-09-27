@@ -519,7 +519,7 @@ test("subname dispatch: a sublabel classifyRegistrability would refuse as a top-
   // Sanity check the premise: "app1" (1 trailing digit) IS refused by
   // classifyRegistrability when treated as a registerable top-level name —
   // otherwise this test wouldn't actually be pinning anything.
-  const registrability = classifyRegistrability("app1");
+  const registrability = classifyRegistrability("app1", "poprules-startingPrice");
   assert.equal(
     registrability.registrable, false,
     ">> FAIL: subname dispatch premise: \"app1\" (1 trailing digit) should be non-registrable as a top-level name, or this test isn't exercising the guard it claims to",

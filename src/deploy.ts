@@ -2803,13 +2803,17 @@ export function formatSubdomainParentError(
   parentLabel: string,
   parentOwner: string | null,
   selfAddress: string,
-  tld: string = DEFAULT_TLD,
+  // #1419: tld and profile were both stale implicit defaults (DEFAULT_TLD /
+  // the old poprules-startingPrice profile) — exactly the class of bug the
+  // comment below used to warn about, just one layer further out. Both are
+  // now required so a caller can't silently inherit a generation that
+  // describes no environment this repo talks to.
+  tld: string,
   // Without this, a v0.6.0 environment would silently fall back to
   // poprules-startingPrice's (stricter, digit-stripping) label semantics
   // here — the exact class of bug the profile-aware classifier exists to
-  // close, just at a call site outside src/dotns.ts. Defaults to the old
-  // profile so every existing call/test keeps its exact prior verdict.
-  profile: DotnsAbiProfile = "poprules-startingPrice",
+  // close, just at a call site outside src/dotns.ts.
+  profile: DotnsAbiProfile,
 ): string {
   // bulletin-deploy #1443: a zero-address owner is the registry's "no owner"
   // sentinel, not an account. Callers now read it straight off

@@ -21,7 +21,7 @@ import {
 } from "../dist/index.js";
 import { registerOrEnsureResolver, domainMatchesEnvTld, manifestSignerOptions } from "../dist/manifest/publish.js";
 import { NonRetryableError } from "../dist/errors.js";
-import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
+import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints, __selectStorageProviderModeForTest, resolveProductSigner } from "../dist/deploy.js";
 import { deriveProductSigner } from "../dist/product-account.js";
 
 describe("validateRootManifest", () => {
@@ -1164,5 +1164,66 @@ describe("manifestSignerOptions", () => {
       ">> FAIL: setResolver on the registry is owner-only; the manifest must be signed by the same account deploy() registered the name with");
     assert.equal(r.mnemonic, undefined);
     assert.equal(r.localSigner, true);
+  });
+});
+
+// Issue #1495. The manifest's icon and executables are billed to the storage account's Bulletin
+// quota, so they must be stored by the SAME account the content upload used — on a chain whose
+// shared pool holds no quota (no testnet authorizer), any divergence is a deploy that writes its
+// content and then fails, or silently skips, the manifest half.
+//
+// publishManifest cannot call deploy()'s resolution directly (it runs as a separate step, from
+// its own options), so the property under test is that both paths feed
+// selectStorageReconnect the same thing: this asserts manifestSignerOptions' output resolves to
+// the identical provider mode AND account as the options deploy() would hold at that point.
+describe("publishManifest — storage identity matches the content upload (#1495)", () => {
+  const PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+  test("--mnemonic: both halves upload from the deployer's own account", () => {
+    const manifest = manifestSignerOptions({ mnemonic: PHRASE, derivationPath: "//deploy/3" });
+    // What deploy() holds for the same invocation: no product name, no slot, so the mnemonic
+    // passes through untouched (src/deploy.ts's resolveProductSigner returns null).
+    const content = { mnemonic: PHRASE, derivationPath: "//deploy/3" };
+    assert.equal(__selectStorageProviderModeForTest(manifest), "direct");
+    assert.equal(__selectStorageProviderModeForTest(manifest), __selectStorageProviderModeForTest(content));
+    assert.equal(manifest.mnemonic, content.mnemonic);
+    assert.equal(manifest.derivationPath, content.derivationPath);
+  });
+
+  test("--product-name: the manifest stores from the product account, not the root mnemonic", () => {
+    const manifest = manifestSignerOptions({ mnemonic: PHRASE, productName: "getcash" });
+    // deploy() applies exactly this before selecting storage:
+    //   options = { ...options, ...resolveProductSigner(options) }
+    const content = { mnemonic: PHRASE, ...resolveProductSigner({ productName: "getcash", mnemonic: PHRASE }) };
+    assert.equal(__selectStorageProviderModeForTest(manifest), "signer",
+      ">> FAIL: under --product-name deploy() stores content from the product account (it swaps the signer before selecting storage). A manifest that falls back to the mnemonic's root account needs a second Bulletin grant nobody provisions.");
+    assert.equal(__selectStorageProviderModeForTest(manifest), __selectStorageProviderModeForTest(content));
+    assert.equal(manifest.signerAddress, content.signerAddress,
+      ">> FAIL: the manifest's icon and executables must be stored by the same account as the content — the product account that owns the name.");
+    assert.equal(manifest.signerAddress, deriveProductSigner(PHRASE, "getcash").ss58);
+    assert.equal(manifest.mnemonic, undefined,
+      ">> FAIL: leaving the mnemonic set would let it win the storage precedence over the product signer.");
+  });
+
+  test("login session: the allowance slot carries over to the manifest", () => {
+    const slot = { storageSigner: { sign: () => {} }, storageSignerAddress: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" };
+    const manifest = manifestSignerOptions({ ...slot });
+    assert.equal(__selectStorageProviderModeForTest(manifest), "storageSigner",
+      ">> FAIL: a signed-in deploy stores content on the user's own Bulletin allowance slot; without the slot here the manifest silently falls back to the shared pool.");
+    assert.equal(manifest.storageSignerAddress, slot.storageSignerAddress);
+  });
+
+  test("slot outranks the mnemonic, exactly as it does in deploy()", () => {
+    const manifest = manifestSignerOptions({
+      mnemonic: PHRASE,
+      storageSigner: { sign: () => {} },
+      storageSignerAddress: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    });
+    assert.equal(__selectStorageProviderModeForTest(manifest), "storageSigner",
+      ">> FAIL: storage precedence is storageSigner > signer > mnemonic > pool on both paths; diverging here puts the two halves of one deploy on different accounts.");
+  });
+
+  test("no credentials at all: the shared pool is still the fallback", () => {
+    assert.equal(__selectStorageProviderModeForTest(manifestSignerOptions({})), "pool");
   });
 });

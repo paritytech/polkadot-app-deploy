@@ -31,7 +31,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests, resolvePoolMnemonic, describeIgnoredPoolMnemonicEnv } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
@@ -25040,7 +25040,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText, resolveProductSigner } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText, resolveProductSigner, isPoolFallbackAllowed, assertPoolFallbackAllowed, setBulletinNetworkContext, __getBulletinNetworkContextForTest } from "../dist/deploy.js";
 import { deriveProductSigner } from "../dist/product-account.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
@@ -26289,5 +26289,127 @@ describe("resolveProductSigner", () => {
 
   test("refuses a product name combined with a derivation path", () => {
     assert.throws(() => resolveProductSigner({ productName: "uid.paseo", mnemonic: MNEMONIC, derivationPath: "//x" }), /cannot be combined/);
+  });
+});
+
+// Issue #1496 (1): bulletin-bootstrap authorizes the accounts a deploy will upload from.
+// The two used to read different env vars, so an env could look bootstrapped while every pool
+// deploy still hit unauthorized accounts. resolvePoolMnemonic is now the single resolution both
+// call, and these pin its precedence.
+describe("pool mnemonic resolution is shared by bootstrap and deploy (#1496)", () => {
+  const DEV_PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+  const OTHER = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+  let savedPool, savedMnemonic;
+
+  beforeEach(() => {
+    savedPool = process.env.BULLETIN_POOL_MNEMONIC;
+    savedMnemonic = process.env.MNEMONIC;
+    delete process.env.BULLETIN_POOL_MNEMONIC;
+    delete process.env.MNEMONIC;
+  });
+  afterEach(() => {
+    if (savedPool === undefined) delete process.env.BULLETIN_POOL_MNEMONIC; else process.env.BULLETIN_POOL_MNEMONIC = savedPool;
+    if (savedMnemonic === undefined) delete process.env.MNEMONIC; else process.env.MNEMONIC = savedMnemonic;
+  });
+
+  test("defaults to the well-known dev phrase when nothing is set", () => {
+    assert.equal(resolvePoolMnemonic(), DEV_PHRASE);
+  });
+
+  test("BULLETIN_POOL_MNEMONIC drives the pool", () => {
+    process.env.BULLETIN_POOL_MNEMONIC = OTHER;
+    assert.equal(resolvePoolMnemonic(), OTHER);
+  });
+
+  test("an explicit argument (bootstrap's --mnemonic) wins over the env", () => {
+    process.env.BULLETIN_POOL_MNEMONIC = OTHER;
+    assert.equal(resolvePoolMnemonic(DEV_PHRASE), DEV_PHRASE);
+  });
+
+  test("MNEMONIC alone does NOT re-point the pool", () => {
+    process.env.MNEMONIC = OTHER;
+    assert.equal(resolvePoolMnemonic(), DEV_PHRASE,
+      ">> FAIL: MNEMONIC names the DotNS signing account. Deriving the pool from it would send deploys to accounts nobody granted quota to — and it is exactly the var bootstrap used to honour and deploy did not.");
+  });
+
+  test("bootstrap and deploy derive the same //deploy/0 under every env combination", () => {
+    for (const env of [{}, { BULLETIN_POOL_MNEMONIC: OTHER }, { MNEMONIC: OTHER }, { BULLETIN_POOL_MNEMONIC: OTHER, MNEMONIC: DEV_PHRASE }]) {
+      delete process.env.BULLETIN_POOL_MNEMONIC;
+      delete process.env.MNEMONIC;
+      Object.assign(process.env, env);
+      // Both call sites now go through resolvePoolMnemonic() with no argument.
+      const fromBootstrap = derivePoolAccounts(1, resolvePoolMnemonic())[0].address;
+      const fromDeploy = derivePoolAccounts(1, resolvePoolMnemonic())[0].address;
+      assert.equal(fromBootstrap, fromDeploy, `>> FAIL: divergent pool derivation for env ${JSON.stringify(env)}`);
+    }
+  });
+
+  test("warns only when MNEMONIC is set and would plausibly be mistaken for the pool key", () => {
+    assert.equal(describeIgnoredPoolMnemonicEnv({}), null);
+    assert.equal(describeIgnoredPoolMnemonicEnv({ BULLETIN_POOL_MNEMONIC: OTHER, MNEMONIC: OTHER }), null);
+    assert.equal(describeIgnoredPoolMnemonicEnv({ MNEMONIC: OTHER }, "explicit-flag"), null);
+    assert.match(describeIgnoredPoolMnemonicEnv({ MNEMONIC: OTHER }) ?? "", /BULLETIN_POOL_MNEMONIC/);
+  });
+});
+
+// Issue #1496 (2): the slot -> pool fallback is testnet-only. On mainnet the //deploy/N accounts
+// are dev-phrase accounts with no grant, so falling back can only defer the failure past the
+// upload, behind a warning that says the situation is fine.
+describe("slot storage failure falls back to the pool only off mainnet (#1496)", () => {
+  test("testnet keeps the historical fallback", () => {
+    assert.equal(isPoolFallbackAllowed("testnet"), true);
+  });
+  test("mainnet refuses it", () => {
+    assert.equal(isPoolFallbackAllowed("mainnet"), false,
+      ">> FAIL: the shared pool holds no authorization on mainnet — falling back turns a precise slot error into an out-of-quota failure mid-upload.");
+  });
+  test("an env that declares no network keeps the old behaviour rather than newly hard-failing", () => {
+    assert.equal(isPoolFallbackAllowed(undefined), true);
+    assert.equal(isPoolFallbackAllowed("unknown"), true);
+  });
+
+  // The refusal itself, not just the predicate: a mainnet slot failure must surface WHY the slot
+  // was unusable, or the operator is left with "storage unavailable" and no way to tell an
+  // expired allowance from a chain that never granted one.
+  test("testnet falls back, mainnet throws a NonRetryableError that preserves the slot reason", () => {
+    assert.doesNotThrow(() => assertPoolFallbackAllowed("testnet", "expired at block 99"));
+    assert.doesNotThrow(() => assertPoolFallbackAllowed(undefined, "expired at block 99"));
+
+    let thrown = null;
+    try {
+      assertPoolFallbackAllowed("mainnet", "expired at block 99");
+    } catch (e) {
+      thrown = e;
+    }
+    assert.ok(thrown instanceof NonRetryableError,
+      ">> FAIL: a mainnet slot failure must be NonRetryableError — retrying cannot help when the shared pool holds no quota on that chain.");
+    assert.match(thrown.message, /expired at block 99/,
+      ">> FAIL: the refusal must carry describeSlotFallbackReason's output, or the operator cannot tell an expired allowance from one that was never granted.");
+    assert.match(thrown.message, /logout && polkadot-app-deploy login/,
+      ">> FAIL: the refusal must name the remedy the testnet warning already prints.");
+  });
+});
+
+// #1494-equivalent for the twin (auto-authorize itself excluded per the port brief — the twin
+// never self-authorizes Bulletin storage): publishManifest opens its own Bulletin provider and
+// can run without a preceding in-process deploy() (it is a public export). The mainnet
+// pool-fallback gate above reads module-level state that only deploy() used to write, so a
+// publishManifest() call with no preceding deploy() would resolve bulletinNetwork=undefined —
+// the historical testnet-shaped fallback, not a hard failure on a real mainnet env.
+// publish.ts now sets it from the same env it already resolves; this pins the setter both
+// paths depend on.
+describe("Bulletin network context is settable from outside deploy() (#1496, minus auto-authorize)", () => {
+  test("round-trips the env's declared network", () => {
+    const saved = __getBulletinNetworkContextForTest();
+    try {
+      setBulletinNetworkContext("mainnet");
+      assert.equal(__getBulletinNetworkContextForTest(), "mainnet",
+        ">> FAIL: without this, a publishManifest() call that does not follow deploy() in-process resolves bulletinNetwork=undefined even on a real mainnet env, and a failed slot silently falls back to the pool instead of refusing.");
+      setBulletinNetworkContext(undefined);
+      assert.equal(__getBulletinNetworkContextForTest(), undefined,
+        ">> FAIL: an env that declares no network must CLEAR the previous one, not inherit it from an earlier deploy in the same process.");
+    } finally {
+      setBulletinNetworkContext(saved);
+    }
   });
 });

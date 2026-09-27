@@ -33,7 +33,7 @@ Options:
 
 | Flag | What it does |
 |---|---|
-| `--mnemonic "..."` | Pool root mnemonic used to derive the pool accounts. Also readable from `BULLETIN_POOL_MNEMONIC`, then `MNEMONIC`. Defaults to the well-known dev phrase — the same key the deploy path uses. |
+| `--mnemonic "..."` | Pool root mnemonic used to derive the pool accounts. Also readable from `BULLETIN_POOL_MNEMONIC`. Defaults to the well-known dev phrase — the same key, read the same way, as the deploy path (`resolvePoolMnemonic` in `src/pool.ts` is the one resolver both use). `MNEMONIC` is deliberately **not** consulted: it names the DotNS signing account, and honouring it here authorized a set of `//deploy/N` accounts no deploy ever uploads from. Bootstrap warns when `MNEMONIC` is set and `BULLETIN_POOL_MNEMONIC` is not, and prints the derived `//deploy/0` so you can compare it against the deploy's own "Using pool account 0: <ss58>" line. |
 | `--authorizer "..."` | Seed/mnemonic of the key that holds authorization authority on this chain (e.g. `//Alice`, a full mnemonic, or a hex seed). If omitted, falls back to the `--env`'s declared `bulletinAuthorizer` (e.g. `//Alice` on `paseo-next-v2`); if the env declares none (or `--env` isn't given), the run is status-only. |
 | `--rpc wss://...` | Override the Bulletin RPC endpoint. Also readable from `BULLETIN_RPC`. |
 | `--env <id>` | Load environment by id from `environments.json` (sets the default RPC). |

@@ -621,6 +621,11 @@ try {
           mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,
           productName: flags.productName,
+          // The slot signer deploy() resolved from the login session, so the manifest's
+          // uploads are billed to the same allowance the content was. Undefined for every
+          // other signer shape, which publishManifest resolves from the options above.
+          storageSigner: result.storageSigner,
+          storageSignerAddress: result.storageSignerAddress,
         });
         // #1164: deploy() deferred the real completion banner (manifestPending
         // was set above) — print it now that the manifest phase actually

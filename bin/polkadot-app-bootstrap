@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE } from "../dist/deploy.js";
-import { bootstrapPool } from "../dist/pool.js";
+import { bootstrapPool, resolvePoolMnemonic, describeIgnoredPoolMnemonicEnv } from "../dist/pool.js";
 import { VERSION } from "../dist/telemetry.js";
 
 const args = process.argv.slice(2);
@@ -66,7 +66,13 @@ Options:
 
 let rpc = flags.rpc ?? process.env.BULLETIN_RPC ?? DEFAULT_BULLETIN_RPC;
 const poolSize = flags.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
-const mnemonic = flags.mnemonic ?? process.env.BULLETIN_POOL_MNEMONIC ?? process.env.MNEMONIC;
+// Same resolver the deploy path uses (src/pool.ts), so the accounts this tool authorizes are
+// exactly the accounts a deploy will upload from. It deliberately ignores MNEMONIC — that names
+// the DotNS signing account, and honouring it here authorized a set of //deploy/N accounts no
+// deploy ever touches, with no visible symptom until storage failed on a bootstrapped env.
+const mnemonic = resolvePoolMnemonic(flags.mnemonic);
+const ignoredMnemonicWarning = describeIgnoredPoolMnemonicEnv(process.env, flags.mnemonic);
+if (ignoredMnemonicWarning) console.warn(`⚠  ${ignoredMnemonicWarning}`);
 
 const bootstrapOpts = {};
 

@@ -48,6 +48,56 @@ function parseDeployedCid(stdout, scenario = "deploy") {
   })[1];
 }
 
+// #1495: which account stored the manifest's icon and executables, and whether it is the one
+// that stored the content. The bytes are billed to the storage account's Bulletin quota, so the
+// two phases diverging means half a deploy is paid for by an account nobody provisioned — on a
+// chain whose shared pool holds no quota, that is a deploy that publishes content and then fails
+// (or silently skips) its manifest. No assertion covered this before: every e2eEligible env
+// auto-authorizes anything that asks, so both accounts always "work" here.
+//
+// Each Bulletin provider logs exactly one of these lines, and publishManifest opens its own
+// provider after the "Manifest publish — <domain>" banner, so the banner splits the phases.
+// Address equality is asserted only when the content phase named a specific account: the pool is
+// a shared identity whose members are interchangeable, so a pool deploy asserts mode parity only.
+function assertManifestStorageMatchesContent(stdout, { scenario }) {
+  const parsePhase = (text) =>
+    [...text.matchAll(/Using (pool account \d+|direct signer|external signer):\s+(\S+)/g)].map((m) => ({
+      mode: m[1].startsWith("pool account") ? "pool" : m[1],
+      address: m[2],
+    }));
+
+  const bannerAt = stdout.indexOf("Manifest publish —");
+  if (bannerAt === -1) {
+    failWith({
+      scenario,
+      message: 'no "Manifest publish —" banner in the deploy output',
+      context: stdout,
+      keywords: ["Manifest", "publish", "Using"],
+      hint: "this scenario must deploy with a manifest sidecar (--config). Without one publishManifest never runs, so there is no manifest storage account to check.",
+    });
+  }
+  // Last provider line before the banner: the one the content upload finished on (a mid-upload
+  // reconnect logs another). First after it: the manifest's own provider.
+  const content = parsePhase(stdout.slice(0, bannerAt)).pop();
+  const manifest = parsePhase(stdout.slice(bannerAt))[0];
+  if (!content || !manifest) {
+    failWith({
+      scenario,
+      message: `could not read both storage accounts (content: ${content?.mode ?? "missing"}, manifest: ${manifest?.mode ?? "missing"})`,
+      context: stdout,
+      keywords: ["Using", "signer", "pool"],
+      hint: "every Bulletin provider logs 'Using pool account N:', 'Using direct signer:' or 'Using external signer:'. A missing manifest-phase line means publishManifest never opened a provider — check for an earlier 'Manifest publish failed' line.",
+    });
+  }
+  assert.equal(manifest.mode, content.mode,
+    `>> FAIL: ${scenario}: the content upload stored from a ${content.mode} provider but the manifest used ${manifest.mode} — both halves of one deploy must be billed to the same Bulletin quota.`);
+  if (content.mode !== "pool") {
+    assert.equal(manifest.address, content.address,
+      `>> FAIL: ${scenario}: content stored from ${content.address} but the manifest from ${manifest.address}. The manifest's icon and executables spend the storage account's quota, so a second account here needs a grant nobody provisions.`);
+  }
+  return { content, manifest };
+}
+
 // Parse the chunk-skip rate from a deploy's stdout.
 // Looks for the Probed summary line emitted by renderSummary in incremental-stats.ts:
 //   "  Probed:        18 chunks  →  15 on chain, 2 absent"
@@ -2216,6 +2266,10 @@ describe("e2e", { skip: !ENABLED }, () => {
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-MANIFEST-ENV" });
+
+        // #1495: this leg already proves the icon lands on the right CHAIN; assert it also
+        // lands from the right ACCOUNT — the one the content upload used.
+        assertManifestStorageMatchesContent(stdout, { scenario: "S-MANIFEST-ENV" });
 
         const deployedCid = parseDeployedCid(stdout, "S-MANIFEST-ENV");
         const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();

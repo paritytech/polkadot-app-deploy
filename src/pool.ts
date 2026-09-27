@@ -62,6 +62,42 @@ export const TOPUP_TRANSACTIONS = 1000;
 export const TOPUP_BYTES = 100_000_000n; // 100MB
 const WS_HEARTBEAT_TIMEOUT_MS = 300_000;
 
+/**
+ * The mnemonic the `//deploy/N` pool is derived from, for EVERY entry point that touches the
+ * pool — the deploy path and `polkadot-app-bootstrap` alike.
+ *
+ * The two used to disagree: the deploy path read `BULLETIN_POOL_MNEMONIC` only, while bootstrap
+ * also accepted `MNEMONIC`. With `MNEMONIC` set and `BULLETIN_POOL_MNEMONIC` unset — the normal
+ * shape for anyone exporting a single mnemonic, and what the nightly E2E jobs do — bootstrap
+ * authorized one set of accounts while deploys uploaded from another, and the only symptom was
+ * an unauthorized-storage failure on an env that had just been bootstrapped.
+ *
+ * `MNEMONIC` deliberately does NOT participate: it names the DotNS signing account, and the pool
+ * is a distinct, shared identity. Accepting it here would silently re-point every pool deploy at
+ * an account with no grant. See `describeIgnoredPoolMnemonicEnv` for the warning bootstrap prints
+ * when the two are confusable.
+ */
+export function resolvePoolMnemonic(explicit?: string): string {
+  return explicit || process.env.BULLETIN_POOL_MNEMONIC || DEV_PHRASE;
+}
+
+/**
+ * Warning text for the one case where an operator can reasonably expect `MNEMONIC` to drive pool
+ * derivation and it does not, or null when there is nothing to say. Pure so it can be unit-tested
+ * without spawning the bootstrap CLI.
+ */
+export function describeIgnoredPoolMnemonicEnv(
+  env: Record<string, string | undefined> = process.env,
+  explicitFlag?: string,
+): string | null {
+  if (explicitFlag || env.BULLETIN_POOL_MNEMONIC || !env.MNEMONIC) return null;
+  return (
+    "MNEMONIC is set but BULLETIN_POOL_MNEMONIC is not — pool accounts are derived from the " +
+    "default dev phrase, NOT from MNEMONIC (the deploy path does the same). Set " +
+    "BULLETIN_POOL_MNEMONIC, or pass --mnemonic, to bootstrap a different pool."
+  );
+}
+
 export function derivePoolAccounts(poolSize: number = 10, mnemonic: string = DEV_PHRASE): PoolAccount[] {
   const entropy = mnemonicToEntropy(mnemonic);
   const miniSecret = entropyToMiniSecret(entropy);
@@ -504,7 +540,8 @@ export async function ensurePoolAccountsFundedOnAssetHub(
   const targetRaw = opts.targetRaw ?? DEFAULT_ASSET_HUB_TOPUP_TARGET;
 
   await cryptoWaitReady();
-  const accounts = derivePoolAccounts(poolSize, poolMnemonic);
+  // Same resolution as bootstrapPool above: fund the accounts a deploy will actually use.
+  const accounts = derivePoolAccounts(poolSize, resolvePoolMnemonic(poolMnemonic));
 
   const entropy = mnemonicToEntropy(opts.funderMnemonic ?? DEV_PHRASE);
   const miniSecret = entropyToMiniSecret(entropy);
@@ -598,7 +635,13 @@ export async function bootstrapPool(
   console.log(`Checking ${poolSize} pool accounts on ${bulletinRpc}...\n`);
 
   await cryptoWaitReady();
-  const accounts = derivePoolAccounts(poolSize, mnemonic);
+  // resolvePoolMnemonic, not the raw argument: the deploy path derives from
+  // BULLETIN_POOL_MNEMONIC (else the dev phrase), and authorizing any other set of accounts
+  // here would leave the env looking bootstrapped while deploys still hit unauthorized ones.
+  const accounts = derivePoolAccounts(poolSize, resolvePoolMnemonic(mnemonic));
+  // The first account, printed so an operator can compare it against the deploy's own
+  // "Using pool account 0: <ss58>" line and spot a mnemonic mismatch at a glance.
+  if (accounts.length > 0) console.log(`Pool root: //deploy/0 = ${accounts[0].address}\n`);
 
   const client = createClient(getWsProvider(
     bulletinRpc,

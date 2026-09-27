@@ -29,7 +29,7 @@ import type { DotnsAbiProfile } from "./dotns-protocol.js";
 import { subnameNestingLevels } from "./subname-depth.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet } from "./pool.js";
+import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
 import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
@@ -61,6 +61,18 @@ export interface DeployResult {
    * instead of recomputing a gateway URL from a hardcoded default.
    */
   browserUrl: string;
+  /**
+   * The Bulletin allowance-slot signer this deploy stored its content with, when it resolved
+   * one from a login session (`resolveStorageSigner`). Exposed so the CLI can hand the SAME
+   * identity to `publishManifest` immediately afterwards: the manifest's icon and executables
+   * are billed to the storage account's quota, and a session deploy whose manifest fell back
+   * to the shared pool would fail on any chain whose pool holds no quota. Undefined when
+   * storage ran on a mnemonic, an external signer, or the pool — those the manifest step
+   * resolves for itself from the options it is already given.
+   */
+  storageSigner?: PolkadotSigner;
+  /** SS58 address of that slot account. Set whenever `storageSigner` is. */
+  storageSignerAddress?: string;
 }
 
 export type DeployContent = string | Uint8Array | Uint8Array[];
@@ -116,7 +128,10 @@ let POOL_SIZE = DEFAULT_POOL_SIZE;
 // detectTestnet call decides from the declared env, not a chain spec_name
 // guess, whenever one is available. Module-level (like BULLETIN_ENDPOINTS/
 // POOL_SIZE above) because getProvider/getDirectProvider/getSignerProvider
-// run outside deploy()'s own scope.
+// run outside deploy()'s own scope. Also read by isPoolFallbackAllowed below
+// to gate whether a failed Bulletin allowance slot may fall back to the
+// shared pool — the pool is derived from the well-known dev phrase and holds
+// no grant on mainnet.
 let bulletinNetwork: string | undefined;
 
 /**
@@ -149,6 +164,24 @@ export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: st
  */
 export function setBulletinEndpoints(endpoints: string[]): void {
   BULLETIN_ENDPOINTS = endpoints;
+}
+
+/**
+ * Set the module-level `bulletinNetwork` context declared above. `manifest/publish.ts`
+ * opens its own storage provider and can run without a preceding in-process `deploy()`,
+ * in which case `bulletinNetwork` would still be undefined — the historical
+ * (testnet-shaped) fallback behavior, not a hard failure on mainnet, and detectTestnet's
+ * own spec_name guess would also be skipped. Same reasoning as `setBulletinEndpoints`:
+ * ESM named imports are read-only bindings, so a setter is the only way for another
+ * module to update this `let`.
+ */
+export function setBulletinNetworkContext(network: string | undefined): void {
+  bulletinNetwork = network;
+}
+
+/** The value above, for tests that assert the wiring without a chain connection. */
+export function __getBulletinNetworkContextForTest(): string | undefined {
+  return bulletinNetwork;
 }
 // Module-level flag: flipped by getWsProvider's onStatusChanged if papi
 // connects to a non-primary endpoint. Flushed into the deploy span at the end
@@ -433,8 +466,9 @@ async function getProvider(): Promise<ProviderResult> {
 
   try {
     await cryptoWaitReady();
-    const poolMnemonic = process.env.BULLETIN_POOL_MNEMONIC || undefined;
-    const poolAccounts = derivePoolAccounts(POOL_SIZE, poolMnemonic);
+    // One resolver, shared with bin/polkadot-app-bootstrap, so the accounts an operator authorizes
+    // are the accounts a deploy uploads from (see resolvePoolMnemonic's doc comment).
+    const poolAccounts = derivePoolAccounts(POOL_SIZE, resolvePoolMnemonic());
     const authorizations = await fetchPoolAuthorizations(unsafeApi, poolAccounts);
     const poolIndexEnv = process.env.BULLETIN_POOL_ACCOUNT_INDEX;
     let pinnedPoolIndex: number | undefined;
@@ -785,6 +819,35 @@ export function describeSlotFallbackReason(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * May a failed allowance slot fall back to the shared `//deploy/N` pool?
+ *
+ * Only off mainnet. The pool is derived from the well-known dev phrase, so on a mainnet chain it
+ * holds no authorization and the fallback cannot succeed — it just trades a precise slot error
+ * for an out-of-quota failure later in the upload, behind a warning that says the situation is
+ * fine. Keyed on the resolved env's declared `network`, the same field used elsewhere to
+ * distinguish testnet-vs-mainnet wording; an env that declares nothing (custom presets, library
+ * callers that never set it) keeps the historical fallback rather than newly hard-failing.
+ */
+export function isPoolFallbackAllowed(network?: string): boolean {
+  return network !== "mainnet";
+}
+
+/**
+ * The refusal itself, extracted so the mainnet branch is unit-testable without a WS connection
+ * (same reasoning as describeSlotFallbackReason). Returns normally when the fallback is allowed;
+ * throws on mainnet, carrying the slot's own failure reason so the message says what actually
+ * went wrong rather than only that storage is unavailable.
+ */
+export function assertPoolFallbackAllowed(network: string | undefined, reason: string): void {
+  if (isPoolFallbackAllowed(network)) return;
+  throw new NonRetryableError(
+    `Bulletin allowance slot not usable: ${reason}. ` +
+    `On mainnet storage must run on your own allowance — the shared pool account holds no ` +
+    `quota there, so there is nothing to fall back to. Run: ${CLI_NAME} logout && ${CLI_NAME} login`,
+  );
+}
+
 export function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
   // Delegate the mode decision to the pure, unit-tested selector (bulletin #1452) so this
   // function and __selectStorageProviderModeForTest can never disagree about which branch runs.
@@ -803,18 +866,19 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
       try {
         return await getSlotSignerProvider(options.storageSigner!, options.storageSignerAddress!);
       } catch (e) {
+        const reason = describeSlotFallbackReason(e);
+        // The pool cannot store on mainnet (dev-phrase accounts, no grant), so falling back
+        // would only defer the failure past the upload. Fail here, where the cause is known.
+        // Attribute first: the refusal throws, and the reason must reach telemetry either way.
+        setDeployAttribute("deploy.signer.fallback_reason", reason);
+        assertPoolFallbackAllowed(bulletinNetwork, reason);
         useSlot = false;
         setDeployAttribute("deploy.signer.mode", "pool-fallback");
-        const reason = describeSlotFallbackReason(e);
-        setDeployAttribute("deploy.signer.fallback_reason", reason);
         console.warn(
           `⚠  Bulletin allowance slot not usable: ${reason}\n` +
           `   Falling back to the shared pool account for storage (fine on testnet).\n` +
           `   To use your own allowance, run: ${CLI_NAME} logout && ${CLI_NAME} login`,
         );
-        // TODO (mainnet): hard-fail here instead of pool fallback when running against mainnet
-        // (tie to the open mainnet-storage-signer gap in src/CLAUDE.md). Env-gating deferred
-        // until mainnet is live.
         return getProvider();
       }
     };
@@ -4121,6 +4185,11 @@ export async function deploy(content: DeployContent, domainName: string | null =
         cid: cid as string,
         ipfsCid,
         browserUrl,
+        // Read off `options`, not the slot resolution above: `options` is what
+        // selectStorageReconnect actually consulted, so this reports the identity that
+        // stored the bytes even when the caller supplied storageSigner itself.
+        storageSigner: options.storageSigner,
+        storageSignerAddress: options.storageSignerAddress,
       };
     } finally {
       // Flush the module-level failover flag in case onStatusChanged fired after

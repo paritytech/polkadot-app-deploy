@@ -7740,6 +7740,24 @@ describe("nightly verify_pool_distribution wiring (#516)", () => {
       "nightly-report must include nightly-verify-pool-distribution in needs:",
     );
   });
+
+  test("e2e.yml's failure-signature grep matches both prefixes bin/polkadot-app-deploy prints (port of bulletin #1499)", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf8");
+    const m = wf.match(/\| grep -aE '([^']+)'/);
+    assert.ok(m, ">> FAIL: e2e.yml signatures: no failure-signature grep found in the report job");
+    const pattern = new RegExp(m[1]);
+    // bin/polkadot-app-deploy prints `Deployment failed${noRetry ? " (not retryable)" : ""}:`,
+    // so a pattern ending at the colon silently drops every non-retryable abort:
+    // funding gates, already-owned domains, config errors.
+    const lines = [
+      "Deployment failed: chunk upload timed out after 180s",
+      "Deployment failed (not retryable): DotNS signer has 178.7007 PAS free; needs 211.1000 PAS for register.",
+    ];
+    for (const line of lines) {
+      assert.match(line, pattern,
+        `>> FAIL: e2e.yml signatures: the report's grep misses "${line}", so the issue body reads "no failure signature found"`);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

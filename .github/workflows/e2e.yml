@@ -2325,7 +2325,7 @@ jobs:
               -H "Authorization: bearer $GITHUB_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "${{ github.api_url }}/repos/${{ github.repository }}/actions/jobs/${job_id}/logs" 2>/dev/null \
-              | grep -aE '>> FAIL:|Deployment failed:' \
+              | grep -aE '>> FAIL:|Deployment failed' \
               | tail -n 1 \
               | tr -d '\r' \
               | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z[[:space:]]*//' \

@@ -109,6 +109,13 @@ export const DEFAULT_POOL_SIZE = 10;
 // backups here once the Bulletin team publishes them (no code change needed).
 export let BULLETIN_ENDPOINTS: string[] = [DEFAULT_BULLETIN_RPC];
 let POOL_SIZE = DEFAULT_POOL_SIZE;
+// bulletin #1362/#1095: the resolved env's environments.json `network` field.
+// Threaded into ensureAuthorized by the provider helpers below so their
+// detectTestnet call decides from the declared env, not a chain spec_name
+// guess, whenever one is available. Module-level (like BULLETIN_ENDPOINTS/
+// POOL_SIZE above) because getProvider/getDirectProvider/getSignerProvider
+// run outside deploy()'s own scope.
+let bulletinNetwork: string | undefined;
 
 /**
  * Bulletin RPC override precedence, shared by every caller that resolves an
@@ -439,7 +446,7 @@ async function getProvider(): Promise<ProviderResult> {
     const selectionResult = selectAccount(authorizations, Math.random, pinnedPoolIndex);
     const selectedAccount = selectionResult.account;
     const eligibleCount = selectionResult.eligibleCount;
-    await ensureAuthorized(unsafeApi, selectedAccount.address, `pool account ${selectedAccount.index}`);
+    await ensureAuthorized(unsafeApi, selectedAccount.address, `pool account ${selectedAccount.index}`, { network: bulletinNetwork });
 
     console.log(`   Using pool account ${selectedAccount.index}: ${selectedAccount.address}`);
     setDeployAttribute("deploy.signer.mode", "pool");
@@ -472,7 +479,7 @@ async function getDirectProvider(mnemonic: string, derivationPath: string = ""):
   let now = currentBlock.number;
   if (!isAuthorizationSufficient(auth, now)) {
     try {
-      await ensureAuthorized(unsafeApi, ss58 as string, "direct signer");
+      await ensureAuthorized(unsafeApi, ss58 as string, "direct signer", { network: bulletinNetwork });
       [auth, currentBlock] = await Promise.all([
         readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
@@ -508,7 +515,7 @@ async function getSignerProvider(signer: PolkadotSigner, ss58: string): Promise<
   let now = currentBlock.number;
   if (!isAuthorizationSufficient(auth, now)) {
     try {
-      await ensureAuthorized(unsafeApi, ss58, "external signer");
+      await ensureAuthorized(unsafeApi, ss58, "external signer", { network: bulletinNetwork });
       [auth, currentBlock] = await Promise.all([
         readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
@@ -1130,6 +1137,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   const authResult = await ensureAuthorized(unsafeApi, ss58 as string, "storage account", {
     needs: { transactions: chunks.length, bytes: BigInt(totalBytes) },
     precheckedAuth: { auth: uploadAuth, currentBlock: currentBlockNum },
+    network: bulletinNetwork,
   });
   if (authResult.quotaExhausted) {
     console.warn(
@@ -2981,6 +2989,12 @@ export function resolveDotnsConnectOptions(
   registerStorageDeposit?: bigint,
   tld?: string,
   contractSources?: Record<string, string>,
+  // bulletin #1362/#1095: appended AFTER contractSources (rather than
+  // inserted earlier in the positional list, as bulletin-deploy does) so
+  // this port doesn't have to renumber the manifest/publish.ts call site
+  // (a separate, non-deploy() publish flow, left untouched here — same
+  // scoping bulletin's own #1221 applied to that file).
+  network?: string,
 ): Pick<
   DotNSConnectOptions,
   | "signer"
@@ -2996,6 +3010,7 @@ export function resolveDotnsConnectOptions(
   | "registerStorageDeposit"
   | "tld"
   | "contractSources"
+  | "network"
 > {
   const tail = assetHubEndpoints && assetHubEndpoints.length > 0 ? { assetHubEndpoints } : {};
   const mappingTail = autoAccountMapping ? { autoAccountMapping } : {};
@@ -3006,10 +3021,14 @@ export function resolveDotnsConnectOptions(
   const popTail = popSelfServe !== undefined ? { popSelfServe } : {};
   const storageTail = registerStorageDeposit !== undefined ? { registerStorageDeposit } : {};
   const tldTail = tld !== undefined ? { tld } : {};
+  // bulletin #1362/#1095: only set when defined — omitting it (rather than
+  // sending an explicit undefined) preserves DotNS's own instance-field
+  // default and matches every other optional tail above.
+  const networkTail = network !== undefined ? { network } : {};
   if (options.signer && options.signerAddress) {
-    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
+    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail, ...networkTail };
   }
-  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail };
+  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail, ...networkTail };
 }
 
 // Upper-bound estimate of how many bytes this deploy will push to Bulletin.
@@ -3262,6 +3281,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   if (options.signer && options.signerAddress && options.mnemonic) {
     throw new NonRetryableError("Pass either a mnemonic or an external signer, not both — they identify the signing account and only one can win.");
   }
+  bulletinNetwork = undefined; // bulletin #1362/#1095: reset per-deploy; set from the resolved env below
   // Resolve the target environment. options.bulletinEndpoints / assetHubEndpoints
   // bypass the loader for tests and library callers.
   const envId = options.env ?? DEFAULT_ENV_ID;
@@ -3302,7 +3322,15 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envSource = source;
       envUserFilePath = userFilePath;
       envUserFileKeys = userFileContractKeys?.[envId];
-      envNetwork = resolved.network;
+      // bulletin #1362/#1095: once an env WAS resolved (this try block
+      // succeeded), a missing `network` field is a config gap, not "no env
+      // context" — normalize to the "unknown" sentinel so
+      // detectTestnet()/isTestnet() fail CLOSED (not-testnet) instead of
+      // falling through to a live spec_name guess. envNetwork stays
+      // genuinely `undefined` only when this whole block is skipped
+      // (options.bulletinEndpoints) or throws — the one case where the
+      // spec_name fallback is still the intended behavior.
+      envNetwork = resolved.network ?? "unknown";
       envName = resolved.envName;
       envIpfs = resolved.ipfs;
       envWebGateway = resolved.webGateway;
@@ -3313,6 +3341,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envTld = resolved.tld ?? DEFAULT_TLD;
       envConfiguredTld = resolved.tld;
       envPopSelfServe = getPopSelfServeConfig(doc, envId);
+      bulletinNetwork = envNetwork; // already normalized (resolved.network ?? "unknown") above
     } catch (e) {
       if (e instanceof NonRetryableError) throw e;
       if (options.env !== undefined) throw e;
@@ -3577,7 +3606,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
 
       const preflight = new DotNS();
-      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources));
+      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork));
       // connect() now guarantees the account is mapped before returning — no
       // post-connect mapping wait needed here. See DotNS.connect() in dotns.ts.
       // Adopt the authoritative, chain-resolved TLD for everything downstream
@@ -3705,7 +3734,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       provider = await reconnect();
       const providerWithReconnect: ExistingProvider = { ...provider, reconnect };
 
-      const isTestnet = await detectTestnet(provider.unsafeApi);
+      const isTestnet = await detectTestnet(provider.unsafeApi, envNetwork);
       setDeployAttribute("deploy.is_testnet", isTestnet ? "true" : "false");
 
       console.log("\n" + "=".repeat(60));
@@ -3890,7 +3919,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
             try { owner.destroy(); } catch { /* best-effort */ }
           };
           await ownerDotns.connect({
-            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources),
+            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
             confirmPhoneReady: options.confirmPhoneReady,
             phoneSigner: true, // owner path is always a real phone/session signer
           });
@@ -3905,7 +3934,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
         const dotns = new DotNS();
         await dotns.connect({
-          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources),
+          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
           confirmPhoneReady: options.confirmPhoneReady,
           // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
           // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.

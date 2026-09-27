@@ -30,7 +30,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
@@ -8760,6 +8760,27 @@ describe("isAutoReauthorizeAllowed", () => {
     assert.strictEqual(isAutoReauthorizeAllowed(null), false,
       ">> FAIL: isAutoReauthorizeAllowed: null env must not be allowed");
   });
+
+  // bulletin #1362/#1095: a declared-but-unrecognized `network` (missing
+  // field, or a hand-edit typo/case mismatch like "Mainnet") must never be
+  // allowed, even with the flag set. Pins the allowlist (`=== "testnet"`)
+  // over a denylist (`!== "mainnet"`) shape — the denylist would let
+  // anything that wasn't literally "mainnet" through.
+  test("a config typo on network (e.g. \"Mainnet\") is never allowed, even with the flag set", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ network: "Mainnet", bulletinAutoAuthorize: true }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: an unrecognized network value must fail CLOSED — a denylist (network !== \"mainnet\") would let this typo through",
+    );
+  });
+
+  test("a resolved env with a missing network field is never allowed, even with the flag set", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ bulletinAutoAuthorize: true }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: an env with no network field at all must fail CLOSED, not default-allow",
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -9194,6 +9215,162 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
       "should throw mainnet message when auth is expired on mainnet",
     );
   });
+
+  // bulletin #1362/#1095: opts.network must override a contradictory
+  // spec_name in BOTH directions — this is the acceptance-criteria example
+  // from the issue.
+  test("opts.network:\"mainnet\" overrides a testnet-looking spec_name → mainnet message", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
+    const api = buildApi({ auth, specName: "bulletin-paseo" }); // spec_name says testnet
+    await assert.rejects(
+      () => ensureAuthorized(api, ADDRESS, "test", { network: "mainnet" }), // env says mainnet
+      /cannot grant it/,
+      ">> FAIL: ensureAuthorized: opts.network:\"mainnet\" must win over a testnet-looking spec_name (mainnet message expected)",
+    );
+  });
+
+  test("opts.network:\"testnet\" overrides a mainnet-looking spec_name → testnet message", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
+    const api = buildApi({ auth, specName: "polkadot-bulletin" }); // spec_name says mainnet
+    await assert.rejects(
+      () => ensureAuthorized(api, ADDRESS, "test", { network: "testnet" }), // env says testnet
+      /no longer self-authorizes/,
+      ">> FAIL: ensureAuthorized: opts.network:\"testnet\" must win over a mainnet-looking spec_name (testnet message expected)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1362/#1095 port: deploy.ts must thread bulletinNetwork (derived
+// from the resolved env's environments.json `network` field) into every
+// ensureAuthorized call site and into the deploy.is_testnet detectTestnet
+// read, or a config-mistake network never reaches the money-movement gates.
+// ---------------------------------------------------------------------------
+describe("deploy.ts threads bulletinNetwork/envNetwork into every testnet-detection call site (#1362/#1095)", () => {
+  test("deploy.ts normalizes envNetwork = resolved.network ?? \"unknown\" and assigns bulletinNetwork from it", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.ok(/envNetwork\s*=\s*resolved\.network\s*\?\?\s*"unknown"/.test(src),
+      ">> FAIL: #1362/#1095: deploy.ts must normalize envNetwork = resolved.network ?? \"unknown\" once an env was resolved, so a config gap (field missing) fails closed instead of falling through to spec_name");
+    assert.ok(/bulletinNetwork\s*=\s*envNetwork/.test(src),
+      ">> FAIL: #1362/#1095: deploy.ts must assign bulletinNetwork from envNetwork, or the env's declared network never reaches ensureAuthorized/detectTestnet");
+  });
+
+  test("every ensureAuthorized call site in deploy.ts passes network: bulletinNetwork", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // Window-based (not a single-paren regex): storeChunkedContent's call site
+    // spans multiple lines with nested object literals (needs/precheckedAuth),
+    // so a `[^)]*\)` match would stop at the first inner `)` rather than the
+    // call's real closing paren. Each call site's opts object is well within
+    // 400 chars of its opening paren in practice.
+    const callStarts = [...src.matchAll(/ensureAuthorized\(/g)].map((m) => m.index);
+    assert.ok(callStarts.length > 0, ">> FAIL: #1362/#1095: expected at least one ensureAuthorized call site in deploy.ts");
+    const missing = callStarts
+      .map((i) => src.slice(i, i + 400))
+      .filter((window) => !/network:\s*bulletinNetwork/.test(window));
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1362/#1095: every ensureAuthorized call site must pass network: bulletinNetwork; ${missing.length} of ${callStarts.length} do not. A missed site silently falls back to a live spec_name read instead of the declared env. Offending: ${missing.join(" | ")}`);
+  });
+
+  test("deploy.ts threads envNetwork into the deploy.is_testnet telemetry detectTestnet call", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.ok(/detectTestnet\(provider\.unsafeApi,\s*envNetwork\)/.test(src),
+      ">> FAIL: #1362/#1095: the deploy.is_testnet telemetry read must pass envNetwork into detectTestnet, not rely solely on a live spec_name read");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DotNS.isTestnet() — bulletin #1362/#1095: same network-overrides-spec_name
+// contract as detectTestnet above, but on the instance used by
+// attemptTestnetTopUp's Alice/Bob dev-phrase transfer path.
+// ---------------------------------------------------------------------------
+describe("DotNS.isTestnet() (bulletin #1362/#1095: network field overrides spec_name)", () => {
+  function withSpecName(specName) {
+    return { client: { constants: { System: { Version: async () => ({ spec_name: { asText: () => specName } }) } } } };
+  }
+
+  test("network:\"mainnet\" wins even when spec_name looks like a testnet", async () => {
+    const d = new DotNS();
+    d._network = "mainnet";
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(
+      await d.isTestnet(),
+      false,
+      ">> FAIL: DotNS.isTestnet: network:\"mainnet\" must never be overridden by a testnet-looking spec_name — attemptTestnetTopUp must never fire on a declared-mainnet env",
+    );
+  });
+
+  test("network:\"testnet\" wins even when spec_name looks like mainnet", async () => {
+    const d = new DotNS();
+    d._network = "testnet";
+    d.clientWrapper = withSpecName("polkadot-bulletin");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), true,
+      ">> FAIL: DotNS.isTestnet: network:\"testnet\" must win over a mainnet-looking spec_name");
+  });
+
+  test("network null (no env context at all) falls back to the spec_name read (unchanged pre-fix behavior)", async () => {
+    const d = new DotNS();
+    d._network = null;
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), true,
+      ">> FAIL: DotNS.isTestnet: with no network signal, a testnet-looking spec_name must still resolve true");
+  });
+
+  test("network:\"unknown\" (env resolved, field genuinely absent) fails safe: not-a-testnet, even against a testnet-looking spec_name", () => {
+    // resolveDotnsConnectOptions/deploy.ts normalize a resolved-but-field-less
+    // env to "unknown" before it ever reaches connect() — this is the literal
+    // "field ABSENT" scenario, and it must fail safe (not-a-testnet) rather
+    // than falling through to spec_name.
+    return (async () => {
+      const d = new DotNS();
+      d._network = "unknown";
+      d.clientWrapper = withSpecName("bulletin-paseo");
+      d.ensureConnected = () => {};
+      assert.strictEqual(await d.isTestnet(), false,
+        ">> FAIL: DotNS.isTestnet: a resolved-but-network-less env must fail CLOSED (not-testnet), never fall through to a spec_name guess");
+    })();
+  });
+
+  test("a declared-but-unrecognized network value (e.g. a typo) fails safe: not-a-testnet", async () => {
+    const d = new DotNS();
+    d._network = "Mainnet"; // config typo — must not be treated as "no env context"
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), false,
+      ">> FAIL: DotNS.isTestnet: an unrecognized-but-declared network value must fail CLOSED (not-testnet), not silently fall back to spec_name on a config typo");
+  });
+
+  test("an explicit network is never overridden by a stale spec_name-derived instance cache", async () => {
+    const d = new DotNS();
+    // Simulate a stale cache from an earlier env-less isTestnet() call that read a
+    // testnet-looking spec_name before connect() ever supplied a network.
+    d._testnetCache = true;
+    d._network = "mainnet";
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(
+      await d.isTestnet(),
+      false,
+      ">> FAIL: DotNS.isTestnet: an explicit network:\"mainnet\" must win over a stale _testnetCache=true left by an earlier spec_name-derived read",
+    );
+  });
+
+  // connect() does a live chain probe end-to-end (no injectable transport), so
+  // this pins the wiring by source inspection rather than executing connect().
+  test("connect() assigns options.network onto the instance before any chain call", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    const connectIdx = src.indexOf("async connect(options: DotNSConnectOptions = {}): Promise<this> {");
+    const networkAssignIdx = src.indexOf("this._network = options.network;");
+    assert.ok(connectIdx !== -1, ">> FAIL: DotNS.connect: could not locate the connect() method signature");
+    assert.ok(networkAssignIdx !== -1,
+      ">> FAIL: DotNS.connect: must assign `this._network = options.network` so isTestnet() can read the resolved env's network");
+    assert.ok(connectIdx < networkAssignIdx,
+      ">> FAIL: DotNS.connect: the network assignment must live inside connect(), not elsewhere");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -9349,6 +9526,93 @@ describe("isTestnetSpecName", () => {
     assert.strictEqual(isTestnetSpecName(undefined), false);
     assert.strictEqual(isTestnetSpecName(null), false);
     assert.strictEqual(isTestnetSpecName(""), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectTestnet(api, network) — bulletin #1362/#1095: the environments.json
+// `network` field must be authoritative over the chain's spec_name for
+// money-movement gates (isAutoReauthorizeAllowed, ensureAuthorized's error
+// branch). spec_name stays as the fallback ONLY when no env `network` is
+// available (e.g. a raw library caller pointed at a custom RPC).
+// ---------------------------------------------------------------------------
+describe("detectTestnet (bulletin #1362/#1095: network field overrides spec_name)", () => {
+  function apiWithSpecName(specName) {
+    return { constants: { System: { Version: async () => ({ spec_name: { asText: () => specName } }) } } };
+  }
+
+  test("network:\"mainnet\" wins even when spec_name looks like a testnet", async () => {
+    _resetTestnetCacheForTests();
+    const api = apiWithSpecName("bulletin-paseo");
+    assert.strictEqual(
+      await detectTestnet(api, "mainnet"),
+      false,
+      ">> FAIL: detectTestnet: network:\"mainnet\" must never be overridden by a testnet-looking spec_name — this is the exact lying-mirror scenario #1095 exists to close",
+    );
+  });
+
+  test("network:\"testnet\" wins even when spec_name looks like mainnet", async () => {
+    _resetTestnetCacheForTests();
+    const api = apiWithSpecName("polkadot-bulletin");
+    assert.strictEqual(
+      await detectTestnet(api, "testnet"),
+      true,
+      ">> FAIL: detectTestnet: network:\"testnet\" must win over a mainnet-looking spec_name (declared env context takes priority)",
+    );
+  });
+
+  test("network undefined (no env context at all) falls back to spec_name (unchanged pre-fix behavior)", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(await detectTestnet(apiWithSpecName("bulletin-paseo"), undefined), true,
+      ">> FAIL: detectTestnet: with no network signal, a testnet-looking spec_name must still resolve true (fallback for env-less callers)");
+    _resetTestnetCacheForTests();
+    assert.strictEqual(await detectTestnet(apiWithSpecName("polkadot-bulletin"), undefined), false,
+      ">> FAIL: detectTestnet: with no network signal, a mainnet-looking spec_name must still resolve false");
+  });
+
+  // An env WAS resolved (e.g. via --env) but its environments.json entry is
+  // missing the `network` field — deploy.ts normalizes this to the
+  // "unknown" sentinel (never leaves it undefined) specifically so it lands
+  // here, not in the spec_name-fallback branch above.
+  test("network:\"unknown\" (env resolved, field genuinely absent) fails safe: not-a-testnet, even against a testnet-looking spec_name", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "unknown"),
+      false,
+      ">> FAIL: detectTestnet: a resolved-but-network-less env must fail CLOSED (not-testnet), never fall through to a spec_name guess",
+    );
+  });
+
+  test("a declared-but-unrecognized network value (e.g. a typo) fails safe: not-a-testnet", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "Mainnet"),
+      false,
+      ">> FAIL: detectTestnet: an unrecognized-but-declared network value must fail CLOSED (not-testnet), not silently fall back to spec_name on a config typo",
+    );
+  });
+
+  test("an explicit network is never overridden by a stale spec_name-derived cache entry", async () => {
+    _resetTestnetCacheForTests();
+    // First call with NO network populates the module cache from spec_name (testnet-looking → true).
+    assert.strictEqual(await detectTestnet(apiWithSpecName("bulletin-paseo"), undefined), true);
+    // A later call on what is declared network:"mainnet" must still return false — the cache
+    // populated by the env-less call above must not leak into (or be read by) this one.
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "mainnet"),
+      false,
+      ">> FAIL: detectTestnet: an explicit network:\"mainnet\" call must not inherit a stale testnet verdict cached by an earlier env-less call",
+    );
+  });
+
+  test("unrecognized/absent network + unreadable chain fails safe (not-testnet)", async () => {
+    _resetTestnetCacheForTests();
+    const brokenApi = { constants: { System: { Version: async () => { throw new Error("rpc down"); } } } };
+    assert.strictEqual(
+      await detectTestnet(brokenApi, undefined),
+      false,
+      ">> FAIL: detectTestnet: when the network signal is absent AND the chain read fails, the safe default is not-testnet (fail closed on money-movement gates)",
+    );
   });
 });
 
@@ -9530,6 +9794,32 @@ describe("resolveDotnsConnectOptions (#209)", () => {
   test("omits registerStorageDeposit when not provided", () => {
     const r = resolveDotnsConnectOptions({});
     assert.strictEqual(r.registerStorageDeposit, undefined);
+  });
+
+  // bulletin #1362/#1095: the resolved env's `network` field must thread
+  // through to DotNS.connect — appended as the LAST positional param in this
+  // port (rather than inserted before contractSources, as bulletin-deploy
+  // does), so the manifest/publish.ts call site (a separate lane) doesn't
+  // need renumbering.
+  test("passes network when provided", () => {
+    const r = resolveDotnsConnectOptions({}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "mainnet");
+    assert.strictEqual(r.network, "mainnet",
+      ">> FAIL: resolveDotnsConnectOptions network: explicit network arg must forward verbatim");
+  });
+
+  test("omits network when not provided", () => {
+    const r = resolveDotnsConnectOptions({});
+    assert.strictEqual(r.network, undefined,
+      ">> FAIL: resolveDotnsConnectOptions network: omitted network must stay undefined (DotNS.isTestnet() then falls back to spec_name, not silently defaulting to testnet or mainnet)");
+  });
+
+  test("deploy.ts passes envNetwork into every deploy()-internal resolveDotnsConnectOptions call site (#1362/#1095)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const calls = src.match(/resolveDotnsConnectOptions\([^;]*?\)(?=[,)])/gs) ?? [];
+    assert.ok(calls.length > 0, ">> FAIL: #1362/#1095: expected at least one resolveDotnsConnectOptions call site in deploy.ts");
+    const missing = calls.filter((c) => !/,\s*envNetwork\)\s*$/.test(c.trim()));
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1362/#1095: every resolveDotnsConnectOptions call site in deploy.ts must end with envNetwork as the last argument, or DotNS.connect() never learns the declared env network and isTestnet() silently falls back to spec_name. Offending: ${missing.join(" | ")}`);
   });
 });
 

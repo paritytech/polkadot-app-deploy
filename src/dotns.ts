@@ -23,7 +23,7 @@ import {
 import { CID } from "multiformats/cid";
 import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath } from "./telemetry.js";
 import { CODE_PATHS } from "./code-paths.js";
-import { isTestnetSpecName } from "./pool.js";
+import { isTestnetSpecName, testnetFromNetworkField } from "./pool.js";
 import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
@@ -52,6 +52,15 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   contracts?: Record<string, string>;
   /** Optional environment ID (e.g. "paseo-next-v2"). Used in shell command examples in error messages. */
   environmentId?: string;
+  /**
+   * bulletin #1362/#1095: the resolved env's environments.json `network`
+   * field ("testnet" | "mainnet"). When set, this is AUTHORITATIVE for
+   * isTestnet() (and everything it gates — attemptTestnetTopUp's Alice/Bob
+   * dev-phrase spend) and is never overridden by a chain spec_name read.
+   * Omit (or pass an env-less/custom RPC) to fall back to the spec_name-based
+   * detection, unchanged from before this issue.
+   */
+  network?: string;
   /** Per-contract origin phrases from describeContractSources, named in address errors. */
   contractSources?: Record<string, string>;
   /** Optional PoP self-serve config resolved from environments.json. Gates state-aware and generic testnet guidance blocks. */
@@ -2660,6 +2669,10 @@ export class DotNS {
   private _contractSources: Record<string, string> = {};
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
   private _environmentId: string | null = null;
+  // bulletin #1362/#1095: the resolved env's declared `network`, when
+  // connect() was given one. Authoritative for isTestnet() over the
+  // spec_name read — see DotNSConnectOptions.network and isTestnet() below.
+  private _network: string | null = null;
   private _popSelfServe: PopSelfServeConfig | null = null;
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
   private _tld: string = DEFAULT_TLD;
@@ -2850,6 +2863,9 @@ export class DotNS {
     this._contractSources = options.contractSources ?? {};
     if (options.environmentId) {
       this._environmentId = options.environmentId;
+    }
+    if (options.network !== undefined) {
+      this._network = options.network;
     }
     if (options.popSelfServe !== undefined) {
       this._popSelfServe = options.popSelfServe ?? null;
@@ -3121,11 +3137,19 @@ export class DotNS {
     }
   }
 
-  // Returns true when the DotNS chain (Asset Hub) reports a testnet spec_name.
-  // Used to gate test-only behaviors like self-granting Full PoP on a Lite
-  // signer for a NoStatus label.
+  // Returns true when this is a testnet — used to gate test-only/money-moving
+  // behaviors like attemptTestnetTopUp's Alice/Bob dev-phrase transfer and
+  // self-granting Full PoP on a Lite signer for a NoStatus label.
+  //
+  // bulletin #1362/#1095: `this._network` (from connect()'s `network` option,
+  // sourced from environments.json) takes precedence over the spec_name read
+  // below via testnetFromNetworkField() (pool.ts) — see its doc comment for
+  // the full three-state rationale. Mirrors detectTestnet()'s use of the same
+  // helper exactly, so the two stay in lockstep by construction.
   private _testnetCache: boolean | null = null;
   async isTestnet(): Promise<boolean> {
+    const override = testnetFromNetworkField(this._network);
+    if (override !== undefined) return override;
     if (this._testnetCache !== null) return this._testnetCache;
     this.ensureConnected();
     // Prefer the polkadot-api chain read (authoritative spec_name).

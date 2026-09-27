@@ -23,7 +23,7 @@ import {
   selectStorageReconnect,
   type DeployOptions,
 } from "../deploy.js";
-import { DotNS, DEFAULT_TLD, stripTldSuffix, type OwnershipResult } from "../dotns.js";
+import { DotNS, DEFAULT_TLD, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
 import {
   loadEnvironments,
@@ -88,12 +88,10 @@ export interface PublishManifestResult {
  */
 export async function publishManifest(opts: PublishManifestOptions): Promise<PublishManifestResult> {
   const { config, sourcePath } = opts.loaded;
-  if (config.domain !== opts.domain) {
-    throw new NonRetryableError(
-      `Config domain '${config.domain}' (in ${sourcePath}) does not match deploy domain '${opts.domain}'. ` +
-        `Either update the config or pass the matching <domain> argument.`,
-    );
-  }
+  // #1156/#1572: domain reconciliation happens below, once envTld is known —
+  // see reconcileManifestDomain. The check that used to live here compared
+  // opts.domain to a value the CLI itself derived from config.domain, so it
+  // always trivially passed; it caught nothing.
   const embeddedErrors = await verifyEmbeddedAppManifests(config, path.dirname(sourcePath));
   if (embeddedErrors.length > 0) {
     throw new NonRetryableError(
@@ -123,6 +121,16 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   const envId = opts.env ?? DEFAULT_ENV_ID;
   const { doc } = await loadEnvironments();
   const resolved = resolveEndpoints(doc, envId);
+  // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
+  // DotNS._tld / connectDotNS below), so callers of those helpers further
+  // down pass the bare label, not this full domain.
+  const envTld = resolved.tld ?? DEFAULT_TLD;
+
+  // #1156/#1572: reconcile config.domain against the ACTUAL deploy target
+  // (opts.domain) — not a config-derived copy of itself. Hoisted here, right
+  // after envTld is known and before any upload below: this makes
+  // publishManifest() itself block the icon/executable upload on a mismatch.
+  reconcileManifestDomain(config.domain, opts.domain, envTld, sourcePath);
   const popSelfServe = getPopSelfServeConfig(doc, envId);
   setBulletinEndpoints(resolveBulletinEndpoints(resolved.bulletin, opts.rpc));
 
@@ -173,24 +181,6 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   const dotns = await connectDotNS(opts, resolved, popSelfServe, envId);
 
   try {
-    // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
-    // DotNS._tld / connectDotNS above), so pass the bare label.
-    const envTld = resolved.tld ?? DEFAULT_TLD;
-
-    // The schema validator deliberately no longer enumerates known TLDs (it
-    // validates shape only), so a typo like ".dto" reaches here unrejected.
-    // This is the layer that knows the environment's TLD, so this is where
-    // the mismatch gets named. Uncaught, the mismatched domain would flow
-    // into ensureContentResolver, which appends the env TLD again —
-    // producing a namehash for a nonsense compound name that nobody owns,
-    // surfacing as an opaque not-the-owner revert deep inside the chain call.
-    if (!domainMatchesEnvTld(config.domain, envTld)) {
-      throw new NonRetryableError(
-        `Domain "${config.domain}" does not end in this environment's DotNS TLD ".${envTld}" ` +
-        `(env: ${envId}). Set "domain" in your product config to "<name>.${envTld}", ` +
-        `or deploy against the environment whose TLD matches.`,
-      );
-    }
     const baseLabel = stripDotSuffix(config.domain, envTld);
 
     await dotns.ensureContentResolver(baseLabel);
@@ -348,4 +338,66 @@ function stripDotSuffix(domain: string, tld: string): string {
 // no label.
 export function domainMatchesEnvTld(domain: string, tld: string): boolean {
   return domain.toLowerCase().endsWith(`.${tld.toLowerCase()}`);
+}
+
+/**
+ * Reconcile a product config's `domain` against the domain the deploy is
+ * actually targeting, before any chain or storage work runs.
+ *
+ * The only prior guard (`config.domain !== opts.domain`, a byte compare) was
+ * toothless — the CLI derived `opts.domain` FROM the config, so the
+ * comparison was against a copy of itself. A config whose `domain` field
+ * doesn't match the CLI's actual deploy target (e.g. a hardcoded
+ * polkadot-app-deploy.config.* left over from a different PR/env) slipped
+ * through untouched and only surfaced later, mid-manifest-publish, as an
+ * opaque `NotAuthorised()` revert from `ensureContentResolver` — the signer
+ * doesn't own the OTHER name the config still names.
+ *
+ * `deployDomainArg` is documented as a BARE label (no TLD), while
+ * `configDomain` always carries a TLD (schema requires it), so the two
+ * cannot be compared as raw strings even when they name the same target.
+ * Both sides are normalized the same way, through `parseDomainName(x,
+ * envTld).fullName`, which accepts either a bare label or a `.<tld>`-suffixed
+ * one and independently rejects a DIFFERENT known TLD. `domainMatchesEnvTld`
+ * (above) still runs first, against `configDomain` only, so a config
+ * carrying the wrong environment's own suffix (e.g. "myapp.dot" against a
+ * ".paseo" env) still fails — this does not weaken that check.
+ *
+ * Lowercased BEFORE normalizing, not after: `parseDomainName` delegates to
+ * `validateDomainLabel`, whose charset is strictly lowercase-only (unlike the
+ * config schema's case-insensitive domain pattern), so a case-insensitive
+ * compare means folding case first — comparing post-throw is not an option.
+ */
+export function reconcileManifestDomain(
+  configDomain: string,
+  deployDomainArg: string,
+  envTld: string,
+  sourcePath: string,
+): void {
+  if (!domainMatchesEnvTld(configDomain, envTld)) {
+    throw new NonRetryableError(
+      `Domain "${configDomain}" (in ${sourcePath}) does not end in this environment's DotNS TLD ".${envTld}". ` +
+        `Set "domain" in your product config to "<name>.${envTld}", or deploy against the environment whose TLD matches.`,
+    );
+  }
+
+  const normalize = (raw: string, what: string): string => {
+    try {
+      return parseDomainName(raw.toLowerCase(), envTld).fullName;
+    } catch (err) {
+      throw new NonRetryableError(
+        `${what} "${raw}" is not a valid dotNS name: ${(err as Error).message}`,
+      );
+    }
+  };
+  const configFull = normalize(configDomain, "Config domain");
+  const deployFull = normalize(deployDomainArg, "Deploy domain");
+
+  if (configFull !== deployFull) {
+    throw new NonRetryableError(
+      `Config domain '${configDomain}' (in ${sourcePath}) resolves to '${configFull}', which does not match ` +
+        `the deploy target '${deployDomainArg}' (resolves to '${deployFull}'). ` +
+        `Either update the config's "domain" or pass the matching <domain> argument.`,
+    );
+  }
 }

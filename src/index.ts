@@ -95,5 +95,5 @@ export {
   writeEmbeddedAppManifests,
   verifyEmbeddedAppManifests,
 } from "./manifest/product-preflight.js";
-export { publishManifest } from "./manifest/publish.js";
+export { publishManifest, reconcileManifestDomain } from "./manifest/publish.js";
 export type { PublishManifestOptions, PublishManifestResult } from "./manifest/publish.js";

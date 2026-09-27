@@ -11,7 +11,8 @@ import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStat
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
 import { loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
-import { loadEnvironments, listEnvironments, formatEnvironmentTable, DEFAULT_ENV_ID } from "../dist/environments.js";
+import { loadEnvironments, listEnvironments, formatEnvironmentTable, resolveEndpoints, DEFAULT_ENV_ID } from "../dist/environments.js";
+import { DEFAULT_TLD } from "../dist/dotns.js";
 import * as fs from "fs";
 import * as readline from "readline";
 
@@ -442,12 +443,32 @@ try {
   // preflight.
   if (!flags.noManifest) {
     try {
-      const { preflightProductConfig } = await import("../dist/index.js");
+      const { preflightProductConfig, reconcileManifestDomain } = await import("../dist/index.js");
       // config-load resolves a relative cwd internally, so no node:path here
       // (it's only dynamically imported later, in the publish block).
-      await preflightProductConfig(
-        flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
-      );
+      // #1572: preflightProductConfig (config discovery/parse + icon/executable
+      // file checks) and loadEnvironments (a local environments.json read)
+      // have no data dependency on each other — run them concurrently rather
+      // than paying their I/O sequentially.
+      const [loadedConfig, { doc }] = await Promise.all([
+        preflightProductConfig(
+          flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
+        ),
+        loadEnvironments({ userFilePath: flags.environmentFile ?? process.env.PAD_ENV_FILE }),
+      ]);
+      // Reconcile the config's domain against the ACTUAL deploy target
+      // BEFORE deploy() runs at all — this is the real "nothing uploaded
+      // yet" gate; src/manifest/publish.ts's own call to the same helper
+      // (inside publishManifest) is only a backstop for a library caller
+      // that skips this CLI entirely. Same env/TLD resolution publishManifest
+      // itself uses (loadEnvironments + resolveEndpoints), so this sees the
+      // identical environment the deploy will target — no RPC call, both are
+      // local config reads.
+      if (loadedConfig) {
+        const resolved = resolveEndpoints(doc, effectiveEnvId ?? DEFAULT_ENV_ID);
+        const envTld = resolved.tld ?? DEFAULT_TLD;
+        reconcileManifestDomain(loadedConfig.config.domain, domain, envTld, loadedConfig.sourcePath);
+      }
     } catch (err) {
       console.error(`Error: ${err?.message ?? err}`);
       process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);

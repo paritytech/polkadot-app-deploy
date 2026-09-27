@@ -1887,6 +1887,16 @@ describe("classifyErrorKind", () => {
     );
   });
 
+  // #272: the ERROR_KIND_RULES comment in src/telemetry.ts explains why this rule is a prefix match.
+  test("naming.contract_unavailable: classifyProtocolVersion's hasCode=false message (#272)", () => {
+    assert.strictEqual(
+      classifyErrorKind(
+        "paseo-next-v2 (POP_RULES 0xabc): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here.",
+      ),
+      "naming.contract_unavailable",
+    );
+  });
+
   test("naming.contract_unavailable: 'Contract call returned empty data' wrapper message (hasCode=true/null)", () => {
     assert.strictEqual(
       classifyErrorKind(

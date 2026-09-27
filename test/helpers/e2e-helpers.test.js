@@ -207,6 +207,7 @@ import {
   parseLineOrExplain,
   assertOnChainMatches,
   failWith,
+  FLAKE_PATTERNS,
 } from "./e2e-failure.js";
 
 describe("e2e-failure: assertDeploySucceeded", () => {
@@ -252,6 +253,63 @@ describe("e2e-failure: assertDeploySucceeded", () => {
         return true;
       },
     );
+  });
+
+  test("a Kubo leg that never ran Kubo fails, even with nothing on stderr", () => {
+    const prev = process.env.E2E_MERKLE;
+    const ranJs = { code: 0, stdout: "   Merkleizing (JS): /tmp/fixture", stderr: "" };
+    try {
+      process.env.E2E_MERKLE = "kubo";
+      assert.throws(() => assertDeploySucceeded(ranJs, { scenario: "S1" }),
+        /^Error: >> FAIL: S1 deploy: Kubo leg never ran the Kubo merkleizer/);
+      assertDeploySucceeded({ code: 0, stdout: "   Merkleizing (Kubo): /tmp/fixture", stderr: "" }, { scenario: "S1" });
+      process.env.E2E_MERKLE = "js";
+      assertDeploySucceeded(ranJs, { scenario: "S1" });
+    } finally {
+      if (prev === undefined) delete process.env.E2E_MERKLE; else process.env.E2E_MERKLE = prev;
+    }
+  });
+
+  test("a Kubo leg that fell back to JS fails even on exit 0", () => {
+    const prev = process.env.E2E_MERKLE;
+    const fellBack = { code: 0, stdout: "ok", stderr: "   Kubo merkleize failed, falling back to JS: no IPFS repo found" };
+    try {
+      process.env.E2E_MERKLE = "kubo";
+      assert.throws(() => assertDeploySucceeded(fellBack, { scenario: "S1" }), /^Error: >> FAIL: S1 deploy: Kubo leg fell back to the JS merkleizer/);
+      process.env.E2E_MERKLE = "js";
+      assertDeploySucceeded(fellBack, { scenario: "S1" });
+    } finally {
+      if (prev === undefined) delete process.env.E2E_MERKLE; else process.env.E2E_MERKLE = prev;
+    }
+  });
+});
+
+// tools/release-retry-wrapper.mjs has its own, separate FLAKE_PATTERNS list
+// (plain substrings, not this file's {needle, class, summary} shape) and
+// test/test-release-retry-wrapper.js scans the WHOLE harness file against
+// that list — this twin has no equivalent scan against e2e-failure.js's own
+// list (tracked separately as #276). This test covers #273's narrower ask:
+// S8's WS-fault legs are the scenario most likely to grow a new failure
+// message that happens to echo one of e2e-failure.js's classifyDeployStderr
+// needles (e.g. "ChainHead disjointed"), which would make a genuine S8
+// regression print as a retryable flake instead of failing the run.
+describe("e2e-failure: FLAKE_PATTERNS avoidance", () => {
+  test("no S8 assertion string in test/e2e.test.js matches a FLAKE_PATTERNS needle", () => {
+    const harness = fs.readFileSync(new URL("../e2e.test.js", import.meta.url), "utf8");
+    const lines = harness.split("\n");
+    const start = lines.findIndex((l) => /describe\("S8 —/.test(l));
+    const end = lines.findIndex((l, i) => i > start && /describe\("S9 —/.test(l));
+    assert.ok(start >= 0 && end > start, "could not find the S8...S9 describe boundary in test/e2e.test.js — did a title change?");
+    const s8Lines = lines.slice(start, end);
+    const assertionLines = s8Lines.filter((l) => /(^|\s)(hint|message):/.test(l) || l.includes(">> FAIL:"));
+    for (const { needle } of FLAKE_PATTERNS) {
+      const offender = assertionLines.find((l) => l.includes(needle));
+      assert.strictEqual(
+        offender,
+        undefined,
+        `>> FAIL: e2e-helpers: S8 in test/e2e.test.js prints the flake pattern "${needle}" on a failure path, so tripping that assertion would be misread as a retryable flake. Reword it. Line: ${offender?.trim()}`,
+      );
+    }
   });
 });
 

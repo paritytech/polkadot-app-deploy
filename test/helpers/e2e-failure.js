@@ -17,7 +17,7 @@
  * Patterns mirror the production telemetry classifier in src/telemetry.ts and
  * tools/release-retry-wrapper.mjs (when that file lands via #534).
  */
-const FLAKE_PATTERNS = [
+export const FLAKE_PATTERNS = [
   { needle: "requires Node.js >=22", class: "node_version_drift", summary: "Runner has Node v18 in PATH — setup-node@v6 didn't take. parity-default runner env regression; rerun on a fresh runner." },
   { needle: "received a shutdown signal", class: "runner_shutdown", summary: "Runner process killed mid-job. Pure CI infra flake; rerun." },
   { needle: "Invalid: Stale", class: "nonce_stale", summary: "Asset Hub tx Invalid (Stale) — nonce race on shared signer account; usually clears on retry." },
@@ -141,7 +141,21 @@ function formatSeenTail(context, keywords) {
  * @param {{ scenario: string, step?: string }} ctx
  */
 export function assertDeploySucceeded(result, { scenario, step = "deploy" }) {
-  if (result.code === 0) return;
+  if (result.code === 0) {
+    // A Kubo leg that fell back to JS exits 0 but no longer tests Kubo.
+    if (process.env.E2E_MERKLE === "kubo") {
+      const out = String(result.stdout ?? "");
+      if (/Kubo merkleize failed/.test(String(result.stderr ?? ""))) {
+        throw new Error(formatBlock(`${scenario} ${step}: Kubo leg fell back to the JS merkleizer`, [formatSeenTail(result.stderr, ["Kubo"])]));
+      }
+      // Without ipfs on PATH the Kubo branch is never entered, so there is no
+      // fallback line to find and the leg would pass having run JS.
+      if (!/Merkleizing \(Kubo/.test(out)) {
+        throw new Error(formatBlock(`${scenario} ${step}: Kubo leg never ran the Kubo merkleizer`, [formatSeenTail(out, ["Merkleizing"])]));
+      }
+    }
+    return;
+  }
   const { class: cls, summary } = classifyDeployStderr(result.stderr);
   const headline = `${scenario} ${step}: ${cls} (exit ${result.code})`;
   const sections = [

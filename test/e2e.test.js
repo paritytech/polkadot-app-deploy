@@ -23,7 +23,7 @@ import {
   assertStdoutMatches,
   parseLineOrExplain,
   assertOnChainMatches,
-  failWith, classifyFixtureState, assertFixtureOwnership } from "./helpers/e2e-failure.js";
+  failWith, assertFixtureOwnership, assertFixtureNotDrifted } from "./helpers/e2e-failure.js";
 
 // The CLI prints "CID: bafy..." at the end of a successful deploy. We parse
 // that — not a client-side recomputation — so we verify "what the CLI said
@@ -738,17 +738,21 @@ describe("e2e", { skip: !ENABLED }, () => {
       // like a product regression instead of the environment problem it
       // actually is. Uses a single short-lived DotNS connection dedicated to
       // this read (S3 has no other open client to reuse) rather than
-      // inferring ownership from CLI text the way classifyFixtureState
+      // inferring ownership from CLI text the way assertFixtureNotDrifted
       // (below) does after the fact.
       const precheckClient = new DotNS();
       await precheckClient.connect({ mnemonic: DEFAULT_MNEMONIC, ...(await resolveDotnsEnvConnectOptions()) });
+      // register-test-fixture-equivalent admin repair can only move a name the
+      // funder (root Alice) holds. Both drift checks below use this to pick
+      // the right fix (bulletin #1398).
+      const funder = precheckClient.evmAddress;
       let ownership;
       try {
         ownership = await precheckClient.checkOwnership(bareLabel, BOB_H160);
       } finally {
         precheckClient.disconnect();
       }
-      assertFixtureOwnership({ ownership, label: bareLabel, tld, expectedOwner: BOB_H160, scenario: "S3", envLabel });
+      assertFixtureOwnership({ ownership, label: bareLabel, tld, expectedOwner: BOB_H160, scenario: "S3", envLabel, funder });
 
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
@@ -768,31 +772,11 @@ describe("e2e", { skip: !ENABLED }, () => {
 
         // Distinguish FIXTURE DRIFT from a product regression before asserting
         // on the exit code. Both surface as "got 0", but they need completely
-        // different responses — and a bare exit-code mismatch reads like a
+        // different responses, and a bare exit-code mismatch reads like a
         // product bug, which is how this sat red for a week in bulletin-deploy.
-        const fixture = classifyFixtureState({ output: combined, expectedOwner: BOB_H160 });
-        const fixtureMissing = fixture.kind === "missing";
-        const driftedTo = fixture.kind === "drifted" ? fixture.owner : null;
-
-        if (fixtureMissing || driftedTo) {
-          const observed = fixtureMissing
-            ? `${ownedLabel} is UNREGISTERED (reported "available")`
-            : `${ownedLabel} is owned by ${driftedTo}, not Bob (${BOB_H160})`;
-          failWith({
-            scenario: "S3",
-            message:
-              `fixture drift on env "${envLabel}" — ${observed}. ` +
-              `This is a test-fixture problem, NOT a polkadot-app-deploy regression: ` +
-              `the CLI behaved correctly for the chain state it was given. ` +
-              `Fix: this scenario needs ${ownedLabel} owned by an account OTHER than the deploy signer. Ask the chain admin to register it to a third party on ${envLabel} — this repo ships no fixture-registration tool.`,
-            context: combined,
-            keywords: ["available", "already owned", "Domain"],
-            hint:
-              "A testnet re-genesis wipes registrations; the next S3 run then finds the label free " +
-              "and the deploy signer registers it to ITSELF, so every later run exits 0 instead of 78. " +
-              "register-test-fixture is idempotent and repairs both cases.",
-          });
-        }
+        // Returns without throwing when the output shows no drift, so the
+        // exit-code check below reports the failure (bulletin #1398).
+        assertFixtureNotDrifted({ output: combined, label: bareLabel, tld, expectedOwner: BOB_H160, funder, scenario: "S3", envLabel });
 
         if (code !== 78) {
           failWith({

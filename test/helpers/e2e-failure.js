@@ -251,17 +251,61 @@ function extractKeywords(pattern) {
  *   2. `drifted`  — a later run found it free and the deploy signer registered
  *                   it to ITSELF, so it is owned, just by the wrong account.
  *
+ * The ownership line ("Domain <label>.<tld> is already owned by 0x...") decides.
+ * Without it, only the domain's own "<label>.<tld> is available" line means
+ * missing. The bare words "is available" also appear in the update notice
+ * ("A newer version of ... is available") — see bulletin #1398/#1333.
+ *
  * @param {object} o
  * @param {string} o.output          combined stdout+stderr from the deploy
  * @param {string} o.expectedOwner   0x-prefixed H160 the fixture must belong to
+ * @param {string} [o.label]         full domain, e.g. "e2eownedns03.paseo"; anchors the availability match
  * @returns {{kind: "missing"|"drifted"|"ok", owner: string|null}}
  */
-export function classifyFixtureState({ output, expectedOwner }) {
+export function classifyFixtureState({ output, expectedOwner, label }) {
   const want = String(expectedOwner).toLowerCase();
-  if (/\bis available\b/i.test(output)) return { kind: "missing", owner: null };
-  const m = output.match(/is already owned by (0x[0-9a-fA-F]{40})/);
-  if (m && m[1].toLowerCase() !== want) return { kind: "drifted", owner: m[1] };
-  return { kind: "ok", owner: m ? m[1] : null };
+  const text = String(output ?? "");
+  const owned = text.match(/is already owned by (0x[0-9a-fA-F]{40})/);
+  if (owned) {
+    return owned[1].toLowerCase() === want
+      ? { kind: "ok", owner: owned[1] }
+      : { kind: "drifted", owner: owned[1] };
+  }
+  const subject = label ? escapeRegExp(String(label)) : "[A-Za-z0-9-]+\\.[A-Za-z0-9.-]+";
+  if (new RegExp(`(?:^|\\s)${subject} is available\\b`, "i").test(text)) return { kind: "missing", owner: null };
+  return { kind: "ok", owner: null };
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The fix for a fixture held by `owner`. This repo ships no
+ * fixture-registration tool (unlike bulletin-deploy's
+ * `tools/register-test-fixture.mjs`), so every remedy here is an admin
+ * action rather than a script to run — but the three-way distinction still
+ * matters: unowned and funder-held are both repairable by an admin transfer,
+ * while third-party-held is not repairable at all (nobody can seize it), so
+ * the honest remedy is a fresh fixture label.
+ */
+export function fixtureRemedy({ label, envLabel, expectedOwner, owner, funder }) {
+  if (!owner) {
+    return {
+      fix: `ask the chain admin to register ${label} to ${expectedOwner} on env "${envLabel}"`,
+      hint: `the name is unowned — likely a registry reset from a DotNS redeploy. This repo ships no fixture-registration tool, so the registration needs to be done manually. Rerun the scenario after.`,
+    };
+  }
+  if (funder && owner.toLowerCase() === String(funder).toLowerCase()) {
+    return {
+      fix: `ask the chain admin to transfer ${label} from the funder (${owner}) to ${expectedOwner} on env "${envLabel}"`,
+      hint: `${owner} is the funder — likely an earlier drifted run registered it to itself. This repo ships no fixture-registration tool, so the transfer needs to be done manually. Rerun the scenario after.`,
+    };
+  }
+  return {
+    fix: `pick a different fixture label on env "${envLabel}"`,
+    hint: `${owner} is neither ${expectedOwner} nor the funder${funder ? ` (${funder})` : ""} — a third party holds this name and it cannot be seized.`,
+  };
 }
 
 /**
@@ -269,11 +313,11 @@ export function classifyFixtureState({ output, expectedOwner }) {
  * E2E fixture is owned by the expected third party BEFORE the scenario runs
  * its main assertion, from a direct on-chain `ownerOf` read (e.g. via the
  * DotNS client's `checkOwnership(label, expectedOwner)`) — not inferred after
- * the fact from CLI text the way `classifyFixtureState` above does. The two
- * helpers are complementary: this one stops the scenario early with a clear
- * diagnosis; `classifyFixtureState` stays as a belt-and-suspenders check on
- * the deploy's own output, in case the fixture drifts in the window between
- * this precheck and the deploy actually running.
+ * the fact from CLI text the way `assertFixtureNotDrifted` below does. The
+ * two helpers are complementary: this one stops the scenario early with a
+ * clear diagnosis; `assertFixtureNotDrifted` stays as a belt-and-suspenders
+ * check on the deploy's own output, in case the fixture drifts in the window
+ * between this precheck and the deploy actually running.
  *
  * Distinguishes three states:
  *   - owned by `expectedOwner`   — returns normally, scenario proceeds.
@@ -292,8 +336,8 @@ export function classifyFixtureState({ output, expectedOwner }) {
  * state (see test/helpers/e2e-helpers.test.js).
  *
  * NOTE — this repo (unlike bulletin-deploy) ships no fixture-registration
- * tool (no `tools/register-test-fixture.mjs`), so the remedy here is an
- * admin action rather than a script to run.
+ * tool (no `tools/register-test-fixture.mjs`), so `fixtureRemedy` above
+ * points at an admin action rather than a script to run.
  *
  * @param {object} o
  * @param {{owned: boolean, owner: string|null}} o.ownership — result of dotns.checkOwnership(label, expectedOwner)
@@ -301,22 +345,74 @@ export function classifyFixtureState({ output, expectedOwner }) {
  * @param {string} o.tld           resolved TLD, e.g. "paseo"
  * @param {string} o.expectedOwner 0x-prefixed H160 the fixture must belong to
  * @param {string} o.scenario      scenario name for the >> FAIL: header
- * @param {string} o.envLabel      env id, used in the diagnosis text
+ * @param {string} o.envLabel      env id, used to build the repair-command hint
+ * @param {string} [o.funder]      0x H160 of the funder (root Alice)
  */
-export function assertFixtureOwnership({ ownership, label, tld, expectedOwner, scenario, envLabel }) {
+export function assertFixtureOwnership({ ownership, label, tld, expectedOwner, scenario, envLabel, funder }) {
   const want = String(expectedOwner).toLowerCase();
   if (ownership.owner && ownership.owner.toLowerCase() === want) return;
 
+  const holder = funder && ownership.owner && ownership.owner.toLowerCase() === String(funder).toLowerCase()
+    ? "the funder holds it, so an earlier run registered it to itself"
+    : "a third party holds it";
   const cause = ownership.owner
-    ? `${label}.${tld} is owned by ${ownership.owner} on env "${envLabel}", expected ${expectedOwner} — a third party (or an earlier drifted run) holds the fixture now`
+    ? `${label}.${tld} is owned by ${ownership.owner} on env "${envLabel}", expected ${expectedOwner}: ${holder}`
     : `${label}.${tld} is UNOWNED on env "${envLabel}" — the registry was probably reset by a DotNS redeploy (CREATE3 keeps every contract address identical, so nothing else signals it)`;
+  const { fix, hint } = fixtureRemedy({ label, envLabel, expectedOwner, owner: ownership.owner, funder });
 
   failWith({
     scenario,
-    message: `fixture precheck failed: ${cause}. Fix: this scenario needs ${label}.${tld} owned by an account OTHER than the deploy signer. Ask the chain admin to register/transfer it on env "${envLabel}" — this repo ships no fixture-registration tool.`,
-    hint:
-      "A testnet re-genesis wipes registrations; the next run then finds the label free and the deploy " +
-      "signer registers it to ITSELF, so every later run exits 0 instead of 78. If a third party already " +
-      "holds it, it cannot be seized — pick a different fixture label instead.",
+    message: `fixture precheck failed: ${cause}. Fix: ${fix}`,
+    hint,
+  });
+}
+
+/**
+ * Checks the deploy output for fixture drift after the deploy ran and fails
+ * with the matching fix. Returns the classification without failing when the
+ * output shows no drift, so the caller's exit-code check reports the failure.
+ *
+ * @param {string} o.output         combined stdout+stderr from the deploy
+ * @param {string} o.label          bare label, e.g. "e2eownedns03"
+ * @param {string} o.tld            e.g. "paseo"
+ * @param {string} o.expectedOwner  0x H160 the fixture must belong to
+ * @param {string} [o.funder]       0x H160 of the funder (root Alice)
+ * @param {string} o.scenario       scenario name for the >> FAIL: header
+ * @param {string} o.envLabel       env id, used in the fix command
+ * @returns {{kind: "missing"|"drifted"|"ok", owner: string|null}}
+ */
+export function assertFixtureNotDrifted({ output, label, tld, expectedOwner, funder, scenario, envLabel }) {
+  const domain = `${label}.${tld}`;
+  const fixture = classifyFixtureState({ output, expectedOwner, label: domain });
+  if (fixture.kind === "ok") return fixture;
+
+  const notARegression = "This is a test-fixture problem, not a polkadot-app-deploy regression.";
+
+  if (fixture.kind === "missing") {
+    // The CLI found the name free and registered it to the deploy signer. The
+    // output does not say who that is; the precheck reads ownerOf, so rerun.
+    failWith({
+      scenario,
+      message:
+        `fixture drift on env "${envLabel}": ${domain} was unregistered when the deploy started and is now ` +
+        `owned by the deploy signer, not ${expectedOwner}. ${notARegression} ` +
+        `Fix: rerun this scenario; the precheck above names the holder and the repair`,
+      context: output,
+      keywords: [`${domain} is available`, "already owned", "Domain"],
+      hint:
+        "this repo ships no fixture-registration tool — ask the chain admin to register/transfer the fixture, " +
+        "then rerun.",
+    });
+  }
+
+  const { fix, hint } = fixtureRemedy({ label, envLabel, expectedOwner, owner: fixture.owner, funder });
+  failWith({
+    scenario,
+    message:
+      `fixture drift on env "${envLabel}": ${domain} is owned by ${fixture.owner}, not ${expectedOwner}. ` +
+      `${notARegression} Fix: ${fix}`,
+    context: output,
+    keywords: ["already owned", "Domain"],
+    hint,
   });
 }

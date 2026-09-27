@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert";
 import { spawn } from "node:child_process";
-import { classifyForRetry, HARNESS_GUARD_MARKER, NO_RETRY_EXIT_CODE } from "../tools/release-retry-wrapper.mjs";
+import { readFileSync } from "node:fs";
+import { classifyForRetry, HARNESS_GUARD_MARKER, NO_RETRY_EXIT_CODE, FLAKE_PATTERNS } from "../tools/release-retry-wrapper.mjs";
 
 const WRAPPER = new URL("../tools/release-retry-wrapper.mjs", import.meta.url).pathname;
 
@@ -186,4 +187,23 @@ test("wrapper reads stdout — clean output with exit 1 produces wrapper exit 1"
   });
   assert.strictEqual(exitCode, 1,
     "expected wrapper to exit 1 when no flake pattern present and child exits 1");
+});
+
+// The wrapper substring-scans its child's whole output, and the child is the
+// test runner. A flake phrase written into a failure hint, a failWith message
+// or a ">> FAIL:" line therefore makes a deterministic failure buy a 30-minute
+// retry. Only those printed strings are scanned, not the regexes that match a
+// deploy's own output: the WS-fault scenarios test for flake wording on
+// purpose, which HARNESS_GUARD_MARKER handles.
+test("no flake pattern appears in a harness failure message or hint", () => {
+  const harness = readFileSync(new URL("./e2e.test.js", import.meta.url), "utf8");
+  const failurePath = harness.split("\n").filter((l) => /(^|\s)(hint|message):/.test(l) || l.includes(">> FAIL:"));
+  for (const needle of FLAKE_PATTERNS) {
+    const offender = failurePath.find((l) => l.includes(needle));
+    assert.strictEqual(
+      offender,
+      undefined,
+      `>> FAIL: test/e2e.test.js prints the flake pattern "${needle}" on a failure path, so tripping that assertion would be retried as a flake. Reword it. Line: ${offender?.trim()}`,
+    );
+  }
 });

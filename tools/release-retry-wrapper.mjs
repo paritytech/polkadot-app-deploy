@@ -21,7 +21,7 @@ import { spawn } from "node:child_process";
 // Exact substrings that map to retry-eligible flake classes.
 // Patterns derived from Sentry telemetry (top transient errors over 30d on
 // the e2e-ci-pr and e2e-ci-release tags).
-const FLAKE_PATTERNS = [
+export const FLAKE_PATTERNS = [
   "Invalid: Stale",                          // tx Invalid/Stale (nonce race) — papi 1.x format
   '"type": "Stale"',                         // tx Invalid/Stale — papi 2.x JSON format
   "ChainHead disjointed",                    // RPC reorg / WS flake

@@ -263,11 +263,20 @@ export interface AutoReauthorizeEnv {
 // NOT self-authorize on the Bulletin chain during a deploy: ensureAuthorized()
 // below never signs anything, it only throws (see its no-self-authorize error
 // text) — unlike bulletin-deploy, which this flag's name is inherited from.
-// The `network !== "mainnet"` check is a deliberate second gate on top of the
+// The `network === "testnet"` check is a deliberate second gate on top of the
 // flag (not redundant with it): it survives a future config mistake where
-// `bulletinAutoAuthorize: true` gets set on a mainnet entry.
+// `bulletinAutoAuthorize: true` gets set on a non-testnet entry, mirroring
+// the "even if the flag were set by mistake, the dispatch is rejected"
+// fail-safe documented on ensureAuthorized's opts.network path.
+//
+// bulletin #1362/#1095: deliberately an ALLOWLIST (`=== "testnet"`), not a
+// denylist (`!== "mainnet"`) — a denylist lets anything that isn't the
+// literal string "mainnet" through, including a missing field or a hand-edit
+// typo like "Mainnet". An allowlist requires the env to explicitly say
+// "testnet", which is the fail-safe direction for a gate that authorizes
+// writes.
 export function isAutoReauthorizeAllowed(env: AutoReauthorizeEnv | null | undefined): boolean {
-  return env?.network !== "mainnet" && env?.bulletinAutoAuthorize === true;
+  return env?.network === "testnet" && env?.bulletinAutoAuthorize === true;
 }
 
 export interface SelectionResult {
@@ -327,6 +336,13 @@ export async function fetchPoolAuthorizations(api: any, accounts: PoolAccount[])
 // authorizer here": testnets can be community-operated with an authorizer
 // this codebase doesn't know (e.g. devnet — see environments.json
 // `bulletinAuthorizer`, deliberately unset there).
+// bulletin #1362/#1095: this is a FALLBACK only, for callers with no
+// environments.json context (a raw library caller pointed at a custom RPC,
+// some tools/* scripts). Any caller that resolved an env should pass its
+// declared `network` field into detectTestnet() instead — spec_name
+// substring matching is a lying mirror (Bulletin on Paseo has reported
+// different spec_names across chain generations) and must never be the sole
+// signal gating a money-movement decision when a better one exists.
 export function isTestnetSpecName(specName: string | undefined | null): boolean {
   if (!specName) return false;
   const s = specName.toLowerCase();
@@ -340,9 +356,37 @@ export function isTestnetSpecName(specName: string | undefined | null): boolean 
   return false;
 }
 
+// bulletin #1362/#1095: precedence for the environments.json-resolved
+// `network` field ("testnet" | "mainnet" | undefined) over a live chain
+// spec_name read. Shared by detectTestnet() below and DotNS.isTestnet()
+// (dotns.ts) — both need the exact same three-state decision before falling
+// back to their own spec_name probe. Three states, deliberately NOT
+// collapsed:
+//   1. network === "testnet"        → true, authoritative.
+//   2. network is a non-empty string that isn't "testnet" (e.g. "mainnet",
+//      or a typo/garbage value like "Mainnet" from a hand-edited env file)
+//      → false, fail CLOSED. A caller resolved SOME env context and it did
+//      not explicitly say "testnet" — never let an unrecognized value fall
+//      through to a spec_name guess, or a config typo reopens the exact
+//      lying-mirror bug this issue exists to close.
+//   3. network is null/undefined    → no env context was resolved at all
+//      (no --env, options.bulletinEndpoints, a raw library/tools/* caller on
+//      a custom RPC) → undefined, meaning: fall back to the spec_name read.
+//      That read itself fails safe (false / not-testnet) on any error.
+// Callers must check `!== undefined` before touching (or populating) their
+// own spec_name cache — a resolved env value must never be overridden by a
+// stale spec_name-derived verdict cached from an earlier, env-less call.
+export function testnetFromNetworkField(network?: string | null): boolean | undefined {
+  if (network === "testnet") return true;
+  if (network != null && network !== "") return false;
+  return undefined;
+}
+
 let _testnetDetectionCache: boolean | null = null;
 
-export async function detectTestnet(api: any): Promise<boolean> {
+export async function detectTestnet(api: any, network?: string | null): Promise<boolean> {
+  const override = testnetFromNetworkField(network);
+  if (override !== undefined) return override;
   if (_testnetDetectionCache !== null) return _testnetDetectionCache;
   try {
     const version = await api.constants.System.Version();
@@ -384,7 +428,12 @@ export async function ensureAuthorized(
   // lets a caller that already read the account's authorization + current block moments
   // earlier (storeChunkedContent's own hard-gate read) hand them in instead of paying a
   // second, redundant RPC round trip.
-  opts: { needs?: AuthorizationNeeds; precheckedAuth?: { auth: BulletinAuthorization | null; currentBlock: number } } = {},
+  // bulletin #1362/#1095: `network` is the resolved env's environments.json
+  // `network` field ("testnet" | "mainnet" | undefined). Threaded into
+  // detectTestnet() below so the failure-message branch (testnet vs. mainnet
+  // wording) is driven by the declared env, not a spec_name guess, whenever
+  // a caller has one.
+  opts: { needs?: AuthorizationNeeds; precheckedAuth?: { auth: BulletinAuthorization | null; currentBlock: number }; network?: string } = {},
 ): Promise<EnsureAuthorizedResult> {
   const [auth, currentBlock] = opts.precheckedAuth
     ? [opts.precheckedAuth.auth, opts.precheckedAuth.currentBlock]
@@ -394,7 +443,7 @@ export async function ensureAuthorized(
       ]);
 
   if (!isAuthorizationSufficient(auth, currentBlock)) {
-    const isTestnet = await detectTestnet(api);
+    const isTestnet = await detectTestnet(api, opts.network);
     const who = `${label ?? "account"} (${address.slice(0, 8)}...)`;
     if (isTestnet) {
       throw new Error(

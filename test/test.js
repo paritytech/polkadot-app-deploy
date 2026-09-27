@@ -30,7 +30,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
-import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
+import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
@@ -4081,6 +4081,7 @@ describe("DotNS initial state", () => {
 
     assert.deepStrictEqual(events, [
       "check-before-trigger:false",
+      "log:   DotNS signer 5Signer... is NOT mapped on Revive (no OriginalAccount entry).",
       "check-before-trigger:false",
       "trigger",
       "check-after-trigger:true",
@@ -4091,6 +4092,118 @@ describe("DotNS initial state", () => {
   test("autoAccountMapping log names Revive.OriginalAccount confirmation", async () => {
     const src = fs.readFileSync("src/dotns.ts", "utf8");
     assert.match(src, /Account: auto-mapped \(Revive\.OriginalAccount confirmed\)/);
+  });
+
+  // bulletin #1221 Part 1: the H160 line printed just before account-mapping
+  // runs must not read as mapping evidence — it's a deterministic
+  // SS58->H160 derivation that says nothing about whether
+  // Revive.OriginalAccount exists yet.
+  test("H160 log line carries the 'derived from SS58' qualifier (#1221)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    assert.match(src, /H160 Address: \$\{this\.evmAddress\} \(derived from SS58; Revive mapping checked next\)/,
+      ">> FAIL: H160 qualifier: the log line must not read as mapping evidence — see #1221 Part 1");
+  });
+
+  // bulletin #1221 Part 1: the "NOT mapped" log must appear before ANY
+  // top-up attempt in source order, and must not be nested inside the
+  // isTestnet() branch — otherwise the messaging fix silently only fires for
+  // testnets.
+  test("ensureAutoMappedAccountReady logs 'NOT mapped' before attempting any top-up (#1221 Part 1)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    const bodyStart = src.indexOf("async ensureAutoMappedAccountReady(");
+    const notMappedIdx = src.indexOf("is NOT mapped on Revive", bodyStart);
+    const topUpIdx = src.indexOf("attemptTestnetTopUp(this.substrateAddress", bodyStart);
+    assert.ok(bodyStart !== -1 && notMappedIdx !== -1 && topUpIdx !== -1,
+      ">> FAIL: #1221 NOT-mapped ordering: could not locate all three markers in ensureAutoMappedAccountReady");
+    assert.ok(notMappedIdx < topUpIdx,
+      ">> FAIL: #1221 NOT-mapped ordering: the 'NOT mapped' log must appear before the top-up attempt in source order");
+  });
+
+  test("ensureAutoMappedAccountReady logs 'NOT mapped' even off testnet (mainnet path, no top-up)", async () => {
+    const d = new DotNS();
+    const events = [];
+    d.connected = true;
+    d.substrateAddress = "5MainnetSigner";
+    d.signer = {};
+    d.clientWrapper = {
+      checkIfAccountMapped: async () => false,
+      client: { tx: { Revive: { call: () => ({}) } } },
+      signAndSubmitWithRetry: async () => { throw new Error("no funds"); },
+    };
+    d.isTestnet = async () => false;
+    const originalLog = console.log;
+    console.log = (message) => { events.push(String(message)); };
+    try {
+      await assert.rejects(() => d.ensureAutoMappedAccountReady());
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(events.some((e) => e.includes("is NOT mapped on Revive")),
+      ">> FAIL: #1221 mainnet NOT-mapped: the log must fire regardless of isTestnet(), not only inside the testnet top-up branch");
+  });
+
+  // bulletin #1221 Part 2: an opt-in autoMapTopUpTarget lets deploy() size
+  // the first top-up for a register instead of the flat 0.5 PAS default.
+  // Read-only callers that never set it must keep the 0.5 PAS default
+  // exactly — that's the safety property that stops every unmapped
+  // read-only connect from draining Alice/Bob at register-sized amounts.
+  function unmappedTestnetSignerCapturingTopUpTarget() {
+    const d = new DotNS();
+    let requestedTarget = null;
+    let mapped = false;
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d.clientWrapper = {
+      checkIfAccountMapped: async () => mapped, // false until the trigger submission below "maps" it
+      client: { tx: { Revive: { call: () => ({}) } } },
+      signAndSubmitWithRetry: async (buildExtrinsic) => { buildExtrinsic(); mapped = true; },
+    };
+    d.isTestnet = async () => true;
+    d.readFreeBalance = async () => 0n;
+    d.attemptTestnetTopUp = async (_addr, target) => {
+      requestedTarget = target;
+      return { source: "Alice", transferred: target };
+    };
+    return { d, getRequestedTarget: () => requestedTarget };
+  }
+
+  test("ensureAutoMappedAccountReady uses autoMapTopUpTarget when the caller provides one (#1221 Part 2)", async () => {
+    const { d, getRequestedTarget } = unmappedTestnetSignerCapturingTopUpTarget();
+
+    await d.ensureAutoMappedAccountReady(75_000_000_000n); // 7.5 PAS, a stand-in register-sized target
+
+    assert.strictEqual(getRequestedTarget(), 75_000_000_000n,
+      ">> FAIL: autoMapTopUpTarget threading: ensureAutoMappedAccountReady must pass the caller's target to attemptTestnetTopUp, not the flat default");
+  });
+
+  test("ensureAutoMappedAccountReady keeps the flat TOP_UP_TARGET default when no override is given (#1221 Part 2 safety property)", async () => {
+    const { d, getRequestedTarget } = unmappedTestnetSignerCapturingTopUpTarget();
+
+    await d.ensureAutoMappedAccountReady(); // no arg — read-only-caller shape
+
+    assert.strictEqual(getRequestedTarget(), 5_000_000_000n, // TOP_UP_TARGET = ONE_PAS/2 = 0.5 PAS = 5_000_000_000n
+      ">> FAIL: autoMapTopUpTarget default: an unset override must still top up to exactly TOP_UP_TARGET (0.5 PAS), or every read-only connect over-funds from Alice/Bob");
+  });
+
+  test("ensureMappedAccountReady threads autoMapTopUpTarget into ensureAutoMappedAccountReady on the auto-map path", async () => {
+    const d = new DotNS();
+    const seenTargets = [];
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d.ensureAutoMappedAccountReady = async (target) => { seenTargets.push(target); };
+    d.clientWrapper = { checkIfAccountMapped: async () => false };
+
+    await d.ensureMappedAccountReady(true, 99_000_000_000n);
+    assert.deepStrictEqual(seenTargets, [99_000_000_000n],
+      ">> FAIL: ensureMappedAccountReady autoAccountMapping=true path must forward autoMapTopUpTarget");
+  });
+
+  test("DotNS.connect() forwards options.autoMapTopUpTarget into ensureMappedAccountReady", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    assert.match(src, /ensureMappedAccountReady\(options\.autoAccountMapping \?\? false, options\.autoMapTopUpTarget\)/,
+      ">> FAIL: connect() wiring: options.autoMapTopUpTarget must reach ensureMappedAccountReady, or deploy.ts's opt-in has no effect");
   });
 
   test("explicit account mapping falls back to auto-map trigger when map_account is unavailable", async () => {
@@ -5948,6 +6061,19 @@ describe("DotNS.preflight", () => {
     assert.strictEqual(fmtPas(10_000_000_000n), "1.0000");
     assert.strictEqual(fmtPas(15_000_000_000n), "1.5000");
     assert.strictEqual(fmtPas(100_000_000n), "0.0100");
+  });
+
+  // bulletin #1221: deploy.ts needs topUpTargetFor + AUTO_MAP_RENT_HEADROOM to
+  // size the first auto-map top-up for a register, so a fresh testnet signer
+  // needs only one top-up (+ finalization wait) instead of two.
+  test("topUpTargetFor and AUTO_MAP_RENT_HEADROOM are exported for deploy.ts's #1221 auto-map sizing", async () => {
+    const dotnsModule = await import("../dist/dotns.js");
+    assert.strictEqual(typeof dotnsModule.topUpTargetFor, "function",
+      ">> FAIL: topUpTargetFor export: deploy.ts needs this to size autoMapTopUpTarget for a register");
+    assert.strictEqual(typeof dotnsModule.AUTO_MAP_RENT_HEADROOM, "bigint",
+      ">> FAIL: AUTO_MAP_RENT_HEADROOM export: must be a bigint constant deploy.ts can pass as rentPriceNative");
+    assert.ok(dotnsModule.AUTO_MAP_RENT_HEADROOM > 0n && dotnsModule.AUTO_MAP_RENT_HEADROOM <= 300_000_000_000n,
+      ">> FAIL: AUTO_MAP_RENT_HEADROOM sanity: expected a headroom in the 0-30 PAS band");
   });
 
   // -----------------------------------------------------------------
@@ -8760,6 +8886,27 @@ describe("isAutoReauthorizeAllowed", () => {
     assert.strictEqual(isAutoReauthorizeAllowed(null), false,
       ">> FAIL: isAutoReauthorizeAllowed: null env must not be allowed");
   });
+
+  // bulletin #1362/#1095: a declared-but-unrecognized `network` (missing
+  // field, or a hand-edit typo/case mismatch like "Mainnet") must never be
+  // allowed, even with the flag set. Pins the allowlist (`=== "testnet"`)
+  // over a denylist (`!== "mainnet"`) shape — the denylist would let
+  // anything that wasn't literally "mainnet" through.
+  test("a config typo on network (e.g. \"Mainnet\") is never allowed, even with the flag set", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ network: "Mainnet", bulletinAutoAuthorize: true }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: an unrecognized network value must fail CLOSED — a denylist (network !== \"mainnet\") would let this typo through",
+    );
+  });
+
+  test("a resolved env with a missing network field is never allowed, even with the flag set", () => {
+    assert.strictEqual(
+      isAutoReauthorizeAllowed({ bulletinAutoAuthorize: true }),
+      false,
+      ">> FAIL: isAutoReauthorizeAllowed: an env with no network field at all must fail CLOSED, not default-allow",
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -9194,6 +9341,162 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
       "should throw mainnet message when auth is expired on mainnet",
     );
   });
+
+  // bulletin #1362/#1095: opts.network must override a contradictory
+  // spec_name in BOTH directions — this is the acceptance-criteria example
+  // from the issue.
+  test("opts.network:\"mainnet\" overrides a testnet-looking spec_name → mainnet message", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
+    const api = buildApi({ auth, specName: "bulletin-paseo" }); // spec_name says testnet
+    await assert.rejects(
+      () => ensureAuthorized(api, ADDRESS, "test", { network: "mainnet" }), // env says mainnet
+      /cannot grant it/,
+      ">> FAIL: ensureAuthorized: opts.network:\"mainnet\" must win over a testnet-looking spec_name (mainnet message expected)",
+    );
+  });
+
+  test("opts.network:\"testnet\" overrides a mainnet-looking spec_name → testnet message", async () => {
+    _resetTestnetCacheForTests();
+    const auth = runtimeAuth({ expiresAt: MOCK_BLOCK - 1 });
+    const api = buildApi({ auth, specName: "polkadot-bulletin" }); // spec_name says mainnet
+    await assert.rejects(
+      () => ensureAuthorized(api, ADDRESS, "test", { network: "testnet" }), // env says testnet
+      /no longer self-authorizes/,
+      ">> FAIL: ensureAuthorized: opts.network:\"testnet\" must win over a mainnet-looking spec_name (testnet message expected)",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulletin #1362/#1095 port: deploy.ts must thread bulletinNetwork (derived
+// from the resolved env's environments.json `network` field) into every
+// ensureAuthorized call site and into the deploy.is_testnet detectTestnet
+// read, or a config-mistake network never reaches the money-movement gates.
+// ---------------------------------------------------------------------------
+describe("deploy.ts threads bulletinNetwork/envNetwork into every testnet-detection call site (#1362/#1095)", () => {
+  test("deploy.ts normalizes envNetwork = resolved.network ?? \"unknown\" and assigns bulletinNetwork from it", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.ok(/envNetwork\s*=\s*resolved\.network\s*\?\?\s*"unknown"/.test(src),
+      ">> FAIL: #1362/#1095: deploy.ts must normalize envNetwork = resolved.network ?? \"unknown\" once an env was resolved, so a config gap (field missing) fails closed instead of falling through to spec_name");
+    assert.ok(/bulletinNetwork\s*=\s*envNetwork/.test(src),
+      ">> FAIL: #1362/#1095: deploy.ts must assign bulletinNetwork from envNetwork, or the env's declared network never reaches ensureAuthorized/detectTestnet");
+  });
+
+  test("every ensureAuthorized call site in deploy.ts passes network: bulletinNetwork", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    // Window-based (not a single-paren regex): storeChunkedContent's call site
+    // spans multiple lines with nested object literals (needs/precheckedAuth),
+    // so a `[^)]*\)` match would stop at the first inner `)` rather than the
+    // call's real closing paren. Each call site's opts object is well within
+    // 400 chars of its opening paren in practice.
+    const callStarts = [...src.matchAll(/ensureAuthorized\(/g)].map((m) => m.index);
+    assert.ok(callStarts.length > 0, ">> FAIL: #1362/#1095: expected at least one ensureAuthorized call site in deploy.ts");
+    const missing = callStarts
+      .map((i) => src.slice(i, i + 400))
+      .filter((window) => !/network:\s*bulletinNetwork/.test(window));
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1362/#1095: every ensureAuthorized call site must pass network: bulletinNetwork; ${missing.length} of ${callStarts.length} do not. A missed site silently falls back to a live spec_name read instead of the declared env. Offending: ${missing.join(" | ")}`);
+  });
+
+  test("deploy.ts threads envNetwork into the deploy.is_testnet telemetry detectTestnet call", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.ok(/detectTestnet\(provider\.unsafeApi,\s*envNetwork\)/.test(src),
+      ">> FAIL: #1362/#1095: the deploy.is_testnet telemetry read must pass envNetwork into detectTestnet, not rely solely on a live spec_name read");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DotNS.isTestnet() — bulletin #1362/#1095: same network-overrides-spec_name
+// contract as detectTestnet above, but on the instance used by
+// attemptTestnetTopUp's Alice/Bob dev-phrase transfer path.
+// ---------------------------------------------------------------------------
+describe("DotNS.isTestnet() (bulletin #1362/#1095: network field overrides spec_name)", () => {
+  function withSpecName(specName) {
+    return { client: { constants: { System: { Version: async () => ({ spec_name: { asText: () => specName } }) } } } };
+  }
+
+  test("network:\"mainnet\" wins even when spec_name looks like a testnet", async () => {
+    const d = new DotNS();
+    d._network = "mainnet";
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(
+      await d.isTestnet(),
+      false,
+      ">> FAIL: DotNS.isTestnet: network:\"mainnet\" must never be overridden by a testnet-looking spec_name — attemptTestnetTopUp must never fire on a declared-mainnet env",
+    );
+  });
+
+  test("network:\"testnet\" wins even when spec_name looks like mainnet", async () => {
+    const d = new DotNS();
+    d._network = "testnet";
+    d.clientWrapper = withSpecName("polkadot-bulletin");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), true,
+      ">> FAIL: DotNS.isTestnet: network:\"testnet\" must win over a mainnet-looking spec_name");
+  });
+
+  test("network null (no env context at all) falls back to the spec_name read (unchanged pre-fix behavior)", async () => {
+    const d = new DotNS();
+    d._network = null;
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), true,
+      ">> FAIL: DotNS.isTestnet: with no network signal, a testnet-looking spec_name must still resolve true");
+  });
+
+  test("network:\"unknown\" (env resolved, field genuinely absent) fails safe: not-a-testnet, even against a testnet-looking spec_name", () => {
+    // resolveDotnsConnectOptions/deploy.ts normalize a resolved-but-field-less
+    // env to "unknown" before it ever reaches connect() — this is the literal
+    // "field ABSENT" scenario, and it must fail safe (not-a-testnet) rather
+    // than falling through to spec_name.
+    return (async () => {
+      const d = new DotNS();
+      d._network = "unknown";
+      d.clientWrapper = withSpecName("bulletin-paseo");
+      d.ensureConnected = () => {};
+      assert.strictEqual(await d.isTestnet(), false,
+        ">> FAIL: DotNS.isTestnet: a resolved-but-network-less env must fail CLOSED (not-testnet), never fall through to a spec_name guess");
+    })();
+  });
+
+  test("a declared-but-unrecognized network value (e.g. a typo) fails safe: not-a-testnet", async () => {
+    const d = new DotNS();
+    d._network = "Mainnet"; // config typo — must not be treated as "no env context"
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(await d.isTestnet(), false,
+      ">> FAIL: DotNS.isTestnet: an unrecognized-but-declared network value must fail CLOSED (not-testnet), not silently fall back to spec_name on a config typo");
+  });
+
+  test("an explicit network is never overridden by a stale spec_name-derived instance cache", async () => {
+    const d = new DotNS();
+    // Simulate a stale cache from an earlier env-less isTestnet() call that read a
+    // testnet-looking spec_name before connect() ever supplied a network.
+    d._testnetCache = true;
+    d._network = "mainnet";
+    d.clientWrapper = withSpecName("bulletin-paseo");
+    d.ensureConnected = () => {};
+    assert.strictEqual(
+      await d.isTestnet(),
+      false,
+      ">> FAIL: DotNS.isTestnet: an explicit network:\"mainnet\" must win over a stale _testnetCache=true left by an earlier spec_name-derived read",
+    );
+  });
+
+  // connect() does a live chain probe end-to-end (no injectable transport), so
+  // this pins the wiring by source inspection rather than executing connect().
+  test("connect() assigns options.network onto the instance before any chain call", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf-8");
+    const connectIdx = src.indexOf("async connect(options: DotNSConnectOptions = {}): Promise<this> {");
+    const networkAssignIdx = src.indexOf("this._network = options.network;");
+    assert.ok(connectIdx !== -1, ">> FAIL: DotNS.connect: could not locate the connect() method signature");
+    assert.ok(networkAssignIdx !== -1,
+      ">> FAIL: DotNS.connect: must assign `this._network = options.network` so isTestnet() can read the resolved env's network");
+    assert.ok(connectIdx < networkAssignIdx,
+      ">> FAIL: DotNS.connect: the network assignment must live inside connect(), not elsewhere");
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -9349,6 +9652,93 @@ describe("isTestnetSpecName", () => {
     assert.strictEqual(isTestnetSpecName(undefined), false);
     assert.strictEqual(isTestnetSpecName(null), false);
     assert.strictEqual(isTestnetSpecName(""), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// detectTestnet(api, network) — bulletin #1362/#1095: the environments.json
+// `network` field must be authoritative over the chain's spec_name for
+// money-movement gates (isAutoReauthorizeAllowed, ensureAuthorized's error
+// branch). spec_name stays as the fallback ONLY when no env `network` is
+// available (e.g. a raw library caller pointed at a custom RPC).
+// ---------------------------------------------------------------------------
+describe("detectTestnet (bulletin #1362/#1095: network field overrides spec_name)", () => {
+  function apiWithSpecName(specName) {
+    return { constants: { System: { Version: async () => ({ spec_name: { asText: () => specName } }) } } };
+  }
+
+  test("network:\"mainnet\" wins even when spec_name looks like a testnet", async () => {
+    _resetTestnetCacheForTests();
+    const api = apiWithSpecName("bulletin-paseo");
+    assert.strictEqual(
+      await detectTestnet(api, "mainnet"),
+      false,
+      ">> FAIL: detectTestnet: network:\"mainnet\" must never be overridden by a testnet-looking spec_name — this is the exact lying-mirror scenario #1095 exists to close",
+    );
+  });
+
+  test("network:\"testnet\" wins even when spec_name looks like mainnet", async () => {
+    _resetTestnetCacheForTests();
+    const api = apiWithSpecName("polkadot-bulletin");
+    assert.strictEqual(
+      await detectTestnet(api, "testnet"),
+      true,
+      ">> FAIL: detectTestnet: network:\"testnet\" must win over a mainnet-looking spec_name (declared env context takes priority)",
+    );
+  });
+
+  test("network undefined (no env context at all) falls back to spec_name (unchanged pre-fix behavior)", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(await detectTestnet(apiWithSpecName("bulletin-paseo"), undefined), true,
+      ">> FAIL: detectTestnet: with no network signal, a testnet-looking spec_name must still resolve true (fallback for env-less callers)");
+    _resetTestnetCacheForTests();
+    assert.strictEqual(await detectTestnet(apiWithSpecName("polkadot-bulletin"), undefined), false,
+      ">> FAIL: detectTestnet: with no network signal, a mainnet-looking spec_name must still resolve false");
+  });
+
+  // An env WAS resolved (e.g. via --env) but its environments.json entry is
+  // missing the `network` field — deploy.ts normalizes this to the
+  // "unknown" sentinel (never leaves it undefined) specifically so it lands
+  // here, not in the spec_name-fallback branch above.
+  test("network:\"unknown\" (env resolved, field genuinely absent) fails safe: not-a-testnet, even against a testnet-looking spec_name", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "unknown"),
+      false,
+      ">> FAIL: detectTestnet: a resolved-but-network-less env must fail CLOSED (not-testnet), never fall through to a spec_name guess",
+    );
+  });
+
+  test("a declared-but-unrecognized network value (e.g. a typo) fails safe: not-a-testnet", async () => {
+    _resetTestnetCacheForTests();
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "Mainnet"),
+      false,
+      ">> FAIL: detectTestnet: an unrecognized-but-declared network value must fail CLOSED (not-testnet), not silently fall back to spec_name on a config typo",
+    );
+  });
+
+  test("an explicit network is never overridden by a stale spec_name-derived cache entry", async () => {
+    _resetTestnetCacheForTests();
+    // First call with NO network populates the module cache from spec_name (testnet-looking → true).
+    assert.strictEqual(await detectTestnet(apiWithSpecName("bulletin-paseo"), undefined), true);
+    // A later call on what is declared network:"mainnet" must still return false — the cache
+    // populated by the env-less call above must not leak into (or be read by) this one.
+    assert.strictEqual(
+      await detectTestnet(apiWithSpecName("bulletin-paseo"), "mainnet"),
+      false,
+      ">> FAIL: detectTestnet: an explicit network:\"mainnet\" call must not inherit a stale testnet verdict cached by an earlier env-less call",
+    );
+  });
+
+  test("unrecognized/absent network + unreadable chain fails safe (not-testnet)", async () => {
+    _resetTestnetCacheForTests();
+    const brokenApi = { constants: { System: { Version: async () => { throw new Error("rpc down"); } } } };
+    assert.strictEqual(
+      await detectTestnet(brokenApi, undefined),
+      false,
+      ">> FAIL: detectTestnet: when the network signal is absent AND the chain read fails, the safe default is not-testnet (fail closed on money-movement gates)",
+    );
   });
 });
 
@@ -9530,6 +9920,77 @@ describe("resolveDotnsConnectOptions (#209)", () => {
   test("omits registerStorageDeposit when not provided", () => {
     const r = resolveDotnsConnectOptions({});
     assert.strictEqual(r.registerStorageDeposit, undefined);
+  });
+
+  // bulletin #1362/#1095: the resolved env's `network` field must thread
+  // through to DotNS.connect — appended as the LAST positional param in this
+  // port (rather than inserted before contractSources, as bulletin-deploy
+  // does), so the manifest/publish.ts call site (a separate lane) doesn't
+  // need renumbering.
+  test("passes network when provided", () => {
+    const r = resolveDotnsConnectOptions({}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "mainnet");
+    assert.strictEqual(r.network, "mainnet",
+      ">> FAIL: resolveDotnsConnectOptions network: explicit network arg must forward verbatim");
+  });
+
+  test("omits network when not provided", () => {
+    const r = resolveDotnsConnectOptions({});
+    assert.strictEqual(r.network, undefined,
+      ">> FAIL: resolveDotnsConnectOptions network: omitted network must stay undefined (DotNS.isTestnet() then falls back to spec_name, not silently defaulting to testnet or mainnet)");
+  });
+
+  test("deploy.ts passes envNetwork into every deploy()-internal resolveDotnsConnectOptions call site (#1362/#1095)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const calls = src.match(/resolveDotnsConnectOptions\([^;]*?\)(?=[,)])/gs) ?? [];
+    assert.ok(calls.length > 0, ">> FAIL: #1362/#1095: expected at least one resolveDotnsConnectOptions call site in deploy.ts");
+    const missing = calls.filter((c) => !/,\s*envNetwork\)\s*$/.test(c.trim()));
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1362/#1095: every resolveDotnsConnectOptions call site in deploy.ts must end with envNetwork as the last argument, or DotNS.connect() never learns the declared env network and isTestnet() silently falls back to spec_name. Offending: ${missing.join(" | ")}`);
+  });
+
+  // bulletin #1221 Part 2: every deploy()-internal connect must size the
+  // first auto-map top-up via topUpTargetFor(..., envRegisterStorageDeposit,
+  // AUTO_MAP_RENT_HEADROOM), so a fresh signer mid-deploy (including the
+  // owner-path reconnect) needs only one top-up instead of two.
+  test("deploy.ts sizes autoMapTopUpTarget via topUpTargetFor(..., envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM) on every deploy()-internal connect (#1221 Part 2)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const deployFnStart = src.indexOf("export async function deploy(");
+    assert.ok(deployFnStart !== -1, ">> FAIL: #1221: could not locate deploy() to scope the call-site search");
+    const deployFnSrc = src.slice(deployFnStart);
+    const calls = [...deployFnSrc.matchAll(/resolveDotnsConnectOptions\([^;]*?\)(?=[,)])/gs)];
+    assert.ok(calls.length >= 3,
+      `>> FAIL: #1221: expected at least 3 resolveDotnsConnectOptions call sites inside deploy(), found ${calls.length}`);
+    const missing = calls.filter((m) => {
+      const after = deployFnSrc.slice(m.index + m[0].length, m.index + m[0].length + 400);
+      return !/autoMapTopUpTarget:\s*topUpTargetFor\([^,]+,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/.test(after);
+    }).map((m) => m[0]);
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1221: every deploy()-internal resolveDotnsConnectOptions call must be followed by an autoMapTopUpTarget: topUpTargetFor(<action>, envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM) sibling key, or a fresh signer mid-deploy still does two top-ups. Offending: ${missing.join(" | ")}`);
+  });
+
+  test("deploy.ts uses autoMapPlannedActionFor (not a hardcoded 'register') at every post-preflight connect (#1221)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const deployFnStart = src.indexOf("export async function deploy(");
+    assert.ok(deployFnStart !== -1, ">> FAIL: #1221: could not locate deploy() to scope the call-site search");
+    const deployFnSrc = src.slice(deployFnStart);
+    const realActionCalls = deployFnSrc.match(/topUpTargetFor\(\s*autoMapPlannedActionFor\(dotnsPreflight\)\s*,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
+    assert.strictEqual(realActionCalls.length, 2,
+      `>> FAIL: #1221: expected exactly 2 post-preflight connects (owner-path reconnect + main signer connect) to use autoMapPlannedActionFor(dotnsPreflight), found ${realActionCalls.length}`);
+    const hardcodedRegisterCalls = deployFnSrc.match(/topUpTargetFor\(\s*["']register["']\s*,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
+    assert.strictEqual(hardcodedRegisterCalls.length, 1,
+      `>> FAIL: #1221: expected exactly 1 connect (the preflight connect, which runs before plannedAction is known) to use a hardcoded "register", found ${hardcodedRegisterCalls.length}`);
+  });
+
+  test("autoMapPlannedActionFor returns the real plannedAction, falling back to 'register' for null/abort (#1221)", async () => {
+    const { autoMapPlannedActionFor } = await import("../dist/deploy.js");
+    assert.strictEqual(autoMapPlannedActionFor(null), "register",
+      ">> FAIL: autoMapPlannedActionFor null: preflight didn't run — must fall back to the conservative 'register'");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "abort" }), "register",
+      ">> FAIL: autoMapPlannedActionFor abort: can't reach this in practice, but must still fall back defensively rather than pass 'abort' to topUpTargetFor");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "already-owned-by-recipient" }), "already-owned-by-recipient",
+      ">> FAIL: autoMapPlannedActionFor owned: must pass through the real action, not override it with 'register'");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "already-owned-by-us" }), "already-owned-by-us");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "register" }), "register");
   });
 });
 
@@ -10265,7 +10726,7 @@ describe("watchTransaction found:false handling", () => {
 // ---------------------------------------------------------------------------
 import { resolveStateDir, stateFilePath, loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const BIN_PATH = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkadot-app-deploy");
 
@@ -24564,7 +25025,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -24956,6 +25417,138 @@ describe("bin/polkadot-app-deploy confirmPhoneReady non-interactive gate (#1363,
       ">> FAIL: bin/polkadot-app-deploy: a genuine interactive Ctrl-C must still reject with 'aborted by user' — only the non-interactive path gets the new distinct error");
     assert.match(bin, /answer === "y" \|\| answer === "yes"/,
       ">> FAIL: bin/polkadot-app-deploy: the explicit y/yes confirmation requirement (#194) must be unchanged");
+  });
+});
+
+// bulletin #1553/#1461: MNEMONIC and DOTNS_MNEMONIC used to be ranked in
+// opposite order by resolveEffectiveMnemonic (MNEMONIC-first, above) and
+// DotNS.connect's own fallback (DOTNS_MNEMONIC-first) — invisible via the CLI
+// because bin/polkadot-app-deploy always pre-resolves options.mnemonic before
+// DotNS.connect ever looks at its own env fallback. src/mnemonic.ts is now
+// the single shared implementation.
+const MN1553_A = "bottom drive obey lake curtain smoke basket hold race lonely fit walk"; // well-known dev phrase
+const MN1553_B = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+describe("resolveEffectiveMnemonic env-vs-env precedence (bulletin #1553/#1461)", () => {
+  test("both env vars set, no flag → MNEMONIC wins (the exact case #1461 found untested)", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_B });
+    assert.strictEqual(resolved, MN1553_A,
+      ">> FAIL: mnemonic-precedence: with both MNEMONIC and DOTNS_MNEMONIC set and no --mnemonic flag, MNEMONIC must win — pre-fix, DotNS.connect's own fallback disagreed and picked DOTNS_MNEMONIC on this exact input");
+  });
+
+  test("empty-string MNEMONIC is treated as unset, not a winning blank value (GH Actions unset-secret shape)", () => {
+    // `MNEMONIC: ${{ secrets.X }}` on an unset secret resolves to "" — must
+    // fall through to DOTNS_MNEMONIC, not win as a blank mnemonic.
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: undefined, envMnemonic: "", envDotnsMnemonic: MN1553_B });
+    assert.strictEqual(resolved, MN1553_B, ">> FAIL: mnemonic-precedence: an empty-string MNEMONIC must fall through to DOTNS_MNEMONIC rather than winning as a blank value");
+  });
+
+  test("whitespace-only --mnemonic flag falls through to MNEMONIC", () => {
+    const resolved = resolveEffectiveMnemonic({ flagMnemonic: "   ", envMnemonic: MN1553_A, envDotnsMnemonic: undefined });
+    assert.strictEqual(resolved, MN1553_A, ">> FAIL: mnemonic-precedence: a whitespace-only --mnemonic flag must fall through to the MNEMONIC env var rather than winning as a blank value");
+  });
+});
+
+describe("mnemonicConflictNotice (bulletin #1553/#1461)", () => {
+  test("both set and differ → a notice naming both env vars, never their values", () => {
+    const notice = mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_B });
+    assert.ok(notice, ">> FAIL: mnemonic-notice: both set and differing must produce a non-null notice");
+    assert.match(notice, /MNEMONIC/, ">> FAIL: mnemonic-notice: notice must name MNEMONIC");
+    assert.match(notice, /DOTNS_MNEMONIC/, ">> FAIL: mnemonic-notice: notice must name DOTNS_MNEMONIC");
+    assert.ok(!notice.includes(MN1553_A) && !notice.includes(MN1553_B),
+      ">> FAIL: mnemonic-notice: notice must never include a raw mnemonic value (trust-boundary: no key material in logs)");
+  });
+
+  test("both set to the SAME value → no notice", () => {
+    const notice = mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: MN1553_A });
+    assert.strictEqual(notice, null, ">> FAIL: mnemonic-notice: identical values must not be flagged as a conflict");
+  });
+
+  test("only one set → no notice", () => {
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: MN1553_A, envDotnsMnemonic: undefined }), null, ">> FAIL: mnemonic-notice: MNEMONIC alone must not be flagged");
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: undefined, envDotnsMnemonic: MN1553_B }), null, ">> FAIL: mnemonic-notice: DOTNS_MNEMONIC alone must not be flagged");
+  });
+
+  test("neither set → no notice", () => {
+    assert.strictEqual(mnemonicConflictNotice({ envMnemonic: undefined, envDotnsMnemonic: undefined }), null, ">> FAIL: mnemonic-notice: nothing set must not be flagged");
+  });
+});
+
+describe("DotNS.connect() shares resolveEffectiveMnemonic's precedence (bulletin #1553/#1461)", () => {
+  const repoRoot = path.resolve(BIN_PATH, "../..");
+  const dotnsUrl = pathToFileURL(path.join(repoRoot, "dist/dotns.js")).href;
+
+  async function addressFor(mnemonic) {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    return keyring.addFromMnemonic(mnemonic).address;
+  }
+
+  test("options.mnemonic absent, both env vars set and differ → derives the signer from MNEMONIC, not DOTNS_MNEMONIC", async () => {
+    const addressA = await addressFor(MN1553_A);
+    // Run in a CHILD process rather than in-process: connect()'s network
+    // step against an unreachable RPC can take much longer than the
+    // signer-derivation step this test cares about, and an in-process await
+    // left the pending connection an open handle with no way to force it
+    // closed. A child process can be killed outright via spawnSync's timeout
+    // once the value we need (substrateAddress, set synchronously before any
+    // network call) has been captured and printed.
+    const script = [
+      `import { DotNS } from ${JSON.stringify(dotnsUrl)};`,
+      `const dotns = new DotNS();`,
+      `dotns.connect({ rpc: "ws://127.0.0.1:1" }).catch(() => {});`,
+      `setTimeout(() => { process.stdout.write(JSON.stringify({ address: dotns.substrateAddress ?? null })); process.exit(0); }, 1200);`,
+    ].join("\n");
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+      encoding: "utf8",
+      timeout: 6000,
+      killSignal: "SIGKILL",
+      env: { ...process.env, MNEMONIC: MN1553_A, DOTNS_MNEMONIC: MN1553_B },
+    });
+    assert.ok(result.stdout, `>> FAIL: dotns-connect-precedence: child process produced no stdout (status ${result.status}, signal ${result.signal}, stderr: ${result.stderr})`);
+    // dotns.ts's own connect() prints "   SS58 Address: ..." to stdout
+    // before our marker JSON does — take only the last line.
+    const lastLine = result.stdout.trim().split("\n").pop();
+    const { address } = JSON.parse(lastLine);
+    assert.strictEqual(address, addressA,
+      ">> FAIL: dotns-connect-precedence: with no options.mnemonic and both env vars set and differing, DotNS.connect must derive its signer from MNEMONIC, not DOTNS_MNEMONIC — this is dotns.ts's own resolution point for a direct connect() caller that bypasses bin's pre-collapse (e.g. deploy() used as a library, or DotNS used directly)");
+  });
+});
+
+describe("CLI end-to-end: bin/polkadot-app-deploy's mnemonic collapse doesn't defeat the fix (bulletin #1553/#1461)", () => {
+  test("MNEMONIC and DOTNS_MNEMONIC both set, no --mnemonic flag → the CLI signs with MNEMONIC and warns about the conflict on stderr", async () => {
+    await ensureAuthCryptoWaitReady();
+    const keyring = new EnsureAuthKeyring({ type: "sr25519" });
+    const addressA = keyring.addFromMnemonic(MN1553_A).address;
+
+    const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "mn1553test-"));
+    fs.writeFileSync(path.join(buildDir, "index.html"), "<html></html>");
+    let result;
+    try {
+      result = spawnSync(process.execPath, [BIN_PATH, buildDir, "mnemonic1553test", "--no-manifest"], {
+        cwd: path.resolve(BIN_PATH, "../.."),
+        encoding: "utf8",
+        timeout: 8000,
+        killSignal: "SIGKILL",
+        env: {
+          ...process.env,
+          MNEMONIC: MN1553_A,
+          DOTNS_MNEMONIC: MN1553_B,
+          // Unreachable on purpose — this test only needs the signer to be
+          // derived and printed, which happens before any network call; the
+          // deploy is expected (and allowed) to fail after.
+          DOTNS_RPC: "ws://127.0.0.1:1",
+          PAD_UPDATE_CHECK: "0",
+        },
+      });
+    } finally {
+      fs.rmSync(buildDir, { recursive: true, force: true });
+    }
+
+    assert.match(result.stdout, new RegExp(`SS58 Address: ${addressA}`),
+      `>> FAIL: cli-mnemonic-collapse: bin/polkadot-app-deploy must sign with the MNEMONIC-derived address (${addressA}) even though it pre-collapses MNEMONIC/DOTNS_MNEMONIC into a single options.mnemonic before DotNS.connect ever runs — got stdout:\n${result.stdout}`);
+    assert.match(result.stderr, /Both MNEMONIC and DOTNS_MNEMONIC are set/,
+      ">> FAIL: cli-mnemonic-collapse: the CLI must print the conflict notice on stderr when both env vars are set and differ");
   });
 });
 

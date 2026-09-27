@@ -6,7 +6,7 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner } from "../dist/deploy.js";
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion, isInteractive } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
@@ -81,6 +81,15 @@ const effectiveMnemonic = resolveEffectiveMnemonic({
   envMnemonic: process.env.MNEMONIC,
   envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
 });
+
+// bulletin #1553/#1461: surface it when MNEMONIC and DOTNS_MNEMONIC are both
+// set and disagree — only meaningful when no --mnemonic flag was given (a
+// flag makes both env vars irrelevant), and skipped on --help/--version
+// since neither deploys anything.
+if (!flags.mnemonic && !flags.help && !flags.version) {
+  const mnemonicNotice = mnemonicConflictNotice({ envMnemonic: process.env.MNEMONIC, envDotnsMnemonic: process.env.DOTNS_MNEMONIC });
+  if (mnemonicNotice) console.error(mnemonicNotice);
+}
 
 // The env id actually targeted this session — --env flag > PAD_ENV env var.
 // `undefined` here still means "let deploy()/the DEFAULT_ENV_ID fallback

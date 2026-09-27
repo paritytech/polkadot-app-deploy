@@ -4,6 +4,7 @@ import { createClient, Enum } from "polkadot-api";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { getWsProvider } from "polkadot-api/ws";
 import { PGAS_ASSET_LOCATION } from "./personhood/constants.js";
+import { resolveEffectiveMnemonic, mnemonicConflictNotice } from "./mnemonic.js";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { Binary } from "polkadot-api";
@@ -23,7 +24,7 @@ import {
 import { CID } from "multiformats/cid";
 import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath } from "./telemetry.js";
 import { CODE_PATHS } from "./code-paths.js";
-import { isTestnetSpecName } from "./pool.js";
+import { isTestnetSpecName, testnetFromNetworkField } from "./pool.js";
 import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { NonRetryableError } from "./errors.js";
@@ -48,10 +49,31 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   */
   assetHubEndpoints?: string[];
   autoAccountMapping?: boolean;
+  /**
+   * bulletin #1221: optional override for the first-time auto-map testnet
+   * top-up target (see TOP_UP_TARGET). When set, ensureAutoMappedAccountReady()
+   * tops an unmapped testnet signer straight to this amount instead of the
+   * default 0.5 PAS — e.g. deploy() sizes it for a register-sized deploy via
+   * topUpTargetFor(), so a fresh signer needs only one top-up + finalization
+   * wait instead of two. Read-only connects (library callers, setup/probe
+   * tools) MUST leave this unset so they keep the safe 0.5 PAS default — see
+   * AUTO_MAP_RENT_HEADROOM's doc comment for why raising it for everyone
+   * would over-fund every content-only deploy.
+   */
+  autoMapTopUpTarget?: bigint;
   nativeToEthRatio?: bigint;
   contracts?: Record<string, string>;
   /** Optional environment ID (e.g. "paseo-next-v2"). Used in shell command examples in error messages. */
   environmentId?: string;
+  /**
+   * bulletin #1362/#1095: the resolved env's environments.json `network`
+   * field ("testnet" | "mainnet"). When set, this is AUTHORITATIVE for
+   * isTestnet() (and everything it gates — attemptTestnetTopUp's Alice/Bob
+   * dev-phrase spend) and is never overridden by a chain spec_name read.
+   * Omit (or pass an env-less/custom RPC) to fall back to the spec_name-based
+   * detection, unchanged from before this issue.
+   */
+  network?: string;
   /** Per-contract origin phrases from describeContractSources, named in address errors. */
   contractSources?: Record<string, string>;
   /** Optional PoP self-serve config resolved from environments.json. Gates state-aware and generic testnet guidance blocks. */
@@ -220,6 +242,23 @@ const FEE_FLOOR_REGISTER = ONE_PAS / 10n;
 const TOP_UP_TARGET = ONE_PAS / 2n;
 // Don't drain the auto-top-up source. Skip if balance < TOP_UP_TARGET + this.
 const SOURCE_BUFFER = ONE_PAS;
+// bulletin #1221: rentPriceNative stand-in for auto-map top-up sizing (via
+// topUpTargetFor('register', ...) at connect()-time in deploy.ts). The real
+// PopRules NoStatus deposit needs a live dry-run, but that dry-run itself
+// needs a mapped origin — which doesn't exist yet when auto-map decides how
+// much to send. bulletin-deploy's tools/probe-register-deposit.mjs measured
+// the live PopRules NoStatus deposit at 10 PAS on every configured env as of
+// 2026-09-25. 20 PAS gives 2x margin; if it's still not enough, the live
+// deposit read gated on the actual register/reveal call is the real safety
+// net — worst case is a second top-up, never a failure.
+//
+// Known cost: deploy.ts's preflight connect assumes "register" before the
+// real outcome is known, so a signer whose deploy turns out to abort
+// (reserved/owned-by-someone-else/PoP-gated) or already be owned still pays
+// this full register-sized top-up rather than the pre-#1221 flat 0.5 PAS.
+// Testnet-only, and paid once per signer per chain generation (a wipe/
+// re-genesis resets Revive mapping state) — not free, but bounded.
+export const AUTO_MAP_RENT_HEADROOM = ONE_PAS * 20n; // 20 PAS
 // Conservative fee estimate for reprove_alias_account. The actual fee on
 // paseo-next-v2 is well under 0.001 PAS; 0.01 PAS gives comfortable headroom.
 // Minimum storage deposit required for a fresh TLD register() on paseo-next-v2.
@@ -2660,6 +2699,10 @@ export class DotNS {
   private _contractSources: Record<string, string> = {};
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
   private _environmentId: string | null = null;
+  // bulletin #1362/#1095: the resolved env's declared `network`, when
+  // connect() was given one. Authoritative for isTestnet() over the
+  // spec_name read — see DotNSConnectOptions.network and isTestnet() below.
+  private _network: string | null = null;
   private _popSelfServe: PopSelfServeConfig | null = null;
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
   private _tld: string = DEFAULT_TLD;
@@ -2851,6 +2894,9 @@ export class DotNS {
     if (options.environmentId) {
       this._environmentId = options.environmentId;
     }
+    if (options.network !== undefined) {
+      this._network = options.network;
+    }
     if (options.popSelfServe !== undefined) {
       this._popSelfServe = options.popSelfServe ?? null;
     }
@@ -2875,7 +2921,22 @@ export class DotNS {
       this.signer = options.signer!;
       this.substrateAddress = options.signerAddress!;
     } else {
-      const mnemonicArg = options.mnemonic || process.env.DOTNS_MNEMONIC || process.env.MNEMONIC;
+      // bulletin #1553/#1461: shared with bin/polkadot-app-deploy via
+      // src/mnemonic.ts, rather than reading process.env directly with a
+      // locally-decided order — this used to read DOTNS_MNEMONIC before
+      // MNEMONIC, the opposite of everywhere else, but was unreachable via
+      // the CLI (bin always pre-resolves options.mnemonic first) so the
+      // disagreement only bit a direct DotNS.connect()/deploy()-as-a-library
+      // caller that left options.mnemonic unset.
+      if (!options.mnemonic) {
+        const notice = mnemonicConflictNotice({ envMnemonic: process.env.MNEMONIC, envDotnsMnemonic: process.env.DOTNS_MNEMONIC });
+        if (notice) console.error(notice);
+      }
+      const mnemonicArg = resolveEffectiveMnemonic({
+        flagMnemonic: options.mnemonic,
+        envMnemonic: process.env.MNEMONIC,
+        envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
+      });
       const keyUriArg = options.keyUri || process.env.DOTNS_KEY_URI;
       let source = keyUriArg || mnemonicArg || DEFAULT_MNEMONIC;
       const isKeyUri = Boolean(keyUriArg);
@@ -2937,7 +2998,7 @@ export class DotNS {
           `DotNS connect: failed to resolve EVM address from ${this.substrateAddress} via ReviveApi.address after ${REVIVE_ADDRESS_ATTEMPTS} attempts (${inner})${rpcHint}`,
         );
       }
-      console.log(`   H160 Address: ${this.evmAddress}`);
+      console.log(`   H160 Address: ${this.evmAddress} (derived from SS58; Revive mapping checked next)`);
       setDeployAttribute("deploy.dotns.rpc_used", rpc);
       setDeployAttribute("deploy.dotns.evm_address", this.evmAddress!);
       this.connected = true;
@@ -2977,7 +3038,7 @@ export class DotNS {
       // the Revive.call trigger when that path is unavailable.
       await this.resolveNativeToEthRatio(options);
       try {
-        await this.ensureMappedAccountReady(options.autoAccountMapping ?? false);
+        await this.ensureMappedAccountReady(options.autoAccountMapping ?? false, options.autoMapTopUpTarget);
       } catch (e) {
         this.connected = false;
         throw e;
@@ -2987,7 +3048,7 @@ export class DotNS {
     });
   }
 
-  async ensureMappedAccountReady(autoAccountMapping: boolean = false): Promise<void> {
+  async ensureMappedAccountReady(autoAccountMapping: boolean = false, autoMapTopUpTarget?: bigint): Promise<void> {
     this.ensureConnected();
     if (!this.clientWrapper || !this.substrateAddress || !this.signer) {
       throw new Error("Account mapping unavailable before DotNS signer is initialized");
@@ -2996,7 +3057,7 @@ export class DotNS {
     if (autoAccountMapping) {
       markCodePath(CODE_PATHS.DOTNS_AUTO_MAPPING);
       setDeployAttribute("deploy.dotns.mapping_source", "auto-account-mapping");
-      await this.ensureAutoMappedAccountReady();
+      await this.ensureAutoMappedAccountReady(autoMapTopUpTarget);
       return;
     }
 
@@ -3021,7 +3082,7 @@ export class DotNS {
         error: e?.message?.slice?.(0, 200) ?? String(e).slice(0, 200),
       });
       setDeployAttribute("deploy.dotns.mapping_source", "auto-map-fallback");
-      await this.ensureAutoMappedAccountReady();
+      await this.ensureAutoMappedAccountReady(autoMapTopUpTarget);
       return;
     }
 
@@ -3029,7 +3090,7 @@ export class DotNS {
     console.log(`   Account: mapped`);
   }
 
-  async ensureAutoMappedAccountReady(): Promise<void> {
+  async ensureAutoMappedAccountReady(autoMapTopUpTarget?: bigint): Promise<void> {
     this.ensureConnected();
     if (!this.clientWrapper || !this.substrateAddress || !this.signer) {
       throw new Error("Account auto-mapping unavailable before DotNS signer is initialized");
@@ -3040,11 +3101,16 @@ export class DotNS {
       return;
     }
 
+    // bulletin #1221: state this unconditionally (not just on testnets) so
+    // the line can never be misread as mapping evidence — it fires before
+    // any top-up attempt is even considered.
+    console.log(`   DotNS signer ${this.substrateAddress.slice(0, 8)}... is NOT mapped on Revive (no OriginalAccount entry).`);
+
     if (await this.isTestnet()) {
       const free = await this.readFreeBalance(this.substrateAddress);
       if (free < FEE_FLOOR_REGISTER) {
-        console.log(`   DotNS signer ${this.substrateAddress.slice(0, 8)}... balance ${fmtPas(free)} PAS before auto-map — attempting testnet auto top-up...`);
-        const toppedUp = await this.attemptTestnetTopUp(this.substrateAddress, TOP_UP_TARGET);
+        console.log(`   Mapping requires submitting a transaction, and the signer holds ${fmtPas(free)} PAS — attempting testnet auto top-up...`);
+        const toppedUp = await this.attemptTestnetTopUp(this.substrateAddress, autoMapTopUpTarget ?? TOP_UP_TARGET);
         if (toppedUp) {
           console.log(`   Topped up ${fmtPas(toppedUp.transferred)} PAS from ${toppedUp.source} for auto-map`);
           setDeployAttribute("deploy.dotns.signer_below_floor", "true");
@@ -3121,11 +3187,19 @@ export class DotNS {
     }
   }
 
-  // Returns true when the DotNS chain (Asset Hub) reports a testnet spec_name.
-  // Used to gate test-only behaviors like self-granting Full PoP on a Lite
-  // signer for a NoStatus label.
+  // Returns true when this is a testnet — used to gate test-only/money-moving
+  // behaviors like attemptTestnetTopUp's Alice/Bob dev-phrase transfer and
+  // self-granting Full PoP on a Lite signer for a NoStatus label.
+  //
+  // bulletin #1362/#1095: `this._network` (from connect()'s `network` option,
+  // sourced from environments.json) takes precedence over the spec_name read
+  // below via testnetFromNetworkField() (pool.ts) — see its doc comment for
+  // the full three-state rationale. Mirrors detectTestnet()'s use of the same
+  // helper exactly, so the two stay in lockstep by construction.
   private _testnetCache: boolean | null = null;
   async isTestnet(): Promise<boolean> {
+    const override = testnetFromNetworkField(this._network);
+    if (override !== undefined) return override;
     if (this._testnetCache !== null) return this._testnetCache;
     this.ensureConnected();
     // Prefer the polkadot-api chain read (authoritative spec_name).

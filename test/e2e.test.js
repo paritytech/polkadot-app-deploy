@@ -1,4 +1,4 @@
-import { test, describe, before } from "node:test";
+import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "fs";
 import * as os from "os";
@@ -7,6 +7,7 @@ import { mutateFixture, makeMultiChunkFixture } from "./helpers/e2e-fixture.js";
 import { buildFixture as buildIncrementalFixture } from "./helpers/e2e-incremental-fixture.js";
 import { buildManifestSidecar, buildPvmAppManifest } from "./helpers/e2e-manifest-fixture.js";
 import { runBulletinDeploy } from "./helpers/e2e-cli.js";
+import { trackTimers, armExitGuard } from "./helpers/e2e-exit-guard.js";
 import { resolveContenthashOnChain, resolveTextRecordOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
 import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, loadEnvironments, resolveEndpoints, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
@@ -133,6 +134,7 @@ async function readTextRecordWithRetry(label, key, envId, ready, attempts = 6, d
 let signerPopStatus = -1;
 
 const ENABLED = process.env.E2E === "1";
+if (ENABLED) trackTimers();
 const SIGNER = process.env.E2E_SIGNER ?? "pool";
 const MERKLE = process.env.E2E_MERKLE ?? "js";
 const SCENARIO = process.env.E2E_SCENARIO ?? "s1";
@@ -379,6 +381,7 @@ function normalizeGatewayBase(url) {
 }
 
 describe("e2e", { skip: !ENABLED }, () => {
+  after(() => armExitGuard());
   before(async () => {
     signerPopStatus = await probeSignerPopStatus({
       dotnsFactory: () => new DotNS(),

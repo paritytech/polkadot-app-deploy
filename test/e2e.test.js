@@ -23,7 +23,7 @@ import {
   assertStdoutMatches,
   parseLineOrExplain,
   assertOnChainMatches,
-  failWith, classifyFixtureState } from "./helpers/e2e-failure.js";
+  failWith, classifyFixtureState, assertFixtureOwnership } from "./helpers/e2e-failure.js";
 
 // The CLI prints "CID: bafy..." at the end of a successful deploy. We parse
 // that — not a client-side recomputation — so we verify "what the CLI said
@@ -710,7 +710,6 @@ describe("e2e", { skip: !ENABLED }, () => {
 
   describe("S3 — domain owned by different account", { skip: SCENARIO !== "s3" }, () => {
     test(`deploy to pre-owned label rejects with exit 78`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
-      const { fixtureDir } = await mutateFixture(RUN_TAG);
       const tld = await resolveE2eTld();
       // Env-conditional: the two fixtures are provisioned separately, so a
       // failure must name which one it actually used — otherwise the operator
@@ -727,6 +726,31 @@ describe("e2e", { skip: !ENABLED }, () => {
         ? `e2eownedns03.${tld}`
         : `e2eownedns01.${tld}`;
       const envLabel = E2E_ENV_ID;
+      // Bob's H160 (from docs/e2e-bootstrap.md).
+      const BOB_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+      const bareLabel = ownedLabel.replace(new RegExp(`\\.${tld}$`), "");
+
+      // PRECHECK (bulletin #1378/#1341): read on-chain ownership directly,
+      // BEFORE attempting the ~2-3 minute deploy. A DotNS redeploy wipes the
+      // registry silently (CREATE3 keeps every contract address identical,
+      // so nothing else signals the reset) — without this, a wiped fixture
+      // surfaces only downstream, as "expected exit 78, got 0", which reads
+      // like a product regression instead of the environment problem it
+      // actually is. Uses a single short-lived DotNS connection dedicated to
+      // this read (S3 has no other open client to reuse) rather than
+      // inferring ownership from CLI text the way classifyFixtureState
+      // (below) does after the fact.
+      const precheckClient = new DotNS();
+      await precheckClient.connect({ mnemonic: DEFAULT_MNEMONIC, ...(await resolveDotnsEnvConnectOptions()) });
+      let ownership;
+      try {
+        ownership = await precheckClient.checkOwnership(bareLabel, BOB_H160);
+      } finally {
+        precheckClient.disconnect();
+      }
+      assertFixtureOwnership({ ownership, label: bareLabel, tld, expectedOwner: BOB_H160, scenario: "S3", envLabel });
+
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
           // S3 needs a label owned by a DIFFERENT account from the deploy signer.
@@ -740,8 +764,6 @@ describe("e2e", { skip: !ENABLED }, () => {
           args: buildArgs(fixtureDir, ownedLabel),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
-        // Bob's H160 (from docs/e2e-bootstrap.md).
-        const BOB_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
         const combined = `${stdout}\n${stderr}`;
 
         // Distinguish FIXTURE DRIFT from a product regression before asserting

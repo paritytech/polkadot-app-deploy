@@ -263,3 +263,60 @@ export function classifyFixtureState({ output, expectedOwner }) {
   if (m && m[1].toLowerCase() !== want) return { kind: "drifted", owner: m[1] };
   return { kind: "ok", owner: m ? m[1] : null };
 }
+
+/**
+ * Fixture-presence PRECHECK (bulletin #1378/#1341): verify a pre-provisioned
+ * E2E fixture is owned by the expected third party BEFORE the scenario runs
+ * its main assertion, from a direct on-chain `ownerOf` read (e.g. via the
+ * DotNS client's `checkOwnership(label, expectedOwner)`) — not inferred after
+ * the fact from CLI text the way `classifyFixtureState` above does. The two
+ * helpers are complementary: this one stops the scenario early with a clear
+ * diagnosis; `classifyFixtureState` stays as a belt-and-suspenders check on
+ * the deploy's own output, in case the fixture drifts in the window between
+ * this precheck and the deploy actually running.
+ *
+ * Distinguishes three states:
+ *   - owned by `expectedOwner`   — returns normally, scenario proceeds.
+ *   - unowned (`owner === null`) — throws: the registry was almost certainly
+ *     reset (a DotNS redeploy wipes registrations; CREATE3 keeps every
+ *     contract address identical, so nothing else signals the reset).
+ *   - owned by a third address   — throws: names who actually holds it.
+ *
+ * Fails LOUDLY rather than skipping. A silently-skipped scenario produces a
+ * green nightly that tested nothing — the same failure class #1367/#1331
+ * exist to catch. An actionable failure costs a moment of operator
+ * attention; a silent skip costs a false sense of coverage.
+ *
+ * Takes the ownership result rather than a live client so it can be unit
+ * tested with a fake `{ owned, owner }` value instead of touching chain
+ * state (see test/helpers/e2e-helpers.test.js).
+ *
+ * NOTE — this repo (unlike bulletin-deploy) ships no fixture-registration
+ * tool (no `tools/register-test-fixture.mjs`), so the remedy here is an
+ * admin action rather than a script to run.
+ *
+ * @param {object} o
+ * @param {{owned: boolean, owner: string|null}} o.ownership — result of dotns.checkOwnership(label, expectedOwner)
+ * @param {string} o.label         bare label being checked (no TLD), e.g. "e2eownedns03"
+ * @param {string} o.tld           resolved TLD, e.g. "paseo"
+ * @param {string} o.expectedOwner 0x-prefixed H160 the fixture must belong to
+ * @param {string} o.scenario      scenario name for the >> FAIL: header
+ * @param {string} o.envLabel      env id, used in the diagnosis text
+ */
+export function assertFixtureOwnership({ ownership, label, tld, expectedOwner, scenario, envLabel }) {
+  const want = String(expectedOwner).toLowerCase();
+  if (ownership.owner && ownership.owner.toLowerCase() === want) return;
+
+  const cause = ownership.owner
+    ? `${label}.${tld} is owned by ${ownership.owner} on env "${envLabel}", expected ${expectedOwner} — a third party (or an earlier drifted run) holds the fixture now`
+    : `${label}.${tld} is UNOWNED on env "${envLabel}" — the registry was probably reset by a DotNS redeploy (CREATE3 keeps every contract address identical, so nothing else signals it)`;
+
+  failWith({
+    scenario,
+    message: `fixture precheck failed: ${cause}. Fix: this scenario needs ${label}.${tld} owned by an account OTHER than the deploy signer. Ask the chain admin to register/transfer it on env "${envLabel}" — this repo ships no fixture-registration tool.`,
+    hint:
+      "A testnet re-genesis wipes registrations; the next run then finds the label free and the deploy " +
+      "signer registers it to ITSELF, so every later run exits 0 instead of 78. If a third party already " +
+      "holds it, it cannot be seized — pick a different fixture label instead.",
+  });
+}

@@ -5,7 +5,7 @@ import * as os from "os";
 import * as path from "path";
 import { mutateFixture } from "./e2e-fixture.js";
 import { runBulletinDeploy } from "./e2e-cli.js";
-import { classifyFixtureState } from "./e2e-failure.js";
+import { classifyFixtureState, assertFixtureOwnership } from "./e2e-failure.js";
 import { buildManifestSidecar, buildPvmAppManifest } from "./e2e-manifest-fixture.js";
 import { resolveE2eEnv, resolveE2eEnvId } from "./e2e-env.js";
 import { preflightProductConfig, DEFAULT_ENV_ID } from "@parity/polkadot-app-deploy";
@@ -377,6 +377,56 @@ describe("classifyFixtureState", () => {
     const out = "Deployment failed: chunk upload timed out after 180s";
     assert.strictEqual(classifyFixtureState({ output: out, expectedOwner: BOB }).kind, "ok",
       ">> FAIL: classifyFixtureState: unrelated failures must fall through to the normal assertions, not be blamed on fixtures");
+  });
+});
+
+// bulletin #1378/#1341: assertFixtureOwnership is the PRECHECK counterpart to
+// classifyFixtureState above — it runs BEFORE the scenario, from a direct
+// ownerOf-style read, and throws instead of returning a classification. It
+// takes the ownership result rather than a live DotNS client precisely so
+// the "registry got wiped" and "registry drifted" states can be driven here
+// without unregistering or transferring any real fixture on chain.
+describe("assertFixtureOwnership", () => {
+  const BOB = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+  const args = { label: "e2eownedns03", tld: "paseo", expectedOwner: BOB, scenario: "S3", envLabel: "paseo-next-v2" };
+
+  test("correctly owned by the expected third party: does not throw", () => {
+    assert.doesNotThrow(() =>
+      assertFixtureOwnership({ ...args, ownership: { owned: false, owner: BOB } }));
+  });
+
+  test("owner comparison is case-insensitive (chains return EIP-55 checksummed addresses)", () => {
+    assert.doesNotThrow(() =>
+      assertFixtureOwnership({ ...args, ownership: { owned: false, owner: "0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01" } }));
+  });
+
+  test("unowned (registry wiped by a redeploy): throws naming the reset + that this repo has no fixture-registration tool", () => {
+    assert.throws(
+      () => assertFixtureOwnership({ ...args, ownership: { owned: false, owner: null } }),
+      (err) => {
+        assert.match(err.message, /^>> FAIL: S3: fixture precheck failed:/);
+        assert.match(err.message, /UNOWNED/);
+        assert.match(err.message, /registry was probably reset/);
+        assert.match(err.message, /ships no fixture-registration tool/);
+        return true;
+      },
+      ">> FAIL: assertFixtureOwnership: an unowned fixture must be reported as a likely registry reset, naming the admin remedy, not left to surface downstream as a confusing exit-code mismatch",
+    );
+  });
+
+  test("owned by an unexpected address (drift): throws naming the actual owner", () => {
+    const squatter = "0x35cdb23ff7fc86e8dccd577ca309bfea9c978d20";
+    assert.throws(
+      () => assertFixtureOwnership({ ...args, ownership: { owned: false, owner: squatter } }),
+      (err) => {
+        assert.match(err.message, /^>> FAIL: S3: fixture precheck failed:/);
+        assert.ok(err.message.includes(squatter), "names the actual owner");
+        assert.ok(err.message.includes(BOB), "names the expected owner");
+        assert.match(err.message, /ships no fixture-registration tool/);
+        return true;
+      },
+      ">> FAIL: assertFixtureOwnership: a fixture owned by the wrong address must name the actual owner, not just say 'not the expected owner'",
+    );
   });
 });
 

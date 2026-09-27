@@ -5,7 +5,7 @@ import * as os from "os";
 import * as path from "path";
 import { mutateFixture } from "./e2e-fixture.js";
 import { runBulletinDeploy } from "./e2e-cli.js";
-import { classifyFixtureState } from "./e2e-failure.js";
+import { classifyFixtureState, assertFixtureOwnership, fixtureRemedy, assertFixtureNotDrifted } from "./e2e-failure.js";
 import { buildManifestSidecar, buildPvmAppManifest } from "./e2e-manifest-fixture.js";
 import { resolveE2eEnv, resolveE2eEnvId } from "./e2e-env.js";
 import { preflightProductConfig, DEFAULT_ENV_ID } from "@parity/polkadot-app-deploy";
@@ -377,6 +377,207 @@ describe("classifyFixtureState", () => {
     const out = "Deployment failed: chunk upload timed out after 180s";
     assert.strictEqual(classifyFixtureState({ output: out, expectedOwner: BOB }).kind, "ok",
       ">> FAIL: classifyFixtureState: unrelated failures must fall through to the normal assertions, not be blamed on fixtures");
+  });
+
+  // Real shape from a version-nudge line adjacent to the ownership line
+  // (bulletin #1398/#1333): the old classifier matched "is available" in the
+  // update notice ("A newer version of ... is available") and reported the
+  // fixture unregistered even though the deploy correctly refused with the
+  // ownership line naming the expected owner.
+  const NUDGE = "   A newer version of @parity/polkadot-app-deploy is available (0.16.0-rc.2 → 0.16.0).";
+  const RUN_ANCHOR_CASE = [
+    NUDGE,
+    "Deployment failed (not retryable): Domain e2eownedns01.testnet is already owned by 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01.",
+    NUDGE,
+  ].join("\n");
+
+  test("update notice does not override an ownership line naming the expected owner", () => {
+    assert.deepStrictEqual(
+      classifyFixtureState({ output: RUN_ANCHOR_CASE, expectedOwner: BOB, label: "e2eownedns01.testnet" }),
+      { kind: "ok", owner: "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01" },
+      ">> FAIL: classifyFixtureState: a correct exit-78 run naming the expected owner must be ok, not 'missing'; the version nudge is not the domain's status",
+    );
+  });
+
+  test("update notice alone does not mean missing", () => {
+    const out = `${NUDGE}\nDeployment failed: chunk upload timed out after 180s`;
+    assert.strictEqual(classifyFixtureState({ output: out, expectedOwner: BOB, label: "e2eownedns01.testnet" }).kind, "ok",
+      ">> FAIL: classifyFixtureState: with no ownership line and no domain status line the cause is unclassified (ok), never 'missing'");
+    assert.strictEqual(classifyFixtureState({ output: out, expectedOwner: BOB }).kind, "ok",
+      ">> FAIL: classifyFixtureState: the unanchored fallback must ignore the version nudge too");
+  });
+
+  test("ownership line wins over an availability line", () => {
+    const out = "   e2eownedns01.dot is available\nDeployment failed: Domain e2eownedns01.dot is already owned by 0x35Cdb23fF7fc86E8DCcd577CA309bFEA9c978D20.";
+    assert.deepStrictEqual(classifyFixtureState({ output: out, expectedOwner: BOB, label: "e2eownedns01.dot" }),
+      { kind: "drifted", owner: "0x35Cdb23fF7fc86E8DCcd577CA309bFEA9c978D20" },
+      ">> FAIL: classifyFixtureState: 'is already owned by' is the CLI's definitive statement and must decide the verdict");
+  });
+
+  test("with a label, only that domain's availability line means missing", () => {
+    const own = "   Checking availability of e2eownedns03.paseo...\n   e2eownedns03.paseo is available\n   Finalizing registration for e2eownedns03.paseo...";
+    assert.strictEqual(classifyFixtureState({ output: own, expectedOwner: BOB, label: "e2eownedns03.paseo" }).kind, "missing",
+      ">> FAIL: classifyFixtureState: the domain's own 'is available' line must still be recognised when anchored to the label");
+    assert.strictEqual(classifyFixtureState({ output: "   e2eother.paseo is available", expectedOwner: BOB, label: "e2eownedns03.paseo" }).kind, "ok",
+      ">> FAIL: classifyFixtureState: another label's availability says nothing about this fixture");
+  });
+});
+
+// bulletin #1378/#1341: assertFixtureOwnership is the PRECHECK counterpart to
+// classifyFixtureState above — it runs BEFORE the scenario, from a direct
+// ownerOf-style read, and throws instead of returning a classification. It
+// takes the ownership result rather than a live DotNS client precisely so
+// the "registry got wiped" and "registry drifted" states can be driven here
+// without unregistering or transferring any real fixture on chain.
+describe("assertFixtureOwnership", () => {
+  const BOB = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+  const args = { label: "e2eownedns03", tld: "paseo", expectedOwner: BOB, scenario: "S3", envLabel: "paseo-next-v2" };
+
+  test("correctly owned by the expected third party: does not throw", () => {
+    assert.doesNotThrow(() =>
+      assertFixtureOwnership({ ...args, ownership: { owned: false, owner: BOB } }));
+  });
+
+  test("owner comparison is case-insensitive (chains return EIP-55 checksummed addresses)", () => {
+    assert.doesNotThrow(() =>
+      assertFixtureOwnership({ ...args, ownership: { owned: false, owner: "0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01" } }));
+  });
+
+  test("unowned (registry wiped by a redeploy): throws naming the reset + that this repo has no fixture-registration tool", () => {
+    assert.throws(
+      () => assertFixtureOwnership({ ...args, ownership: { owned: false, owner: null } }),
+      (err) => {
+        assert.match(err.message, /^>> FAIL: S3: fixture precheck failed:/);
+        assert.match(err.message, /UNOWNED/);
+        assert.match(err.message, /registry was probably reset/);
+        assert.match(err.message, /ships no fixture-registration tool/);
+        return true;
+      },
+      ">> FAIL: assertFixtureOwnership: an unowned fixture must be reported as a likely registry reset, naming the admin remedy, not left to surface downstream as a confusing exit-code mismatch",
+    );
+  });
+
+  // register-test-fixture-equivalent admin repair can only move a name the
+  // funder holds; anyone else's holding cannot be repaired at all (bulletin #1398).
+  test("owned by the funder: names the holder and recommends the admin transfer remedy", () => {
+    const funder = "0x35cdb23ff7fc86e8dccd577ca309bfea9c978d20";
+    assert.throws(
+      () => assertFixtureOwnership({ ...args, funder, ownership: { owned: false, owner: funder } }),
+      (err) => {
+        assert.match(err.message, /^>> FAIL: S3: fixture precheck failed:/);
+        assert.ok(err.message.includes(funder), "names the actual owner");
+        assert.ok(err.message.includes(BOB), "names the expected owner");
+        assert.match(err.message, /transfer .*from the funder/);
+        return true;
+      },
+      ">> FAIL: assertFixtureOwnership: a funder-held fixture must name the holder and recommend an admin transfer, since it's the one holder an admin CAN move",
+    );
+  });
+
+  test("owned by a third party: names the holder and does not recommend a transfer", () => {
+    const squatter = "0x237a2b18d1e5e3b2a1c4f6e7d8c9b0a1f2e3d4c5";
+    assert.throws(
+      () => assertFixtureOwnership({ ...args, funder: "0x35cdb23ff7fc86e8dccd577ca309bfea9c978d20", ownership: { owned: false, owner: squatter } }),
+      (err) => {
+        assert.match(err.message, /^>> FAIL: S3: fixture precheck failed:/);
+        assert.ok(err.message.includes(squatter), "names the actual owner");
+        assert.ok(err.message.includes(BOB), "names the expected owner");
+        assert.doesNotMatch(err.message, /transfer .*from the funder/,
+          "must not prescribe a transfer this repo has no authority or tool to perform");
+        assert.match(err.message, /fresh fixture label|different fixture label/);
+        assert.match(err.message, /cannot be seized/);
+        return true;
+      },
+      ">> FAIL: assertFixtureOwnership: a third-party-held fixture must not recommend a transfer remedy; the honest remedy is a fresh label",
+    );
+  });
+});
+
+// fixtureRemedy follows the twin's admin-repair reality: no register-test-fixture
+// tool exists, so every remedy is an admin action, but unowned/funder-held stay
+// repairable while third-party-held is not (bulletin #1398).
+describe("fixtureRemedy", () => {
+  const BOB = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+  const FUNDER = "0x35cdb23ff7fc86e8dccd577ca309bfea9c978d20";
+  const base = { label: "e2eownedns03", envLabel: "paseo-next-v2", expectedOwner: BOB, funder: FUNDER };
+
+  test("unowned: admin registers it to the expected owner", () => {
+    const { fix, hint } = fixtureRemedy({ ...base, owner: null });
+    assert.match(fix, /ask the chain admin to register e2eownedns03/);
+    assert.match(hint, /unowned/);
+  });
+
+  test("funder-held: admin transfers it (case-insensitive)", () => {
+    const { fix, hint } = fixtureRemedy({ ...base, owner: "0x35Cdb23fF7fc86E8DCcd577CA309bFEA9c978D20" });
+    assert.match(fix, /ask the chain admin to transfer e2eownedns03 from the funder/);
+    assert.match(hint, /is the funder/);
+  });
+
+  test("third-party-held: fresh label, no transfer prescribed", () => {
+    const { fix, hint } = fixtureRemedy({ ...base, owner: "0x237a2b18d1e5e3b2a1c4f6e7d8c9b0a1f2e3d4c5" });
+    assert.doesNotMatch(fix, /transfer/,
+      ">> FAIL: fixtureRemedy: must not tell the operator to move a name nobody has authority to seize");
+    assert.match(fix, /different fixture label/);
+    assert.match(hint, /cannot be seized/);
+  });
+
+  test("funder unknown: a wrong holder is not treated as repairable", () => {
+    const { fix, hint } = fixtureRemedy({ ...base, funder: undefined, owner: FUNDER });
+    assert.doesNotMatch(fix, /transfer/);
+    assert.match(hint, /neither .* nor the funder/);
+  });
+});
+
+// assertFixtureNotDrifted checks the deploy output offline (bulletin #1398).
+describe("assertFixtureNotDrifted", () => {
+  const BOB = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";
+  const FUNDER = "0x35cdb23ff7fc86e8dccd577ca309bfea9c978d20";
+  const NUDGE = "   A newer version of @parity/polkadot-app-deploy is available (0.16.0-rc.2 → 0.16.0).";
+  const args = { label: "e2eownedns01", tld: "testnet", expectedOwner: BOB, funder: FUNDER, scenario: "S3", envLabel: "preview" };
+
+  test("exit-78 refusal naming the expected owner, with the update notice around it, is not drift", () => {
+    const output = [NUDGE, "Deployment failed (not retryable): Domain e2eownedns01.testnet is already owned by 0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01.", NUDGE].join("\n");
+    assert.doesNotThrow(() => assertFixtureNotDrifted({ ...args, output }),
+      ">> FAIL: assertFixtureNotDrifted: a correct exit-78 refusal must pass through to the exit-code assertions, not be reported as drift");
+  });
+
+  test("unclassified output returns kind ok without throwing", () => {
+    const got = assertFixtureNotDrifted({ ...args, output: `${NUDGE}\nDeployment failed: chunk upload timed out after 180s` });
+    assert.deepStrictEqual(got, { kind: "ok", owner: null },
+      ">> FAIL: assertFixtureNotDrifted: with no drift evidence the helper must not guess a cause");
+  });
+
+  test("name found free and registered by the deploy signer", () => {
+    const output = "   Checking availability of e2eownedns01.testnet...\n   e2eownedns01.testnet is available\n   Finalizing registration for e2eownedns01.testnet...";
+    assert.throws(() => assertFixtureNotDrifted({ ...args, output }), (err) => {
+      assert.match(err.message, /^>> FAIL: S3: fixture drift on env "preview"/);
+      assert.match(err.message, /was unregistered when the deploy started/);
+      assert.match(err.message, /owned by the deploy signer/);
+      assert.match(err.message, /Fix: rerun this scenario/);
+      return true;
+    }, ">> FAIL: assertFixtureNotDrifted: a wiped fixture must be described as it actually is after the deploy ran");
+  });
+
+  test("owned by the funder: names both addresses and recommends the admin transfer remedy", () => {
+    const output = "Deployment failed (not retryable): Domain e2eownedns01.testnet is already owned by 0x35Cdb23fF7fc86E8DCcd577CA309bFEA9c978D20.";
+    assert.throws(() => assertFixtureNotDrifted({ ...args, output }), (err) => {
+      assert.match(err.message, /^>> FAIL: S3: fixture drift on env "preview"/);
+      assert.ok(err.message.includes("0x35Cdb23fF7fc86E8DCcd577CA309bFEA9c978D20"), "names the actual owner");
+      assert.ok(err.message.includes(BOB), "names the expected owner");
+      assert.match(err.message, /transfer e2eownedns01 from the funder/);
+      return true;
+    }, ">> FAIL: assertFixtureNotDrifted: a funder-held fixture must name both parties and the transfer remedy");
+  });
+
+  test("owned by a third party: names both addresses and does not recommend a transfer", () => {
+    const output = "Deployment failed (not retryable): Domain e2eownedns01.testnet is already owned by 0x237a2b18d1e5e3b2a1c4f6e7d8c9b0a1f2e3d4c5.";
+    assert.throws(() => assertFixtureNotDrifted({ ...args, output }), (err) => {
+      assert.ok(err.message.includes("0x237a2b18d1e5e3b2a1c4f6e7d8c9b0a1f2e3d4c5"), "names the actual owner");
+      assert.ok(err.message.includes(BOB), "names the expected owner");
+      assert.doesNotMatch(err.message, /transfer e2eownedns01/);
+      assert.match(err.message, /different fixture label/);
+      return true;
+    }, ">> FAIL: assertFixtureNotDrifted: a third-party-held fixture must not recommend a remedy nobody has authority to perform");
   });
 });
 

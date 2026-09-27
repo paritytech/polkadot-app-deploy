@@ -1233,6 +1233,118 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
   });
 
+  // S-INC-CROSSLABEL verifies that Bulletin's content-addressed storage lets
+  // a byte-identical redeploy under a BRAND NEW label reuse another domain's
+  // already-uploaded chunks, even with NO previous manifest at all for the
+  // new label (manifest_source: none / first_deploy). Unlike S-INC-PORTABILITY
+  // (which carries workspace A's manifest.json into workspace B to hit the
+  // fast "embedded" path), this scenario builds workspace B from scratch —
+  // proving the probe-only path (storeChunkedContent's skipCids probe against
+  // TransactionStorage.TransactionByContentHash) is what actually enables
+  // sharing, not manifest portability. Chunk CIDs for files >= CHUNK_SIZE_TARGET
+  // (1 MiB) are a pure function of that file's bytes, independent of domain or
+  // manifest history.
+  //
+  // Spec: port of bulletin #1571/#1387.
+  describe("S-INC-CROSSLABEL — cross-label dedup with no previous manifest", { skip: SCENARIO !== "s-inc-crosslabel" }, () => {
+    test(`second label's first-ever deploy still skips section-1 chunks uploaded under the first label`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
+      const labelA = pickFreshRunLabel("e2exlbla");
+      const labelB = pickFreshRunLabel("e2exlblb");
+      const tld = await resolveE2eTld();
+      const fixA = fs.mkdtempSync(path.join(os.tmpdir(), "e2exlbl-A-"));
+      const fixB = fs.mkdtempSync(path.join(os.tmpdir(), "e2exlbl-B-"));
+      // Same seed for both — section-1 (>1 MiB + content-hashed) files must
+      // be byte-identical across workspaces for their chunk CIDs to coincide.
+      // Different runTag only affects the volatile index.html padding.
+      buildIncrementalFixture({ targetDir: fixA, seed: "s-inc-crosslabel", runTag: RUN_TAG + "-xlbl-a" });
+      try {
+        // Deploy under label A — puts the shared content on chain.
+        const rA = await runBulletinDeploy({
+          args: buildArgs(fixA, `${labelA}.${tld}`),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded(rA, { scenario: "S-INC-CROSSLABEL", step: "deploy under label A" });
+
+        // Build workspace B from scratch — deliberately NOT copying fixA's
+        // .bulletin-deploy/manifest.json. Label B has never been deployed to,
+        // so this must hit the true first-deploy path (manifest_source: none).
+        // (buildIncrementalFixture never writes .bulletin-deploy/manifest.json
+        // itself — only the CLI does, during deploy — so there's no separate
+        // precondition to assert here; the "no previous manifest" property is
+        // verified below via the deploy's own "Manifest:" summary line, which
+        // is the assertion that can actually catch a regression.)
+        buildIncrementalFixture({ targetDir: fixB, seed: "s-inc-crosslabel", runTag: RUN_TAG + "-xlbl-b" });
+
+        const rB = await runBulletinDeploy({
+          args: buildArgs(fixB, `${labelB}.${tld}`),
+          timeoutMs: DEPLOY_TIMEOUT_MS,
+        });
+        assertDeploySucceeded(rB, { scenario: "S-INC-CROSSLABEL", step: "first-ever deploy under label B" });
+
+        // Manifest line must say true first-deploy (no previous manifest),
+        // confirming B's own domain genuinely has no manifest history — this
+        // is what distinguishes the scenario from S-INC-PORTABILITY.
+        assertStdoutMatches(rB.stdout, /Manifest:\s+first deploy \(no previous manifest\)/, {
+          scenario: "S-INC-CROSSLABEL",
+          what: "manifest_source: none / first_deploy for label B",
+          hint: "label B must be genuinely fresh (never deployed before). If this fails with an 'embedded'/'heuristic_fallback' line instead, label B collided with a previously-used domain — check pickFreshRunLabel's per-run uniqueness.",
+        });
+
+        // Despite no previous manifest, the probe-only path must still find
+        // and skip label A's already-uploaded section-1 chunks (global,
+        // content-addressed storage — dedup doesn't need a manifest or a
+        // domain link, only coinciding chunk CIDs). Note: unlike S-INC's own
+        // >= 60% regression floor, this scenario requires a full 100% skip —
+        // every section-1 chunk was just uploaded under label A, so anything
+        // less than "all found on chain" means cross-label reuse missed one.
+        // (Unlike S-INC-PORTABILITY, which never asserts on this line at all —
+        // its embedded-manifest fast path is a different code path — this
+        // scenario's whole point is exercising the probe, so it must run.)
+        //
+        // parseChunkSkipRateFromOutput treats "0 chunks probed" as a 100 %
+        // skip (its general convention: nothing to do = nothing missed).
+        // That's the wrong read here — this scenario forces the probe-only
+        // path specifically, so "0 probed" would mean that path silently
+        // didn't run at all, which is exactly the regression this test
+        // exists to catch. Assert a non-zero probe count explicitly before
+        // trusting the shared helper's ratio.
+        assertStdoutMatches(rB.stdout, /Probed:\s+(?!0\s+chunks)\d+\s+chunks/, {
+          scenario: "S-INC-CROSSLABEL",
+          what: "at least one chunk actually probed for label B",
+          hint: "0 chunks probed means the probe-only path didn't run at all for label B — this scenario exists specifically to exercise that path.",
+        });
+        const skipRate = parseChunkSkipRateFromOutput(rB.stdout, "S-INC-CROSSLABEL");
+        if (skipRate < 1) {
+          failWith({
+            scenario: "S-INC-CROSSLABEL",
+            message: `cross-label chunk-skip rate ${(skipRate * 100).toFixed(1)}% < 100% — some section-1 chunks uploaded under label A were not found on chain for label B`,
+            context: rB.stdout,
+            keywords: ["Probed", "Cache", "Manifest"],
+            hint: "every section-1 chunk uploaded under label A should be found by label B's skipCids probe, since chunk CIDs for files >= 1 MiB are a pure function of file bytes.",
+          });
+        }
+
+        // Bytes-uploaded gate: with all section-1 chunks skipped, label B's
+        // first-ever deploy should upload only section 0 (manifest) + section
+        // 2 (root dir + volatile index.html) overhead — well under the
+        // ceiling S-INC/S-INC-PORTABILITY already use for the same fixture.
+        const bytesUploaded = parseBytesUploadedFromOutput(rB.stdout);
+        if (bytesUploaded > 50_000) {
+          failWith({
+            scenario: "S-INC-CROSSLABEL",
+            message: `bytes uploaded ${(bytesUploaded / 1024).toFixed(1)} KB > 50 KB ceiling on a cross-label, no-manifest redeploy`,
+            context: rB.stdout,
+            keywords: ["Probed", "Cache", "Manifest"],
+            hint: "live observation on S-INC/S-INC-PORTABILITY's same fixture is ~10-20 KB. Significantly more means cross-label chunk reuse silently stopped working.",
+          });
+        }
+      } finally {
+        try { fs.rmSync(fixA, { recursive: true, force: true }); } catch {}
+        try { fs.rmSync(fixB, { recursive: true, force: true }); } catch {}
+      }
+    });
+  });
+
   // S-INC-ASSET-ROTATION simulates a real frontend rebuild: one source file
   // changed, Vite emits a new content-hashed bundle filename and updates
   // index.html's script tag. The expected behaviour: the unchanged 9.1 MB

@@ -2177,9 +2177,19 @@ jobs:
     name: Nightly S-INC ${{ matrix.scenario }} / ${{ matrix.merkle }}
     # Waits for nightly-s1-pool (shares Alice/pool mnemonic) and nightly-s-car
     # (further serializes Alice pool nonces in the third Alice-root deploy chain).
-    # max-parallel: 1 serializes the 5 matrix legs against each other since all
-    # legs deploy to the same stable pool labels (e2einc.dot / e2erot.dot or
-    # e2eincpool01.dot / e2erotpool01.dot) — concurrent legs would collide.
+    # Single-env: the s-inc/roundtrip/portability/asset-rotation legs share
+    # e2eincpool01/e2erotpool01, so a second env would not give them distinct
+    # names. s-inc-crosslabel (port of bulletin #1571/#1387) doesn't share that
+    # constraint — it builds its own fresh per-run labels via pickFreshRunLabel —
+    # but stays in this single-env job because it shares the job's pool signing
+    # account. Not also added to nightly-pr-coverage's multi-env matrix: bulletin
+    # #1387 asked only for nightly-s-inc coverage. Multi-env coverage for this
+    # scenario is a reasonable follow-up, not a gap introduced here.
+    # max-parallel: 1 serializes all matrix legs against each other: most legs
+    # deploy to the same stable pool labels (e2einc.dot / e2erot.dot or
+    # e2eincpool01.dot / e2erotpool01.dot) and would collide if concurrent;
+    # s-inc-crosslabel is serialized too so it doesn't race the others for the
+    # shared pool account's Asset Hub nonce.
     needs: [build-nightly, nightly-s1-pool, nightly-s-car, select-env, ensure-e2e-authorized]
     if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     # Only runs from source (BULLETIN_DEPLOY_REF path); npm-install path does
@@ -2201,6 +2211,8 @@ jobs:
         include:
           - { scenario: s-inc, merkle: js }
           - { scenario: s-inc, merkle: kubo }
+          - { scenario: s-inc-crosslabel, merkle: js }
+          - { scenario: s-inc-crosslabel, merkle: kubo }
           - { scenario: s-inc-roundtrip, merkle: js }
           - { scenario: s-inc-portability, merkle: js }
           - { scenario: s-inc-asset-rotation, merkle: js }

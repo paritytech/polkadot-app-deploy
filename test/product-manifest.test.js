@@ -19,12 +19,9 @@ import {
   publishManifest,
   formatConfigLoadError,
 } from "../dist/index.js";
-import { registerOrEnsureResolver } from "../dist/manifest/publish.js";
+import { registerOrEnsureResolver, domainMatchesEnvTld } from "../dist/manifest/publish.js";
 import { NonRetryableError } from "../dist/errors.js";
 import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
-import { KNOWN_TLDS as DOTNS_KNOWN_TLDS } from "../dist/dotns.js";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -373,10 +370,24 @@ describe("validateProductConfig", () => {
       `>> FAIL: validateProductConfig .paseo: expected ok:true, got errors: ${JSON.stringify(result.ok ? [] : result.errors)}`);
   });
 
-  test("still rejects a domain ending in an unknown TLD", () => {
-    const result = validateProductConfig({ ...VALID_CONFIG, domain: "demoapp.example" });
-    assert.equal(result.ok, false,
-      ">> FAIL: validateProductConfig unknown TLD: 'demoapp.example' must still be rejected — only KNOWN_TLDS suffixes are valid");
+  // Domain validation is shape-based, not an enumerated TLD allowlist, so a
+  // network DotNS has never been configured for validates with no code
+  // change. This is the property that broke when previewnet's real TLD
+  // changed underneath a hardcoded allowlist in bulletin-deploy (#1241).
+  for (const tld of ["dot", "paseo", "example", "newnet"]) {
+    test(`accepts a domain ending in an arbitrary well-formed TLD (.${tld})`, () => {
+      const result = validateProductConfig({ ...VALID_CONFIG, domain: `demoapp.${tld}` });
+      assert.equal(
+        result.ok,
+        true,
+        `expected domain 'demoapp.${tld}' to validate; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+      );
+    });
+  }
+
+  test("accepts a subdomain under an arbitrary well-formed TLD", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, domain: "sub.demoapp.example" });
+    assert.equal(result.ok, true);
   });
 
   // bulletin-deploy #1449 (folded into #1443): subname depth is observed at
@@ -395,21 +406,23 @@ describe("validateProductConfig", () => {
     });
   }
 
-  // Keeps src/manifest/schema.ts's hand-copied KNOWN_TLDS list (documented as
-  // "kept in sync with dotns.ts's KNOWN_TLDS by hand") from silently drifting
-  // — schema.ts deliberately doesn't import dotns.ts (stays free of the
-  // polkadot-api dep), so nothing else would catch a divergence.
-  test("schema.ts's KNOWN_TLDS list stays in sync with dotns.ts's KNOWN_TLDS", () => {
-    const schemaSrc = readFileSync(fileURLToPath(new URL("../src/manifest/schema.ts", import.meta.url)), "utf8");
-    const m = schemaSrc.match(/const KNOWN_TLDS = \[([^\]]+)\] as const;/);
-    assert.ok(m, ">> FAIL: could not find schema.ts's KNOWN_TLDS declaration to compare");
-    const schemaTlds = m[1].split(",").map((s) => s.trim().replace(/^"|"$/g, "")).filter(Boolean);
-    assert.deepEqual(
-      schemaTlds.sort(),
-      [...DOTNS_KNOWN_TLDS].sort(),
-      `>> FAIL: KNOWN_TLDS drift: src/manifest/schema.ts has ${JSON.stringify(schemaTlds)} but src/dotns.ts has ${JSON.stringify(DOTNS_KNOWN_TLDS)} — a config domain valid on-chain could now fail schema validation, or vice versa`,
-    );
-  });
+  for (const domain of [
+    "demoapp.d", // TLD shorter than 2 chars
+    "demoapp.d0t", // digit in TLD
+    "demoapp.do-t", // hyphen in TLD
+    "demoapp.12", // all-digit TLD
+    "demoapp.", // empty TLD
+    "-demoapp.dot", // label starts with hyphen
+    "demoapp-.dot", // label ends with hyphen
+    "my..app.dot", // empty label
+    "my_app.dot", // underscore not allowed
+  ]) {
+    test(`rejects malformed domain '${domain}'`, () => {
+      const result = validateProductConfig({ ...VALID_CONFIG, domain });
+      assert.equal(result.ok, false, `expected domain '${domain}' to be rejected`);
+      assert.ok(result.errors.some((e) => e.includes("domain")));
+    });
+  }
 
   test("rejects empty executables array", () => {
     const result = validateProductConfig({ ...VALID_CONFIG, executables: [] });
@@ -790,6 +803,28 @@ describe("formatConfigLoadError — pure helper", () => {
     const message = formatConfigLoadError("/proj/polkadot-app-deploy.config.ts", "plain string throw");
     assert.match(message, /threw while loading: plain string throw\./, `>> FAIL: formatConfigLoadError non-Error throw: expected stringified value (got "${message}")`);
   });
+});
+
+// The schema validator no longer enumerates TLDs (shape only), so a typo'd
+// TLD like ".dto" validates as well-formed and reaches the publish layer.
+// This guard is the only thing that names the mismatch; uncaught, the full
+// mismatched domain flows into ensureContentResolver, which appends the env
+// TLD again and namehashes a compound nobody owns, surfacing as an opaque
+// not-the-owner revert from deep inside a chain call.
+describe("manifest/publish.ts: the wrong-env-TLD guard", () => {
+  for (const { domain, tld, expected, why } of [
+    { domain: "myapp.paseo", tld: "paseo", expected: true, why: "the env's own TLD must pass" },
+    { domain: "myapp.dto", tld: "paseo", expected: false, why: "a typo'd TLD must be rejected here — the schema validator no longer enumerates TLDs" },
+    { domain: "myapp.dot", tld: "paseo", expected: false, why: "another environment's real TLD is still wrong for THIS env" },
+    { domain: "MyApp.PASEO", tld: "paseo", expected: true, why: "must match case-insensitively, like stripTldSuffix and DOMAIN_RE" },
+    { domain: "paseo", tld: "paseo", expected: false, why: "the bare TLD carries no label, so it is a mismatch not a match" },
+    { domain: "myapp.paseo.dot", tld: "paseo", expected: false, why: "the TLD must be the FINAL segment, not merely present" },
+  ]) {
+    test(`domainMatchesEnvTld("${domain}", "${tld}") === ${expected}`, () => {
+      assert.strictEqual(domainMatchesEnvTld(domain, tld), expected,
+        `>> FAIL: manifest/publish.ts domainMatchesEnvTld("${domain}", "${tld}") should be ${expected}: ${why}`);
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

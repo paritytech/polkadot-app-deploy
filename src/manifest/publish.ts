@@ -152,7 +152,23 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   try {
     // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
     // DotNS._tld / connectDotNS above), so pass the bare label.
-    const baseLabel = stripDotSuffix(config.domain, resolved.tld ?? DEFAULT_TLD);
+    const envTld = resolved.tld ?? DEFAULT_TLD;
+
+    // The schema validator deliberately no longer enumerates known TLDs (it
+    // validates shape only), so a typo like ".dto" reaches here unrejected.
+    // This is the layer that knows the environment's TLD, so this is where
+    // the mismatch gets named. Uncaught, the mismatched domain would flow
+    // into ensureContentResolver, which appends the env TLD again —
+    // producing a namehash for a nonsense compound name that nobody owns,
+    // surfacing as an opaque not-the-owner revert deep inside the chain call.
+    if (!domainMatchesEnvTld(config.domain, envTld)) {
+      throw new NonRetryableError(
+        `Domain "${config.domain}" does not end in this environment's DotNS TLD ".${envTld}" ` +
+        `(env: ${envId}). Set "domain" in your product config to "<name>.${envTld}", ` +
+        `or deploy against the environment whose TLD matches.`,
+      );
+    }
+    const baseLabel = stripDotSuffix(config.domain, envTld);
 
     await dotns.ensureContentResolver(baseLabel);
 
@@ -300,4 +316,13 @@ function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
 // was dead code.
 function stripDotSuffix(domain: string, tld: string): string {
   return stripTldSuffix(domain, tld);
+}
+
+// Does `domain` end in `.<tld>`? Exported so the wrong-env-TLD guard above is
+// testable without a live DotNS connection. Case-insensitive to match
+// stripTldSuffix and DOMAIN_RE, which both use the `i` flag; a domain equal
+// to the bare TLD ("paseo" against "paseo") is a mismatch, since it carries
+// no label.
+export function domainMatchesEnvTld(domain: string, tld: string): boolean {
+  return domain.toLowerCase().endsWith(`.${tld.toLowerCase()}`);
 }

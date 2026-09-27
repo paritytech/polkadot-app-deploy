@@ -3290,10 +3290,14 @@ export class DotNS {
    *
    * A fourth probe (isPopIssued, against DOTNS_POP_CONTROLLER — see
    * DotnsProtocolProbe.isPopIssuedOk's own comment) runs in the SAME
-   * Promise.all as the other three: pricingVersionOk answering true on
-   * either v0.5.8-rc1 or v0.6.0 is the common case once v0.6.0 is live
-   * everywhere, so gating isPopIssued behind pricingVersionOk resolving
-   * first would cost every such connect() an extra serialized round-trip.
+   * Promise.all as the other three: gating it behind pricingVersionOk
+   * resolving first would just add a serialized round-trip for no benefit
+   * — worse as v0.6.0 spreads (#1410), since that "no benefit" case becomes
+   * the common one. The discarded-probe cost does NOT self-liquidate the
+   * moment v0.6.0 ships: it persists on every environment still running an
+   * older generation (dotns-protocol.ts's profile comment owns per-generation
+   * status — this one does not restate it). Parallel regardless: one
+   * discarded read beats a serialized round-trip on every connect.
    * classifyProtocolVersion only actually consults isPopIssuedOk when
    * pricingVersionOk is true, so running it unconditionally costs nothing
    * when pricingVersionOk turns out false. The probe is skipped entirely

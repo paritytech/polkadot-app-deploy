@@ -568,14 +568,38 @@ export function shouldPublishManifest(opts: {
   return opts.configFound && !opts.noManifest;
 }
 
-/** storageSigner > signer > mnemonic > pool precedence for storage routing. Exported for unit testing. */
+/**
+ * storageSigner > signer (unless session-backed with no slot, bulletin #1452) > mnemonic > pool
+ * precedence for storage routing. `selectStorageReconnect` delegates to this so the two
+ * never drift apart. Exported for unit testing.
+ */
 export function __selectStorageProviderModeForTest(
-  options: Pick<DeployOptions, "storageSigner" | "storageSignerAddress" | "signer" | "signerAddress" | "mnemonic">,
+  options: Pick<DeployOptions, "storageSigner" | "storageSignerAddress" | "signer" | "signerAddress" | "mnemonic" | "sessionSigner">,
 ): "storageSigner" | "signer" | "direct" | "pool" {
   if (options.storageSigner && options.storageSignerAddress) return "storageSigner";
-  if (options.signer && options.signerAddress) return "signer";
+  // bulletin #1452: a phone-backed session signer with no allowance slot must fall through to
+  // pool/mnemonic, not sign chunks itself. A caller-injected external signer (sessionSigner
+  // unset — e.g. playground-cli) is unaffected and still routes to "signer" here.
+  if (options.signer && options.signerAddress && !options.sessionSigner) return "signer";
   if (options.mnemonic) return "direct";
   return "pool";
+}
+
+/**
+ * Build the signer-related DeployOptions fields from a resolved `resolveDeployActors`
+ * result. Pulled out of the resolve branch (bulletin #1452) so the session-vs-local
+ * distinction that gates Bulletin storage routing is directly unit-testable without
+ * exercising `resolveDeployActors`' SSO stack. Exported for unit testing.
+ */
+export function deployActorsToSignerOptions(
+  actors: { worker: { signer: PolkadotSigner; address: string; source: string }; recipientH160?: string },
+): Pick<DeployOptions, "signer" | "signerAddress" | "transferTo" | "sessionSigner"> {
+  return {
+    signer: actors.worker.signer,
+    signerAddress: actors.worker.address,
+    ...(actors.recipientH160 ? { transferTo: actors.recipientH160 } : {}),
+    sessionSigner: actors.worker.source === "session",
+  };
 }
 
 /**
@@ -692,7 +716,10 @@ export function describeSlotFallbackReason(e: unknown): string {
 }
 
 export function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
-  if (options.storageSigner && options.storageSignerAddress) {
+  // Delegate the mode decision to the pure, unit-tested selector (bulletin #1452) so this
+  // function and __selectStorageProviderModeForTest can never disagree about which branch runs.
+  const mode = __selectStorageProviderModeForTest(options);
+  if (mode === "storageSigner") {
     // Committed-signer: once the slot provider fails on the first attempt,
     // every subsequent reconnect uses pool. Prevents signer drift mid-upload
     // (nonce/attribution would break if storage switched signers between chunks).
@@ -722,13 +749,15 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
       }
     };
   }
-  // External signer (options.signer + options.signerAddress): use getSignerProvider for
-  // Bulletin storage when no dedicated slot signer is available. This supports
-  // programmatic callers (playground-cli, library consumers) that pass their own
-  // PolkadotSigner without a pre-allocated BulletInAllowance slot key.
-  if (options.signer && options.signerAddress)
+  // External signer (options.signer + options.signerAddress, NOT session-backed): use
+  // getSignerProvider for Bulletin storage when no dedicated slot signer is available.
+  // This supports programmatic callers (playground-cli, library consumers) that pass
+  // their own PolkadotSigner without a pre-allocated BulletInAllowance slot key. A
+  // phone-backed session signer with no slot (mode "pool" — bulletin #1452) falls
+  // through below.
+  if (mode === "signer")
     return () => getSignerProvider(options.signer!, options.signerAddress!);
-  if (options.mnemonic)
+  if (mode === "direct")
     return () => getDirectProvider(options.mnemonic!, options.derivationPath);
   return () => getProvider();
 }
@@ -2660,6 +2689,16 @@ export interface DeployOptions {
   signer?: PolkadotSigner;
   /** SS58 address for the signer (required when signer is provided). */
   signerAddress?: string;
+  /**
+   * Internal: `signer`/`signerAddress` were resolved from a phone-backed login
+   * session (`resolveDeployActors`'s `actors.worker.source === "session"`), as
+   * opposed to a local `--suri`/mnemonic-derived worker or a caller-injected
+   * `PolkadotSigner` (programmatic callers, e.g. playground-cli). Set by
+   * `deployActorsToSignerOptions`. Storage routing must not silently sign
+   * Bulletin chunks with this signer when no allowance slot is available —
+   * a session signer with no slot must route to pool instead. See bulletin #1452.
+   */
+  sessionSigner?: boolean;
   /** Slot-account signer for Bulletin chunk uploads. When set, used instead of pool/mnemonic
    *  for storage. DotNS still uses signer/signerAddress. */
   storageSigner?: PolkadotSigner;
@@ -3198,12 +3237,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         isTestnet: isTestnetEnv,
         sessionPresent: hasSession,
       });
-      options = {
-        ...options,
-        signer: actors.worker.signer,
-        signerAddress: actors.worker.address,
-        ...(actors.recipientH160 ? { transferTo: actors.recipientH160 } : {}),
-      };
+      options = { ...options, ...deployActorsToSignerOptions(actors) };
       sessionCleanup = actors.worker.destroy.bind(actors.worker);
       if (actors.worker.source === "session") resolvedUserSession = actors.worker;
       if (actors.recipientH160) {

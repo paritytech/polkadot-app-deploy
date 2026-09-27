@@ -82,6 +82,105 @@ describe("formatStorageSignerLine", async () => {
     });
 });
 
+describe("deployActorsToSignerOptions (bulletin #1452)", async () => {
+    // Pure helper pulled out of deploy()'s resolve branch so the session-vs-local
+    // distinction that gates Bulletin storage routing is unit-testable without the
+    // SSO stack. Feeds directly into __selectStorageProviderModeForTest below.
+    const { deployActorsToSignerOptions } = await import("../dist/deploy.js");
+    const STUB_SIGNER = { publicKey: new Uint8Array(32) };
+
+    test("session-sourced worker (transfer off) → sessionSigner: true, no transferTo", () => {
+        const actors = { worker: { signer: STUB_SIGNER, address: "5Session", source: "session" } };
+        const result = deployActorsToSignerOptions(actors);
+        assert.equal(result.signer, STUB_SIGNER, ">> FAIL: deployActorsToSignerOptions: signer must be the worker's signer");
+        assert.equal(result.signerAddress, "5Session", ">> FAIL: deployActorsToSignerOptions: signerAddress must be the worker's address");
+        assert.equal(result.sessionSigner, true, ">> FAIL: deployActorsToSignerOptions: a session-sourced worker must set sessionSigner: true");
+        assert.equal(result.transferTo, undefined, ">> FAIL: deployActorsToSignerOptions: no recipientH160 must leave transferTo unset");
+    });
+
+    test("dev-sourced worker (transfer on, --suri/Alice) → sessionSigner: false, transferTo set", () => {
+        const actors = { worker: { signer: STUB_SIGNER, address: "5Dev", source: "dev" }, recipientH160: "0xPROD" };
+        const result = deployActorsToSignerOptions(actors);
+        assert.equal(result.sessionSigner, false, ">> FAIL: deployActorsToSignerOptions: a dev/--suri worker must NOT be flagged as session-backed");
+        assert.equal(result.transferTo, "0xPROD", ">> FAIL: deployActorsToSignerOptions: recipientH160 must populate transferTo (transfer mode)");
+    });
+});
+
+describe("storage routing must agree with the reported signer (bulletin #1452)", async () => {
+    // Reproduces the issue's own deterministic repro: a phone-backed session signer,
+    // transfer off, no usable BulletinAllowance. Chains the real resolveStorageSigner
+    // (returning null — documented pool fallback) into deployActorsToSignerOptions
+    // and __selectStorageProviderModeForTest — the exact production decision path
+    // selectStorageReconnect now delegates to — so this pins actual routing, not a
+    // parallel guess at it.
+    const { resolveStorageSigner } = await import("../dist/deploy-actors.js");
+    const { deployActorsToSignerOptions, __selectStorageProviderModeForTest, formatStorageSignerLine } =
+        await import("../dist/deploy.js");
+
+    const SESSION_ADDRESS = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+    const SESSION_SIGNER = { publicKey: new Uint8Array(32) }; // phone-backed
+
+    test("session signer, no session (userSession missing) → pool, and log agrees", async () => {
+        const slotResult = await resolveStorageSigner(null, {
+            getBulletinSigner: async () => { throw new Error("should not be called"); },
+            requestResourceAllocation: async () => { throw new Error("should not be called"); },
+            ss58Encode: () => SESSION_ADDRESS,
+            promptBeforeAllocation: () => {},
+        });
+        assert.strictEqual(slotResult, null, ">> FAIL: bulletin #1452 repro: no session must resolve to null (pool)");
+    });
+
+    test("logged in, no allowance, user declines the prompt (the issue's exact repro) → routes to pool, not the phone signer", async () => {
+        const slotResult = await resolveStorageSigner(
+            { userSession: { id: "s1" }, adapter: {} },
+            {
+                getBulletinSigner: async () => ({
+                    isOk: () => false, isErr: () => true, error: { reason: "NotAvailable" },
+                }),
+                requestResourceAllocation: async () => [{ tag: "Rejected" }],
+                createSlotAccountSigner: async () => null,
+                ss58Encode: () => SESSION_ADDRESS,
+                promptBeforeAllocation: () => {},
+            },
+        );
+        assert.strictEqual(slotResult, null,
+            ">> FAIL: bulletin #1452 repro: a declined/unavailable allowance must resolve to null (documented '→ pool')");
+
+        // deploy() only sets options.storageSigner when slotResult is truthy (unchanged),
+        // so options keeps the session signer that deployActorsToSignerOptions produced
+        // for this (transfer-off, session-sourced) worker.
+        const options = {
+            ...deployActorsToSignerOptions({ worker: { signer: SESSION_SIGNER, address: SESSION_ADDRESS, source: "session" } }),
+        };
+
+        const mode = __selectStorageProviderModeForTest(options);
+        const logLine = formatStorageSignerLine(null, "no allowance");
+
+        assert.ok(mode === "pool" && logLine.includes("pool fallback"),
+            `>> FAIL: bulletin #1452: routing (mode="${mode}") must agree with the log line ("${logLine.trim()}") — a phone-backed session signer with no allowance slot must route storage to pool, not sign chunks on the phone`);
+    });
+
+    test("a caller-injected external signer (no session, e.g. playground-cli) is unaffected: still routes to 'signer'", () => {
+        // sessionSigner is unset here — this is the library/programmatic-caller path,
+        // not deploy()'s own resolve branch. Must keep working exactly as before #1452.
+        const options = { signer: SESSION_SIGNER, signerAddress: SESSION_ADDRESS };
+        const mode = __selectStorageProviderModeForTest(options);
+        assert.strictEqual(mode, "signer",
+            ">> FAIL: bulletin #1452: an injected external signer with no sessionSigner flag must still activate signer mode for storage");
+    });
+
+    test("transfer mode (dev worker signs storage) is NOT collapsed into the pool case", () => {
+        const options = deployActorsToSignerOptions({
+            worker: { signer: SESSION_SIGNER, address: "5Worker", source: "dev" },
+            recipientH160: "0xPROD",
+        });
+        const mode = __selectStorageProviderModeForTest(options);
+        assert.strictEqual(mode, "signer",
+            ">> FAIL: bulletin #1452: transfer mode's local worker must still sign storage directly — this is deliberately NOT a pool fallback");
+        assert.equal(options.transferTo, "0xPROD", ">> FAIL: bulletin #1452: transfer mode must carry transferTo through unchanged");
+    });
+});
+
 describe("deploy-path stale-session message", async () => {
     // Behavioral coverage is in whoami.test.js (stale-fixture test: same message, same
     // hasPersistedSession gate). This test guards the export contract for deploy.ts's emit site.

@@ -1,7 +1,8 @@
-import { test, describe } from "node:test";
+import { test, describe, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { collectUnitTestFiles } from "../scripts/run-unit-tests.mjs";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
+import { setupIsolatedHome } from "./helpers/isolated-home.js";
 // Personhood bootstrap imports (loaded after build)
 import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason } from "../dist/dotns.js";
 import { getAdapter } from "../dist/dotns-protocol.js";
@@ -4674,6 +4675,20 @@ describe("isCommitmentTimingBarerevert", () => {
 // DotNS.register — contract path
 // ---------------------------------------------------------------------------
 describe("DotNS.register contract path", () => {
+  // #1412: DotNS.register() now routes through commitAndRegister(), which
+  // persists/clears a commitment record via src/run-state.ts's
+  // resolveStateDir() — the REAL per-user OS state dir, not a test fixture.
+  // None of the tests below stub that away, so without this isolation every
+  // run in this describe block would read and write actual files under the
+  // machine's real `~/Library/Application Support/polkadot-app-deploy/` (or
+  // the Linux/Windows equivalent) using this file's placeholder evmAddress/
+  // label values — a real side effect leaking out of a unit test suite.
+  // Point HOME (and the other platform-specific vars resolveStateDir()
+  // consults) at a fresh tmpdir for the duration of each test in this block.
+  let isolatedHome;
+  beforeEach(() => { isolatedHome = setupIsolatedHome(); });
+  afterEach(() => { isolatedHome.restore(); });
+
   function makeDotnsForRegister() {
     const d = new DotNS();
     d.connected = true;

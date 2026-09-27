@@ -31,6 +31,8 @@ import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
+import { loadCommitmentRecord, writeCommitmentRecord, clearCommitmentRecord, FALLBACK_MAX_COMMITMENT_AGE_SECONDS } from "./run-state.js";
+import type { DotnsCommitmentRecord } from "./run-state.js";
 
 /** One step in the phone-signature plan fired at preflight. */
 export type PhoneSignatureStep = "Commitment" | "Register" | "Link content";
@@ -4927,7 +4929,7 @@ export class DotNS {
     ]);
 
     const minimumAgeSeconds = typeof minimumAge === "bigint" ? Number(minimumAge) : minimumAge;
-    const maximumAgeSeconds = typeof maximumAge === "bigint" ? Number(maximumAge) : (maximumAge ?? 86400);
+    const maximumAgeSeconds = typeof maximumAge === "bigint" ? Number(maximumAge) : (maximumAge ?? FALLBACK_MAX_COMMITMENT_AGE_SECONDS);
     const commitTimestamp = typeof initialCommitTimestamp === "bigint" ? Number(initialCommitTimestamp) : initialCommitTimestamp;
 
     if (commitTimestamp === 0) {
@@ -5088,6 +5090,296 @@ export class DotNS {
       } else {
         console.log(`      finalised (tx ${registerTxRes.hash})`);
       }
+    }
+  }
+
+  // Persists a just-submitted commitment so a later invocation can resume it
+  // (issue #1412) instead of abandoning it. Never throws — a write failure
+  // degrades to today's behaviour (no resume, pay a fresh commit next time),
+  // which must never fail the deploy that's actually in progress.
+  private persistCommitmentRecord(label: string, reserved: boolean, registration: Record<string, unknown>, commitment: unknown): void {
+    // writeCommitmentRecord SHOULD never throw — run-state.ts resolves every
+    // path inside its own try, and resolveStateDir() itself now falls back
+    // rather than throwing (see homedirOrFallback in run-state.ts) — but
+    // that contract is enforced by convention across two files, not by the
+    // type system. This call site is guarded too, as the real safety net:
+    // code review on #1412 found a never-throw contract phrased exactly
+    // this confidently had a real gap elsewhere in this same flow.
+    let ok: boolean;
+    let err: unknown;
+    try {
+      ok = writeCommitmentRecord({
+        savedAt: Date.now(),
+        environmentId: this._environmentId ?? "unknown",
+        tld: this._tld,
+        protocol: this._protocolVersion,
+        label,
+        owner: this.evmAddress!,
+        reserved,
+        secret: registration.secret as string,
+        maxPrice: registration.maxPrice !== undefined ? (registration.maxPrice as bigint).toString() : undefined,
+        pricingVersion: registration.pricingVersion !== undefined ? (registration.pricingVersion as bigint).toString() : undefined,
+        commitment: commitment as string,
+      });
+    } catch (caught) {
+      ok = false;
+      err = caught;
+    }
+    if (!ok) {
+      const suffix = err !== undefined ? ` (${(err as Error)?.message ?? err})` : "";
+      console.log(`   Warning: could not persist commitment state to disk${suffix}. If this process is interrupted before registration finishes, this commitment cannot be resumed — a later attempt will pay for a fresh one.`);
+    }
+  }
+
+  // Resolves a previously-persisted commitment (issue #1412) into a
+  // ready-to-use { commitment, registration } pair, or null if there is
+  // nothing usable — meaning the caller should commit fresh. Every "no"
+  // path here either discards a record that can never help again (wrong
+  // label/owner/tld/protocol, never landed on-chain, expired, stale pricing
+  // version, or provably corrupt) or leaves an unverifiable record in place
+  // for a later run to re-try (a transient RPC failure here is not evidence
+  // the record is bad). Correctness beats reuse: every check here exists to
+  // avoid resuming something that would fail at reveal, which is the
+  // expensive end of this flow.
+  async resolveResumableCommitment(label: string, reserved: boolean): Promise<{ commitment: unknown; registration: Record<string, unknown> } | null> {
+    const environmentId = this._environmentId ?? "unknown";
+    const owner = this.evmAddress!;
+
+    // The ENTIRE body (including the load itself) is best-effort: a resumed
+    // commitment only ever saves a fee/wait that a fresh commit would
+    // happily pay again. Code review on #1412 found this could throw (a
+    // hand-edited/schema-drifted record with a missing field, an unguarded
+    // chain read like Timestamp.Now.getValue()) and crash the WHOLE
+    // register() call — strictly worse than pre-#1412 behaviour for those
+    // inputs. Wrap everything in a catch-all so any surprise here degrades
+    // to "don't resume this run", never a crash — including a defensive
+    // catch on loadCommitmentRecord itself: run-state.ts's never-throw
+    // contract is enforced by convention (a path-thunk pattern every caller
+    // must use correctly), not by the type system, and this is exactly the
+    // class of gap that slipped through once already.
+    try {
+      const record: DotnsCommitmentRecord | null = loadCommitmentRecord(environmentId, this._tld, owner, label);
+      if (!record) return null;
+
+      if (
+        typeof record.owner !== "string" ||
+        typeof record.label !== "string" ||
+        typeof record.secret !== "string" ||
+        typeof record.commitment !== "string" ||
+        typeof record.tld !== "string" ||
+        typeof record.protocol !== "string" ||
+        typeof record.environmentId !== "string" ||
+        typeof record.reserved !== "boolean"
+      ) {
+        // Malformed shape (hand-edited file, schema drift from an older
+        // version of this tool). Can never be resumed regardless of this
+        // run's own values — safe to discard rather than leave around to
+        // fail the same way on every future run too.
+        clearCommitmentRecord(environmentId, this._tld, owner, label);
+        return null;
+      }
+
+      if (
+        record.environmentId !== environmentId ||
+        record.tld !== this._tld ||
+        record.protocol !== this._protocolVersion ||
+        record.label !== label ||
+        record.owner.toLowerCase() !== owner.toLowerCase() ||
+        record.reserved !== reserved
+      ) {
+        // Not this run's commitment. Nothing about this run can ever resume
+        // it, and no fee is at risk either way (register() never ran), so
+        // it's safe to clear rather than leave a permanently-unmatchable file
+        // around.
+        clearCommitmentRecord(environmentId, this._tld, owner, label);
+        return null;
+      }
+
+      const registration: Record<string, unknown> = {
+        label: record.label,
+        owner: record.owner,
+        secret: record.secret,
+        reserved: record.reserved,
+        ...(record.maxPrice !== undefined ? { maxPrice: BigInt(record.maxPrice) } : {}),
+        ...(record.pricingVersion !== undefined ? { pricingVersion: BigInt(record.pricingVersion) } : {}),
+      };
+
+      // Prove the rehydrated tuple is byte-for-byte what was actually
+      // committed — a free view call. Catches any rehydration drift (a bigint
+      // that didn't round-trip, a dropped field) here instead of at reveal.
+      let recomputed: unknown;
+      try {
+        recomputed = await withTimeout(
+          this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "makeCommitment", [registration]),
+          30000, "makeCommitment (resume verify)",
+        );
+      } catch {
+        // Can't verify right now — don't trust an unverified record, but
+        // don't discard it either; a later invocation may still resume it.
+        return null;
+      }
+      if (typeof recomputed !== "string" || recomputed.toLowerCase() !== String(record.commitment).toLowerCase()) {
+        // Provably corrupt or inconsistent — this record can never be valid.
+        clearCommitmentRecord(environmentId, this._tld, owner, label);
+        return null;
+      }
+
+      // On-chain existence + expiry are ground truth — never trust a locally
+      // cached timestamp for this decision.
+      let onChainTimestamp: unknown;
+      let maximumAge: unknown;
+      try {
+        [onChainTimestamp, maximumAge] = await Promise.all([
+          withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "commitments", [record.commitment]), 30000, "commitments (resume check)"),
+          withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "maxCommitmentAge", []), 30000, "maxCommitmentAge (resume check)"),
+        ]);
+      } catch {
+        return null; // Transient — don't discard, just don't resume this run.
+      }
+      const commitTimestamp = typeof onChainTimestamp === "bigint" ? Number(onChainTimestamp) : Number(onChainTimestamp ?? 0);
+      if (commitTimestamp === 0) {
+        // Never landed on-chain, or already consumed/cleared. No fee is at
+        // risk either way — safe to discard.
+        clearCommitmentRecord(environmentId, this._tld, owner, label);
+        return null;
+      }
+      const maximumAgeSeconds = typeof maximumAge === "bigint" ? Number(maximumAge) : Number(maximumAge ?? FALLBACK_MAX_COMMITMENT_AGE_SECONDS);
+      const nowMs = await this.clientWrapper!.client.query.Timestamp.Now.getValue();
+      const chainNowSeconds = Math.floor(Number(nowMs) / 1000);
+      if (chainNowSeconds >= commitTimestamp + maximumAgeSeconds) {
+        // Resuming an expired commitment is worse than starting fresh (#1412)
+        // — it wastes the wait and still fails at reveal. Discard.
+        console.log(`\n   Stored commitment for ${label}.${this._tld} has expired on-chain (chain.now=${chainNowSeconds}, expired at=${commitTimestamp + maximumAgeSeconds}). Discarding, starting fresh.\n`);
+        clearCommitmentRecord(environmentId, this._tld, owner, label);
+        return null;
+      }
+
+      // Priced profiles pin pricingVersion into the committed tuple. If the
+      // live version has moved on, we can no longer independently confirm the
+      // contract will honour this tuple's price at reveal — discard rather
+      // than risk mispricing or a doomed reveal.
+      if (this._adapter.needsPricingBeforeCommit && record.pricingVersion !== undefined) {
+        let livePricingVersion: unknown;
+        try {
+          livePricingVersion = await withTimeout(this.contractCall(this._contracts.POP_RULES, this._adapter.popRulesAbi, "pricingVersion", []), 30000, "pricingVersion (resume check)");
+        } catch {
+          return null;
+        }
+        const liveStr = (typeof livePricingVersion === "bigint" ? livePricingVersion : BigInt(livePricingVersion as any)).toString();
+        if (liveStr !== record.pricingVersion) {
+          console.log(`\n   Stored commitment's pricing version (${record.pricingVersion}) is stale (live: ${liveStr}). Discarding, starting fresh.\n`);
+          clearCommitmentRecord(environmentId, this._tld, owner, label);
+          return null;
+        }
+
+        // A matching pricingVersion is necessary but not sufficient (#1412
+        // code review): priceWithCheckAtVersion can still return a HIGHER
+        // price for the SAME pricingVersion later — a per-caller or
+        // time-decaying component independent of the version stamp.
+        // Resuming with a stale, now-too-low maxPrice ceiling would either
+        // underpay at reveal or fail outright, so re-check the live price
+        // against the committed ceiling before trusting the record.
+        if (record.maxPrice !== undefined) {
+          let livePriceMeta: unknown;
+          try {
+            livePriceMeta = await withTimeout(
+              this.contractCall(this._contracts.POP_RULES, this._adapter.popRulesAbi, "priceWithCheckAtVersion", [label, owner, livePricingVersion]),
+              30000, "priceWithCheckAtVersion (resume check)",
+            );
+          } catch {
+            return null; // Transient — don't discard, just don't resume this run.
+          }
+          const livePriceRaw = (livePriceMeta as any)?.price;
+          const livePriceWei = typeof livePriceRaw === "bigint" ? livePriceRaw : BigInt(livePriceRaw);
+          if (livePriceWei > BigInt(record.maxPrice)) {
+            console.log(`\n   Stored commitment's committed price ceiling (${record.maxPrice}) is now below the live price (${livePriceWei}). Discarding, starting fresh.\n`);
+            clearCommitmentRecord(environmentId, this._tld, owner, label);
+            return null;
+          }
+        }
+      }
+
+      console.log(`\n   Resuming previously-submitted commitment for ${label}.${this._tld} (still valid on-chain).\n`);
+      return { commitment: record.commitment, registration };
+    } catch (err) {
+      // Safety net for anything not already handled above (a maxPrice/
+      // pricingVersion string BigInt() can't parse, an RPC drop on
+      // Timestamp.Now.getValue(), ...). Don't discard — we can't tell here
+      // whether the record itself is bad or the chain briefly hiccuped —
+      // just don't resume this run.
+      console.log(`   Warning: could not verify a stored commitment for resume (${(err as Error)?.message ?? err}); starting fresh instead.`);
+      return null;
+    }
+  }
+
+  // The commit -> wait -> register orchestration, including the pre-existing
+  // one-shot bare-revert retry and (#1412) an attempt to resume a
+  // previously-persisted, still-valid commitment before paying for a fresh
+  // one. Extracted from register() as its own method so it's testable
+  // end-to-end (stubbing generateCommitment/submitCommitment/
+  // waitForCommitmentAge/getPriceAndValidate/finalizeRegistration) without a
+  // live chain or register()'s unrelated preflight checks.
+  async commitAndRegister(label: string, reverse: boolean): Promise<void> {
+    let pricingEarly: PriceValidationResult | null = null;
+
+    const doCommitAndRegister = async (resumeWith: { commitment: unknown; registration: Record<string, unknown> } | null): Promise<void> => {
+      let commitment: unknown;
+      let registration: Record<string, unknown>;
+      if (resumeWith) {
+        ({ commitment, registration } = resumeWith);
+      } else {
+        // v0.5.8-rc1 (needsPricingBeforeCommit): maxPrice + pricingVersion are
+        // part of the COMMITTED tuple, so pricing must be resolved before
+        // makeCommitment/commit — moved ahead of the commitment here.
+        // poprules-startingPrice: pricingEarly stays null, so the call order
+        // below is byte-for-byte identical to before this change (generate →
+        // submit → wait → price → finalize) — this is the global constraint
+        // that the poprules-startingPrice profile must never change.
+        pricingEarly = this._adapter.needsPricingBeforeCommit
+          ? await withSpan("deploy.dotns.price-validation", "2a-0. price-validation", {}, () => this.getPriceAndValidate(label))
+          : null;
+        const generated = await this.generateCommitment(
+          label, reverse,
+          pricingEarly ? { priceWei: pricingEarly.priceWei, pricingVersion: pricingEarly.pricingVersion } : undefined,
+        );
+        commitment = generated.commitment;
+        registration = generated.registration;
+        // Persisted BEFORE submitting (#1412): if this process dies during
+        // or after the commit tx — RPC drop, SIGKILL, chain timeout — the
+        // secret must already be on disk, since it's never regenerable. A
+        // record whose tx never actually lands is harmless to keep around:
+        // resolveResumableCommitment's on-chain check treats
+        // "commitments[hash] == 0" as not-yet-landed and discards it for
+        // free (no fee was ever paid for it).
+        this.persistCommitmentRecord(label, reverse, registration, commitment);
+        await withSpan("deploy.dotns.submit-commitment", "2a-i. submit-commitment", {}, () => this.submitCommitment(commitment));
+      }
+      await withSpan("deploy.dotns.wait-commitment-age", "2a-ii. wait-commitment-age", {}, () => this.waitForCommitmentAge(commitment));
+      const pricing = pricingEarly ?? await withSpan("deploy.dotns.price-validation", "2a-iii. price-validation", {}, () => this.getPriceAndValidate(label));
+      await withSpan("deploy.dotns.finalize-registration", "2a-iv. finalize-registration", {}, () => this.finalizeRegistration(registration, pricing.priceWei));
+      clearCommitmentRecord(this._environmentId ?? "unknown", this._tld, this.evmAddress!, label);
+    };
+
+    // Resolved BEFORE the retry block below, so a stale/expired/mismatched
+    // stored record never consumes the bare-revert retry's single attempt —
+    // that retry exists for a different failure mode entirely (register()'s
+    // dry-run racing commitment maturity), not for "no usable stored
+    // commitment".
+    const resumable = await this.resolveResumableCommitment(label, reverse);
+
+    try {
+      await doCommitAndRegister(resumable);
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      if (!isCommitmentTimingBarerevert(msg)) throw err;
+      // Commitment timing race: the register dry-run saw a block where the
+      // commitment was still too new (node lag) or had just expired. Generate
+      // a fresh commitment (new secret, new on-chain entry) and retry once.
+      // Bounded to one attempt so a real double-revert (label collision, PoP
+      // status mismatch) fails after two tries, not N.
+      console.log(`\n   Register bare-reverted (commitment timing race — node saw a block where commitment was too new or expired).`);
+      console.log(`   Retrying with a fresh commitment. This usually resolves in one block.\n`);
+      await doCommitAndRegister(null);
     }
   }
 
@@ -5531,40 +5823,11 @@ export class DotNS {
         rejectIneligible(requiredStatus, userStatus);
       }
 
-      const doCommitAndRegister = async (): Promise<void> => {
-        // v2 (needsPricingBeforeCommit): maxPrice + pricingVersion are part of
-        // the COMMITTED tuple, so pricing must be resolved before
-        // makeCommitment/commit — moved ahead of the commitment here. v1:
-        // pricingEarly stays null, so the call order below is byte-for-byte
-        // identical to before this change (generate → submit → wait → price →
-        // finalize) — this is the global constraint that v1 must never change.
-        const pricingEarly = this._adapter.needsPricingBeforeCommit
-          ? await withSpan("deploy.dotns.price-validation", "2a-0. price-validation", {}, () => this.getPriceAndValidate(label))
-          : null;
-        const { commitment, registration } = await this.generateCommitment(
-          label, reverse,
-          pricingEarly ? { priceWei: pricingEarly.priceWei, pricingVersion: pricingEarly.pricingVersion } : undefined,
-        );
-        await withSpan("deploy.dotns.submit-commitment", "2a-i. submit-commitment", {}, () => this.submitCommitment(commitment));
-        await withSpan("deploy.dotns.wait-commitment-age", "2a-ii. wait-commitment-age", {}, () => this.waitForCommitmentAge(commitment));
-        const pricing = pricingEarly ?? await withSpan("deploy.dotns.price-validation", "2a-iii. price-validation", {}, () => this.getPriceAndValidate(label));
-        await withSpan("deploy.dotns.finalize-registration", "2a-iv. finalize-registration", {}, () => this.finalizeRegistration(registration, pricing.priceWei));
-      };
-
-      try {
-        await doCommitAndRegister();
-      } catch (err) {
-        const msg = (err as Error).message ?? "";
-        if (!isCommitmentTimingBarerevert(msg)) throw err;
-        // Commitment timing race: the register dry-run saw a block where the
-        // commitment was still too new (node lag) or had just expired. Generate
-        // a fresh commitment (new secret, new on-chain entry) and retry once.
-        // Bounded to one attempt so a real double-revert (label collision, PoP
-        // status mismatch) fails after two tries, not N.
-        console.log(`\n   Register bare-reverted (commitment timing race — node saw a block where commitment was too new or expired).`);
-        console.log(`   Retrying with a fresh commitment. This usually resolves in one block.\n`);
-        await doCommitAndRegister();
-      }
+      // #1412: commit -> wait -> register, including the bare-revert retry
+      // and an attempt to resume a previously-persisted, still-valid
+      // commitment. Extracted to its own method — see commitAndRegister's
+      // doc comment.
+      await this.commitAndRegister(label, reverse);
 
       await this.verifyOwnership(label);
       console.log(`\n   Registration complete!`);

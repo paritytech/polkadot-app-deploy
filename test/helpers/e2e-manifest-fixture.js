@@ -41,9 +41,13 @@ const PNG_1X1 = Buffer.from(
  *                                began passing a label that already carried the env's TLD, which the
  *                                CLI rejected as a config/deploy domain mismatch (#1244).
  * @param {object} [opts.appManifest] An App v2 manifest; emits an App v2 executable instead of App v1.
+ * @param {Record<string, string[]>} [opts.trustedProducts] Passed straight through to
+ *                                `ProductConfig.trustedProducts` (#1484). Optional — omitted
+ *                                entirely from the written config when not given, matching every
+ *                                existing caller's config shape byte-for-byte.
  * @returns {{ sidecarDir: string, configPath: string, iconPath: string }}
  */
-export function buildManifestSidecar({ buildDir, label, tld = "dot", appManifest }) {
+export function buildManifestSidecar({ buildDir, label, tld = "dot", appManifest, trustedProducts }) {
   const sidecarDir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-manifest-"));
   const iconPath = path.join(sidecarDir, "icon.png");
   fs.writeFileSync(iconPath, PNG_1X1);
@@ -62,6 +66,7 @@ export function buildManifestSidecar({ buildDir, label, tld = "dot", appManifest
         ...(appManifest ? { manifest: appManifest } : { appVersion: [0, 0, 0] }),
       },
     ],
+    ...(trustedProducts !== undefined ? { trustedProducts } : {}),
   };
 
   const configPath = path.join(sidecarDir, "polkadot-app-deploy.config.mjs");

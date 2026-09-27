@@ -82,7 +82,7 @@ Key options:
 | `--to <0xH160>` | Recipient address for the `transfer` subcommand. Defaults to the signed-in account; the zero address is refused. |
 | `--js-merkle` | Use pure-JS merkleization (no IPFS Kubo binary required). |
 | `--no-manifest`, `--content-only` | Skip manifest publishing even when a `polkadot-app-deploy.config.*` is discoverable — plain content deploy. |
-| `--config <path>` | Explicit path to `polkadot-app-deploy.config.ts` for product deploys. |
+| `--config <path>` | Explicit path to `polkadot-app-deploy.config.ts` for product deploys. See [`docs/product-manifest.md`](docs/product-manifest.md). |
 | `--tag "..."` | Label the deploy in telemetry. |
 | `--version` | Print the installed version and exit. |
 

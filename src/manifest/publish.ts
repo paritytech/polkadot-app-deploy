@@ -37,18 +37,9 @@ import {
   type PopSelfServeConfig,
 } from "../environments.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
+import { composeExecutable, composeRoot } from "./compose.js";
 import type { LoadedProductConfig } from "./config-load.js";
 import { verifyEmbeddedAppManifests } from "./product-preflight.js";
-import type {
-  AppManifest,
-  ExecutableConfig,
-  ExecutableManifest,
-  FundingManifest,
-  ProductConfig,
-  RootManifest,
-  WidgetManifest,
-  WorkerManifest,
-} from "./types.js";
 
 export interface PublishManifestOptions {
   /** Loaded + validated product config (call loadProductConfig first). */
@@ -347,42 +338,6 @@ async function connectDotNS(
   const dotns = new DotNS();
   await dotns.connect(connectOpts);
   return dotns;
-}
-
-function composeRoot(config: ProductConfig, iconCid: string): RootManifest {
-  return {
-    $v: 1,
-    displayName: config.displayName,
-    description: config.description,
-    icon: { cid: iconCid, format: config.icon.format },
-  };
-}
-
-function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
-  if (exec.kind === "app") {
-    return "manifest" in exec
-      ? exec.manifest
-      : ({ $v: 1, kind: "app", appVersion: exec.appVersion } as AppManifest);
-  }
-  if (exec.kind === "widget") {
-    return {
-      $v: 1,
-      kind: "widget",
-      appVersion: exec.appVersion,
-      dimensions: exec.dimensions,
-      ...(exec.description !== undefined ? { description: exec.description } : {}),
-    } as WidgetManifest;
-  }
-  if (exec.kind === "funding") {
-    return { $v: 1, kind: "funding", appVersion: exec.appVersion, modes: exec.modes } as FundingManifest;
-  }
-  return {
-    $v: 1,
-    kind: "worker",
-    appVersion: exec.appVersion,
-    entrypoint: exec.entrypoint,
-    includes: exec.includes,
-  } as WorkerManifest;
 }
 
 // tld is a required param: this function's single caller (below) always

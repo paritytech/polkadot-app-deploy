@@ -416,6 +416,28 @@ function buildArgs(fixtureDir, label) {
   return args;
 }
 
+// Shared --product-name deploy args for S-PRODUCT-MANIFEST and
+// S-PRODUCT-MANIFEST-TRUSTED (#1484) — built here, not via buildArgs: that
+// adds --derivation-path for a pinned pool leg, which --product-name refuses
+// (it derives its own signer). NOT a general-purpose builder: "e2eproduct" is
+// hardcoded because both current callers target the same pre-owned fixture
+// (e2eprodman00.<tld>, owned by the account that name derives — see the
+// comment on S-PRODUCT-MANIFEST). A scenario needing a different product
+// name would need its own fixture anyway (see that same comment for why),
+// so take productName as a parameter here if that day comes rather than
+// assuming this generalizes as-is.
+function buildProductManifestArgs(fixtureDir, domain, configPath) {
+  return [
+    fixtureDir, domain,
+    "--tag", process.env.DEPLOY_TAG,
+    "--js-merkle",
+    "--env", E2E_ENV_ID,
+    "--mnemonic", ALICE_MNEMONIC,
+    "--product-name", "e2eproduct",
+    "--config", configPath,
+  ];
+}
+
 function buildInputCarArgs(dumpPath, label) {
   const args = ["--input-car", dumpPath, label, "--tag", process.env.DEPLOY_TAG];
   args.push("--env", E2E_ENV_ID);
@@ -2258,17 +2280,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld });
       try {
-        // Built here, not via buildArgs: that adds --derivation-path for a pinned
-        // pool leg, which --product-name refuses (it derives its own signer).
-        const args = [
-          fixtureDir, `${label}.${tld}`,
-          "--tag", process.env.DEPLOY_TAG,
-          "--js-merkle",
-          "--env", E2E_ENV_ID,
-          "--mnemonic", ALICE_MNEMONIC,
-          "--product-name", "e2eproduct",
-          "--config", configPath,
-        ];
+        const args = buildProductManifestArgs(fixtureDir, `${label}.${tld}`, configPath);
         const { code, stdout, stderr } = await runBulletinDeploy({ args, timeoutMs: DEPLOY_TIMEOUT_MS });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-PRODUCT-MANIFEST" });
 
@@ -2293,6 +2305,93 @@ describe("e2e", { skip: !ENABLED }, () => {
         const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
         const onChain = await readContenthashWithRetry(label, expected);
         assertOnChainMatches(onChain, expected, { scenario: "S-PRODUCT-MANIFEST", label });
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // #1484 point 5: "an e2e alongside #1471 (--product-name with a manifest
+  // publish) that round-trips a trustedProducts entry through the text
+  // record." composeRoot's normalizeTrustedProducts (src/manifest/compose.ts)
+  // is unit-tested directly in test/product-manifest.test.js — that proves
+  // the COMPOSER produces the right object, but says nothing about whether
+  // that object actually lands on chain byte-for-byte as the "manifest" text
+  // record's trustedProducts field. This scenario proves the real round
+  // trip: publish a config whose grants are deliberately unsorted and
+  // duplicated, then read back the SAME on-chain text record the deploy just
+  // wrote and assert on THAT — never on a local composeRoot() call, which
+  // would only prove the composer agrees with itself.
+  //
+  // Deliberately reuses S-PRODUCT-MANIFEST's fixed pre-owned domain/account
+  // (e2eprodman00.<tld>, owned by the account --product-name e2eproduct
+  // derives) instead of a fresh label: a fresh register costs ~211 PAS and
+  // the product-derived account's testnet auto-top-up only covers a fraction
+  // of that (see the comment on S-PRODUCT-MANIFEST above) — there is no
+  // other pre-owned --product-name fixture to target. Gated on the exact
+  // SAME `skip` predicate as S-PRODUCT-MANIFEST (not a new SCENARIO value)
+  // so this only ever runs as a SECOND describe in the SAME leg/process,
+  // never in a separate CI matrix leg that could run concurrently with it —
+  // two matrix legs writing the same text record on the same
+  // --product-name-derived account (no poolIndex to pin, same as
+  // S-PRODUCT-MANIFEST) would race both the DotNS nonce and the record
+  // itself. node:test runs top-level describes within one file sequentially
+  // by default (verified empirically); `concurrency: false` pins that
+  // explicitly so this never overlaps S-PRODUCT-MANIFEST's own write to the
+  // same domain. No e2e.yml matrix entry is needed for this reason — it
+  // rides the existing `s-product-manifest` leg.
+  describe("S-PRODUCT-MANIFEST-TRUSTED — trustedProducts round-trips through the manifest text record (#1484)", { skip: SCENARIO !== "s-product-manifest", concurrency: false }, () => {
+    test(`deploy with --product-name and a trustedProducts config writes the normalized grant on chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      const label = "e2eprodman00";
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      // Deliberately unsorted + duplicated: pins ordering, de-duplication AND
+      // the "all" collapse through one real round trip (composeRoot's
+      // normalizeTrustedProducts, src/manifest/compose.ts).
+      const trustedProducts = {
+        zed: ["storage", "all"],
+        alpha: ["context", "context"],
+      };
+      const expectedTrustedProducts = { alpha: ["context"], zed: ["all"] };
+      const { configPath, sidecarDir } = buildManifestSidecar({
+        buildDir: fixtureDir,
+        label: `${label}.${tld}`,
+        tld,
+        trustedProducts,
+      });
+      try {
+        const args = buildProductManifestArgs(fixtureDir, `${label}.${tld}`, configPath);
+        const { code, stdout, stderr } = await runBulletinDeploy({ args, timeoutMs: DEPLOY_TIMEOUT_MS });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-PRODUCT-MANIFEST-TRUSTED" });
+
+        const raw = await readTextRecordWithRetry(label, "manifest", E2E_ENV_ID, (r) => {
+          if (!r) return false;
+          try {
+            const parsed = JSON.parse(r);
+            return !!(parsed && typeof parsed === "object" && "trustedProducts" in parsed);
+          } catch { return false; }
+        });
+        assert.ok(raw,
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: the "manifest" text record on ${label}.${tld} read back empty after the deploy reported success — either the setTextRecord tx never landed, or the read raced the write past the retry budget.`);
+
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          assert.fail(`>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: the on-chain "manifest" text record is not valid JSON (${err.message}): ${raw.slice(0, 200)}`);
+        }
+
+        // Two checks, not one: deepEqual alone doesn't pin key ORDER (an
+        // object with the same keys reversed still deep-equals), so the
+        // value-shape check (dedup + "all" collapse) and the key-order check
+        // (sort) are asserted separately — together they pin everything the
+        // task's unsorted/duplicated input is meant to exercise in one
+        // real round trip.
+        assert.deepEqual(parsed.trustedProducts, expectedTrustedProducts,
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: on-chain trustedProducts is ${JSON.stringify(parsed.trustedProducts)}, expected ${JSON.stringify(expectedTrustedProducts)} — composeRoot's normalizeTrustedProducts should have deduped ["context","context"], collapsed ["storage","all"] to ["all"], and dropped neither key.`);
+        assert.deepEqual(Object.keys(parsed.trustedProducts ?? {}), Object.keys(expectedTrustedProducts),
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: on-chain trustedProducts key order is ${JSON.stringify(Object.keys(parsed.trustedProducts ?? {}))}, expected sorted order ${JSON.stringify(Object.keys(expectedTrustedProducts))} — composeRoot must sort keys before writing the text record.`);
       } finally {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
         fs.rmSync(sidecarDir, { recursive: true, force: true });

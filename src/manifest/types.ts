@@ -20,11 +20,34 @@ export interface Icon {
   format: IconFormat;
 }
 
+/**
+ * A grant one product's manifest issues to another product, naming what the
+ * grantee may do *to* the grantor when the Host mediates a cross-product
+ * interaction. See `RootManifest.trustedProducts` and the RFC's "Trusted
+ * products" section (paritytech/host-rust-core `docs/rfcs/product-manifest.md`):
+ * `"all"` is a superset wildcard covering every mediated interaction, present
+ * and future; `"storage"` covers read-only access to the grantor's
+ * host-local storage; `"context"` covers acting as the grantor's account —
+ * reading its identity and signing under its keys. A Host ignores any value
+ * it does not recognise rather than failing validation over it.
+ */
+export type Granted = "all" | "storage" | "context";
+
 export interface RootManifest {
   $v: 1;
   displayName: string;
   description: string;
   icon: Icon;
+  /**
+   * Pre-approved cross-product grants, keyed by the OTHER product's bare
+   * label (lowercase, no TLD suffix — e.g. `"wallet"`, never `"wallet.dot"`;
+   * the Host appends the TLD of the network it resolves against). Each entry
+   * says what that product may do *to this one*; it says nothing about the
+   * reverse direction. Absent, `{}`, and an empty grant array all mean "no
+   * grants" — the Host prompts for consent as usual. See the RFC's "Trusted
+   * products" section for full semantics.
+   */
+  trustedProducts?: Record<string, Granted[]>;
 }
 
 interface CommonExecutableFieldsV1 {
@@ -176,6 +199,12 @@ export interface ProductConfig {
   description: string;
   icon: IconConfig;
   executables: ExecutableConfig[];
+  /**
+   * What this product's `RootManifest.trustedProducts` should carry once
+   * published — same shape, same rules. See `Granted` and
+   * `RootManifest.trustedProducts` above.
+   */
+  trustedProducts?: Record<string, Granted[]>;
 }
 
 /**

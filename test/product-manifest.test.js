@@ -13,6 +13,7 @@ import {
   assertWithinBudget,
   getTextRecordBudgetBytes,
   DEFAULT_TEXT_RECORD_BUDGET_BYTES,
+  PLACEHOLDER_CID,
   loadProductConfig,
   preflightProductConfig,
   checkProductConfigFilesExist,
@@ -20,6 +21,7 @@ import {
   formatConfigLoadError,
 } from "../dist/index.js";
 import { registerOrEnsureResolver, domainMatchesEnvTld, manifestSignerOptions } from "../dist/manifest/publish.js";
+import { composeRoot } from "../dist/manifest/compose.js";
 import { NonRetryableError } from "../dist/errors.js";
 import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints, __selectStorageProviderModeForTest, resolveProductSigner } from "../dist/deploy.js";
 import { deriveProductSigner } from "../dist/product-account.js";
@@ -742,6 +744,264 @@ describe("pessimisticSizePreflight", () => {
     const report = pessimisticSizePreflight(config, 256);
     assert.equal(report.ok, false);
     assert.ok(report.checks.some(c => c.key.endsWith("#manifest") && !c.ok));
+  });
+
+  test("root check byte count agrees with composeRoot's own serialisation", () => {
+    // publish.ts and byte-budget.ts both compose the root manifest — this
+    // pins them to the same shared composer (src/manifest/compose.ts) so a
+    // future edit to one path can't silently drift from the other.
+    const report = pessimisticSizePreflight(VALID_CONFIG);
+    const rootCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(rootCheck);
+    const expectedBytes = Buffer.byteLength(
+      JSON.stringify(composeRoot(VALID_CONFIG, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    assert.equal(rootCheck.bytes, expectedBytes);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1484: composeRoot's normalizeTrustedProducts() decides what the host sees
+// as "no grants" (absence / {} / a per-key []), and pins the deterministic
+// key+grant ordering that keeps setTextRecord's skip-if-unchanged pre-check
+// working when a config is merely reordered, not substantively changed.
+// ---------------------------------------------------------------------------
+describe("composeRoot — trustedProducts (#1484)", () => {
+  test("includes an exact trustedProducts object when the config sets one", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: ["context"] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(manifest, {
+      $v: 1,
+      displayName: VALID_CONFIG.displayName,
+      description: VALID_CONFIG.description,
+      icon: { cid: PLACEHOLDER_CID, format: VALID_CONFIG.icon.format },
+      trustedProducts: { dim2: ["context"] },
+    });
+  });
+
+  test("omits trustedProducts entirely when the config doesn't set it", () => {
+    const manifest = composeRoot(VALID_CONFIG, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-absent: field must not appear on the manifest at all when the config never sets it",
+    );
+  });
+
+  test("omits trustedProducts when the config sets an empty object", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: {} };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-empty-object: {} must normalize to field-absent, not an empty-object literal",
+    );
+  });
+
+  test("omits trustedProducts when every key's grant array is empty", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: [] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-per-key-empty: a key with an empty grant array must be dropped, and dropping the only key must drop the field entirely",
+    );
+  });
+
+  test("de-duplicates grants within a key", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["context", "context"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(manifest.trustedProducts, { dim2: ["context"] });
+  });
+
+  test("sorts keys and grants so config ordering doesn't affect the serialised record", () => {
+    const configA = {
+      ...VALID_CONFIG,
+      trustedProducts: { zed: ["storage", "all"], alpha: ["context"] },
+    };
+    const configB = {
+      ...VALID_CONFIG,
+      trustedProducts: { alpha: ["context"], zed: ["all", "storage"] },
+    };
+    assert.equal(
+      JSON.stringify(composeRoot(configA, PLACEHOLDER_CID)),
+      JSON.stringify(composeRoot(configB, PLACEHOLDER_CID)),
+      ">> FAIL: composeRoot trustedProducts-ordering: differently-ordered but equivalent configs must serialise identically, or setTextRecord's skip-if-unchanged pre-check would bill a pointless on-chain write on every reorder",
+    );
+  });
+
+  // RFC line 142: "all" is a superset, not a peer — ["all", "storage"] IS
+  // ["all"]. Collapsing it both saves bytes against the only unbounded field
+  // in the 1024-byte budget, and keeps a purely cosmetic tidy-up from
+  // producing different bytes and defeating setTextRecord's
+  // skip-if-unchanged pre-check.
+  test("collapses a grant array containing 'all' down to exactly ['all']", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["all", "storage"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["all"] },
+      ">> FAIL: composeRoot trustedProducts-all-superset: ['all','storage'] must collapse to ['all'] per RFC 142",
+    );
+  });
+
+  test("leaves a grant array of just ['all'] unchanged", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: ["all"] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["all"] },
+      ">> FAIL: composeRoot trustedProducts-all-alone: ['all'] must stay ['all']",
+    );
+  });
+
+  test("leaves a grant array with no 'all' unchanged apart from sorting", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["storage", "context"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["context", "storage"] },
+      ">> FAIL: composeRoot trustedProducts-no-all: a grant array without 'all' must keep every recognised value, just sorted",
+    );
+  });
+
+  // RFC line 143: "A product listing itself is ignored." composeRoot has the
+  // full ProductConfig in hand, so the product's own bare label — domain up
+  // to the first '.' — is knowable without a chain call.
+  test("drops a key equal to the product's own label", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"], wallet: ["storage"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { wallet: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing: a key equal to the product's own bare label must be dropped per RFC 143",
+    );
+  });
+
+  test("omits trustedProducts entirely when the only key is the self-listing", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-self-listing-only-key: dropping the only key (the self-listing) must omit the field entirely, exactly like {}",
+    );
+  });
+
+  test("drops a self-listing key case-insensitively", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"], wallet: ["storage"] },
+    };
+    const upperDomainConfig = { ...config, domain: "DemoApp.dot" };
+    const manifest = composeRoot(upperDomainConfig, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { wallet: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing-case-insensitive: the self-listing match between config.domain's label and a trustedProducts key must be case-insensitive",
+    );
+  });
+
+  // Subname depth is deliberately unchecked (#1449), so a config domain can
+  // carry a modality subname. The product is then the label under the TLD,
+  // not the first one — reading the first segment would drop a grant issued
+  // to a different product that happens to share that subname's name.
+  test("takes the self-label from under the TLD, not the first segment, on a deep domain", () => {
+    const config = {
+      ...VALID_CONFIG,
+      domain: "worker.demoapp.dot",
+      trustedProducts: { worker: ["storage"], demoapp: ["all"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { worker: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing-deep-domain: on 'worker.demoapp.dot' the product is 'demoapp', so only that key may be dropped — dropping 'worker' would silently lose a grant to an unrelated product of that name",
+    );
+  });
+});
+
+describe("pessimisticSizePreflight — trustedProducts (#1484)", () => {
+  // Many keys x all three grants each, so the composed root JSON grows well
+  // past a small explicit budget without relying on BULLETIN_TEXT_BUDGET.
+  function bigTrustedProducts(n) {
+    const out = {};
+    for (let i = 0; i < n; i++) {
+      out[`product${String(i).padStart(3, "0")}dim`] = [
+        "all",
+        "storage",
+        "context",
+      ];
+    }
+    return out;
+  }
+
+  test("a large trustedProducts pushes the #manifest check over budget", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: bigTrustedProducts(20),
+    };
+    const bytesWithField = Buffer.byteLength(
+      JSON.stringify(composeRoot(config, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    const budget = bytesWithField - 1;
+
+    const report = pessimisticSizePreflight(config, budget);
+    const manifestCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(manifestCheck, ">> FAIL: pessimisticSizePreflight trustedProducts-over-budget: expected a '#manifest' check in the report");
+    assert.equal(
+      manifestCheck.ok,
+      false,
+      ">> FAIL: pessimisticSizePreflight trustedProducts-over-budget: composeRoot's shared use in the preflight must count trustedProducts bytes, but the #manifest check still passed",
+    );
+    assert.equal(report.ok, false);
+  });
+
+  test("the same budget passes once trustedProducts is absent (mirror)", () => {
+    const configWithField = {
+      ...VALID_CONFIG,
+      trustedProducts: bigTrustedProducts(20),
+    };
+    const bytesWithField = Buffer.byteLength(
+      JSON.stringify(composeRoot(configWithField, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    const budget = bytesWithField - 1;
+
+    const configWithoutField = { ...VALID_CONFIG };
+    delete configWithoutField.trustedProducts;
+
+    const report = pessimisticSizePreflight(configWithoutField, budget);
+    const manifestCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(manifestCheck, ">> FAIL: pessimisticSizePreflight trustedProducts-absent-mirror: expected a '#manifest' check in the report");
+    assert.equal(
+      manifestCheck.ok,
+      true,
+      ">> FAIL: pessimisticSizePreflight trustedProducts-absent-mirror: the same budget that failed with trustedProducts present must pass once it's absent",
+    );
   });
 });
 

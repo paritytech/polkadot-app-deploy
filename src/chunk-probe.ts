@@ -10,7 +10,12 @@ import { getLookupFn, getDynamicBuilder } from "@polkadot-api/metadata-builders"
 import { CID } from "multiformats/cid";
 import { captureWarning } from "./telemetry.js";
 
-export type ChunkProbeFailureReason = "rpc_error" | "decode_error" | "metadata_error";
+export type ChunkProbeFailureReason = "rpc_error" | "decode_error" | "metadata_error" | "timeout";
+
+/** A stalled socket, as opposed to a chain that answered with an error. */
+export class ChainProbeTimeoutError extends Error {
+  constructor(msg: string) { super(msg); this.name = "ChainProbeTimeoutError"; }
+}
 
 export type ChunkProbeResult =
   | { cid: string; present: false }
@@ -21,6 +26,22 @@ export interface ChainProbeOptions {
   client: any;
   batchSize?: number;
   atFinalized?: boolean;
+  /** Applies per request, not to a whole probeChunks call. */
+  requestTimeoutMs?: number;
+}
+
+// A stalled socket never rejects, so every read below needs its own ceiling.
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+
+function requestWithTimeout(client: any, method: string, params: any[], timeoutMs: number): Promise<any> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ChainProbeTimeoutError(`chunk-probe: ${method} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  // Inside a promise because a client stub without _request throws synchronously,
+  // escaping before .finally can clear the timer.
+  const request = Promise.resolve().then(() => client._request(method, params));
+  return Promise.race([request, timeout]).finally(() => clearTimeout(timer));
 }
 
 export class ChainProbeMetadataError extends Error {
@@ -74,10 +95,10 @@ export function _decodeStorageValue(hex: string | null | undefined): { block: nu
   return { block, index };
 }
 
-async function ensureMetadataChecked(client: any): Promise<void> {
+async function ensureMetadataChecked(client: any, timeoutMs: number): Promise<void> {
   if (_metadataChecked) return;
 
-  const metaHex: string = await client._request("state_getMetadata", []);
+  const metaHex: string = await requestWithTimeout(client, "state_getMetadata", [], timeoutMs);
   const decoded = decAnyMetadata(hexToBytes(metaHex));
   const unified = unifyMetadata(decoded);
 
@@ -109,7 +130,8 @@ async function crossValidateFirstHit(
   cid: string,
   block: number,
   index: number,
-  contentHashBytes: Uint8Array
+  contentHashBytes: Uint8Array,
+  timeoutMs: number
 ): Promise<void> {
   if (_crossValidated) return;
   _crossValidated = true;
@@ -125,7 +147,7 @@ async function crossValidateFirstHit(
       ...Blake2128Concat(blockBuf),
     ]).toString("hex");
 
-    const result = await client._request("state_queryStorageAt", [[txKey]]);
+    const result = await requestWithTimeout(client, "state_queryStorageAt", [[txKey]], timeoutMs);
     const hex: string | null = result[0]?.changes?.[0]?.[1];
     if (!hex) {
       // Can't validate — Transactions map may have a different key encoding.
@@ -150,20 +172,29 @@ async function crossValidateFirstHit(
 export async function probeChunks(cids: string[], options: ChainProbeOptions): Promise<ChunkProbeResult[]> {
   if (cids.length === 0) return [];
 
-  const { client, batchSize = DEFAULT_BATCH_SIZE, atFinalized } = options;
+  const { client, batchSize = DEFAULT_BATCH_SIZE, atFinalized, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = options;
 
   try {
-    await ensureMetadataChecked(client);
+    await ensureMetadataChecked(client, requestTimeoutMs);
   } catch (e) {
     if (e instanceof ChainProbeMetadataError) throw e;
-    return cids.map((cid) => ({ cid, present: null as null, failureReason: "metadata_error" as const }));
+    const reason = e instanceof ChainProbeTimeoutError ? "timeout" as const : "metadata_error" as const;
+    captureWarning(`chunk-probe: metadata read ${reason}`, { error: String(e).slice(0, 200) });
+    return cids.map((cid) => ({ cid, present: null as null, failureReason: reason }));
   }
 
   let atHash: string | undefined;
   if (atFinalized) {
     try {
-      atHash = await client._request("chain_getFinalizedHead", []);
+      atHash = await requestWithTimeout(client, "chain_getFinalizedHead", [], requestTimeoutMs);
     } catch (e) {
+      // Falling back to best-chain here would answer a "is it finalised?"
+      // question with "it is in some block", and a caller would publish a root
+      // that GRANDPA has not sealed. Report no answer instead.
+      if (e instanceof ChainProbeTimeoutError) {
+        captureWarning("chunk-probe: chain_getFinalizedHead timed out", { error: String(e).slice(0, 200) });
+        return cids.map((cid) => ({ cid, present: null as null, failureReason: "timeout" as const }));
+      }
       captureWarning("chunk-probe: chain_getFinalizedHead failed, probing best-chain", { error: String(e).slice(0, 200) });
     }
   }
@@ -177,11 +208,13 @@ export async function probeChunks(cids: string[], options: ChainProbeOptions): P
 
     let changes: [string, string | null][];
     try {
-      const rpcResult = await client._request("state_queryStorageAt", atHash ? [batchKeys, atHash] : [batchKeys]);
+      const rpcResult = await requestWithTimeout(client, "state_queryStorageAt", atHash ? [batchKeys, atHash] : [batchKeys], requestTimeoutMs);
       changes = rpcResult[0]?.changes ?? [];
-    } catch {
+    } catch (e) {
+      const reason = e instanceof ChainProbeTimeoutError ? "timeout" as const : "rpc_error" as const;
+      if (reason === "timeout") captureWarning("chunk-probe: storage query timed out", { error: String(e).slice(0, 200) });
       for (let i = 0; i < batchCids.length; i++) {
-        results[start + i] = { cid: batchCids[i], present: null, failureReason: "rpc_error" };
+        results[start + i] = { cid: batchCids[i], present: null, failureReason: reason };
       }
       continue;
     }
@@ -213,7 +246,7 @@ export async function probeChunks(cids: string[], options: ChainProbeOptions): P
       results[start + i] = { cid, present: true, block: decoded.block, index: decoded.index };
 
       if (!_crossValidated) {
-        await crossValidateFirstHit(client, cid, decoded.block, decoded.index, batchDigests[i]);
+        await crossValidateFirstHit(client, cid, decoded.block, decoded.index, batchDigests[i], requestTimeoutMs);
       }
     }
 
@@ -287,9 +320,9 @@ export async function probeFinalityGap(
  * must treat `null` as "can't tell" and fail open (proceed as if live)
  * rather than blocking forever on a single bad peer.
  */
-export async function getBestBlockNumber(client: any): Promise<number | null> {
+export async function getBestBlockNumber(client: any, requestTimeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS): Promise<number | null> {
   try {
-    const header = await client._request("chain_getHeader", []);
+    const header = await requestWithTimeout(client, "chain_getHeader", [], requestTimeoutMs);
     const hex = header?.number;
     if (typeof hex !== "string") return null;
     const n = parseInt(hex, 16);

@@ -582,6 +582,20 @@ function okProbeResult() {
   };
 }
 
+// #1587: resolveSubnodeOwnerShape now dry-runs TWO distinct encodings of
+// setSubnodeOwner (the v0.7+ 5-field tuple, then — only on a bare revert of
+// that first probe — the legacy 4-field tuple), so the shape-probe stubs
+// below need to tell the two apart by selector rather than returning the
+// same canned result for every performDryRunCall invocation.
+const V07_SET_SUBNODE_OWNER_SELECTOR = toFunctionSelector("setSubnodeOwner((bytes32,string,string,address,bool))");
+const LEGACY_SET_SUBNODE_OWNER_SELECTOR = toFunctionSelector("setSubnodeOwner((bytes32,string,string,address))");
+
+// Shared dispatcher for the common "v0.7+ bare-reverts, legacy confirms" case
+// several tests below drive resolveSubnodeOwnerShape's fallback through.
+function v07BareRevertLegacyOk(encodedData) {
+  return encodedData.slice(0, 10) === V07_SET_SUBNODE_OWNER_SELECTOR ? bareRevertProbeResult() : okProbeResult();
+}
+
 // A transferSubname stub whose subname ownership is STATEFUL — the post-tx
 // owner() read reflects whatever contractTransaction's setSubnodeOwner call
 // actually wrote — so the same `d` can be driven through transferSubname
@@ -648,13 +662,30 @@ function stubSubnameForShapeProbe({
   return { d, getProbeCalls: () => probeCalls, getSubmittedCalls: () => submittedCalls };
 }
 
-test("transferSubname: setSubnodeOwner shape probe falls back to the legacy 4-field tuple on a bare (selector-not-found) revert", async () => {
+// #1587: falling back to "legacy" now requires the legacy 4-field encoding
+// to ALSO be dry-run and confirmed (not bare-reverting) before it's trusted
+// — a lone v0.7+ bare revert is no longer sufficient on its own, since it can
+// have unrelated causes (a failed authorization check, a transient node
+// issue) that have nothing to do with which tuple shape the chain accepts.
+test("transferSubname: setSubnodeOwner shape probe falls back to the legacy 4-field tuple only after confirming the legacy dry-run does NOT also bare-revert (#1587)", async () => {
+  const seenSelectors = new Set();
   const { d, getProbeCalls, getSubmittedCalls } = stubSubnameForShapeProbe({
-    probeDryRunCall: bareRevertProbeResult,
+    probeDryRunCall: (encodedData) => {
+      const selector = encodedData.slice(0, 10);
+      seenSelectors.add(selector);
+      return selector === V07_SET_SUBNODE_OWNER_SELECTOR ? bareRevertProbeResult() : okProbeResult();
+    },
   });
   const r = await d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111");
+  assert.ok(
+    seenSelectors.has(LEGACY_SET_SUBNODE_OWNER_SELECTOR),
+    ">> FAIL: setSubnodeOwner shape probe legacy fallback: expected the confirmation dry-run to actually use the legacy 4-field selector",
+  );
   assert.equal(r.status, "ok", `>> FAIL: setSubnodeOwner shape probe legacy fallback: expected status "ok", got "${r.status}"`);
-  assert.equal(getProbeCalls(), 1, ">> FAIL: setSubnodeOwner shape probe legacy fallback: expected exactly one probe dry-run call");
+  assert.equal(
+    getProbeCalls(), 2,
+    ">> FAIL: setSubnodeOwner shape probe legacy fallback: expected exactly two probe dry-run calls (#1587: the v0.7+ bare revert must be confirmed by also dry-running the legacy shape before it is cached)",
+  );
   const [{ abi, args }] = getSubmittedCalls();
   assert.equal(
     abi[0].inputs[0].components.length, 4,
@@ -663,6 +694,72 @@ test("transferSubname: setSubnodeOwner shape probe falls back to the legacy 4-fi
   assert.ok(
     !("persist" in args[0]),
     ">> FAIL: setSubnodeOwner shape probe legacy fallback: submitted args must not carry a persist field on the legacy 4-field shape",
+  );
+});
+
+// #1587 acceptance test: a v0.7+ bare revert for an UNRELATED reason (e.g. a
+// failed authorization check, or a transient node issue) must not be blindly
+// trusted as "chain predates v0.7" — if the legacy shape ALSO bare-reverts,
+// neither selector was actually found, so nothing should be cached and the
+// caller must get a clear, actionable error rather than a silently wrong
+// shape pinned for the rest of the connection.
+test("transferSubname: setSubnodeOwner shape probe does not cache 'legacy' when both the v0.7+ and legacy dry-runs bare-revert, and throws a clear error naming both attempts (#1587)", async () => {
+  // Legacy leg bare-reverts too (both-bare-revert) until flipped below —
+  // the v0.7+ leg always bare-reverts throughout this test.
+  let legacyAlsoBareReverts = true;
+  const { d, getProbeCalls, getSubmittedCalls } = stubSubnameForShapeProbe({
+    probeDryRunCall: (encodedData) => (
+      encodedData.slice(0, 10) === V07_SET_SUBNODE_OWNER_SELECTOR || legacyAlsoBareReverts
+        ? bareRevertProbeResult()
+        : okProbeResult()
+    ),
+  });
+  await assert.rejects(
+    () => d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111"),
+    (err) => {
+      assert.match(err.message, /v0\.7/i, ">> FAIL: #1587 both-bare-revert error: message must name the v0.7+ attempt");
+      assert.match(err.message, /legacy/i, ">> FAIL: #1587 both-bare-revert error: message must name the legacy attempt");
+      return true;
+    },
+    ">> FAIL: #1587 both-bare-revert: when both the v0.7+ and legacy setSubnodeOwner encodings bare-revert, resolveSubnodeOwnerShape must throw a clear error instead of silently caching 'legacy'",
+  );
+  assert.equal(
+    getSubmittedCalls().length, 0,
+    ">> FAIL: #1587 both-bare-revert: setSubnodeOwner must never be submitted when neither shape's dry-run was confirmed",
+  );
+  assert.equal(getProbeCalls(), 2, ">> FAIL: #1587 both-bare-revert: expected exactly two probe dry-run calls (v0.7+, then legacy)");
+
+  // Prove nothing was cached (behaviourally, not by reaching into the
+  // instance's internals): flip the legacy leg to confirm-not-bare-revert
+  // and retry on the SAME instance — a wrongly-cached verdict would skip
+  // straight to submission with zero further probe calls; the correct,
+  // uncached behaviour re-probes both legs again before it can succeed.
+  legacyAlsoBareReverts = false;
+  const r = await d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111");
+  assert.equal(r.status, "ok", ">> FAIL: #1587 both-bare-revert: a retry after the legacy dry-run stops bare-reverting must succeed, proving the earlier failure was never cached");
+  assert.equal(getProbeCalls(), 4, ">> FAIL: #1587 both-bare-revert: the retry must re-probe both the v0.7+ and legacy shapes again (2 more calls), proving the failed attempt left no cached shape behind");
+});
+
+// The legacy leg can also revert WITH data (the legacy selector exists, but
+// this specific write is rejected for a real reason) — that confirms the
+// legacy shape (it's the SAME real-rejection-vs-shape-mismatch distinction
+// the v0.7+ leg above already makes), so it must propagate the real failure
+// immediately rather than being swallowed into treating it as "legacy" and
+// silently re-attempting the same doomed write a second time.
+test("transferSubname: setSubnodeOwner shape probe propagates a legacy revert WITH data as a real rejection, confirming (but not silently proceeding on) the legacy shape (#1587)", async () => {
+  const { d, getSubmittedCalls } = stubSubnameForShapeProbe({
+    probeDryRunCall: (encodedData) => (
+      encodedData.slice(0, 10) === V07_SET_SUBNODE_OWNER_SELECTOR ? bareRevertProbeResult() : revertWithDataProbeResult("0x1648fd01")
+    ),
+  });
+  await assert.rejects(
+    () => d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111"),
+    /Contract execution would revert/,
+    ">> FAIL: #1587 legacy revert-with-data: a revert WITH data on the legacy probe is a real rejection and must propagate, not be silently treated as a successful shape resolution",
+  );
+  assert.equal(
+    getSubmittedCalls().length, 0,
+    ">> FAIL: #1587 legacy revert-with-data: setSubnodeOwner must never be submitted when the legacy probe itself reverted with data",
   );
 });
 
@@ -720,13 +817,13 @@ test("transferSubname: setSubnodeOwner shape probe propagates a revert WITH data
 
 test("setSubnodeOwner shape is cached per connection: a second subname write does not re-probe", async () => {
   const { d, getProbeCalls, getSubmittedCalls } = stubSubnameForShapeProbe({
-    probeDryRunCall: bareRevertProbeResult,
+    probeDryRunCall: v07BareRevertLegacyOk,
   });
   await d.transferSubname("app", "foo", "0x2222222222222222222222222222222222222222");
-  assert.equal(getProbeCalls(), 1, ">> FAIL: setSubnodeOwner shape cache: expected the first subname write to probe exactly once");
+  assert.equal(getProbeCalls(), 2, ">> FAIL: setSubnodeOwner shape cache: expected the first subname write to probe exactly twice (#1587: v0.7+ bare revert confirmed by a legacy dry-run)");
   await d.transferSubname("app", "foo", "0x3333333333333333333333333333333333333333");
   assert.equal(
-    getProbeCalls(), 1,
+    getProbeCalls(), 2,
     ">> FAIL: setSubnodeOwner shape cache: a second subname write in the same connection re-probed instead of reusing the cached shape",
   );
   assert.equal(getSubmittedCalls().length, 2, ">> FAIL: setSubnodeOwner shape cache: expected both writes to actually submit a setSubnodeOwner transaction");
@@ -805,7 +902,8 @@ test("setSubnodeOwner shape cache is shared across call sites: registerSubdomain
     performDryRunCall: async (_origin, _addr, _value, encodedData) => {
       if (encodedData.slice(0, 10) === IS_AUTHORISED_SELECTOR) return bareRevertProbeResult();
       probeCalls += 1;
-      return bareRevertProbeResult();
+      // #1587: v0.7+ bare-reverts, confirmed by a legacy leg that doesn't.
+      return v07BareRevertLegacyOk(encodedData);
     },
   };
 
@@ -825,14 +923,14 @@ test("setSubnodeOwner shape cache is shared across call sites: registerSubdomain
     return { kind: "hash", hash: "0xsub" };
   };
   await d.transferSubname("app", "foo", "0x1111111111111111111111111111111111111111");
-  assert.equal(probeCalls, 1, ">> FAIL: setSubnodeOwner shape cache (cross-call-site): expected transferSubname to probe exactly once");
+  assert.equal(probeCalls, 2, ">> FAIL: setSubnodeOwner shape cache (cross-call-site): expected transferSubname to probe exactly twice (#1587: v0.7+ bare revert confirmed by a legacy dry-run)");
 
   // --- leg 2: registerSubdomain must reuse the cached shape, no new probe ---
   let submittedCalls = null;
   d.submitBatchedContractCalls = async (calls) => { submittedCalls = calls; return { kind: "hash", hash: "0xreg" }; };
   await d.registerSubdomain("mywallet", "myapp");
   assert.equal(
-    probeCalls, 1,
+    probeCalls, 2,
     ">> FAIL: setSubnodeOwner shape cache (cross-call-site): registerSubdomain re-probed even though transferSubname already resolved the shape earlier on this same connection",
   );
   const setSubnodeOwnerCall = submittedCalls.find((c) => c.functionName === "setSubnodeOwner");

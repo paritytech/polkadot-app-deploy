@@ -3892,61 +3892,38 @@ export class DotNS {
    *  file (see computeDomainTokenId's doc comment). Fixed here the same way:
    *  derive every node from `this._tld`, resolved by connect(), not a literal. */
   /**
-   * bulletin-deploy #1435/#1453: resolve — once per connection — which
-   * `setSubnodeOwner` tuple shape this chain's DOTNS_REGISTRY accepts, and
-   * cache the verdict on `_subnodeOwnerShape` for the rest of this
-   * connection's life. Called by buildSetSubnodeOwnerCall on the first
-   * subname write (register or transfer, whichever runs first); every
-   * subsequent subname write in the same connection reuses the cached shape
-   * with no further chain I/O.
+   * Dry-run ONE setSubnodeOwner encoding (v0.7+ or legacy) against
+   * `sampleRecord` and classify the result — shared by both legs
+   * resolveSubnodeOwnerShape probes, so the encode/dry-run/classify/format
+   * steps exist exactly once regardless of which shape is being tried:
    *
-   * There is no read-only capability probe for this (v0.7 adds no new
-   * function/contract to probe), so this probes the WRITE itself: dry-run
-   * the v0.7+ (5-field, `persist: true`) encoding against `sampleRecord`
-   * first (a dry run commits no state, so this never spends a fee or
-   * mutates the registry). Three outcomes:
-   *
-   *   - The dry run succeeds → this chain is on v0.7+; cache "v07".
-   *   - The dry run bare-reverts (empty `0x` data, flags=1 — i.e. no
-   *     function matches this selector at all) → this chain predates v0.7;
-   *     cache "legacy" and fall back to the 4-field encoding.
-   *   - The dry run reverts WITH data → the 5-field function EXISTS and
-   *     rejected the call for a real reason (bad parent, not authorised,
-   *     etc.) — that is a genuine failure of the caller's actual write, not
-   *     a shape mismatch, so it propagates immediately rather than being
-   *     swallowed into a fallback attempt.
-   *
-   * `sampleRecord` is the actual record the caller is about to write (not a
-   * throwaway probe payload) — probing with real args means a chain that
-   * genuinely rejects this specific write (e.g. the signer doesn't own the
-   * parent) reports that real reason here, on the first (probe) dry run.
-   *
-   * `persist: true` on the probe matches what buildSetSubnodeOwnerCall
-   * submits (#1453: `persist: false` reverts NotAuthorised from a
-   * non-controller on DotNS v0.8.0), so a stale `false` here would revert
-   * during the probe before the real write got a chance.
+   *   - "ok": the dry run succeeded — this IS the chain's accepted shape.
+   *   - "bare-revert": selector not found (empty `0x` data, flags=1) — no
+   *     evidence either way; the caller decides what that means.
+   *   - "revert-with-data": the function exists and rejected this specific
+   *     write for a real reason — the shape is confirmed, but the write
+   *     itself is invalid, so the caller gets a ready-to-throw message.
    */
-  private async resolveSubnodeOwnerShape(sampleRecord: { parentNode: string; subLabel: string; parentLabel: string; owner: string }): Promise<"legacy" | "v07"> {
-    if (this._subnodeOwnerShape !== null) return this._subnodeOwnerShape;
-    this.ensureConnected();
+  private async probeSetSubnodeOwnerLeg(
+    abi: readonly any[],
+    args: any[],
+  ): Promise<
+    | { outcome: "ok" }
+    | { outcome: "bare-revert"; revertData: string | undefined; revertFlags: bigint | undefined }
+    | { outcome: "revert-with-data"; message: string }
+  > {
     if (!this.clientWrapper) throw new Error("resolveSubnodeOwnerShape: polkadot-api client not available");
     const contractAddress = this._contracts.DOTNS_REGISTRY;
-    const v07Abi: readonly any[] = DOTNS_REGISTRY_SET_SUBNODE_OWNER_ABI_V07;
-    const v07Args: any[] = [{ ...sampleRecord, persist: true }];
-    const encodedCallData = encodeFunctionData({ abi: v07Abi, functionName: "setSubnodeOwner", args: v07Args });
+    const encodedCallData = encodeFunctionData({ abi, functionName: "setSubnodeOwner", args });
     const callResult = await this.clientWrapper.performDryRunCall(this.substrateAddress!, contractAddress, 0n, encodedCallData);
-    if (callResult.result.isOk) {
-      this._subnodeOwnerShape = "v07";
-      return "v07";
-    }
+    if (callResult.result.isOk) return { outcome: "ok" };
     const errorData = callResult.result.value;
     const revertData: string | undefined = errorData?.data;
     const revertFlags: bigint | undefined = errorData?.flags;
-    if (!isBareRevertResult(revertData, revertFlags)) {
-      // A real rejection of the v0.7+ shape — this chain accepts a selector
-      // this doesn't bare-revert on, and the actual write is invalid for a
-      // real reason. Propagate rather than falling back to the legacy shape.
-      throw new Error(formatContractDryRunFailure({
+    if (isBareRevertResult(revertData, revertFlags)) return { outcome: "bare-revert", revertData, revertFlags };
+    return {
+      outcome: "revert-with-data",
+      message: formatContractDryRunFailure({
         revertData,
         revertFlags,
         gasConsumed: callResult.gasConsumed,
@@ -3959,14 +3936,92 @@ export class DotNS {
         signerEvmAddress: this.evmAddress ?? undefined,
         value: 0n,
         encodedData: encodedCallData,
-        args: v07Args,
+        args,
         contracts: this._contracts,
-      }));
+      }),
+    };
+  }
+
+  /**
+   * bulletin-deploy #1435/#1453/#1587: resolve — once per connection — which
+   * `setSubnodeOwner` tuple shape this chain's DOTNS_REGISTRY accepts, and
+   * cache the verdict on `_subnodeOwnerShape` for the rest of this
+   * connection's life. Called by buildSetSubnodeOwnerCall on the first
+   * subname write; every subsequent subname write in the same connection
+   * reuses the cached shape with no further chain I/O.
+   *
+   * There is no read-only capability probe for this (v0.7 adds no new
+   * function/contract to probe), so this probes the WRITE itself via
+   * probeSetSubnodeOwnerLeg, v0.7+ first then, only if needed, legacy:
+   *
+   *   - v0.7+ "ok" → cache "v07".
+   *   - v0.7+ "revert-with-data" → a real rejection (bad parent, not
+   *     authorised, etc.), not a shape mismatch — propagate immediately
+   *     rather than falling back to legacy (which would also fail, just
+   *     with a less informative error, masking the real cause).
+   *   - v0.7+ "bare-revert" → #1587: NOT proof this chain predates v0.7 on
+   *     its own — a bare revert can have unrelated causes (a failed
+   *     authorization check that reverts before the runtime ever dispatches
+   *     to a selector, a transient node issue), so it's only the TRIGGER to
+   *     also probe the legacy 4-field encoding, never cached on its own:
+   *       - legacy "ok" or "revert-with-data" (selector found either way)
+   *         → confirmed; cache "legacy" (a revert-with-data still
+   *         propagates immediately, same reasoning as the v0.7+ case).
+   *       - legacy ALSO "bare-revert" → neither shape's selector was found
+   *         at all; nothing is cached (so a retry re-probes rather than
+   *         replaying a bad guess) and a clear error names both attempts.
+   *
+   * `sampleRecord` is the actual record the caller is about to write (not a
+   * throwaway probe payload), so a genuine rejection (e.g. the signer
+   * doesn't own the parent) surfaces here rather than a second time once
+   * the real submission's own internal dry run repeats the same call.
+   *
+   * `persist: true` on the v0.7+ probe matches what buildSetSubnodeOwnerCall
+   * submits (#1453: `persist: false` reverts NotAuthorised from a
+   * non-controller on DotNS v0.8.0), so a stale `false` here would revert
+   * during the probe before the real write got a chance.
+   */
+  private async resolveSubnodeOwnerShape(sampleRecord: { parentNode: string; subLabel: string; parentLabel: string; owner: string }): Promise<"legacy" | "v07"> {
+    if (this._subnodeOwnerShape !== null) return this._subnodeOwnerShape;
+    this.ensureConnected();
+    if (!this.clientWrapper) throw new Error("resolveSubnodeOwnerShape: polkadot-api client not available");
+
+    const v07Result = await this.probeSetSubnodeOwnerLeg(DOTNS_REGISTRY_SET_SUBNODE_OWNER_ABI_V07, [{ ...sampleRecord, persist: true }]);
+    if (v07Result.outcome === "ok") {
+      this._subnodeOwnerShape = "v07";
+      return "v07";
     }
-    // Bare revert on the v0.7+ shape (selector not found) → this chain
-    // predates v0.7; fall back to the legacy 4-field encoding.
-    this._subnodeOwnerShape = "legacy";
-    return "legacy";
+    // Real rejection, not a shape mismatch — see doc comment above.
+    if (v07Result.outcome === "revert-with-data") throw new Error(v07Result.message);
+
+    // #1587: v0.7+ bare-revert is only a trigger — confirm via the legacy
+    // leg before trusting it (see doc comment above).
+    const legacyResult = await this.probeSetSubnodeOwnerLeg(DOTNS_REGISTRY_ABI, [sampleRecord]);
+    if (legacyResult.outcome === "ok") {
+      this._subnodeOwnerShape = "legacy";
+      return "legacy";
+    }
+    if (legacyResult.outcome === "revert-with-data") {
+      // Legacy selector confirmed, but still a real rejection of this
+      // write — propagate immediately (see doc comment above).
+      this._subnodeOwnerShape = "legacy";
+      throw new Error(legacyResult.message);
+    }
+
+    // Both bare-reverted — neither shape confirmed. Don't cache (a retry
+    // re-probes rather than replaying a bad guess); throw naming both
+    // attempts (see doc comment above).
+    const contractAddress = this._contracts.DOTNS_REGISTRY;
+    throw new Error(
+      [
+        `setSubnodeOwner shape probe inconclusive on ${dotnsContractName(contractAddress, this._contracts)} (${contractAddress}): both the v0.7+ (5-field) and legacy (4-field) encodings reverted with no selector match.`,
+        `  This is not the ordinary "chain predates v0.7" fallback (that only bare-reverts the v0.7+ shape) — neither shape's function was found here, so the shape could not be confirmed.`,
+        `  Likely causes: DOTNS_REGISTRY misconfigured for this environment, an unrelated failure (e.g. a failed authorization check) reverting before the call ever dispatches to a selector, or a transient RPC/node issue.`,
+        `  v0.7+ attempt:   flags=${v07Result.revertFlags?.toString() ?? "unknown"} data=${v07Result.revertData ?? "0x"}`,
+        `  legacy attempt:  flags=${legacyResult.revertFlags?.toString() ?? "unknown"} data=${legacyResult.revertData ?? "0x"}`,
+        `  signer: ${this.substrateAddress ?? "unknown"}${this.evmAddress ? ` (${this.evmAddress})` : ""}`,
+      ].join("\n"),
+    );
   }
 
   /**

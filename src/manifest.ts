@@ -52,7 +52,8 @@ const STABLE_EXTENSIONS = new Set([
 
 // Bundler content-hash patterns: -<6+ hex>, -<6+ alnum>, .<6+ hex>.<ext>.
 // Examples: main-AbcDef12.js, vendor.a1b2c3d4.css, runtime-Xyz789.wasm.
-// {6,16} relaxed from v2's {8,} per PR #11 measurements (Vite hashes can be 6).
+// Lower bound {6,} relaxed from v2's {8,} per PR #11 measurements (Vite
+// hashes can be 6).
 //
 // #1355: the alnum class alone (`[A-Za-z0-9]`) missed Vite/Rollup's actual
 // hash alphabet, which is base64url (`A-Za-z0-9_-`) — e.g. errors-CHrKVge_.js,
@@ -68,7 +69,21 @@ const STABLE_EXTENSIONS = new Set([
 // that chunking is a pure function of content). Measured against
 // test/fixtures/realistic-vite/v1/assets/ (59 files): 14 failed the old
 // alnum-only class, 0 fail this one.
-const CONTENT_HASH_RE = /[-.](?:[a-f0-9]{6,16}|[A-Za-z0-9_-]{6,16})\.[a-zA-Z0-9]+$/;
+//
+// #1390: the old upper bound of 16 was narrower than common bundler digest
+// lengths, so a stock webpack config's whole JS/CSS bundle fell through to
+// "volatile" and re-uploaded every deploy. The two branches take different
+// caps because they carry different false-positive risk — the alnum branch
+// already accepts "-" and ordinary words, per #1355 above:
+// - hex: 32, the length of an md5 digest, the longest hash shape mainstream
+//   bundlers emit. webpack's 20-char `output.hashDigestLength` default and
+//   the issue's 17/20/32-char cases are all hex and sit inside it.
+// - alnum/base64url: 20, webpack's `hashDigestLength` default exactly, which
+//   is also the only non-hex case in the issue's table. Reusing the hex
+//   branch's 32 here would flip a 21-32 char ordinary segment such as
+//   "data-longdescriptivefilename.json" from volatile to stable — the
+//   regression test pins that.
+const CONTENT_HASH_RE = /[-.](?:[a-f0-9]{6,32}|[A-Za-z0-9_-]{6,20})\.[a-zA-Z0-9]+$/;
 
 export function isVolatilePath(p: string): boolean {
   return p.startsWith(`${MANIFEST_DIR}/`) || p === MANIFEST_DIR;
@@ -88,9 +103,6 @@ export function classifyFileHeuristic(filePath: string, framework?: string | nul
   if (ext && STABLE_EXTENSIONS.has(ext)) return "stable";
   if (framework === "next") {
     if (filePath.startsWith("_next/static/")) return "stable";
-  }
-  if (framework === "vite") {
-    if (filePath.startsWith("assets/") && CONTENT_HASH_RE.test(filePath)) return "stable";
   }
   return "volatile";
 }

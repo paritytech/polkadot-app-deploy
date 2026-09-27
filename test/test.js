@@ -33,7 +33,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
 import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingTransactions, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
-import { classifyFile, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
+import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
 import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest, classifyFinalityGap, probeFinalityGap, getBestBlockNumber } from "../dist/chunk-probe.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
@@ -11119,6 +11119,84 @@ describe("manifest (incremental-upload-v2)", () => {
     test("documents the accepted false-positive surface from widening the hash class", () => {
       assert.equal(classifyFile("vendor-bundle.js"), "stable"); // pre-existing, not new
       assert.equal(classifyFile("report-2026-09-04.json"), "stable"); // new surface: multi-hyphen numeric run now bridges via "-"
+    });
+
+    // #1390: CONTENT_HASH_RE's hash-segment length was capped at {6,16}.
+    // webpack's `output.hashDigestLength` defaults to 20, and md5-style
+    // digests are 32 hex characters — both longer than the old cap, so a
+    // stock webpack build had every content-hashed JS/CSS asset
+    // misclassified "volatile" and re-uploaded on every deploy despite
+    // being byte-identical. Cap raised from 16 to 32: exactly covers
+    // md5-length (32 hex) digests, the longest hash shape actually in use
+    // by mainstream bundlers, while still refusing an unbounded segment
+    // (see the "one char over the new cap" case below). Table reproduced
+    // verbatim from the issue body, confirmed failing under the pre-fix
+    // regex before this change.
+    test("treats webpack-default (20-char) and md5-style (32-char) hash suffixes as stable (#1390)", () => {
+      assert.equal(classifyFile("index-a1b2c3d4.js"), "stable", ">> FAIL: vite/rollup 8-char base64url hash: expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8.js"), "stable", ">> FAIL: 16 hex (old cap boundary): expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b81.js"), "stable", ">> FAIL: 17 hex (one over the old cap): expected stable after raising the bound");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8c9d0.js"), "stable", ">> FAIL: 20 hex (webpack output.hashDigestLength default): expected stable");
+      assert.equal(classifyFile("main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6.js"), "stable", ">> FAIL: 32 hex (md5-style digest): expected stable");
+      assert.equal(classifyFile("app.abcdefghijklmnopqrst.css"), "stable", ">> FAIL: 20 alnum: expected stable");
+    });
+
+    // Negative: each branch's cap must still be finite and independent —
+    // one character past either bound must stay volatile. Proves the fix
+    // raised each ceiling rather than removing it (the issue explicitly
+    // warns against widening "so far that a normal word-with-digits
+    // filename becomes stable").
+    test("still treats a segment one character over either branch's cap as volatile (#1390)", () => {
+      assert.equal(
+        classifyFile("main.a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e.js"),
+        "volatile",
+        ">> FAIL: 33 hex (one over the hex branch's new cap): expected volatile, cap must stay finite"
+      );
+      assert.equal(
+        classifyFile("app.abcdefghijklmnopqrstu.css"),
+        "volatile",
+        ">> FAIL: 21 non-hex alnum (one over the alnum branch's cap): expected volatile, cap must stay finite"
+      );
+    });
+
+    // Negative: the alnum/base64url branch is capped at 20 (webpack's
+    // hashDigestLength default), not reused from the hex branch's 32 —
+    // deliberately narrower, since that branch already accepts ordinary
+    // words and "-" (per #1355 above). A 21-32 char ordinary,
+    // descriptive-looking filename segment must stay volatile: raising
+    // the hex cap for real md5 digests must not also make a longer plain
+    // word look like a hash.
+    test("still treats a long ordinary (non-hash) filename segment as volatile, even within the raised hex cap's range (#1390)", () => {
+      assert.equal(
+        classifyFile("data-longdescriptivefilename.json"),
+        "volatile",
+        ">> FAIL: 23-char ordinary word segment (non-hex, within 20<len<=32): expected volatile — alnum branch capped at 20, not 32"
+      );
+    });
+
+    // A word ending in digits is the shape most likely to be mistaken for a
+    // hash once the caps go up. index.html / data.json / styles.css are
+    // already covered by the "plain, non-hashed filenames" negative above,
+    // so only the new shape is asserted here.
+    test("still treats a word-with-trailing-digits filename as volatile after raising the caps (#1390)", () => {
+      assert.equal(classifyFile("changelog2026.md"), "volatile", ">> FAIL: word+digits, no delimiter before it: expected volatile");
+    });
+
+    // The vite branch of classifyFileHeuristic used to re-test CONTENT_HASH_RE
+    // on a string the function had already rejected one line earlier, against
+    // the same non-global regex — it could never return "stable", so it went.
+    // An assets/ path is classified on its filename alone, exactly as any
+    // other path is.
+    test("classifies an unhashed vite assets/ path on its name alone, with or without the framework hint (#1390)", () => {
+      assert.equal(classifyFileHeuristic("assets/logo.png", "vite"), "stable", ">> FAIL: assets/logo.png: .png is in STABLE_EXTENSIONS, so it is stable with or without the hint");
+      assert.equal(classifyFileHeuristic("assets/data.json", "vite"), "volatile", ">> FAIL: unhashed assets/data.json under vite: expected volatile, same as without the hint");
+      for (const path of ["assets/data.json", "assets/logo.png", "assets/index-a1b2c3d4.js", "assets/style.css"]) {
+        assert.equal(
+          classifyFileHeuristic(path, "vite"),
+          classifyFileHeuristic(path, null),
+          `>> FAIL: ${path}: the vite hint must not change classification — its branch only ever re-tested a regex that had already failed`
+        );
+      }
     });
   });
 

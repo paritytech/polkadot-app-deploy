@@ -2758,9 +2758,30 @@ export function assertSubdomainOwnerMatchesSigner(
  * non-registrable per classifyRegistrability AND unowned, this additionally
  * teaches the dotns-cli whitelisted-registration route, via the SAME
  * formatUnregistrableReason preflight/register() use, so the texts cannot
- * drift. Owned-by-another-account keeps the original message unchanged —
- * that case is about ownership, not registrability, and must NOT suggest
- * registering a name someone else already holds.
+ * drift.
+ *
+ * bulletin-deploy #1380 (issue #1062): the two remaining branches used to
+ * name the problem but not the remedy — recurring on a consumer's
+ * per-branch preview deploys, each one only discovered after
+ * connect/build/upload had already run. Both branches now name a concrete
+ * next step:
+ *   - unregistered, registrable parent: deploying the parent directly IS the
+ *     registration path (this CLI has no separate register-only command),
+ *     so the remedy is that same command aimed at the parent.
+ *   - owned by another account: this signer cannot self-serve. The only
+ *     route is the current owner handing the name over. Verified against
+ *     src/commands/transfer.ts: `runTransfer` always signs as
+ *     `opts.mnemonic ?? DEFAULT_MNEMONIC` (Alice's dev key) — never from a
+ *     session — so the hint MUST include --mnemonic for the owner's own
+ *     key, or run verbatim it connects as Alice and fails with "it is owned
+ *     by ..., not the worker <alice-address>" (DotNS.transferName). Only
+ *     --to may default (to the signed-in session). selfAddress can be ""
+ *     (the call site passes `preflight.evmAddress ?? ""`), so the transfer
+ *     hint is only emitted when it's non-empty — a dangling `--to ` is worse
+ *     than no hint.
+ * Neither addition weakens the refusal: both still throw, they only add an
+ * actionable line after the unchanged "is owned by ..." sentence that
+ * telemetry's naming.subdomain_orphan classifier keys on (src/telemetry.ts).
  */
 export function formatSubdomainParentError(
   fullName: string,
@@ -2776,11 +2797,18 @@ export function formatSubdomainParentError(
   profile: DotnsAbiProfile = "poprules-startingPrice",
 ): string {
   if (parentOwner !== null) {
-    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${parentOwner}, not by this signer.`;
+    const transferBullet = selfAddress
+      ? `  - ask the ${parentOwner} account to hand the parent to this signer, run BY that account: ${CLI_NAME} transfer ${parentLabel}.${tld} --to ${selfAddress} --mnemonic <the ${parentOwner} account's key>\n`
+      : "";
+    const ownedParentBullet = `  - deploy the subdomain under a parent this signer already owns instead.`;
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by ${parentOwner}, not by this signer.\n\n` +
+      (transferBullet ? `Either:\n${transferBullet}${ownedParentBullet}` : ownedParentBullet);
   }
   const registrability = classifyRegistrability(parentLabel, profile);
   if (registrability.registrable) {
-    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by no one, not by this signer.`;
+    return `Cannot deploy ${fullName}: parent ${parentLabel}.${tld} is owned by no one, not by this signer.\n\n` +
+      `Register the parent with this signer first, then redeploy the subdomain unchanged:\n` +
+      `  ${CLI_NAME} <build-dir> ${parentLabel}.${tld}`;
   }
   return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld, profile })}`;
 }

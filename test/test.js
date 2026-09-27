@@ -5665,15 +5665,22 @@ describe("assertSubdomainOwnerMatchesSigner (issue #562)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// formatSubdomainParentError — subdomain parent ownership message (#1185)
+// formatSubdomainParentError — subdomain parent ownership message (#1185, bulletin #1380)
 //
 // Task 7 of the #1185 plan. Today an unregistered reserved parent yields
 // "parent game.dot is owned by no one, not by this signer" — awkward, and
 // silent about the only route forward. When the parent is non-registrable
 // per classifyRegistrability AND unowned, the message must additionally
 // teach the dotns-cli whitelisted-registration route.
+//
+// bulletin #1380 (issue #1062): recurring on a consumer's per-branch preview
+// deploys — the refusal was correct but silent about the remedy for the
+// other two states too. Both the "unregistered, registrable parent" and
+// "owned by another account" branches now name a concrete, verified next
+// step (see the doc comment on formatSubdomainParentError in src/deploy.ts
+// for how each was verified).
 // ---------------------------------------------------------------------------
-describe("formatSubdomainParentError (#1185)", () => {
+describe("formatSubdomainParentError (#1185, bulletin #1380)", () => {
   test("unregistered, non-registrable parent: names it and teaches the dotns-cli route", () => {
     const m = formatSubdomainParentError("app.game.dot", "game", null, "0xaaa");
     assert.match(m, /parent game\.dot is not registered/,
@@ -5682,18 +5689,57 @@ describe("formatSubdomainParentError (#1185)", () => {
       `>> FAIL: formatSubdomainParentError: must give the exact dotns-cli command; got: ${m}`);
   });
 
-  test("owned by another account: still names the owner, does NOT suggest registering", () => {
+  test("owned by another account: names the owner AND a transfer remedy that actually works, does NOT suggest registering", () => {
     const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa");
     assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must name the owner; got: ${m}`);
     assert.doesNotMatch(m, /dotns register domain/,
       `>> FAIL: formatSubdomainParentError: an already-owned parent must NOT suggest registering it; got: ${m}`);
+    // bulletin #1380: must name a concrete next step — the transfer command run
+    // BY the current owner (0xbbb), handing to this signer (0xaaa). runTransfer
+    // (src/commands/transfer.ts) always signs as `opts.mnemonic ??
+    // DEFAULT_MNEMONIC` — never from a session — so a hint without --mnemonic
+    // would connect as Alice's dev key and fail on-chain unless the real owner
+    // happens to be Alice. The command must include it.
+    assert.match(m, /transfer game\.dot --to 0xaaa --mnemonic/,
+      `>> FAIL: formatSubdomainParentError: must give a transfer command that includes --mnemonic — without it, runTransfer signs as DEFAULT_MNEMONIC (Alice) instead of the real owner and the transfer fails on-chain; got: ${m}`);
   });
 
-  test("unregistered, registrable parent: unchanged pre-#1185 message (no dotns-cli line)", () => {
+  test("owned by another account, empty selfAddress: no dangling --to, still refuses", () => {
+    // The deploy.ts call site passes `preflight.evmAddress ?? ""` — guard
+    // against selfAddress being unresolved so the message never renders a
+    // command with a missing --to value.
+    const m = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "");
+    assert.match(m, /owned by 0xbbb/i, `>> FAIL: formatSubdomainParentError: must still name the owner; got: ${m}`);
+    assert.doesNotMatch(m, /--to\b/, `>> FAIL: formatSubdomainParentError: must not render a --to flag with no address to give it; got: ${m}`);
+  });
+
+  test("unregistered, registrable parent: now names the register-by-deploying remedy (bulletin #1380)", () => {
     const m = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa");
     assert.match(m, /parent mysitedemo00\.dot is owned by no one, not by this signer/,
-      `>> FAIL: formatSubdomainParentError: a registrable, unregistered parent must keep the original message; got: ${m}`);
-    assert.doesNotMatch(m, /dotns register domain/, `>> FAIL: formatSubdomainParentError: must not add unnecessary registration advice; got: ${m}`);
+      `>> FAIL: formatSubdomainParentError: a registrable, unregistered parent must keep the original refusal sentence (telemetry's naming.subdomain_orphan classifier keys on it); got: ${m}`);
+    assert.doesNotMatch(m, /dotns register domain/,
+      `>> FAIL: formatSubdomainParentError: a registrable parent is not governance-reserved, must not point at the dotns-cli whitelisted route; got: ${m}`);
+    // This CLI has no register-only command — deploying the parent directly
+    // IS the registration path. Verify the exact command is offered.
+    assert.match(m, /polkadot-app-deploy <build-dir> mysitedemo00\.dot/,
+      `>> FAIL: formatSubdomainParentError: must give the exact register-the-parent command; got: ${m}`);
+  });
+
+  test("tld=paseo: transfer remedy uses the resolved tld, not a hardcoded .dot", () => {
+    const m = formatSubdomainParentError("app.game.paseo", "game", "0xbbb", "0xaaa", "paseo");
+    assert.match(m, /parent game\.paseo is owned by 0xbbb/i,
+      `>> FAIL: formatSubdomainParentError tld=paseo: must use .paseo, not .dot; got: ${m}`);
+    assert.match(m, /transfer game\.paseo --to 0xaaa --mnemonic/,
+      `>> FAIL: formatSubdomainParentError tld=paseo: transfer remedy must use .paseo, not .dot; got: ${m}`);
+  });
+
+  test("naming.subdomain_orphan classifier still matches both unregistered and owned-by-other messages (bulletin #1380 must not weaken telemetry)", () => {
+    const unregistered = formatSubdomainParentError("app.mysitedemo00.dot", "mysitedemo00", null, "0xaaa");
+    const ownedByOther = formatSubdomainParentError("app.game.dot", "game", "0xbbb", "0xaaa");
+    assert.strictEqual(classifyErrorKind(unregistered), 'naming.subdomain_orphan',
+      `>> FAIL: formatSubdomainParentError: unregistered-parent message must still classify as naming.subdomain_orphan; got kind for: ${unregistered}`);
+    assert.strictEqual(classifyErrorKind(ownedByOther), 'naming.subdomain_orphan',
+      `>> FAIL: formatSubdomainParentError: owned-by-other-parent message must still classify as naming.subdomain_orphan; got kind for: ${ownedByOther}`);
   });
 });
 

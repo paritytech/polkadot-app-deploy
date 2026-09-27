@@ -66,6 +66,33 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
+/**
+ * Validate `icon.format`, shared by `validateRootManifest` (read) and
+ * `validateProductConfig` (publish).
+ *
+ * Shape (both sides, unconditional) — `format` must be a non-empty string,
+ * same requirement as `icon.cid`/`icon.path` right next to it.
+ *
+ * Value (`strict` picks the side):
+ * - `strict: false` (read side) — an unrecognised value is exempt: a Host
+ *   that cannot decode it renders a placeholder and keeps the product
+ *   launchable. This package has no icon-rendering surface of its own, so
+ *   tolerating the value here is the entirety of the read-side obligation.
+ * - `strict: true` (publish side) — publishers MUST NOT emit an
+ *   unrecognised value, so it still fails validation.
+ */
+function validateIconFormat(format: unknown, label: string, strict: boolean): string[] {
+  if (!isNonEmptyString(format)) {
+    return [`${label} icon.format must be a non-empty string (got ${JSON.stringify(format)})`];
+  }
+  if (strict && !ICON_FORMATS.includes(format as IconFormat)) {
+    return [
+      `${label} icon.format must be one of ${ICON_FORMATS.join(", ")} (got ${JSON.stringify(format)})`,
+    ];
+  }
+  return [];
+}
+
 function isAppVersion(value: unknown): value is AppVersion {
   if (!Array.isArray(value)) return false;
   if (value.length !== 3 && value.length !== 4) return false;
@@ -312,9 +339,7 @@ export function validateRootManifest(input: unknown): ValidationResult<RootManif
     errors.push("root manifest icon must be an object");
   } else {
     if (!isNonEmptyString(input.icon.cid)) errors.push("root manifest icon.cid must be a non-empty string");
-    if (!ICON_FORMATS.includes(input.icon.format as IconFormat)) {
-      errors.push(`root manifest icon.format must be one of ${ICON_FORMATS.join(", ")} (got ${JSON.stringify(input.icon.format)})`);
-    }
+    errors.push(...validateIconFormat(input.icon.format, "root manifest", /* strict */ false));
   }
   return errors.length === 0 ? { ok: true, value: input as unknown as RootManifest } : { ok: false, errors };
 }
@@ -366,9 +391,7 @@ export function validateProductConfig(input: unknown): ValidationResult<ProductC
     errors.push("product config icon must be an object");
   } else {
     if (!isNonEmptyString(input.icon.path)) errors.push("product config icon.path must be a non-empty string");
-    if (!ICON_FORMATS.includes(input.icon.format as IconFormat)) {
-      errors.push(`product config icon.format must be one of ${ICON_FORMATS.join(", ")}`);
-    }
+    errors.push(...validateIconFormat(input.icon.format, "product config", /* strict */ true));
   }
   if (!Array.isArray(input.executables) || input.executables.length === 0) {
     errors.push("product config executables must be a non-empty array");

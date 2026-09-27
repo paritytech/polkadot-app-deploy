@@ -45,15 +45,55 @@ describe("validateRootManifest", () => {
     assert.ok(result.errors.some(e => e.includes("$v must be 1")));
   });
 
-  test("rejects unknown icon format", () => {
+  // A Host reading this on-chain record must not fail validation over an
+  // unrecognised icon.format — it renders a placeholder and keeps the
+  // product launchable. This test used to assert the reverse (rejection);
+  // that strictness still exists, just on the publish side — see
+  // validateProductConfig's "still rejects an unrecognised icon.format" test
+  // below, unaffected by this change.
+  test("tolerates an unrecognised icon.format (read side must not fail)", () => {
     const result = validateRootManifest({
       $v: 1,
       displayName: "DemoApp",
       description: "",
       icon: { cid: "bafy", format: "webp" },
     });
-    assert.equal(result.ok, false);
-    assert.ok(result.errors.some(e => e.includes("icon.format")));
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest unrecognised-icon-format-tolerated: a Host must not fail validation over an unrecognised icon.format and must instead render a placeholder; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // The exemption is for an unrecognised *value*, not a missing or
+  // wrong-typed field. Shape stays strict on both sides, same as icon.cid
+  // right next to it.
+  test("rejects icon.format entirely absent — shape error, not an unrecognised value", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy" },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      `>> FAIL: validateRootManifest icon-format-absent-rejected: a missing icon.format is a shape error (same as a missing icon.cid), not the unrecognised-value exemption; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("rejects a non-string icon.format — shape error, not an unrecognised value", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: 42 },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      `>> FAIL: validateRootManifest icon-format-non-string-rejected: icon.format must be a string before "is it a recognised one" is even the question; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
   });
 
   test("rejects when icon is missing entirely", () => {
@@ -369,6 +409,14 @@ describe("validateProductConfig", () => {
   test("accepts a full four-variant config", () => {
     const result = validateProductConfig(VALID_CONFIG);
     assert.equal(result.ok, true);
+  });
+
+  // The read-side tolerance for an unrecognised icon.format does not extend
+  // to the publish side — publishers MUST NOT emit an unrecognised format.
+  test("still rejects an unrecognised icon.format on the publish side", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, icon: { path: "./icon.png", format: "webp" } });
+    assert.equal(result.ok, false);
+    assert.ok(result.errors.some((e) => e.includes("icon.format")));
   });
 
   test("rejects a domain without .dot suffix", () => {

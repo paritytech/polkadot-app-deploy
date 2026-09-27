@@ -49,6 +49,18 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   */
   assetHubEndpoints?: string[];
   autoAccountMapping?: boolean;
+  /**
+   * bulletin #1221: optional override for the first-time auto-map testnet
+   * top-up target (see TOP_UP_TARGET). When set, ensureAutoMappedAccountReady()
+   * tops an unmapped testnet signer straight to this amount instead of the
+   * default 0.5 PAS — e.g. deploy() sizes it for a register-sized deploy via
+   * topUpTargetFor(), so a fresh signer needs only one top-up + finalization
+   * wait instead of two. Read-only connects (library callers, setup/probe
+   * tools) MUST leave this unset so they keep the safe 0.5 PAS default — see
+   * AUTO_MAP_RENT_HEADROOM's doc comment for why raising it for everyone
+   * would over-fund every content-only deploy.
+   */
+  autoMapTopUpTarget?: bigint;
   nativeToEthRatio?: bigint;
   contracts?: Record<string, string>;
   /** Optional environment ID (e.g. "paseo-next-v2"). Used in shell command examples in error messages. */
@@ -230,6 +242,23 @@ const FEE_FLOOR_REGISTER = ONE_PAS / 10n;
 const TOP_UP_TARGET = ONE_PAS / 2n;
 // Don't drain the auto-top-up source. Skip if balance < TOP_UP_TARGET + this.
 const SOURCE_BUFFER = ONE_PAS;
+// bulletin #1221: rentPriceNative stand-in for auto-map top-up sizing (via
+// topUpTargetFor('register', ...) at connect()-time in deploy.ts). The real
+// PopRules NoStatus deposit needs a live dry-run, but that dry-run itself
+// needs a mapped origin — which doesn't exist yet when auto-map decides how
+// much to send. bulletin-deploy's tools/probe-register-deposit.mjs measured
+// the live PopRules NoStatus deposit at 10 PAS on every configured env as of
+// 2026-09-25. 20 PAS gives 2x margin; if it's still not enough, the live
+// deposit read gated on the actual register/reveal call is the real safety
+// net — worst case is a second top-up, never a failure.
+//
+// Known cost: deploy.ts's preflight connect assumes "register" before the
+// real outcome is known, so a signer whose deploy turns out to abort
+// (reserved/owned-by-someone-else/PoP-gated) or already be owned still pays
+// this full register-sized top-up rather than the pre-#1221 flat 0.5 PAS.
+// Testnet-only, and paid once per signer per chain generation (a wipe/
+// re-genesis resets Revive mapping state) — not free, but bounded.
+export const AUTO_MAP_RENT_HEADROOM = ONE_PAS * 20n; // 20 PAS
 // Conservative fee estimate for reprove_alias_account. The actual fee on
 // paseo-next-v2 is well under 0.001 PAS; 0.01 PAS gives comfortable headroom.
 // Minimum storage deposit required for a fresh TLD register() on paseo-next-v2.
@@ -2969,7 +2998,7 @@ export class DotNS {
           `DotNS connect: failed to resolve EVM address from ${this.substrateAddress} via ReviveApi.address after ${REVIVE_ADDRESS_ATTEMPTS} attempts (${inner})${rpcHint}`,
         );
       }
-      console.log(`   H160 Address: ${this.evmAddress}`);
+      console.log(`   H160 Address: ${this.evmAddress} (derived from SS58; Revive mapping checked next)`);
       setDeployAttribute("deploy.dotns.rpc_used", rpc);
       setDeployAttribute("deploy.dotns.evm_address", this.evmAddress!);
       this.connected = true;
@@ -3009,7 +3038,7 @@ export class DotNS {
       // the Revive.call trigger when that path is unavailable.
       await this.resolveNativeToEthRatio(options);
       try {
-        await this.ensureMappedAccountReady(options.autoAccountMapping ?? false);
+        await this.ensureMappedAccountReady(options.autoAccountMapping ?? false, options.autoMapTopUpTarget);
       } catch (e) {
         this.connected = false;
         throw e;
@@ -3019,7 +3048,7 @@ export class DotNS {
     });
   }
 
-  async ensureMappedAccountReady(autoAccountMapping: boolean = false): Promise<void> {
+  async ensureMappedAccountReady(autoAccountMapping: boolean = false, autoMapTopUpTarget?: bigint): Promise<void> {
     this.ensureConnected();
     if (!this.clientWrapper || !this.substrateAddress || !this.signer) {
       throw new Error("Account mapping unavailable before DotNS signer is initialized");
@@ -3028,7 +3057,7 @@ export class DotNS {
     if (autoAccountMapping) {
       markCodePath(CODE_PATHS.DOTNS_AUTO_MAPPING);
       setDeployAttribute("deploy.dotns.mapping_source", "auto-account-mapping");
-      await this.ensureAutoMappedAccountReady();
+      await this.ensureAutoMappedAccountReady(autoMapTopUpTarget);
       return;
     }
 
@@ -3053,7 +3082,7 @@ export class DotNS {
         error: e?.message?.slice?.(0, 200) ?? String(e).slice(0, 200),
       });
       setDeployAttribute("deploy.dotns.mapping_source", "auto-map-fallback");
-      await this.ensureAutoMappedAccountReady();
+      await this.ensureAutoMappedAccountReady(autoMapTopUpTarget);
       return;
     }
 
@@ -3061,7 +3090,7 @@ export class DotNS {
     console.log(`   Account: mapped`);
   }
 
-  async ensureAutoMappedAccountReady(): Promise<void> {
+  async ensureAutoMappedAccountReady(autoMapTopUpTarget?: bigint): Promise<void> {
     this.ensureConnected();
     if (!this.clientWrapper || !this.substrateAddress || !this.signer) {
       throw new Error("Account auto-mapping unavailable before DotNS signer is initialized");
@@ -3072,11 +3101,16 @@ export class DotNS {
       return;
     }
 
+    // bulletin #1221: state this unconditionally (not just on testnets) so
+    // the line can never be misread as mapping evidence — it fires before
+    // any top-up attempt is even considered.
+    console.log(`   DotNS signer ${this.substrateAddress.slice(0, 8)}... is NOT mapped on Revive (no OriginalAccount entry).`);
+
     if (await this.isTestnet()) {
       const free = await this.readFreeBalance(this.substrateAddress);
       if (free < FEE_FLOOR_REGISTER) {
-        console.log(`   DotNS signer ${this.substrateAddress.slice(0, 8)}... balance ${fmtPas(free)} PAS before auto-map — attempting testnet auto top-up...`);
-        const toppedUp = await this.attemptTestnetTopUp(this.substrateAddress, TOP_UP_TARGET);
+        console.log(`   Mapping requires submitting a transaction, and the signer holds ${fmtPas(free)} PAS — attempting testnet auto top-up...`);
+        const toppedUp = await this.attemptTestnetTopUp(this.substrateAddress, autoMapTopUpTarget ?? TOP_UP_TARGET);
         if (toppedUp) {
           console.log(`   Topped up ${fmtPas(toppedUp.transferred)} PAS from ${toppedUp.source} for auto-map`);
           setDeployAttribute("deploy.dotns.signer_below_floor", "true");

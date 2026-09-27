@@ -22,8 +22,8 @@ import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./ma
 import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, CONTENT_HASH_RE, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
 import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
-import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode } from "./dotns.js";
-import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions } from "./dotns.js";
+import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode, topUpTargetFor, AUTO_MAP_RENT_HEADROOM } from "./dotns.js";
+import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions, DotnsSuccessAction } from "./dotns.js";
 import type { DotnsAbiProfile } from "./dotns-protocol.js";
 import { subnameNestingLevels } from "./subname-depth.js";
 export type { PhoneSignatureStep };
@@ -3027,6 +3027,17 @@ export function resolveDotnsConnectOptions(
   return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail, ...networkTail };
 }
 
+// bulletin #1221: the planned action to size a post-preflight auto-map
+// top-up (topUpTargetFor's first arg). Once preflight has run, use its REAL
+// plannedAction rather than assuming "register", so an owned action's
+// (smaller) floor is requested instead. "abort" can't actually reach here
+// (deploy() throws on !dotnsPreflight.canProceed before either post-preflight
+// connect site), but the type is wider than DotnsSuccessAction, so fall back
+// to "register" defensively rather than assert past it.
+export function autoMapPlannedActionFor(dotnsPreflight: DotnsPreflightResult | null): DotnsSuccessAction {
+  return dotnsPreflight && dotnsPreflight.plannedAction !== "abort" ? dotnsPreflight.plannedAction : "register";
+}
+
 // Upper-bound estimate of how many bytes this deploy will push to Bulletin.
 // Used to size the defensive pre-authorization. Returns null if the input
 // can't be measured cheaply (caller should skip the defensive top-up).
@@ -3602,7 +3613,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
 
       const preflight = new DotNS();
-      await preflight.connect(resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork));
+      await preflight.connect({
+        ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+        // bulletin #1221: plannedAction isn't known until preflight() runs below, so
+        // assume "register" (see AUTO_MAP_RENT_HEADROOM's doc comment in dotns.ts for the cost).
+        autoMapTopUpTarget: topUpTargetFor("register", envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
+      });
       // connect() now guarantees the account is mapped before returning — no
       // post-connect mapping wait needed here. See DotNS.connect() in dotns.ts.
       // Adopt the authoritative, chain-resolved TLD for everything downstream
@@ -3916,6 +3932,9 @@ export async function deploy(content: DeployContent, domainName: string | null =
           };
           await ownerDotns.connect({
             ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+            // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
+            // real plannedAction rather than a hardcoded "register".
+            autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
             confirmPhoneReady: options.confirmPhoneReady,
             phoneSigner: true, // owner path is always a real phone/session signer
           });
@@ -3931,6 +3950,9 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const dotns = new DotNS();
         await dotns.connect({
           ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+          // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
+          // real plannedAction rather than a hardcoded "register".
+          autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
           confirmPhoneReady: options.confirmPhoneReady,
           // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
           // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.

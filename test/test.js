@@ -4081,6 +4081,7 @@ describe("DotNS initial state", () => {
 
     assert.deepStrictEqual(events, [
       "check-before-trigger:false",
+      "log:   DotNS signer 5Signer... is NOT mapped on Revive (no OriginalAccount entry).",
       "check-before-trigger:false",
       "trigger",
       "check-after-trigger:true",
@@ -4091,6 +4092,118 @@ describe("DotNS initial state", () => {
   test("autoAccountMapping log names Revive.OriginalAccount confirmation", async () => {
     const src = fs.readFileSync("src/dotns.ts", "utf8");
     assert.match(src, /Account: auto-mapped \(Revive\.OriginalAccount confirmed\)/);
+  });
+
+  // bulletin #1221 Part 1: the H160 line printed just before account-mapping
+  // runs must not read as mapping evidence — it's a deterministic
+  // SS58->H160 derivation that says nothing about whether
+  // Revive.OriginalAccount exists yet.
+  test("H160 log line carries the 'derived from SS58' qualifier (#1221)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    assert.match(src, /H160 Address: \$\{this\.evmAddress\} \(derived from SS58; Revive mapping checked next\)/,
+      ">> FAIL: H160 qualifier: the log line must not read as mapping evidence — see #1221 Part 1");
+  });
+
+  // bulletin #1221 Part 1: the "NOT mapped" log must appear before ANY
+  // top-up attempt in source order, and must not be nested inside the
+  // isTestnet() branch — otherwise the messaging fix silently only fires for
+  // testnets.
+  test("ensureAutoMappedAccountReady logs 'NOT mapped' before attempting any top-up (#1221 Part 1)", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    const bodyStart = src.indexOf("async ensureAutoMappedAccountReady(");
+    const notMappedIdx = src.indexOf("is NOT mapped on Revive", bodyStart);
+    const topUpIdx = src.indexOf("attemptTestnetTopUp(this.substrateAddress", bodyStart);
+    assert.ok(bodyStart !== -1 && notMappedIdx !== -1 && topUpIdx !== -1,
+      ">> FAIL: #1221 NOT-mapped ordering: could not locate all three markers in ensureAutoMappedAccountReady");
+    assert.ok(notMappedIdx < topUpIdx,
+      ">> FAIL: #1221 NOT-mapped ordering: the 'NOT mapped' log must appear before the top-up attempt in source order");
+  });
+
+  test("ensureAutoMappedAccountReady logs 'NOT mapped' even off testnet (mainnet path, no top-up)", async () => {
+    const d = new DotNS();
+    const events = [];
+    d.connected = true;
+    d.substrateAddress = "5MainnetSigner";
+    d.signer = {};
+    d.clientWrapper = {
+      checkIfAccountMapped: async () => false,
+      client: { tx: { Revive: { call: () => ({}) } } },
+      signAndSubmitWithRetry: async () => { throw new Error("no funds"); },
+    };
+    d.isTestnet = async () => false;
+    const originalLog = console.log;
+    console.log = (message) => { events.push(String(message)); };
+    try {
+      await assert.rejects(() => d.ensureAutoMappedAccountReady());
+    } finally {
+      console.log = originalLog;
+    }
+    assert.ok(events.some((e) => e.includes("is NOT mapped on Revive")),
+      ">> FAIL: #1221 mainnet NOT-mapped: the log must fire regardless of isTestnet(), not only inside the testnet top-up branch");
+  });
+
+  // bulletin #1221 Part 2: an opt-in autoMapTopUpTarget lets deploy() size
+  // the first top-up for a register instead of the flat 0.5 PAS default.
+  // Read-only callers that never set it must keep the 0.5 PAS default
+  // exactly — that's the safety property that stops every unmapped
+  // read-only connect from draining Alice/Bob at register-sized amounts.
+  function unmappedTestnetSignerCapturingTopUpTarget() {
+    const d = new DotNS();
+    let requestedTarget = null;
+    let mapped = false;
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d.clientWrapper = {
+      checkIfAccountMapped: async () => mapped, // false until the trigger submission below "maps" it
+      client: { tx: { Revive: { call: () => ({}) } } },
+      signAndSubmitWithRetry: async (buildExtrinsic) => { buildExtrinsic(); mapped = true; },
+    };
+    d.isTestnet = async () => true;
+    d.readFreeBalance = async () => 0n;
+    d.attemptTestnetTopUp = async (_addr, target) => {
+      requestedTarget = target;
+      return { source: "Alice", transferred: target };
+    };
+    return { d, getRequestedTarget: () => requestedTarget };
+  }
+
+  test("ensureAutoMappedAccountReady uses autoMapTopUpTarget when the caller provides one (#1221 Part 2)", async () => {
+    const { d, getRequestedTarget } = unmappedTestnetSignerCapturingTopUpTarget();
+
+    await d.ensureAutoMappedAccountReady(75_000_000_000n); // 7.5 PAS, a stand-in register-sized target
+
+    assert.strictEqual(getRequestedTarget(), 75_000_000_000n,
+      ">> FAIL: autoMapTopUpTarget threading: ensureAutoMappedAccountReady must pass the caller's target to attemptTestnetTopUp, not the flat default");
+  });
+
+  test("ensureAutoMappedAccountReady keeps the flat TOP_UP_TARGET default when no override is given (#1221 Part 2 safety property)", async () => {
+    const { d, getRequestedTarget } = unmappedTestnetSignerCapturingTopUpTarget();
+
+    await d.ensureAutoMappedAccountReady(); // no arg — read-only-caller shape
+
+    assert.strictEqual(getRequestedTarget(), 5_000_000_000n, // TOP_UP_TARGET = ONE_PAS/2 = 0.5 PAS = 5_000_000_000n
+      ">> FAIL: autoMapTopUpTarget default: an unset override must still top up to exactly TOP_UP_TARGET (0.5 PAS), or every read-only connect over-funds from Alice/Bob");
+  });
+
+  test("ensureMappedAccountReady threads autoMapTopUpTarget into ensureAutoMappedAccountReady on the auto-map path", async () => {
+    const d = new DotNS();
+    const seenTargets = [];
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    d.ensureAutoMappedAccountReady = async (target) => { seenTargets.push(target); };
+    d.clientWrapper = { checkIfAccountMapped: async () => false };
+
+    await d.ensureMappedAccountReady(true, 99_000_000_000n);
+    assert.deepStrictEqual(seenTargets, [99_000_000_000n],
+      ">> FAIL: ensureMappedAccountReady autoAccountMapping=true path must forward autoMapTopUpTarget");
+  });
+
+  test("DotNS.connect() forwards options.autoMapTopUpTarget into ensureMappedAccountReady", () => {
+    const src = fs.readFileSync("src/dotns.ts", "utf8");
+    assert.match(src, /ensureMappedAccountReady\(options\.autoAccountMapping \?\? false, options\.autoMapTopUpTarget\)/,
+      ">> FAIL: connect() wiring: options.autoMapTopUpTarget must reach ensureMappedAccountReady, or deploy.ts's opt-in has no effect");
   });
 
   test("explicit account mapping falls back to auto-map trigger when map_account is unavailable", async () => {
@@ -5948,6 +6061,19 @@ describe("DotNS.preflight", () => {
     assert.strictEqual(fmtPas(10_000_000_000n), "1.0000");
     assert.strictEqual(fmtPas(15_000_000_000n), "1.5000");
     assert.strictEqual(fmtPas(100_000_000n), "0.0100");
+  });
+
+  // bulletin #1221: deploy.ts needs topUpTargetFor + AUTO_MAP_RENT_HEADROOM to
+  // size the first auto-map top-up for a register, so a fresh testnet signer
+  // needs only one top-up (+ finalization wait) instead of two.
+  test("topUpTargetFor and AUTO_MAP_RENT_HEADROOM are exported for deploy.ts's #1221 auto-map sizing", async () => {
+    const dotnsModule = await import("../dist/dotns.js");
+    assert.strictEqual(typeof dotnsModule.topUpTargetFor, "function",
+      ">> FAIL: topUpTargetFor export: deploy.ts needs this to size autoMapTopUpTarget for a register");
+    assert.strictEqual(typeof dotnsModule.AUTO_MAP_RENT_HEADROOM, "bigint",
+      ">> FAIL: AUTO_MAP_RENT_HEADROOM export: must be a bigint constant deploy.ts can pass as rentPriceNative");
+    assert.ok(dotnsModule.AUTO_MAP_RENT_HEADROOM > 0n && dotnsModule.AUTO_MAP_RENT_HEADROOM <= 300_000_000_000n,
+      ">> FAIL: AUTO_MAP_RENT_HEADROOM sanity: expected a headroom in the 0-30 PAS band");
   });
 
   // -----------------------------------------------------------------
@@ -9820,6 +9946,51 @@ describe("resolveDotnsConnectOptions (#209)", () => {
     const missing = calls.filter((c) => !/,\s*envNetwork\)\s*$/.test(c.trim()));
     assert.deepStrictEqual(missing, [],
       `>> FAIL: #1362/#1095: every resolveDotnsConnectOptions call site in deploy.ts must end with envNetwork as the last argument, or DotNS.connect() never learns the declared env network and isTestnet() silently falls back to spec_name. Offending: ${missing.join(" | ")}`);
+  });
+
+  // bulletin #1221 Part 2: every deploy()-internal connect must size the
+  // first auto-map top-up via topUpTargetFor(..., envRegisterStorageDeposit,
+  // AUTO_MAP_RENT_HEADROOM), so a fresh signer mid-deploy (including the
+  // owner-path reconnect) needs only one top-up instead of two.
+  test("deploy.ts sizes autoMapTopUpTarget via topUpTargetFor(..., envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM) on every deploy()-internal connect (#1221 Part 2)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const deployFnStart = src.indexOf("export async function deploy(");
+    assert.ok(deployFnStart !== -1, ">> FAIL: #1221: could not locate deploy() to scope the call-site search");
+    const deployFnSrc = src.slice(deployFnStart);
+    const calls = [...deployFnSrc.matchAll(/resolveDotnsConnectOptions\([^;]*?\)(?=[,)])/gs)];
+    assert.ok(calls.length >= 3,
+      `>> FAIL: #1221: expected at least 3 resolveDotnsConnectOptions call sites inside deploy(), found ${calls.length}`);
+    const missing = calls.filter((m) => {
+      const after = deployFnSrc.slice(m.index + m[0].length, m.index + m[0].length + 400);
+      return !/autoMapTopUpTarget:\s*topUpTargetFor\([^,]+,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/.test(after);
+    }).map((m) => m[0]);
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1221: every deploy()-internal resolveDotnsConnectOptions call must be followed by an autoMapTopUpTarget: topUpTargetFor(<action>, envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM) sibling key, or a fresh signer mid-deploy still does two top-ups. Offending: ${missing.join(" | ")}`);
+  });
+
+  test("deploy.ts uses autoMapPlannedActionFor (not a hardcoded 'register') at every post-preflight connect (#1221)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    const deployFnStart = src.indexOf("export async function deploy(");
+    assert.ok(deployFnStart !== -1, ">> FAIL: #1221: could not locate deploy() to scope the call-site search");
+    const deployFnSrc = src.slice(deployFnStart);
+    const realActionCalls = deployFnSrc.match(/topUpTargetFor\(\s*autoMapPlannedActionFor\(dotnsPreflight\)\s*,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
+    assert.strictEqual(realActionCalls.length, 2,
+      `>> FAIL: #1221: expected exactly 2 post-preflight connects (owner-path reconnect + main signer connect) to use autoMapPlannedActionFor(dotnsPreflight), found ${realActionCalls.length}`);
+    const hardcodedRegisterCalls = deployFnSrc.match(/topUpTargetFor\(\s*["']register["']\s*,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
+    assert.strictEqual(hardcodedRegisterCalls.length, 1,
+      `>> FAIL: #1221: expected exactly 1 connect (the preflight connect, which runs before plannedAction is known) to use a hardcoded "register", found ${hardcodedRegisterCalls.length}`);
+  });
+
+  test("autoMapPlannedActionFor returns the real plannedAction, falling back to 'register' for null/abort (#1221)", async () => {
+    const { autoMapPlannedActionFor } = await import("../dist/deploy.js");
+    assert.strictEqual(autoMapPlannedActionFor(null), "register",
+      ">> FAIL: autoMapPlannedActionFor null: preflight didn't run — must fall back to the conservative 'register'");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "abort" }), "register",
+      ">> FAIL: autoMapPlannedActionFor abort: can't reach this in practice, but must still fall back defensively rather than pass 'abort' to topUpTargetFor");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "already-owned-by-recipient" }), "already-owned-by-recipient",
+      ">> FAIL: autoMapPlannedActionFor owned: must pass through the real action, not override it with 'register'");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "already-owned-by-us" }), "already-owned-by-us");
+    assert.strictEqual(autoMapPlannedActionFor({ plannedAction: "register" }), "register");
   });
 });
 

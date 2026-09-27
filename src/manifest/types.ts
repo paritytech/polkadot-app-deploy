@@ -49,7 +49,7 @@ export interface WebRuntime {
 
 export interface PolkaVmRuntime {
   kind: "polkavm";
-  abiVersion: 1;
+  abiVersion: 1 | 2;
   entrypoint: string;
 }
 

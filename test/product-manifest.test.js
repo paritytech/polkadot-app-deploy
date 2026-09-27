@@ -78,7 +78,7 @@ const APP_V2_MANIFEST = {
   appVersion: [0, 1, 7],
   runtime: {
     kind: "polkavm",
-    abiVersion: 1,
+    abiVersion: 2,
     entrypoint: "app.polkavm",
   },
   capabilities: {
@@ -149,6 +149,22 @@ describe("validateExecutableManifest — App v2", () => {
     const entrypointResult = validateExecutableManifest(unsafeEntrypoint);
     assert.equal(entrypointResult.ok, false);
     assert.ok(entrypointResult.errors.some((error) => error.includes("entrypoint")));
+  });
+
+  test("accepts runtime ABI 1 and 2, rejects other values", () => {
+    const abi1 = structuredClone(APP_V2_MANIFEST);
+    abi1.runtime.abiVersion = 1;
+    assert.equal(validateExecutableManifest(abi1).ok, true);
+
+    const abi3 = structuredClone(APP_V2_MANIFEST);
+    abi3.runtime.abiVersion = 3;
+    const result = validateExecutableManifest(abi3);
+    assert.equal(result.ok, false);
+    assert.ok(
+      result.errors.some((error) =>
+        error.includes("runtime.abiVersion must be 1 or 2"),
+      ),
+    );
   });
 
   test("rejects PolkaVM manifests without graphics", () => {

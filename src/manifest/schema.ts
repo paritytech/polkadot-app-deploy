@@ -216,7 +216,8 @@ function validateAppV2(input: Record<string, unknown>, prefix: string): string[]
     ...rejectUnknownFields(runtime, ["kind", "abiVersion", "entrypoint"], `${prefix}runtime `),
     ...validateRelativeEntrypoint(runtime.entrypoint, ".polkavm", `${prefix}runtime.`),
   ];
-  if (runtime.abiVersion !== 1) errors.push(`${prefix}runtime.abiVersion must be 1`);
+  if (runtime.abiVersion !== 1 && runtime.abiVersion !== 2)
+    errors.push(`${prefix}runtime.abiVersion must be 1 or 2`);
   if (!isPlainObject(input.capabilities)) {
     errors.push(`${prefix}capabilities must be an object`);
     return errors;

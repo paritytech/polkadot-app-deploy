@@ -38,7 +38,7 @@ import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCh
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
-import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache } from "../dist/deploy.js";
+import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache, computePhaseACounts, formatUploadInclusionLine } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
 import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
 import * as nodeCrypto from "node:crypto";
@@ -2060,6 +2060,35 @@ describe("classifyErrorKind", () => {
     const msg = "Chunk 3 failed after 3 retries: upload aborted by user";
     assert.notStrictEqual(classifyErrorKind(msg), "user.aborted",
       ">> FAIL: user.aborted: the rule is unanchored — a real chunk failure was reclassified as an operator interrupt and vanished from the failure rate");
+  });
+
+  // signer.phone_confirmation_unavailable (#1363) — a non-interactive caller
+  // (CI, no TTY) hit the phone-confirmation gate. Distinct from user.aborted:
+  // this is NEVER a deliberate cancellation, so it must not land in the kind
+  // that dashboards treat as "not a product failure", nor fall into 'unknown'
+  // the way it did pre-fix (misclassified as an operator abort).
+  test("signer.phone_confirmation_unavailable: nonInteractivePhoneConfirmationError's message classifies distinctly from user.aborted and unknown", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    const kind = classifyErrorKind(err.message);
+    assert.strictEqual(kind, "signer.phone_confirmation_unavailable",
+      `>> FAIL: signer.phone_confirmation_unavailable: got ${kind} — the non-interactive phone-gate failure must have its own kind, not fall into unknown`);
+    assert.notStrictEqual(kind, "user.aborted",
+      ">> FAIL: signer.phone_confirmation_unavailable: must not be folded into user.aborted — nobody deliberately cancelled a CI run");
+  });
+
+  test("signer.phone_confirmation_unavailable: still classifies if a future wrapper prefixes the message (deliberately unanchored)", () => {
+    // Traced the live propagation path (confirmPhoneReady -> _awaitPhoneReady ->
+    // contractTransaction -> withSpan chain -> withDeploySpan) and confirmed no
+    // current layer wraps/prefixes this message — every hop rethrows the same
+    // Error object. This rule is left unanchored anyway (unlike user.aborted,
+    // which must stay anchored so over-matching can't delete real failures from
+    // the failure rate): this rule only ADDS a bucket, so there's no downside to
+    // tolerating a future wrapper, and no plausible unrelated message contains
+    // this phrase by accident.
+    const err = nonInteractivePhoneConfirmationError("Register");
+    const wrapped = `dotns register failed: ${err.message}`;
+    assert.strictEqual(classifyErrorKind(wrapped), "signer.phone_confirmation_unavailable",
+      `>> FAIL: signer.phone_confirmation_unavailable: a wrapped/prefixed variant of the message must still classify correctly; got ${classifyErrorKind(wrapped)}`);
   });
 
   // naming.contract_unavailable (1 span) — env config carries a zero/absent
@@ -6316,6 +6345,238 @@ describe("DotNS.setContenthashAndTextRecord", () => {
     assert.strictEqual(result.contenthashSkipped, true);
     assert.strictEqual(result.textSkipped, true);
     assert.strictEqual(result.txHash, "skipped");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1164: DotNS.ensureResolverAndSetTextRecord — the skip/single-write/batch
+// trichotomy, tested via the same instance-stubbing pattern as the sibling
+// DotNS.setContenthashAndTextRecord block above (no live chain needed:
+// contractCallNullable/getTextRecord/ensureContentResolver/setTextRecord/
+// submitBatchedContractCalls are all plain instance methods, stubbable
+// directly).
+// ---------------------------------------------------------------------------
+describe("DotNS.ensureResolverAndSetTextRecord", () => {
+  const RESOLVER = "0xBBBB000000000000000000000000000000BBBB";
+
+  function baseInstance() {
+    const d = new DotNS();
+    d.connected = true;
+    d._contracts = { DOTNS_REGISTRY: "0xAAAA000000000000000000000000000000AAAA", DOTNS_CONTENT_RESOLVER: RESOLVER };
+    return d;
+  }
+
+  test("neither stale: skips entirely, no chain write of any kind", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => RESOLVER;
+    d.getTextRecord = async () => "manifest json";
+    d.ensureContentResolver = async () => assert.fail("resolver already matches — must not write");
+    d.setTextRecord = async () => assert.fail("text already matches — must not write");
+    d.submitBatchedContractCalls = async () => assert.fail("neither field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "manifest json");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: false, textWritten: false },
+      ">> FAIL: ensureResolverAndSetTextRecord both-unchanged: expected a pure skip, 0 writes");
+  });
+
+  test("only the resolver is stale: delegates to ensureContentResolver, never batches", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => "0xSomeOtherResolver000000000000000000000";
+    d.getTextRecord = async () => "manifest json";
+    let ensureContentResolverCalls = 0;
+    d.ensureContentResolver = async (domainName) => { ensureContentResolverCalls++; assert.strictEqual(domainName, "app.example"); return { changed: true }; };
+    d.setTextRecord = async () => assert.fail("text already matches — must not write");
+    d.submitBatchedContractCalls = async () => assert.fail("only one field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "manifest json");
+    assert.strictEqual(ensureContentResolverCalls, 1,
+      ">> FAIL: ensureResolverAndSetTextRecord resolver-only: ensureContentResolver must be called exactly once");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: true, textWritten: false },
+      ">> FAIL: ensureResolverAndSetTextRecord resolver-only: expected resolverWritten:true, textWritten:false");
+  });
+
+  test("only the text is stale: delegates to setTextRecord, never batches", async () => {
+    const d = baseInstance();
+    d.contractCallNullable = async () => RESOLVER;
+    d.getTextRecord = async () => "old manifest json";
+    d.ensureContentResolver = async () => assert.fail("resolver already matches — must not write");
+    let setTextRecordCalls = 0;
+    d.setTextRecord = async (domainName, key, value) => {
+      setTextRecordCalls++;
+      assert.strictEqual(domainName, "app.example");
+      assert.strictEqual(key, "manifest");
+      assert.strictEqual(value, "new manifest json");
+      return { value, txHash: "0xtexttx" };
+    };
+    d.submitBatchedContractCalls = async () => assert.fail("only one field is stale — must not batch");
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "new manifest json");
+    assert.strictEqual(setTextRecordCalls, 1,
+      ">> FAIL: ensureResolverAndSetTextRecord text-only: setTextRecord must be called exactly once");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: false, textWritten: true },
+      ">> FAIL: ensureResolverAndSetTextRecord text-only: expected resolverWritten:false, textWritten:true");
+  });
+
+  test("both stale: batches setResolver+setText in ONE Utility.batch_all, in that order", async () => {
+    const d = baseInstance();
+    let resolverReads = 0;
+    d.contractCallNullable = async () => (resolverReads++ === 0 ? "0xSomeOtherResolver000000000000000000000" : RESOLVER);
+    let textReads = 0;
+    d.getTextRecord = async () => (textReads++ === 0 ? "old manifest json" : "new manifest json");
+    d.ensureContentResolver = async () => assert.fail("both fields stale — must batch, not delegate to ensureContentResolver alone");
+    d.setTextRecord = async () => assert.fail("both fields stale — must batch, not delegate to setTextRecord alone");
+    let submitted;
+    d.submitBatchedContractCalls = async (calls, _status, label, options) => {
+      submitted = { calls, label, options };
+      return { kind: "hash", hash: "0xbatch" };
+    };
+
+    const result = await d.ensureResolverAndSetTextRecord("app.example", "manifest", "new manifest json");
+    assert.strictEqual(submitted.calls.length, 2,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: must submit exactly 2 inner calls");
+    assert.deepStrictEqual(submitted.calls.map(({ functionName }) => functionName), ["setResolver", "setText"],
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: inner call order must be [setResolver, setText]");
+    assert.strictEqual(submitted.calls[0].args[1], RESOLVER,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setResolver's target arg must be the content resolver address");
+    assert.strictEqual(submitted.calls[1].args[1], "manifest",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's key arg must be the text-record key");
+    assert.strictEqual(submitted.calls[1].args[2], "new manifest json",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's value arg must be the new value");
+    assert.strictEqual(submitted.label, "Utility.batch_all(setResolver+setText[manifest])",
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: unexpected batch label");
+    assert.strictEqual(submitted.options.independentCalls, true,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: must pass independentCalls: true — setResolver and setText have no on-chain data dependency on each other");
+    assert.strictEqual(await submitted.options.verifyEffect(), true,
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: verifyEffect must re-read both values and confirm the write");
+    assert.deepStrictEqual(result, { node: result.node, resolverWritten: true, textWritten: true },
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: expected resolverWritten:true, textWritten:true");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1164: DotNS.submitBatchedContractCalls — independentCalls opt-in and the
+// multi-dry-run/max-selection it enables. Drives the private method directly
+// with a fake clientWrapper and captures what actually gets passed to
+// client.tx.Revive.call — the literal args the submitted extrinsic is built
+// from, not an intermediate.
+// ---------------------------------------------------------------------------
+describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#1164)", () => {
+  test("without independentCalls, dry-runs ONLY the head call (default, dependent-calls-safe behavior)", async () => {
+    // #1164 regression guard: registerSubdomain's batch (setSubnodeOwner then
+    // setResolver, both DOTNS_REGISTRY) has a genuine on-chain data dependency —
+    // setResolver's authorization check only passes once setSubnodeOwner has
+    // actually applied. Dry-running setResolver on its own (against
+    // pre-setSubnodeOwner state) reverts with flags=1 data=0x1648fd01 — verified
+    // live against paseo-next-v2 while developing #1164's independentCalls
+    // option. Without `independentCalls: true`, submitBatchedContractCalls MUST
+    // dry-run only the head call, never the second — this pins that default.
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    let estimateCalls = 0;
+    d.clientWrapper = {
+      ensureAccountMapped: async () => {},
+      estimateGasForCall: async () => {
+        estimateCalls++;
+        return { success: true, gasRequired: { referenceTime: 1_000_000_000n, proofSize: 50_000n }, storageDeposit: 0n };
+      },
+      client: {
+        tx: {
+          Revive: { call: () => ({ decodedCall: {} }) },
+          Utility: { batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }) },
+        },
+      },
+      signAndSubmitWithRetry: async (buildBatch) => { buildBatch(); return { kind: "hash", hash: "0xbatch" }; },
+    };
+
+    const abiOne = [{ type: "function", name: "setSubnodeOwner", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const abiTwo = [{ type: "function", name: "setResolver", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    await d["submitBatchedContractCalls"](
+      [
+        { contractAddress: "0xAAAA000000000000000000000000000000AAAA", abi: abiOne, functionName: "setSubnodeOwner", args: [] },
+        { contractAddress: "0xBBBB000000000000000000000000000000BBBB", abi: abiTwo, functionName: "setResolver", args: [] },
+      ],
+      () => {},
+      "test batch",
+      // no independentCalls — the default, dependent-calls-safe path.
+    );
+
+    assert.strictEqual(estimateCalls, 1,
+      ">> FAIL: submitBatchedContractCalls default dry-run scope: without independentCalls, exactly ONE call (the head) must be dry-run — dry-running the second call independently would see pre-first-call on-chain state and could revert a call that will actually succeed once batched (registerSubdomain's setResolver dependency, #1164)");
+  });
+
+  // ensureResolverAndSetTextRecord's batched branch is this codebase's first
+  // CROSS-contract batch (a small setResolver head call ahead of a
+  // potentially much larger setText tail call). A head-only dry-run estimate
+  // could under-provision the tail call. This pins the fix: with
+  // independentCalls:true, submitBatchedContractCalls dry-runs EVERY inner
+  // call and declares the component-wise MAX across all of them — proven
+  // here with per-call estimates that deliberately differ (a small head, a
+  // large tail), so a regression back to "head estimate only" would
+  // under-declare and this test would catch it.
+  //
+  // Both weight_limit and storage_deposit_limit are routed through their
+  // respective buffer helpers (weightLimitFor / storageDepositLimitFor,
+  // bulletin #1522/#1491/#1518) applied to the MAX estimate computed here —
+  // so both expected values below are the 20%-buffered max, not the raw one.
+  test("declares the LARGER of two differing per-call estimates, not just the head call's", async () => {
+    const d = new DotNS();
+    d.connected = true;
+    d.substrateAddress = "5Signer";
+    d.signer = {};
+    const capturedCalls = [];
+    // storageDeposit values deliberately both exceed computeStorageDepositLimit's
+    // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT floor (2e12) so the floor can't mask
+    // which estimate actually won the max-selection.
+    const estimates = [
+      { success: true, gasRequired: { referenceTime: 1_000_000_000n, proofSize: 50_000n }, storageDeposit: 2_000_000_000_000n },
+      { success: true, gasRequired: { referenceTime: 9_000_000_000n, proofSize: 900_000n }, storageDeposit: 20_000_000_000_000n },
+    ];
+    let estimateCallIndex = 0;
+    d.clientWrapper = {
+      ensureAccountMapped: async () => {},
+      estimateGasForCall: async () => estimates[estimateCallIndex++],
+      client: {
+        tx: {
+          Revive: {
+            call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
+          },
+          Utility: {
+            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+          },
+        },
+      },
+      signAndSubmitWithRetry: async (buildBatch) => {
+        buildBatch();
+        return { kind: "hash", hash: "0xbatch" };
+      },
+    };
+
+    const abiHead = [{ type: "function", name: "setResolver", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    const abiTail = [{ type: "function", name: "setText", inputs: [], outputs: [], stateMutability: "nonpayable" }];
+    await d["submitBatchedContractCalls"](
+      [
+        { contractAddress: "0xAAAA000000000000000000000000000000AAAA", abi: abiHead, functionName: "setResolver", args: [] },
+        { contractAddress: "0xBBBB000000000000000000000000000000BBBB", abi: abiTail, functionName: "setText", args: [] },
+      ],
+      () => {},
+      "test batch",
+      // independentCalls: true — only the caller can assert its inner calls have
+      // no on-chain data dependency on each other (see ensureResolverAndSetTextRecord).
+      { independentCalls: true },
+    );
+
+    assert.strictEqual(estimateCallIndex, 2,
+      ">> FAIL: submitBatchedContractCalls estimate count: every inner call must be dry-run individually, not just the head call");
+    assert.strictEqual(capturedCalls.length, 2,
+      ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
+    for (const call of capturedCalls) {
+      assert.deepStrictEqual(call.weight_limit, { ref_time: (9_000_000_000n * 120n) / 100n, proof_size: (900_000n * 120n) / 100n },
+        ">> FAIL: submitBatchedContractCalls max-estimate weight_limit: must declare the LARGER (tail-call) buffered estimate, not the head call's smaller one — a head-only estimate would under-provision the tail call");
+      assert.strictEqual(call.storage_deposit_limit, (20_000_000_000_000n * 120n) / 100n,
+        ">> FAIL: submitBatchedContractCalls max-estimate storage_deposit_limit: must declare the LARGER (tail-call) buffered storage deposit, not the head call's smaller one");
+    }
   });
 });
 
@@ -13716,10 +13977,13 @@ describe("incremental-stats v3 summary", () => {
 
   test("storeChunkedContent emits monotonic upload indices [K/U] (#511 regression guard)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // Upload batch line uses uploadEmitted/uploadTotal (not i+1/chunks.length)
-    // so progress is monotonic when trusted/skipped chunks live interleaved
-    // with uploaded ones in CAR position order.
-    assert.match(src, /\[\$\{uploadEmitted\}\/\$\{uploadTotal\}\] chunk \$\{i\}/);
+    // Upload batch line uses uploadEmitted/uploadTotal (not chunks.length) for
+    // the [K/U] progress counter, so progress is monotonic when trusted/skipped
+    // chunks live interleaved with uploaded ones in CAR position order. The
+    // per-chunk index shown alongside it is 1-based (#1011) — see the
+    // "ONE 1-based convention" test below for why.
+    assert.match(src, /\[\$\{uploadEmitted\}\/\$\{uploadTotal\}\] chunk \$\{i \+ 1\}/,
+      ">> FAIL: #511 guard: the batch line's [K/U] counter (uploadEmitted/uploadTotal) must stay monotonic and distinct from the 1-based chunk index shown alongside it");
     // Trusted summary collapses per-chunk lines into one row listing indices.
     assert.match(src, /Trusted: \$\{trustedCount\} chunks skipped without re-probe \(chunks /);
   });
@@ -13735,22 +13999,53 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: #932 guard: must check uploadEmittedIndices.has(i) before incrementing uploadEmitted");
   });
 
-  test("storeChunkedContent chunk-index display is 0-based everywhere (no batch/retry off-by-one)", () => {
+  // #1011: this test used to protect "0-based everywhere" — a single shared
+  // convention across every chunk-index display site. That convention flipped
+  // to 1-based (issue #1011's own triage: "label chunks 1-based everywhere a
+  // user sees them"), because the missing-positions error (a few lines below
+  // this whole block) and the structured captureWarning({chunkIndex: ...})
+  // payloads were ALREADY 1-based — "0-based everywhere" was never actually
+  // true of the whole function, which is exactly the "chunk numbers are all
+  // over the place" bug #1011 reports. This test now protects the SAME
+  // property (one shared convention, so the same chunk never shows under two
+  // different numbers across batch/retry/nonce-collision/verify-mismatch
+  // lines) in its corrected 1-based form.
+  test("storeChunkedContent chunk-index display is ONE 1-based convention everywhere (#1011 — no mixed bases)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // The batch upload line shows `chunk ${i}` (0-based). The retry / consumed /
-    // nonce-collision re-upload / verify-mismatch lines must use the SAME 0-based
-    // index — NOT `${fail.index + 1}` / `${idx + 1}` / `${i + 1}`. Otherwise the
-    // same chunk shows under two numbers (a retrying chunk N looked like a phantom
-    // "chunk N+1" colliding with the trusted chunk N+1). The [K/U] progress
-    // counter is a count and legitimately stays 1-based.
-    assert.match(src, /chunk \$\{i\}/,
-      ">> FAIL: chunk-numbering: the batch upload line must display the 0-based chunk index `chunk ${i}`");
-    assert.doesNotMatch(src, /chunk \$\{fail\.index \+ 1\}/,
-      ">> FAIL: chunk-numbering: retry/consumed lines must use 0-based `${fail.index}`, not `${fail.index + 1}` (off-by-one vs the batch line)");
-    assert.doesNotMatch(src, /chunk \$\{idx \+ 1\}/,
-      ">> FAIL: chunk-numbering: nonce-collision re-upload lines must use 0-based `${idx}`, not `${idx + 1}`");
-    assert.doesNotMatch(src, /chunk \$\{i \+ 1\} CID mismatch/,
-      ">> FAIL: chunk-numbering: the verify-mismatch error must use 0-based `${i}`, not `${i + 1}`");
+    assert.match(src, /chunk \$\{i \+ 1\} —/,
+      ">> FAIL: chunk-numbering: the batch upload line must display the 1-based chunk index `chunk ${i + 1}`");
+    assert.match(src, /Chunk \$\{idx \+ 1\}: nonce/,
+      ">> FAIL: chunk-numbering: the nonce-consumed heuristic line must use 1-based `${idx + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: isValid:false but CID was probe-failed/,
+      ">> FAIL: chunk-numbering: the isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: tx rejected/,
+      ">> FAIL: chunk-numbering: the mortal-expiry note must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Retrying chunk \$\{fail\.index \+ 1\} \(attempt/,
+      ">> FAIL: chunk-numbering: the retry-progress line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: reconcile found it already included/,
+      ">> FAIL: chunk-numbering: the reconcile-found line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: chain still frozen/,
+      ">> FAIL: chunk-numbering: the frozen-chain-wait line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: retry isValid:false/,
+      ">> FAIL: chunk-numbering: the retry isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\} failed after \$\{MAX_CHUNK_RETRIES\} retries/,
+      ">> FAIL: chunk-numbering: the final chunk-failure throw must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Nonce-collision re-upload: chunk \$\{idx \+ 1\} \(attempt/,
+      ">> FAIL: chunk-numbering: the nonce-collision re-upload progress line must use 1-based `${idx + 1}`");
+    assert.match(src, /Nonce-collision re-upload of chunk \$\{idx \+ 1\} failed/,
+      ">> FAIL: chunk-numbering: the nonce-collision re-upload failure throw must use 1-based `${idx + 1}`");
+    assert.match(src, /chunk \$\{i \+ 1\} CID mismatch/,
+      ">> FAIL: chunk-numbering: the verify-mismatch error must use 1-based `${i + 1}`, matching the missing-positions error which was already 1-based");
+    assert.match(src, /trustedIndices\.push\(i \+ 1\)/,
+      ">> FAIL: chunk-numbering: trustedIndices must push 1-based (i + 1), matching every other display site");
+  });
+
+  test("storeDirectoryV2 prints 'Phase A (stable section):' / 'Phase B (full CAR):' headers (#1011)", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.match(src, /Phase A \(stable section\):/,
+      ">> FAIL: chunk-numbering: storeDirectoryV2 must print a 'Phase A (stable section):' header before the Phase A upload block");
+    assert.match(src, /Phase B \(full CAR\):/,
+      ">> FAIL: chunk-numbering: storeDirectoryV2 must print a 'Phase B (full CAR):' header before the Phase B upload block");
   });
 
   test("owned-name update preflight announces the owner phone signature; header drops the transfer claim (#60 regression guard)", () => {
@@ -13787,6 +14082,39 @@ describe("incremental-stats v3 summary", () => {
     };
     const out = renderSummary(stats);
     assert.match(out, /Upload:.*3 chunks/);
+  });
+
+  test("renderSummary labels Probed as Phase-A-only and Upload as A+B combined (#1011)", () => {
+    // #1011: Probed: (probedTotal/probePresent/probeAbsent) is populated ONLY from
+    // Phase A's section-1 probe (probeResultsForStats in deploy.ts omits sections
+    // 0/2, which Phase A never probes) while Upload: (chunksUploaded/bytesUploaded)
+    // combines BOTH phases — the exact "9 / 10 / 13 contradict each other" report.
+    // Labeling them removes the ambiguity without changing either figure.
+    const stats = {
+      manifestSource: "embedded", manifestFetchAttempts: 1, manifestBytes: 27_000,
+      framework: null,
+      filesTotal: 76, filesStable: 75, filesVolatile: 1,
+      probedTotal: 13, probePresent: 10, probeAbsent: 0, probeFailed: 3,
+      probeFailedRpc: 3, probeFailedDecode: 0, probeFailedMetadata: 0,
+      recycledCids: 0, retentionPeriodBlocks: 100800,
+      bytesProbePresent: 9_300_000, bytesProbeAbsent: 0,
+      bytesSkipped: 9_300_000, bytesUploaded: 1_500_000,
+      chunksTotal: 13, chunksUploaded: 3, chunksSkipped: 10,
+      carBytes: 10_300_000,
+      section0Bytes: 27_000, section1Bytes: 9_312_991, section2Bytes: 1_458_630,
+      estimatedSecondsSaved: 35,
+      tier2VerifiedCount: 0, tier2FallbackCount: 0, tier2InconclusiveCount: 0,
+    };
+    const out = renderSummary(stats);
+    // test/e2e.test.js parses live stdout with /Probed:\s+(\d+)\s+chunks/ and
+    // /Upload:\s+([\d.]+)\s+MB\s+across\s+(\d+)\s+chunks/ (no end anchor) — the
+    // phase label must come AFTER the number, never between "Probed"/"Upload"
+    // and the colon or between the colon and the number, or it silently breaks
+    // the live E2E harness's parsing.
+    assert.match(out, /Probed:\s+13 chunks.*\(Phase A only\)/,
+      ">> FAIL: renderSummary: Probed line must be suffixed '(Phase A only)' after the existing count/absent text");
+    assert.match(out, /Upload:\s+[\d.]+ MB across 3 chunks \(A\+B combined\)/,
+      ">> FAIL: renderSummary: Upload line must be suffixed '(A+B combined)' right after the chunk count");
   });
 
   test("probeResultsForStats omits non-probed Phase A chunks (#513 — no fabricated rpc_error)", () => {
@@ -18433,7 +18761,12 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
 
   test("dotns.ts: submitBatchedContractCalls threads this._registerStorageDeposit, not a bare default call", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
-    assert.match(dotnsSrc, /storageDepositLimitFor\(headEstimate\.storageDeposit,\s*this\._registerStorageDeposit\)/,
+    // #1164: the estimate submitBatchedContractCalls buffers is the component-wise
+    // max across every dry-run'd inner call (maxStorageDeposit), not just the head
+    // call's own estimate (headEstimate.storageDeposit, the pre-#1164 shape) — see
+    // the independentCalls/multi-dry-run block above this call site. The floor
+    // argument itself is unaffected by that change.
+    assert.match(dotnsSrc, /storageDepositLimitFor\(maxStorageDeposit,\s*this\._registerStorageDeposit\)/,
       ">> FAIL: submitBatchedContractCalls must pass this._registerStorageDeposit as the floor — the per-env config, " +
       "otherwise it silently falls back to the generic 200 PAS default regardless of environments.json");
   });
@@ -19355,6 +19688,75 @@ describe("dotns.ts: finalisation poll prints only when chain time advances", () 
     assert.ok(
       /Awaiting finalization/.test(src),
       "dotns.ts: 'Awaiting finalization' log message must still exist"
+    );
+  });
+});
+
+test("publishManifest prints a 60-char '=' banner titled 'Manifest publish — <domain>' (#1011)", () => {
+  const src = fs.readFileSync("src/manifest/publish.ts", "utf8");
+  assert.match(src, /const banner = "=".repeat\(60\);\s*\n\s*console\.log\("\\n" \+ banner\);\s*\n\s*console\.log\(`Manifest publish — \$\{config\.domain\}`\);\s*\n\s*console\.log\(banner\);/,
+    ">> FAIL: publish.ts: manifest phase must print the same 60-char '=' banner style as Storage/DotNS/Preflight, titled 'Manifest publish — <domain>'");
+});
+
+describe("computePhaseACounts (#1011)", () => {
+  test("first deploy (no trusted CIDs) reports everything as toCheck, zero trusted", () => {
+    const counts = computePhaseACounts(["cidA", "cidB", "cidC"], new Set());
+    assert.deepEqual(counts, { toCheck: 3, trusted: 0, duplicates: 0 },
+      ">> FAIL: computePhaseACounts: first deploy: trusted must be 0 when trustedCids is empty");
+  });
+
+  test("all trusted: toCheck is 0, trusted equals the unique count", () => {
+    const counts = computePhaseACounts(["cidA", "cidB"], new Set(["cidA", "cidB"]));
+    assert.deepEqual(counts, { toCheck: 0, trusted: 2, duplicates: 0 },
+      ">> FAIL: computePhaseACounts: all-trusted: toCheck must be 0 and trusted must equal the unique CID count");
+  });
+
+  test("duplicate untrusted CID is not miscounted as trusted (the #1011 bug shape)", () => {
+    // Old buggy formula: trustedCount = uploadCids.length - new Set(uploadCids).size
+    // = 4 - 3 = 1, reporting 1 "trusted from prev manifest" chunk that was never in
+    // any previous manifest — it was just a duplicate CID within this section.
+    const counts = computePhaseACounts(["cidA", "cidA", "cidB", "cidC"], new Set());
+    assert.deepEqual(counts, { toCheck: 3, trusted: 0, duplicates: 1 },
+      ">> FAIL: computePhaseACounts: a duplicate of an UNTRUSTED CID must count as a duplicate, never as trusted");
+  });
+
+  test("duplicate TRUSTED CID is counted once in trusted, once in duplicates (not double-counted as trusted)", () => {
+    const counts = computePhaseACounts(["cidA", "cidA", "cidB"], new Set(["cidA"]));
+    assert.deepEqual(counts, { toCheck: 1, trusted: 1, duplicates: 1 },
+      ">> FAIL: computePhaseACounts: a trusted CID appearing twice must count as ONE trusted chunk plus one duplicate, not two trusted (this is the edge case where toCheck = uniqueSize - occurrences would go negative)");
+  });
+
+  test("first deploy with duplicate CIDs never reports a nonzero trusted count (contradiction guard)", () => {
+    // This is the literal #1011 report: a FIRST deploy printed "1 trusted from prev
+    // manifest" purely because of a duplicate CID, with no previous manifest at all.
+    const counts = computePhaseACounts(["cidX", "cidX", "cidY"], new Set());
+    assert.equal(counts.trusted, 0,
+      ">> FAIL: computePhaseACounts: a first deploy (empty trustedCids set) must never report trusted > 0, regardless of duplicate CIDs in section 1");
+  });
+});
+
+describe("formatUploadInclusionLine (#1011)", () => {
+  test("nothing submitted: uploadTotal 0", () => {
+    assert.equal(
+      formatUploadInclusionLine(13, 0),
+      "All 13 chunks already on chain — nothing submitted",
+      ">> FAIL: formatUploadInclusionLine: uploadTotal=0 must print the existing 'nothing submitted' wording"
+    );
+  });
+
+  test("partial: some submitted, some already on chain", () => {
+    assert.equal(
+      formatUploadInclusionLine(13, 3),
+      "3 submitted and included, 10 already on chain",
+      ">> FAIL: formatUploadInclusionLine: must report uploadTotal as submitted and (total - uploadTotal) as already on chain"
+    );
+  });
+
+  test("everything submitted: no chunks were already known present", () => {
+    assert.equal(
+      formatUploadInclusionLine(5, 5),
+      "5 submitted and included, 0 already on chain",
+      ">> FAIL: formatUploadInclusionLine: uploadTotal == totalChunks must report 0 already-on-chain, not skip the line"
     );
   });
 });
@@ -22939,6 +23341,172 @@ describe("browserUrlFor", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// DeployResult.browserUrl + its plumbing (#1157)
+// browserUrlFor() already resolved the env's real webGateway (and the
+// previewnet suffix) for the CLI's "Check it out here" console line — this
+// section pins that the SAME resolution reaches DeployResult, bin/polkadot-
+// app-deploy's GITHUB_OUTPUT, and the reusable workflow's PR-comment/summary
+// URL, instead of a second, out-of-sync mechanism recomputing a gateway URL
+// from a hardcoded default.
+// ---------------------------------------------------------------------------
+
+describe("DeployResult.browserUrl (#1157)", () => {
+  test("DeployResult interface declares browserUrl: string", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf-8");
+    const ifaceMatch = src.match(/export interface DeployResult \{[\s\S]*?\n\}/);
+    assert.ok(ifaceMatch, ">> FAIL: DeployResult.browserUrl: could not locate the DeployResult interface in src/deploy.ts");
+    assert.match(
+      ifaceMatch[0],
+      /browserUrl:\s*string;/,
+      ">> FAIL: DeployResult.browserUrl: DeployResult must declare `browserUrl: string` so library callers (and the CLI's GITHUB_OUTPUT write) can reuse the env-resolved URL instead of recomputing one"
+    );
+  });
+
+  test("deploy()'s return site reuses ONE browserUrlFor(...) call — no second URL mechanism", () => {
+    // #1164: the "Check it out here" console lines moved out of this call
+    // site and into printDeploymentCompleteBanner (deferred until after a
+    // pending manifest publish succeeds, so a manifest failure never leaves
+    // a false completion banner on screen) — they no longer appear
+    // immediately after this assignment. The invariant this test protects
+    // (one resolution, reused everywhere) still holds and is asserted
+    // directly: browserUrlFor is called exactly once in this file, and the
+    // banner call passes the SAME `browserUrl` variable rather than
+    // resolving a second time.
+    const src = fs.readFileSync("src/deploy.ts", "utf-8");
+    const returnStatement = "domainName: name,\n        fullDomain: `${name}.${envTld}`,\n        cid: cid as string,\n        ipfsCid,\n        browserUrl,";
+    assert.ok(src.includes(returnStatement), ">> FAIL: browserUrl-single-resolution: deploy()'s DeployResult return must include a `browserUrl` field");
+    assert.ok(
+      !returnStatement.includes("browserUrlFor("),
+      ">> FAIL: browserUrl-single-resolution: the return statement must reuse the `browserUrl` variable, not call browserUrlFor(...) again"
+    );
+    assert.match(
+      src,
+      /const browserUrl = browserUrlFor\(name, envId, envWebGateway\);/,
+      ">> FAIL: browserUrl-single-resolution: expected `const browserUrl = browserUrlFor(name, envId, envWebGateway)` assigned once in deploy()"
+    );
+    // Matches only the CALL shape (name, envId, envWebGateway args) — not the
+    // `export function browserUrlFor(...)` definition or its doc-comment
+    // mention, either of which would false-positive a naive `browserUrlFor(`
+    // occurrence count.
+    const browserUrlForCallCount = (src.match(/browserUrlFor\(name, envId, envWebGateway\)/g) || []).length;
+    assert.equal(
+      browserUrlForCallCount,
+      1,
+      ">> FAIL: browserUrl-single-resolution: browserUrlFor(name, envId, envWebGateway) must be called exactly once in src/deploy.ts — a second call site would be the exact drift this test guards against"
+    );
+    assert.match(
+      src,
+      /printDeploymentCompleteBanner\(`\$\{name\}\.\$\{envTld\}`, browserUrl\)/,
+      ">> FAIL: browserUrl-single-resolution: the completion banner must reuse the SAME browserUrl variable via printDeploymentCompleteBanner(..., browserUrl), not a second resolution"
+    );
+  });
+
+  test("bin/polkadot-app-deploy writes browserUrl to GITHUB_OUTPUT", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+    assert.match(
+      bin,
+      /appendFileSync\(output, `browserUrl=\$\{result\.browserUrl\}\\n`\)/,
+      ">> FAIL: bin-browserUrl-output: bin/polkadot-app-deploy must append `browserUrl=${result.browserUrl}` to GITHUB_OUTPUT alongside cid/domain, so a consumer's reusable-workflow step can read the env-resolved URL"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: browser-URL step prefers the CLI-resolved URL over the gateway fallback", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const stepMatch = wf.match(/- name: Compute browser URL[\s\S]*?(?=\n {6}- name:|\Z)/);
+    assert.ok(stepMatch, ">> FAIL: workflow-browser-url: could not locate the 'Compute browser URL' step");
+    const step = stepMatch[0];
+    assert.match(
+      step,
+      /RESOLVED_URL:\s*\$\{\{\s*steps\.final\.outputs\.browserUrl\s*\}\}/,
+      ">> FAIL: workflow-browser-url: step must read steps.final.outputs.browserUrl (the CLI's env-resolved URL)"
+    );
+    assert.match(
+      step,
+      /if \[ -n "\$RESOLVED_URL" \]; then\s*\n\s*URL="\$RESOLVED_URL"/,
+      ">> FAIL: workflow-browser-url: a non-empty RESOLVED_URL must win over the inputs.gateway-based fallback construction"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: 'Set deployment outputs' propagates browserUrl on both the cache-hit and fresh-deploy branches", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const stepMatch = wf.match(/- name: Set deployment outputs[\s\S]*?(?=\n {6}- name:|\Z)/);
+    assert.ok(stepMatch, ">> FAIL: workflow-final-outputs: could not locate the 'Set deployment outputs' step");
+    const step = stepMatch[0];
+    assert.match(
+      step,
+      /echo "browserUrl=\$\{\{ steps\.deploy\.outputs\.browserUrl \}\}" >> "\$GITHUB_OUTPUT"/,
+      ">> FAIL: workflow-final-outputs: fresh-deploy branch must propagate steps.deploy.outputs.browserUrl"
+    );
+    assert.match(
+      step,
+      /echo "browserUrl=" >> "\$GITHUB_OUTPUT"/,
+      ">> FAIL: workflow-final-outputs: cache-hit branch must emit an explicit empty browserUrl (deploy step never ran, so no env-resolved URL exists) rather than omitting the key"
+    );
+  });
+
+  test(".github/workflows/deploy.yml: gateway input is documented as a fallback, not the primary mechanism", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const gatewayInput = wf.match(/gateway:\s*\n\s*description: '([^']*)'/);
+    assert.ok(gatewayInput, ">> FAIL: workflow-gateway-doc: could not locate the `gateway` input description");
+    assert.match(
+      gatewayInput[1],
+      /FALLBACK ONLY/,
+      ">> FAIL: workflow-gateway-doc: `gateway` input description must flag itself as fallback-only now that polkadot-app-deploy's own env-resolved URL is preferred"
+    );
+  });
+});
+
+// The config is only discoverable if the caller's repo is on disk at the
+// workspace root, and the artifact must land where the config points (#1418).
+describe(".github/workflows/deploy.yml: checks out the caller repo so its product manifest is found (#1418)", () => {
+  test("checks out the caller repo at the root before the artifact download", () => {
+    const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const checkoutStep = wf.split(/\n(?= {6}- )/).find((step) => /- name: Checkout caller repository$/m.test(step));
+    assert.ok(checkoutStep, ">> FAIL: deploy.yml: the caller checkout step must exist");
+    // No repository:/path: — either one moves the config outside the walk-up.
+    assert.doesNotMatch(checkoutStep, /^ {10}(repository|path):/m,
+      ">> FAIL: deploy.yml: the caller checkout must not set repository: or path:, or the config leaves the walk-up path");
+    const checkout = wf.indexOf("- name: Checkout caller repository");
+    const download = wf.indexOf("- name: Download build artifact");
+    assert.ok(checkout > -1 && download > checkout,
+      ">> FAIL: deploy.yml: the caller checkout must precede the artifact download, or checkout's git clean removes it");
+    assert.match(wf, /^ {6}build-dir:\n {8}description:/m, ">> FAIL: deploy.yml: build-dir input must exist");
+    assert.match(wf, /path: \$\{\{ inputs\.build-dir \}\}/,
+      ">> FAIL: deploy.yml: the artifact must download into inputs.build-dir");
+    // The cache key must track the directory actually deployed.
+    const hashStep = wf.split(/\n(?= {6}- )/).find((step) => /- name: Compute build hash$/m.test(step));
+    assert.match(hashStep, /BUILD_DIR: \$\{\{ inputs\.build-dir \}\}/,
+      ">> FAIL: deploy.yml: the build hash must be computed over inputs.build-dir, not a literal directory");
+    // The manifest is republished only when the deploy step runs, and that step is
+    // skipped on a cache hit. A config-only edit must therefore change the key.
+    assert.match(hashStep, /polkadot-app-deploy\.config\.ts/,
+      ">> FAIL: deploy.yml: the build hash must cover polkadot-app-deploy.config.*, or editing only the config hits the cache and the manifest is never republished");
+    // A caller-controlled input in script text is a shell injection in the job
+    // that exports the deploy mnemonic. Scan the script bodies themselves: the
+    // deploy step is a `command:` block on nick-fields/retry, not a `run:`, so a
+    // line-scoped `run:` check cannot see where injection would happen.
+    const lines = wf.split("\n");
+    const scripts = [];
+    for (let i = 0; i < lines.length; i++) {
+      const open = lines[i].match(/^( +)(?:run|command): \|-?\s*$/);
+      if (!open) continue;
+      const indent = open[1].length;
+      const body = [];
+      while (++i < lines.length) {
+        const line = lines[i];
+        if (line.trim() !== "" && (line.length - line.trimStart().length) <= indent) { i--; break; }
+        body.push(line);
+      }
+      scripts.push(body.join("\n"));
+    }
+    assert.ok(scripts.length >= 2, `>> FAIL: deploy.yml: expected to find the run/command script bodies, found ${scripts.length}`);
+    const injected = scripts.filter((body) => body.includes("${{ inputs.build-dir }}"));
+    assert.deepStrictEqual(injected.map((b) => b.trim().split("\n")[0]), [],
+      ">> FAIL: deploy.yml: build-dir must reach scripts through env:, never interpolated into a run:/command: body");
+  });
+});
+
 // import { shouldEmit } from "../tools/cache-savings-totals.mjs";
 
 describe.skip("shouldEmit (cache-savings-totals DSN gate)", () => { // skipped in public snapshot: tool not shipped
@@ -23996,7 +24564,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText } from "../dist/deploy.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
 // #1058: describeSlotFallbackReason is the extracted, unit-testable reason
@@ -24298,6 +24866,99 @@ describe("resolveEffectiveMnemonic env/flag precedence (#1107)", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// nonInteractivePhoneConfirmationError (#1363) — non-interactive callers must
+// not hit "aborted by user"
+//
+// Pre-fix: bin/polkadot-app-deploy's confirmPhoneReady hook unconditionally
+// built a readline interface and awaited a keypress. In CI (no TTY),
+// readline's "close" event fires immediately (nothing will ever answer), and
+// the gate rejected with `new Error("aborted by user")` — indistinguishable
+// from a deliberate Ctrl-C. This is the pure, readline-free piece of the fix:
+// the message + error type the CLI now throws BEFORE creating readline once
+// it detects a non-interactive environment (via the existing isInteractive()
+// helper, not a new mechanism).
+// ---------------------------------------------------------------------------
+describe("nonInteractivePhoneConfirmationError (#1363)", () => {
+  test("returns a NonRetryableError — retrying an unattended CI run fails identically every time", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    assert.ok(err instanceof NonRetryableError,
+      `>> FAIL: nonInteractivePhoneConfirmationError: must be a NonRetryableError so bin/polkadot-app-deploy exits EXIT_CODE_NO_RETRY instead of a retryable-looking generic failure; got ${err.constructor.name}`);
+  });
+
+  test("message names the label, states the run is non-interactive, and never says 'aborted by user'", () => {
+    const err = nonInteractivePhoneConfirmationError("Link content");
+    assert.match(err.message, /Link content/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name which signature step was blocked");
+    assert.match(err.message, /non-interactive/i,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must say the run is non-interactive, not disguise the cause");
+    assert.doesNotMatch(err.message, /aborted by user/i,
+      ">> FAIL: nonInteractivePhoneConfirmationError: must never reuse the 'aborted by user' phrasing — that's the issue this fixes (misattributing a CI failure to an operator who was never there)");
+  });
+
+  test("message names the actionable fix: --mnemonic, MNEMONIC, and DOTNS_MNEMONIC", () => {
+    // There is no safe default for a phone signature (unlike a yes/no prompt,
+    // silently proceeding would submit an unapproved transaction), so the
+    // message must point the caller at a signer that never needs phone
+    // confirmation instead of guessing on their behalf.
+    const err = nonInteractivePhoneConfirmationError("Commitment");
+    assert.match(err.message, /--mnemonic/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the --mnemonic flag as the fix");
+    assert.match(err.message, /\bMNEMONIC\b/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the MNEMONIC env var as an alternative fix");
+    assert.match(err.message, /DOTNS_MNEMONIC/,
+      ">> FAIL: nonInteractivePhoneConfirmationError: message must name the DOTNS_MNEMONIC env var as an alternative fix");
+  });
+
+  test("error_category classifies as 'user' — the fix is in the caller's hands (pass --mnemonic), not the tool's", () => {
+    const err = nonInteractivePhoneConfirmationError("Register");
+    const category = classifyDeployError(err.message);
+    assert.strictEqual(category, "user",
+      `>> FAIL: nonInteractivePhoneConfirmationError category: got ${category} — this is an actionable caller-side fix, same family as insufficient-balance/invalid-label, not an environment/internal fault`);
+  });
+});
+
+describe("bin/polkadot-app-deploy confirmPhoneReady non-interactive gate (#1363, source wiring)", () => {
+  // bin/polkadot-app-deploy is a plain executable script (not compiled, no
+  // top-level exports), and driving it far enough to hit the live
+  // confirmPhoneReady closure requires a real chain connection — that's E2E
+  // territory. These assertions pin the wiring the interactive-vs-CI split
+  // depends on, the same way this file's other bin/polkadot-app-deploy tests
+  // check source shape directly rather than executing the script end-to-end.
+  const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+
+  test("imports isInteractive from version-check.js and nonInteractivePhoneConfirmationError from deploy.js", () => {
+    assert.match(bin, /isInteractive/,
+      ">> FAIL: bin/polkadot-app-deploy must import isInteractive from ../dist/version-check.js — reuse the existing TTY/CI detection, not a second mechanism");
+    assert.match(bin, /nonInteractivePhoneConfirmationError/,
+      ">> FAIL: bin/polkadot-app-deploy must import and use nonInteractivePhoneConfirmationError from ../dist/deploy.js");
+  });
+
+  test("confirmPhoneReady checks isInteractive() BEFORE readline.createInterface is reached", () => {
+    const confirmBlock = bin.slice(bin.indexOf("confirmPhoneReady: ("), bin.indexOf("readline.createInterface"));
+    assert.ok(confirmBlock.length > 0 && confirmBlock.includes("isInteractive"),
+      ">> FAIL: bin/polkadot-app-deploy: the isInteractive() check must run before readline.createInterface — otherwise a non-TTY run still builds a readline interface it can never satisfy");
+    assert.match(confirmBlock, /!isInteractive\(\)/,
+      ">> FAIL: bin/polkadot-app-deploy: confirmPhoneReady must gate on !isInteractive(), rejecting before creating readline");
+  });
+
+  test("the interactive branch (readline prompt, Y/yes handling, genuine Ctrl-C abort) is still present, unmodified in behavior", () => {
+    // The fix must ONLY add a guard in front of the existing prompt — a real
+    // interactive deploy must still see "Check your phone", accept y/yes, and
+    // a genuine Ctrl-C during the prompt must still reject as "aborted by
+    // user" (that classification stays correct for an actual interactive
+    // cancellation; #1363 only stops CI from reaching it).
+    assert.match(bin, /Check your phone/,
+      ">> FAIL: bin/polkadot-app-deploy: interactive phone-check prompt text must still be present");
+    assert.match(bin, /readline\.createInterface/,
+      ">> FAIL: bin/polkadot-app-deploy: interactive readline wiring must still be present for a real TTY session");
+    assert.match(bin, /new Error\("aborted by user"\)/,
+      ">> FAIL: bin/polkadot-app-deploy: a genuine interactive Ctrl-C must still reject with 'aborted by user' — only the non-interactive path gets the new distinct error");
+    assert.match(bin, /answer === "y" \|\| answer === "yes"/,
+      ">> FAIL: bin/polkadot-app-deploy: the explicit y/yes confirmation requirement (#194) must be unchanged");
+  });
+});
+
 describe("resolveEnvId env/flag precedence (#1165)", () => {
   const FLAG_ENV = "preview";
   const VAR_ENV = "summit";
@@ -24345,6 +25006,106 @@ describe("shouldPublishManifest — --no-manifest / --content-only (#1163)", () 
       ">> FAIL: shouldPublishManifest: with no config discovered, manifest publishing must stay skipped (legacy contenthash-only path)");
     assert.strictEqual(shouldPublishManifest({ configFound: false, noManifest: true }), false,
       ">> FAIL: shouldPublishManifest: with no config discovered AND --no-manifest set, manifest publishing must stay skipped");
+  });
+});
+
+describe("pickPostDeployBannerText (#1164)", () => {
+  test("manifestPending true → interim banner, not DEPLOYMENT COMPLETE", () => {
+    assert.strictEqual(pickPostDeployBannerText(true), "CONTENT DEPLOYED — publishing product manifest…",
+      ">> FAIL: pickPostDeployBannerText: manifestPending:true must defer the completion banner (#1164)");
+  });
+
+  test("manifestPending false → DEPLOYMENT COMPLETE (unchanged default)", () => {
+    assert.strictEqual(pickPostDeployBannerText(false), "DEPLOYMENT COMPLETE!",
+      ">> FAIL: pickPostDeployBannerText: manifestPending:false must keep today's banner");
+  });
+
+  test("manifestPending undefined (every existing library caller) → DEPLOYMENT COMPLETE (default unchanged)", () => {
+    assert.strictEqual(pickPostDeployBannerText(undefined), "DEPLOYMENT COMPLETE!",
+      ">> FAIL: pickPostDeployBannerText: an unset flag (e.g. playground-cli, which never sets manifestPending) must keep today's banner — the change is opt-in, not a behavior change for existing callers");
+  });
+});
+
+describe("bin/polkadot-app-deploy manifestPending + deferred banner wiring (#1164, source wiring)", () => {
+  const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+
+  test("passes manifestPending to deploy() derived from shouldPublishManifest", () => {
+    assert.match(bin, /manifestPending:\s*manifestWillPublish/,
+      ">> FAIL: bin/polkadot-app-deploy must pass manifestPending: manifestWillPublish (derived from shouldPublishManifest) into deploy()'s options — the banner defers only when a manifest publish will actually follow");
+  });
+
+  test("prints the real completion banner AFTER publishManifest succeeds, not before", () => {
+    const publishIdx = bin.indexOf("await publishManifest(");
+    const bannerIdx = bin.indexOf("printDeploymentCompleteBanner(");
+    assert.ok(publishIdx > -1 && bannerIdx > -1 && bannerIdx > publishIdx,
+      ">> FAIL: bin/polkadot-app-deploy: printDeploymentCompleteBanner must be called AFTER await publishManifest(...) resolves, inside the same try block, so a manifest publish failure never prints a false completion banner");
+  });
+});
+
+// The reusable workflow downloads only the build artifact, so the caller's
+// config is on disk only if their repo is checked out at the workspace root (#1418).
+describe("product config discovery in the reusable-workflow layout (#1418)", () => {
+  const CONFIG = (domain) => `export default {
+  domain: '${domain}',
+  displayName: 'Demo',
+  description: 'Fixture for #1418.',
+  icon: { path: './icon.png', format: 'png' },
+  executables: [{ kind: 'app', path: './build', appVersion: [0, 1, 0] }],
+};
+`;
+
+  // A fresh dir per case: tryLoadProductConfig import()s the config, and Node
+  // caches ES modules by path, so a reused dir would serve the previous body.
+  let seq = 0;
+  function workspace({ repo = {}, artifact = {}, buildDir = "build" }) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `pad-1418-${seq++}-`));
+    for (const [rel, body] of Object.entries(repo)) {
+      fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+      fs.writeFileSync(path.join(root, rel), body);
+    }
+    const bd = path.join(root, buildDir);
+    fs.mkdirSync(bd, { recursive: true });
+    fs.writeFileSync(path.join(bd, "index.html"), "<h1>site</h1>");
+    for (const [rel, body] of Object.entries(artifact)) {
+      fs.mkdirSync(path.dirname(path.join(bd, rel)), { recursive: true });
+      fs.writeFileSync(path.join(bd, rel), body);
+    }
+    return { root, bd };
+  }
+  const find = async (bd) => {
+    const { tryLoadProductConfig } = await import("../dist/index.js");
+    return tryLoadProductConfig({ cwd: path.resolve(bd), walkUp: true });
+  };
+
+  test("no caller checkout: the config is not on disk, so the manifest is silently skipped", async () => {
+    const { bd } = workspace({});
+    const loaded = await find(bd);
+    assert.strictEqual(shouldPublishManifest({ configFound: !!loaded, noManifest: false }), false,
+      ">> FAIL: #1418 fixture: with no caller checkout there is no config to find; this pins the bug the workflow change fixes");
+  });
+
+  test("caller checked out at the workspace root: the config is found and the manifest publishes", async () => {
+    const { bd } = workspace({ repo: { "polkadot-app-deploy.config.ts": CONFIG("demo.dot"), "icon.png": "x" } });
+    const loaded = await find(bd);
+    assert.ok(loaded, ">> FAIL: #1418: a root config must be found by walking up from the build dir");
+    assert.strictEqual(shouldPublishManifest({ configFound: !!loaded, noManifest: false }), true,
+      ">> FAIL: #1418: a discovered config must trigger the manifest publish");
+  });
+
+  test("a build-dir other than build/ still reaches a root config", async () => {
+    const { bd } = workspace({ repo: { "polkadot-app-deploy.config.ts": CONFIG("demo.dot"), "icon.png": "x" }, buildDir: "out" });
+    assert.ok(await find(bd),
+      ">> FAIL: #1418: build-dir must not break the walk-up, or callers that build to out/ or dist/ stay broken");
+  });
+
+  test("a config inside the artifact wins over one at the repo root", async () => {
+    const { bd } = workspace({
+      repo: { "polkadot-app-deploy.config.ts": CONFIG("stale.dot"), "icon.png": "x" },
+      artifact: { "polkadot-app-deploy.config.ts": CONFIG("generated.dot"), "icon.png": "x" },
+    });
+    const loaded = await find(bd);
+    assert.equal(loaded?.config?.domain, "generated.dot",
+      ">> FAIL: #1418: the walk-up must stop at the build dir, or a caller that generates a per-domain config into its artifact would deploy against a stale root config");
   });
 });
 

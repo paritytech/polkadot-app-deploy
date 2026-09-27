@@ -1045,7 +1045,12 @@ describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
     const loaded = {
       config: {
         ...VALID_CONFIG,
-        domain: "manifestrpctest.dot",
+        // #1572: must carry the DEFAULT env's real TLD (paseo-next-v2 ->
+        // "paseo", not the schema-generic ".dot" this fixture used before
+        // reconcileManifestDomain existed) — otherwise the env-TLD guard now
+        // fires before this test ever reaches the icon read it means to
+        // exercise.
+        domain: "manifestrpctest.paseo",
         icon: { path: "./missing-icon.png", format: "png" },
         executables: [],
       },
@@ -1053,7 +1058,7 @@ describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
     };
 
     await assert.rejects(
-      () => publishManifest({ loaded, domain: "manifestrpctest.dot" }),
+      () => publishManifest({ loaded, domain: "manifestrpctest.paseo" }),
       err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
       ">> FAIL: publishManifest #1094 default-env setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
     );
@@ -1066,6 +1071,81 @@ describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
       BULLETIN_ENDPOINTS,
       ["wss://paseo-bulletin-next-rpc.polkadot.io"],
       ">> FAIL: publishManifest #1094 default-env: omitting --env must still resolve to paseo-next-v2's OWN Bulletin endpoint, not the unrelated DEFAULT_BULLETIN_RPC seed constant",
+    );
+  });
+});
+
+describe("reconcileManifestDomain (#1572)", () => {
+  test("bare CLI label + suffixed config domain matches (documented normal case)", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("myapp.dot", "myapp", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain bare-label-matches-suffixed-config: a bare CLI label naming the same target as a .<tld>-suffixed config domain must not throw",
+    );
+  });
+
+  test("both sides suffixed and identical matches", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("myapp.dot", "myapp.dot", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain both-sides-suffixed-identical: two identical, already-suffixed domains must not throw",
+    );
+  });
+
+  test("different labels throws, naming both raw values", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.throws(
+      () => reconcileManifestDomain("padtesting-pr2.dot", "padtesting-pr", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      (error) => {
+        assert.match(error.message, /padtesting-pr2/,
+          ">> FAIL: reconcileManifestDomain different-labels-names-both: error must name the config's raw domain value");
+        assert.match(error.message, /padtesting-pr\b/,
+          ">> FAIL: reconcileManifestDomain different-labels-names-both: error must name the deploy target's raw value");
+        return true;
+      },
+      ">> FAIL: reconcileManifestDomain different-labels-names-both: two genuinely different labels must throw",
+    );
+  });
+
+  test("config domain carrying the wrong environment's TLD throws (does not weaken the env-TLD guard)", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.throws(
+      () => reconcileManifestDomain("myapp.dot", "myapp", "paseo", "/cfg/polkadot-app-deploy.config.mjs"),
+      /does not end in this environment's DotNS TLD/,
+      ">> FAIL: reconcileManifestDomain wrong-env-tld-still-rejected: a config domain whose TLD is not the current env's TLD must still throw, even though both sides name the same label",
+    );
+  });
+
+  test("deploy argument carrying a different known TLD throws", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.throws(
+      () => reconcileManifestDomain("myapp.dot", "myapp.paseo", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      undefined,
+      ">> FAIL: reconcileManifestDomain deploy-arg-wrong-known-tld: a deploy argument suffixed with a DIFFERENT known TLD than the env's must throw, not silently misparse",
+    );
+  });
+
+  test("case differences match case-insensitively", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("MyApp.DOT", "myapp", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain case-insensitive-match: differently-cased domains naming the same target must not throw",
+    );
+  });
+
+  test("trailing-digit label (myapp2) bare vs suffixed config matches", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("myapp2.dot", "myapp2", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain trailing-digit-label-matches: a bare label ending in a digit must match its suffixed config counterpart unchanged",
+    );
+  });
+
+  test("subdomain-shaped deploy target matches an identically-shaped config domain", async () => {
+    const { reconcileManifestDomain } = await import("../dist/manifest/publish.js");
+    assert.doesNotThrow(
+      () => reconcileManifestDomain("app.myapp.dot", "app.myapp", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
+      ">> FAIL: reconcileManifestDomain subdomain-shape-matches: a nested subname must normalize and compare the same as a top-level label",
     );
   });
 });

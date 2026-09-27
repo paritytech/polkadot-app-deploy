@@ -6,12 +6,13 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest } from "../dist/deploy.js";
+import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
-import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion } from "../dist/version-check.js";
+import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion, isInteractive } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
 import { loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
-import { loadEnvironments, listEnvironments, formatEnvironmentTable, DEFAULT_ENV_ID } from "../dist/environments.js";
+import { loadEnvironments, listEnvironments, formatEnvironmentTable, resolveEndpoints, DEFAULT_ENV_ID } from "../dist/environments.js";
+import { DEFAULT_TLD } from "../dist/dotns.js";
 import * as fs from "fs";
 import * as readline from "readline";
 
@@ -440,24 +441,58 @@ try {
   // --no-manifest (--content-only) skips this entirely — the deploy is
   // content-only regardless of any discoverable config, so there's nothing to
   // preflight.
+  //
+  // #1164: hoisted so the SAME loaded config (one filesystem walk-up + parse)
+  // can drive both the manifestPending banner decision below and the actual
+  // publishManifest() call further down — previously each of those call sites
+  // reloaded the config independently.
+  let preflightedConfig = null;
   if (!flags.noManifest) {
     try {
-      const { preflightProductConfig } = await import("../dist/index.js");
+      const { preflightProductConfig, reconcileManifestDomain } = await import("../dist/index.js");
       // config-load resolves a relative cwd internally, so no node:path here
       // (it's only dynamically imported later, in the publish block).
-      await preflightProductConfig(
-        flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
-      );
+      // #1572: preflightProductConfig (config discovery/parse + icon/executable
+      // file checks) and loadEnvironments (a local environments.json read)
+      // have no data dependency on each other — run them concurrently rather
+      // than paying their I/O sequentially.
+      const [loadedConfig, { doc }] = await Promise.all([
+        preflightProductConfig(
+          flags.config ? { path: flags.config } : { cwd: buildDir, walkUp: true },
+        ),
+        loadEnvironments({ userFilePath: flags.environmentFile ?? process.env.PAD_ENV_FILE }),
+      ]);
+      preflightedConfig = loadedConfig;
+      // Reconcile the config's domain against the ACTUAL deploy target
+      // BEFORE deploy() runs at all — this is the real "nothing uploaded
+      // yet" gate; src/manifest/publish.ts's own call to the same helper
+      // (inside publishManifest) is only a backstop for a library caller
+      // that skips this CLI entirely. Same env/TLD resolution publishManifest
+      // itself uses (loadEnvironments + resolveEndpoints), so this sees the
+      // identical environment the deploy will target — no RPC call, both are
+      // local config reads.
+      if (loadedConfig) {
+        const resolved = resolveEndpoints(doc, effectiveEnvId ?? DEFAULT_ENV_ID);
+        const envTld = resolved.tld ?? DEFAULT_TLD;
+        reconcileManifestDomain(loadedConfig.config.domain, domain, envTld, loadedConfig.sourcePath);
+      }
     } catch (err) {
       console.error(`Error: ${err?.message ?? err}`);
       process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
     }
   }
 
+  // #1164: determine up front whether a manifest publish will follow, so
+  // deploy() can defer the "DEPLOYMENT COMPLETE" banner until publishManifest
+  // actually succeeds. Reuses the SAME preflightedConfig loaded just above —
+  // no second config load.
+  const manifestWillPublish = shouldPublishManifest({ configFound: !!preflightedConfig, noManifest: !!flags.noManifest });
+
   const result = await deploy(buildDir, domain, {
     mnemonic: effectiveMnemonic,
     derivationPath: flags.derivationPath,
     suri: flags.suri,
+    manifestPending: manifestWillPublish,
     rpc: flags.rpc,
     env: effectiveEnvId,
     poolSize: flags.poolSize,
@@ -488,42 +523,59 @@ try {
     // `reason: "silence"` marks a watcher-silence re-arm (no response within
     // the budget) as distinct from the pre-existing verifyEffect-false-negative
     // re-sign case (undefined/"resign", still rendered off `attempt`).
-    confirmPhoneReady: ({ label, attempt, approvalBudgetMs, reason }) => new Promise((resolve, reject) => {
-      const budgetSeconds = Math.round(approvalBudgetMs / 1000);
-      if (reason === "silence") {
-        console.log(`\n   still nothing from your phone — press Y to re-send, Ctrl-C to abort`);
-      } else if (attempt >= 2) {
-        console.log(`\n   Re-sign needed (attempt ${attempt}) — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
-      } else {
-        console.log(`\n   Check your phone → ${label}`);
-        console.log(`   Press Y when ready — you'll have ~${budgetSeconds}s to approve on your phone (Ctrl-C to abort):`);
-      }
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      let settled = false;
-      const settle = (fn) => { if (!settled) { settled = true; rl.close(); fn(); } };
-      rl.on("close", () => settle(reject.bind(null, new Error("aborted by user"))));
-      const ask = () => {
-        rl.question("   > ", (line) => {
-          const answer = line.trim().toLowerCase();
-          // #194: require an EXPLICIT y/yes — bare Enter is the input most
-          // likely to come from something other than a deliberate keypress
-          // (buffered newline, stray Enter, piped stdin), and accepting it
-          // starts a fatal clock with nobody watching.
-          if (answer === "y" || answer === "yes") {
-            settle(resolve);
-          } else {
-            ask();
-          }
-        });
-      };
-      ask();
-    }),
+    confirmPhoneReady: ({ label, attempt, approvalBudgetMs, reason }) => {
+      // #1363: a non-interactive caller (CI, no TTY) can reach this gate — e.g.
+      // a stale login session left on the runner's $HOME resolves the signer to
+      // "phone required" even though nobody set out to run interactively. Fail
+      // fast with an actionable message BEFORE creating readline: readline's
+      // "close" fires immediately on a closed/non-TTY stdin, and the old
+      // unconditional rl.on("close", ...) below rejected with "aborted by
+      // user" for that case too — indistinguishable from a real Ctrl-C, and
+      // wrong (nobody aborted anything). Reuses isInteractive() (TTY + !CI)
+      // rather than adding a second interactivity check.
+      if (!isInteractive()) return Promise.reject(nonInteractivePhoneConfirmationError(label));
+      return new Promise((resolve, reject) => {
+        const budgetSeconds = Math.round(approvalBudgetMs / 1000);
+        if (reason === "silence") {
+          console.log(`\n   still nothing from your phone — press Y to re-send, Ctrl-C to abort`);
+        } else if (attempt >= 2) {
+          console.log(`\n   Re-sign needed (attempt ${attempt}) — approve on your phone, then press Y to continue (Ctrl-C to abort).`);
+        } else {
+          console.log(`\n   Check your phone → ${label}`);
+          console.log(`   Press Y when ready — you'll have ~${budgetSeconds}s to approve on your phone (Ctrl-C to abort):`);
+        }
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        let settled = false;
+        const settle = (fn) => { if (!settled) { settled = true; rl.close(); fn(); } };
+        rl.on("close", () => settle(reject.bind(null, new Error("aborted by user"))));
+        const ask = () => {
+          rl.question("   > ", (line) => {
+            const answer = line.trim().toLowerCase();
+            // #194: require an EXPLICIT y/yes — bare Enter is the input most
+            // likely to come from something other than a deliberate keypress
+            // (buffered newline, stray Enter, piped stdin), and accepting it
+            // starts a fatal clock with nobody watching.
+            if (answer === "y" || answer === "yes") {
+              settle(resolve);
+            } else {
+              ask();
+            }
+          });
+        };
+        ask();
+      });
+    },
   });
 
   const output = process.env.GITHUB_OUTPUT;
   if (output) {
     fs.appendFileSync(output, `cid=${result.cid}\n`);
     fs.appendFileSync(output, `domain=${result.domainName}\n`);
+    // #1157: same env-aware URL as the "Check it out here" console line —
+    // lets the reusable workflow's PR-comment/summary step reuse this
+    // resolution instead of recomputing a gateway URL from its own
+    // hardcoded-dot.li default.
+    fs.appendFileSync(output, `browserUrl=${result.browserUrl}\n`);
   }
 
   console.log(`CID: ${result.cid}`);
@@ -537,16 +589,15 @@ try {
   //
   // --no-manifest (--content-only) skips manifest publishing even when a
   // config is present. shouldPublishManifest() is the single source of truth
-  // for that decision (config discovery still runs either way, so the
-  // "config found but --no-manifest set" case is exercised for real, not just
-  // in unit tests).
+  // for that decision.
+  //
+  // #1164: reuses `preflightedConfig` (loaded once, above) instead of a
+  // second independent tryLoadProductConfig call.
   {
-    const { tryLoadProductConfig, publishManifest } = await import("../dist/index.js");
+    const { publishManifest } = await import("../dist/index.js");
     const path = await import("node:path");
     const buildDirAbs = path.resolve(buildDir);
-    const loaded = await tryLoadProductConfig(
-      flags.config ? { path: flags.config } : { cwd: buildDirAbs, walkUp: true },
-    );
+    const loaded = preflightedConfig;
     if (shouldPublishManifest({ configFound: !!loaded, noManifest: !!flags.noManifest })) {
       try {
         await publishManifest({
@@ -558,10 +609,19 @@ try {
           mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,
         });
+        // #1164: deploy() deferred the real completion banner (manifestPending
+        // was set above) — print it now that the manifest phase actually
+        // succeeded, so a manifest publish failure never leaves a false
+        // "DEPLOYMENT COMPLETE!" on screen.
+        printDeploymentCompleteBanner(result.fullDomain, result.browserUrl);
       } catch (err) {
         console.error(`Manifest publish failed: ${err?.message ?? err}`);
         process.exit(err instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
       }
+    } else if (!loaded && !flags.noManifest) {
+      // Only the walk-up can come back empty: an explicit --config that is
+      // missing throws out of tryLoadProductConfig rather than returning null.
+      console.log(`No product config found from ${buildDirAbs} upward; content deployed, no manifest published.`);
     }
     // No config (or --no-manifest) → the contenthash-only deploy above is the whole job; nothing else to do.
   }

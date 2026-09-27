@@ -2102,7 +2102,7 @@ export async function storeDirectoryV2(
   // old positions). Backend chosen by jsMerkle option, matching the legacy
   // storeDirectory's behaviour:
   //   - jsMerkle: true       → JS importer (works everywhere, no daemon)
-  //   - jsMerkle: false      → Kubo, hard-required (throws if ipfs not on PATH)
+  //   - jsMerkle: false      → Kubo (throws if ipfs not on PATH; a failed ipfs call falls back to JS)
   //   - jsMerkle: undefined  → smart default: Kubo if available, JS otherwise
   // The same buildOrderedCar runs over both backends' output, so the resulting
   // CAR is byte-identical regardless of merkleizer choice for identical content.

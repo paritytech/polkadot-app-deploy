@@ -31,7 +31,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
 import { derivePoolAccounts, selectAccount, isTestnetSpecName, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingTransactions, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests } from "../dist/pool.js";
-import { merkleizeJS, merkleizeWithStableOrder, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
+import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
 import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest, classifyFinalityGap, probeFinalityGap, getBestBlockNumber } from "../dist/chunk-probe.js";
@@ -11694,6 +11694,25 @@ describe("merkle backends — JS vs Kubo (incremental-upload-v2)", () => {
       assert.equal(r1.carBytes.length, r2.carBytes.length, "CAR length must match");
       assert.equal(Buffer.compare(r1.carBytes, r2.carBytes), 0, "CAR bytes must be identical");
     } finally { fs.rmSync(dir, { recursive: true }); }
+  });
+
+  test("a failing ipfs call falls back to the JS backend (bulletin #1557)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "kubo-fallback-"));
+    const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "kubo-shim-"));
+    const prevPath = process.env.PATH;
+    try {
+      buildFixture({ targetDir: dir, seed: "kubo-fallback" });
+      fs.writeFileSync(path.join(shimDir, "ipfs"), '#!/bin/sh\necho "simulated ipfs failure" >&2\nexit 1\n', { mode: 0o755 });
+      process.env.PATH = `${shimDir}${path.delimiter}${prevPath}`;
+
+      const got = await merkleizeBackend(dir, true, "Phase B");
+      const expected = await merkleizeJSBackend(dir);
+      assert.equal(got.rootCid, expected.rootCid, ">> FAIL: kubo fallback: rootCid diverged from the JS backend");
+    } finally {
+      process.env.PATH = prevPath;
+      fs.rmSync(dir, { recursive: true });
+      fs.rmSync(shimDir, { recursive: true });
+    }
   });
 
   test("hidden directories (.bulletin-deploy/) are included in both JS and Kubo backends", { skip: !hasIPFS() }, async () => {

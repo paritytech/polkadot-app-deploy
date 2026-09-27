@@ -278,6 +278,17 @@ jobs:
             # single quotes inside the value become literal argv characters — that's
             # how `--tag '$val'` ended up producing deploy.tag="'e2e-ci-release'" in
             # Sentry. An array preserves argv boundaries and needs no quote escaping.
+            #
+            # A polkadot-app-deploy.config.ts with a per-PR or per-env domain (no
+            # static default works) has to read that domain from somewhere — the
+            # CLI aborts the manifest publish unless config.domain resolves to the
+            # same target as the positional <domain> argument below. There is no
+            # other channel from this workflow_call into the CLI's own process, so
+            # export the exact same value under one standardized name in the
+            # PAD_* namespace the CLI already owns (PAD_ENV, PAD_ENV_FILE). Unused
+            # unless a config.ts opts in — pure additive, no existing behavior
+            # changes.
+            export PAD_DOMAIN='${{ inputs.dotns-domain }}'
             FLAGS=()
             if [ -n "${{ inputs.tag }}" ]; then FLAGS+=(--tag "${{ inputs.tag }}"); fi
             if [ "${{ inputs.js-merkle }}" = "true" ]; then FLAGS+=(--js-merkle); fi

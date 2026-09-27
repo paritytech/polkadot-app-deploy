@@ -691,7 +691,7 @@ export function describeSlotFallbackReason(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
+export function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
   if (options.storageSigner && options.storageSignerAddress) {
     // Committed-signer: once the slot provider fails on the first attempt,
     // every subsequent reconnect uses pool. Prevents signer drift mid-upload

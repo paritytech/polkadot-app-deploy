@@ -17,6 +17,7 @@ import type {
   AppVersion,
   ExecutableManifest,
   FundingMode,
+  Granted,
   IconFormat,
   ProductConfig,
   RootManifest,
@@ -42,6 +43,14 @@ const KIND_WORKER = "worker";
 const EXECUTABLE_KINDS = [KIND_APP, KIND_WIDGET, KIND_FUNDING, KIND_WORKER] as const satisfies readonly ExecutableManifest["kind"][];
 // Strict on the publishing side: Hosts ignore unrecognised modes, publishers MUST NOT emit them.
 const FUNDING_MODES: readonly FundingMode[] = ["CARD", "BANK", "CRYPTO"];
+// Same asymmetry as FUNDING_MODES, but it cuts only one way — see the
+// `strict` parameter on validateTrustedProducts below. The publish side
+// rejects an unrecognised grant (RFC line 338: publishers MUST NOT emit
+// them), because a typo there would silently grant nothing. The read side
+// MUST NOT reject it (RFC lines 464, 492): a Host ignores the value and
+// keeps the recognised ones, so a manifest carrying a grant from a newer
+// RFC version still has to validate here.
+const GRANTED_VALUES: readonly Granted[] = ["all", "storage", "context"];
 
 /** dotNS label rule: 1 to 63 chars of `[a-z0-9-]`, no leading or trailing hyphen. */
 const LABEL = String.raw`(?!-)[a-z0-9-]{1,63}(?<!-)`;
@@ -57,6 +66,28 @@ const LABEL = String.raw`(?!-)[a-z0-9-]{1,63}(?<!-)`;
 // becoming an opaque not-the-owner revert.
 const TLD_FRAGMENT = "[a-z]{2,63}";
 const DOMAIN_RE = new RegExp(`^${LABEL}(\\.${LABEL})*\\.${TLD_FRAGMENT}$`, "i");
+// A trustedProducts key is a single dotNS label with no TLD suffix (the Host
+// appends the network's TLD itself) — reuses the same per-label shape as
+// LABEL above, anchored to the whole key.
+const PRODUCT_LABEL_RE = new RegExp(`^${LABEL}$`);
+
+// #1487: the top-level `ProductConfig` shape, per src/manifest/types.ts.
+// Unlike an unrecognised icon.format or trustedProducts grant value — which
+// the RFC requires a *reader* (validateRootManifest) to tolerate for
+// forward-compat (RFC lines 464, 492-494) — there is no such requirement for
+// an unrecognised top-level key on the *author-facing* config. Keeping this
+// permissive let a typo'd or unsupported key (e.g. #1484's `trustedProducts`
+// mistake) deploy green while the field was silently dropped. Deliberately
+// scoped to validateProductConfig only: validateRootManifest stays as
+// tolerant of unknown top-level manifest fields as it already is.
+const PRODUCT_CONFIG_TOP_LEVEL_FIELDS = [
+  "domain",
+  "displayName",
+  "description",
+  "icon",
+  "executables",
+  "trustedProducts",
+] as const;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -64,6 +95,79 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
+}
+
+/**
+ * Validate `trustedProducts`, shared by `validateRootManifest` (on-chain
+ * read shape) and `validateProductConfig` (author-facing publish shape).
+ *
+ * The RFC does NOT define the same rules both places: `strict` picks between
+ * them.
+ *
+ * - `strict: true` (product config / publish side, RFC line 338) — a
+ *   TLD-suffixed key and an unrecognised grant value are both publisher
+ *   mistakes and MUST fail validation, same as today.
+ * - `strict: false` (root manifest / read side, RFC lines 464, 492-494) —
+ *   models "would a Host accept this manifest". A TLD-suffixed key resolves
+ *   to a name that does not exist, so the entry is inert, not invalid
+ *   (line 494); an unrecognised grant value is ignored, with recognised
+ *   values in the same entry still applying (line 492). Neither may fail
+ *   validation on this side.
+ *
+ * Structural shape — `trustedProducts` must be an object, each value must be
+ * an array — stays strict on both sides; those are shape errors, not the
+ * documented-inert cases. An empty key and a non-lowercase key are likewise
+ * unchanged by `strict`: the RFC exempts only the TLD-suffix and
+ * unrecognised-grant cases above.
+ *
+ * `label` is `"root manifest"` or `"product config"`, matching this file's
+ * existing hardcoded-prefix message style.
+ */
+function validateTrustedProducts(
+  value: unknown,
+  label: string,
+  strict: boolean,
+): string[] {
+  if (!isPlainObject(value))
+    return [`${label} trustedProducts must be an object`];
+  const errors: string[] = [];
+  for (const [key, grants] of Object.entries(value)) {
+    if (key.length === 0) {
+      errors.push(`${label} trustedProducts key must not be empty`);
+    } else if (key.includes(".")) {
+      // Read side (RFC 494): a TLD-suffixed key resolves to a name that does
+      // not exist — the entry is inert, not a validation error, so no error
+      // is pushed here when !strict.
+      if (strict) {
+        errors.push(
+          `${label} trustedProducts key '${key}' must not include a TLD suffix (the host appends its own TLD) — use '${key.split(".")[0]}' instead of '${key}'`,
+        );
+      }
+    } else if (key !== key.toLowerCase()) {
+      errors.push(`${label} trustedProducts key '${key}' must be lowercase`);
+    } else if (!PRODUCT_LABEL_RE.test(key)) {
+      errors.push(
+        `${label} trustedProducts key '${key}' must be a valid dotNS label`,
+      );
+    }
+    if (!Array.isArray(grants)) {
+      errors.push(`${label} trustedProducts['${key}'] must be an array`);
+      continue;
+    }
+    // Read side (RFC 464, 492): an unrecognised grant value is ignored, not
+    // a validation error — recognised values in the same entry still apply.
+    // Only the publish side rejects it up front.
+    if (strict) {
+      errors.push(
+        ...rejectUnknownEntries(
+          grants,
+          GRANTED_VALUES,
+          `${label} trustedProducts['${key}']`,
+        ),
+      );
+    }
+  }
+  return errors;
 }
 
 /**
@@ -111,6 +215,27 @@ function rejectUnknownFields(
   return Object.keys(input)
     .filter((key) => !allowed.includes(key))
     .map((key) => `${prefix}contains unknown field '${key}'`);
+}
+
+/**
+ * Reject array entries outside a known value set, one message per offender.
+ *
+ * Shared by the two publish-side enum arrays — an executable's funding
+ * `modes` and a `trustedProducts` grant list. Both are strict on the way out
+ * for the same reason: a Host ignores a value it does not recognise, so an
+ * unrecognised entry published here would silently do nothing.
+ */
+function rejectUnknownEntries<T extends string>(
+  values: unknown[],
+  allowed: readonly T[],
+  describe: string,
+): string[] {
+  return values
+    .filter((value) => !allowed.includes(value as T))
+    .map(
+      (value) =>
+        `${describe} entries must be one of ${allowed.join(", ")} (got ${JSON.stringify(value)})`,
+    );
 }
 
 function validateRelativeEntrypoint(
@@ -296,9 +421,7 @@ function validateFundingFields(input: Record<string, unknown>, p: string): strin
   if (!Array.isArray(input.modes) || input.modes.length === 0) {
     return [`${p}modes must be a non-empty array`];
   }
-  return input.modes
-    .filter(mode => !FUNDING_MODES.includes(mode as FundingMode))
-    .map(mode => `${p}modes entries must be one of ${FUNDING_MODES.join(", ")} (got ${JSON.stringify(mode)})`);
+  return rejectUnknownEntries(input.modes, FUNDING_MODES, `${p}modes`);
 }
 
 function validateWorkerFields(input: Record<string, unknown>, p: string): string[] {
@@ -341,6 +464,15 @@ export function validateRootManifest(input: unknown): ValidationResult<RootManif
     if (!isNonEmptyString(input.icon.cid)) errors.push("root manifest icon.cid must be a non-empty string");
     errors.push(...validateIconFormat(input.icon.format, "root manifest", /* strict */ false));
   }
+  if (input.trustedProducts !== undefined) {
+    errors.push(
+      ...validateTrustedProducts(
+        input.trustedProducts,
+        "root manifest",
+        /* strict */ false,
+      ),
+    );
+  }
   return errors.length === 0 ? { ok: true, value: input as unknown as RootManifest } : { ok: false, errors };
 }
 
@@ -380,6 +512,9 @@ export function validateProductConfig(input: unknown): ValidationResult<ProductC
   if (!isPlainObject(input)) {
     return { ok: false, errors: ["product config must be an object (did you forget `export default`?)"] };
   }
+  errors.push(
+    ...rejectUnknownFields(input, PRODUCT_CONFIG_TOP_LEVEL_FIELDS, "product config "),
+  );
   if (!isNonEmptyString(input.domain) || !DOMAIN_RE.test(input.domain)) {
     errors.push(
       "product config domain must be a non-empty dotNS name ending in a TLD of 2 or more letters (e.g. 'myapp.dot')",
@@ -392,6 +527,15 @@ export function validateProductConfig(input: unknown): ValidationResult<ProductC
   } else {
     if (!isNonEmptyString(input.icon.path)) errors.push("product config icon.path must be a non-empty string");
     errors.push(...validateIconFormat(input.icon.format, "product config", /* strict */ true));
+  }
+  if (input.trustedProducts !== undefined) {
+    errors.push(
+      ...validateTrustedProducts(
+        input.trustedProducts,
+        "product config",
+        /* strict */ true,
+      ),
+    );
   }
   if (!Array.isArray(input.executables) || input.executables.length === 0) {
     errors.push("product config executables must be a non-empty array");

@@ -1023,6 +1023,9 @@ jobs:
           - { scenario: s-subdomain,              signer: pool,   merkle: js,   poolIndex: 7 }
           - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 8 }
           - { scenario: s-manifest-env,           signer: pool,   merkle: js,   poolIndex: 9 }
+          # No poolIndex: --product-name derives its own signer and refuses a
+          # derivation path, so this leg cannot be pinned to a //deploy/N account.
+          - { scenario: s-product-manifest,       signer: direct, merkle: js }
           # App v2 PolkaVM manifest publish and executable read-back.
           - { scenario: s-manifest-pvm,           signer: pool,   merkle: js,   poolIndex: 12 }
           # S-TRANSFER: register-as-worker then hand over via the `transfer`

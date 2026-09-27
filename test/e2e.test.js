@@ -48,6 +48,56 @@ function parseDeployedCid(stdout, scenario = "deploy") {
   })[1];
 }
 
+// #1495: which account stored the manifest's icon and executables, and whether it is the one
+// that stored the content. The bytes are billed to the storage account's Bulletin quota, so the
+// two phases diverging means half a deploy is paid for by an account nobody provisioned — on a
+// chain whose shared pool holds no quota, that is a deploy that publishes content and then fails
+// (or silently skips) its manifest. No assertion covered this before: every e2eEligible env
+// auto-authorizes anything that asks, so both accounts always "work" here.
+//
+// Each Bulletin provider logs exactly one of these lines, and publishManifest opens its own
+// provider after the "Manifest publish — <domain>" banner, so the banner splits the phases.
+// Address equality is asserted only when the content phase named a specific account: the pool is
+// a shared identity whose members are interchangeable, so a pool deploy asserts mode parity only.
+function assertManifestStorageMatchesContent(stdout, { scenario }) {
+  const parsePhase = (text) =>
+    [...text.matchAll(/Using (pool account \d+|direct signer|external signer):\s+(\S+)/g)].map((m) => ({
+      mode: m[1].startsWith("pool account") ? "pool" : m[1],
+      address: m[2],
+    }));
+
+  const bannerAt = stdout.indexOf("Manifest publish —");
+  if (bannerAt === -1) {
+    failWith({
+      scenario,
+      message: 'no "Manifest publish —" banner in the deploy output',
+      context: stdout,
+      keywords: ["Manifest", "publish", "Using"],
+      hint: "this scenario must deploy with a manifest sidecar (--config). Without one publishManifest never runs, so there is no manifest storage account to check.",
+    });
+  }
+  // Last provider line before the banner: the one the content upload finished on (a mid-upload
+  // reconnect logs another). First after it: the manifest's own provider.
+  const content = parsePhase(stdout.slice(0, bannerAt)).pop();
+  const manifest = parsePhase(stdout.slice(bannerAt))[0];
+  if (!content || !manifest) {
+    failWith({
+      scenario,
+      message: `could not read both storage accounts (content: ${content?.mode ?? "missing"}, manifest: ${manifest?.mode ?? "missing"})`,
+      context: stdout,
+      keywords: ["Using", "signer", "pool"],
+      hint: "every Bulletin provider logs 'Using pool account N:', 'Using direct signer:' or 'Using external signer:'. A missing manifest-phase line means publishManifest never opened a provider — check for an earlier 'Manifest publish failed' line.",
+    });
+  }
+  assert.equal(manifest.mode, content.mode,
+    `>> FAIL: ${scenario}: the content upload stored from a ${content.mode} provider but the manifest used ${manifest.mode} — both halves of one deploy must be billed to the same Bulletin quota.`);
+  if (content.mode !== "pool") {
+    assert.equal(manifest.address, content.address,
+      `>> FAIL: ${scenario}: content stored from ${content.address} but the manifest from ${manifest.address}. The manifest's icon and executables spend the storage account's quota, so a second account here needs a grant nobody provisions.`);
+  }
+  return { content, manifest };
+}
+
 // Parse the chunk-skip rate from a deploy's stdout.
 // Looks for the Probed summary line emitted by renderSummary in incremental-stats.ts:
 //   "  Probed:        18 chunks  →  15 on chain, 2 absent"
@@ -364,6 +414,28 @@ function buildArgs(fixtureDir, label) {
     args.push("--config", configPath);
   }
   return args;
+}
+
+// Shared --product-name deploy args for S-PRODUCT-MANIFEST and
+// S-PRODUCT-MANIFEST-TRUSTED (#1484) — built here, not via buildArgs: that
+// adds --derivation-path for a pinned pool leg, which --product-name refuses
+// (it derives its own signer). NOT a general-purpose builder: "e2eproduct" is
+// hardcoded because both current callers target the same pre-owned fixture
+// (e2eprodman00.<tld>, owned by the account that name derives — see the
+// comment on S-PRODUCT-MANIFEST). A scenario needing a different product
+// name would need its own fixture anyway (see that same comment for why),
+// so take productName as a parameter here if that day comes rather than
+// assuming this generalizes as-is.
+function buildProductManifestArgs(fixtureDir, domain, configPath) {
+  return [
+    fixtureDir, domain,
+    "--tag", process.env.DEPLOY_TAG,
+    "--js-merkle",
+    "--env", E2E_ENV_ID,
+    "--mnemonic", ALICE_MNEMONIC,
+    "--product-name", "e2eproduct",
+    "--config", configPath,
+  ];
 }
 
 function buildInputCarArgs(dumpPath, label) {
@@ -2196,6 +2268,137 @@ describe("e2e", { skip: !ENABLED }, () => {
   // end-to-end behavior a unit test (which mocks the network) cannot: the
   // icon actually lands on, and is fetchable from, the resolved env's own
   // gateway.
+  // setResolver is owner-only, so every DotNS write must come from the account
+  // --product-name derives. deploy() and publishManifest() resolve it separately.
+  //
+  // The label is fixed: the product account must already own it, since a fresh
+  // register costs ~211 PAS and testnet auto-top-up targets a fraction of that.
+  describe("S-PRODUCT-MANIFEST — --product-name publishes the manifest as the account that owns the name", { skip: SCENARIO !== "s-product-manifest" }, () => {
+    test(`deploy with --product-name and a manifest signs every DotNS write as the product account`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      const label = "e2eprodman00";
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      const { configPath, sidecarDir } = buildManifestSidecar({ buildDir: fixtureDir, label: `${label}.${tld}`, tld });
+      try {
+        const args = buildProductManifestArgs(fixtureDir, `${label}.${tld}`, configPath);
+        const { code, stdout, stderr } = await runBulletinDeploy({ args, timeoutMs: DEPLOY_TIMEOUT_MS });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-PRODUCT-MANIFEST" });
+
+        // The deploy and the manifest step open separate DotNS sessions. Each one
+        // that applies --product-name logs this line; a session that missed the
+        // flag stays silent and signs as the bare mnemonic account.
+        const deployers = [...stdout.matchAll(/Product deployer:\s+(\S+)/g)].map((m) => m[1]);
+        assert.ok(deployers.length >= 2,
+          `>> FAIL: S-PRODUCT-MANIFEST: expected a "Product deployer:" line from both the deploy and the manifest step, saw ${deployers.length}. publishManifest resolves its own signer; without productName it connects as the bare mnemonic account and setResolver reverts NotAuthorised.`);
+        assert.equal(new Set(deployers).size, 1,
+          `>> FAIL: S-PRODUCT-MANIFEST: every DotNS write must be signed by one account, saw ${[...new Set(deployers)].join(" and ")} — the registry refuses setResolver from anyone but the name's owner`);
+
+        // #1495: the same account must also STORE the manifest's bytes. --product-name is the
+        // case where the two can silently diverge: deploy() swaps in the product signer before
+        // selecting storage, so a manifest step that resolved storage from the raw mnemonic
+        // would upload from the root account instead — needing a second Bulletin grant.
+        const { manifest } = assertManifestStorageMatchesContent(stdout, { scenario: "S-PRODUCT-MANIFEST" });
+        assert.equal(manifest.address, deployers[0],
+          `>> FAIL: S-PRODUCT-MANIFEST: the manifest's icon and executables were stored by ${manifest.address}, not by the product account ${deployers[0]} that signs its records and paid for the content.`);
+
+        const deployedCid = parseDeployedCid(stdout, "S-PRODUCT-MANIFEST");
+        const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();
+        const onChain = await readContenthashWithRetry(label, expected);
+        assertOnChainMatches(onChain, expected, { scenario: "S-PRODUCT-MANIFEST", label });
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  // #1484 point 5: "an e2e alongside #1471 (--product-name with a manifest
+  // publish) that round-trips a trustedProducts entry through the text
+  // record." composeRoot's normalizeTrustedProducts (src/manifest/compose.ts)
+  // is unit-tested directly in test/product-manifest.test.js — that proves
+  // the COMPOSER produces the right object, but says nothing about whether
+  // that object actually lands on chain byte-for-byte as the "manifest" text
+  // record's trustedProducts field. This scenario proves the real round
+  // trip: publish a config whose grants are deliberately unsorted and
+  // duplicated, then read back the SAME on-chain text record the deploy just
+  // wrote and assert on THAT — never on a local composeRoot() call, which
+  // would only prove the composer agrees with itself.
+  //
+  // Deliberately reuses S-PRODUCT-MANIFEST's fixed pre-owned domain/account
+  // (e2eprodman00.<tld>, owned by the account --product-name e2eproduct
+  // derives) instead of a fresh label: a fresh register costs ~211 PAS and
+  // the product-derived account's testnet auto-top-up only covers a fraction
+  // of that (see the comment on S-PRODUCT-MANIFEST above) — there is no
+  // other pre-owned --product-name fixture to target. Gated on the exact
+  // SAME `skip` predicate as S-PRODUCT-MANIFEST (not a new SCENARIO value)
+  // so this only ever runs as a SECOND describe in the SAME leg/process,
+  // never in a separate CI matrix leg that could run concurrently with it —
+  // two matrix legs writing the same text record on the same
+  // --product-name-derived account (no poolIndex to pin, same as
+  // S-PRODUCT-MANIFEST) would race both the DotNS nonce and the record
+  // itself. node:test runs top-level describes within one file sequentially
+  // by default (verified empirically); `concurrency: false` pins that
+  // explicitly so this never overlaps S-PRODUCT-MANIFEST's own write to the
+  // same domain. No e2e.yml matrix entry is needed for this reason — it
+  // rides the existing `s-product-manifest` leg.
+  describe("S-PRODUCT-MANIFEST-TRUSTED — trustedProducts round-trips through the manifest text record (#1484)", { skip: SCENARIO !== "s-product-manifest", concurrency: false }, () => {
+    test(`deploy with --product-name and a trustedProducts config writes the normalized grant on chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
+      const label = "e2eprodman00";
+      const tld = await resolveE2eTld();
+      const { fixtureDir } = await mutateFixture(RUN_TAG);
+      // Deliberately unsorted + duplicated: pins ordering, de-duplication AND
+      // the "all" collapse through one real round trip (composeRoot's
+      // normalizeTrustedProducts, src/manifest/compose.ts).
+      const trustedProducts = {
+        zed: ["storage", "all"],
+        alpha: ["context", "context"],
+      };
+      const expectedTrustedProducts = { alpha: ["context"], zed: ["all"] };
+      const { configPath, sidecarDir } = buildManifestSidecar({
+        buildDir: fixtureDir,
+        label: `${label}.${tld}`,
+        tld,
+        trustedProducts,
+      });
+      try {
+        const args = buildProductManifestArgs(fixtureDir, `${label}.${tld}`, configPath);
+        const { code, stdout, stderr } = await runBulletinDeploy({ args, timeoutMs: DEPLOY_TIMEOUT_MS });
+        assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-PRODUCT-MANIFEST-TRUSTED" });
+
+        const raw = await readTextRecordWithRetry(label, "manifest", E2E_ENV_ID, (r) => {
+          if (!r) return false;
+          try {
+            const parsed = JSON.parse(r);
+            return !!(parsed && typeof parsed === "object" && "trustedProducts" in parsed);
+          } catch { return false; }
+        });
+        assert.ok(raw,
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: the "manifest" text record on ${label}.${tld} read back empty after the deploy reported success — either the setTextRecord tx never landed, or the read raced the write past the retry budget.`);
+
+        let parsed;
+        try {
+          parsed = JSON.parse(raw);
+        } catch (err) {
+          assert.fail(`>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: the on-chain "manifest" text record is not valid JSON (${err.message}): ${raw.slice(0, 200)}`);
+        }
+
+        // Two checks, not one: deepEqual alone doesn't pin key ORDER (an
+        // object with the same keys reversed still deep-equals), so the
+        // value-shape check (dedup + "all" collapse) and the key-order check
+        // (sort) are asserted separately — together they pin everything the
+        // task's unsorted/duplicated input is meant to exercise in one
+        // real round trip.
+        assert.deepEqual(parsed.trustedProducts, expectedTrustedProducts,
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: on-chain trustedProducts is ${JSON.stringify(parsed.trustedProducts)}, expected ${JSON.stringify(expectedTrustedProducts)} — composeRoot's normalizeTrustedProducts should have deduped ["context","context"], collapsed ["storage","all"] to ["all"], and dropped neither key.`);
+        assert.deepEqual(Object.keys(parsed.trustedProducts ?? {}), Object.keys(expectedTrustedProducts),
+          `>> FAIL: S-PRODUCT-MANIFEST-TRUSTED: on-chain trustedProducts key order is ${JSON.stringify(Object.keys(parsed.trustedProducts ?? {}))}, expected sorted order ${JSON.stringify(Object.keys(expectedTrustedProducts))} — composeRoot must sort keys before writing the text record.`);
+      } finally {
+        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(sidecarDir, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("S-MANIFEST-ENV — manifest publish honors --env for icon Bulletin storage on a non-default env (#1094)", { skip: SCENARIO !== "s-manifest-env" }, () => {
     test(`deploy ${SIGNER}/${MERKLE} with a manifest lands the icon on the resolved env's Bulletin chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
       // The regression this guards is publishManifest ignoring --env and
@@ -2216,6 +2419,10 @@ describe("e2e", { skip: !ENABLED }, () => {
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
         assertDeploySucceeded({ code, stdout, stderr }, { scenario: "S-MANIFEST-ENV" });
+
+        // #1495: this leg already proves the icon lands on the right CHAIN; assert it also
+        // lands from the right ACCOUNT — the one the content upload used.
+        assertManifestStorageMatchesContent(stdout, { scenario: "S-MANIFEST-ENV" });
 
         const deployedCid = parseDeployedCid(stdout, "S-MANIFEST-ENV");
         const expected = ("0x" + encodeContenthash(deployedCid)).toLowerCase();

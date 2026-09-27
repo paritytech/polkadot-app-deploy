@@ -5,11 +5,8 @@
  * publishers can probe larger payloads when the on-chain cap is raised.
  */
 
-import type {
-  ExecutableManifest,
-  ProductConfig,
-  RootManifest,
-} from "./types.js";
+import { composeExecutable, composeRoot } from "./compose.js";
+import type { ProductConfig } from "./types.js";
 
 export const DEFAULT_TEXT_RECORD_BUDGET_BYTES = 1024;
 
@@ -71,12 +68,7 @@ export function pessimisticSizePreflight(
 ): PessimisticSizeReport {
   const checks: BudgetCheck[] = [];
 
-  const placeholderRoot: RootManifest = {
-    $v: 1,
-    displayName: config.displayName,
-    description: config.description,
-    icon: { cid: PLACEHOLDER_CID, format: config.icon.format },
-  };
+  const placeholderRoot = composeRoot(config, PLACEHOLDER_CID);
   checks.push(
     assertWithinBudget(
       `${config.domain}#manifest`,
@@ -86,7 +78,7 @@ export function pessimisticSizePreflight(
   );
 
   for (const exec of config.executables) {
-    const placeholder = composePlaceholderExecutable(exec);
+    const placeholder = composeExecutable(exec);
     checks.push(
       assertWithinBudget(
         `${exec.kind}.${config.domain}#executable`,
@@ -97,40 +89,4 @@ export function pessimisticSizePreflight(
   }
 
   return { ok: checks.every((c) => c.ok), budget, checks };
-}
-
-function composePlaceholderExecutable(
-  exec: ProductConfig["executables"][number],
-): ExecutableManifest {
-  if (exec.kind === "app") {
-    return "manifest" in exec
-      ? exec.manifest
-      : { $v: 1, kind: "app", appVersion: exec.appVersion };
-  }
-  if (exec.kind === "widget") {
-    return {
-      $v: 1,
-      kind: "widget",
-      appVersion: exec.appVersion,
-      dimensions: exec.dimensions,
-      ...(exec.description !== undefined
-        ? { description: exec.description }
-        : {}),
-    };
-  }
-  if (exec.kind === "funding") {
-    return {
-      $v: 1,
-      kind: "funding",
-      appVersion: exec.appVersion,
-      modes: exec.modes,
-    };
-  }
-  return {
-    $v: 1,
-    kind: "worker",
-    appVersion: exec.appVersion,
-    entrypoint: exec.entrypoint,
-    includes: exec.includes,
-  };
 }

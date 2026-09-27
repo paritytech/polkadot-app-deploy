@@ -13,15 +13,18 @@ import {
   assertWithinBudget,
   getTextRecordBudgetBytes,
   DEFAULT_TEXT_RECORD_BUDGET_BYTES,
+  PLACEHOLDER_CID,
   loadProductConfig,
   preflightProductConfig,
   checkProductConfigFilesExist,
   publishManifest,
   formatConfigLoadError,
 } from "../dist/index.js";
-import { registerOrEnsureResolver, domainMatchesEnvTld } from "../dist/manifest/publish.js";
+import { registerOrEnsureResolver, domainMatchesEnvTld, manifestSignerOptions } from "../dist/manifest/publish.js";
+import { composeRoot } from "../dist/manifest/compose.js";
 import { NonRetryableError } from "../dist/errors.js";
-import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints } from "../dist/deploy.js";
+import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints, __selectStorageProviderModeForTest, resolveProductSigner } from "../dist/deploy.js";
+import { deriveProductSigner } from "../dist/product-account.js";
 
 describe("validateRootManifest", () => {
   test("accepts a well-formed v1 root manifest", () => {
@@ -103,6 +106,42 @@ describe("validateRootManifest", () => {
       description: "",
     });
     assert.equal(result.ok, false);
+  });
+
+  // #1487 regression guard: the fix for #1487 only adds an unknown-top-level-field
+  // check to validateProductConfig. These two cases are the RFC-protected
+  // leniency validateRootManifest must keep even after that change — RFC
+  // lines 464/492: "Two things are exempt and MUST NOT fail validation: an
+  // unrecognised grant value in trustedProducts" (icon.format's own RFC-464
+  // exemption is a separate, pre-existing gap — see PR description).
+  test("tolerates an unrecognised trustedProducts grant value (RFC line 492 — read side must not fail)", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: "png" },
+      trustedProducts: { dim2: ["context", "some-future-grant"] },
+    });
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest unrecognised-grant-tolerated: a Host MUST ignore an unrecognised trustedProducts grant value and keep validating, per RFC line 492; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("tolerates a TLD-suffixed trustedProducts key (RFC line 494 — entry is inert, not invalid)", () => {
+    const result = validateRootManifest({
+      $v: 1,
+      displayName: "DemoApp",
+      description: "",
+      icon: { cid: "bafy", format: "png" },
+      trustedProducts: { "dim2.paseo": ["context"] },
+    });
+    assert.equal(
+      result.ok,
+      true,
+      `>> FAIL: validateRootManifest tld-suffixed-key-inert: a TLD-suffixed trustedProducts key resolves to a name that does not exist and must be inert, not a validation error, per RFC line 494; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
   });
 
   test("rejects non-object inputs", () => {
@@ -409,6 +448,102 @@ describe("validateProductConfig", () => {
   test("accepts a full four-variant config", () => {
     const result = validateProductConfig(VALID_CONFIG);
     assert.equal(result.ok, true);
+  });
+
+  // #1487: an unknown top-level field must be reported, not silently
+  // dropped — a typo'd or unsupported key deploys green today and the
+  // field simply never reaches chain (this is how #1484 presented).
+  test("rejects an unknown top-level field", () => {
+    const result = validateProductConfig({ ...VALID_CONFIG, banana: "oops" });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig unknown-top-level-field: a config carrying an unrecognised top-level key must not validate silently",
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'banana'")),
+      `>> FAIL: validateProductConfig unknown-top-level-field: expected an error naming the offending field 'banana'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("rejects a misspelled known field ('trustedProduct' singular) as unknown — the exact #1484 failure mode", () => {
+    const { trustedProducts, ...rest } = VALID_CONFIG;
+    const result = validateProductConfig({
+      ...rest,
+      trustedProduct: { dim2: ["context"] },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig typo-top-level-field: a typo'd field name (trustedProduct vs trustedProducts) must be reported, not silently ignored",
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'trustedProduct'")),
+      `>> FAIL: validateProductConfig typo-top-level-field: expected an error naming the typo'd field 'trustedProduct'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  test("reports every unknown top-level field, not just the first", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      banana: "oops",
+      kiwi: "also oops",
+    });
+    assert.equal(result.ok, false, ">> FAIL: validateProductConfig multiple-unknown-top-level-fields: expected rejection");
+    assert.ok(
+      result.errors.some((e) => e.includes("'banana'")) &&
+        result.errors.some((e) => e.includes("'kiwi'")),
+      `>> FAIL: validateProductConfig multiple-unknown-top-level-fields: expected an error naming each offending field; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // A typo on a REQUIRED field is the case that compounds: the key is
+  // unknown AND the field it was meant to be is now missing, so the operator
+  // gets both messages. Worth pinning because the order matters — the
+  // unknown-field check runs first, so the actionable "you wrote 'domian'"
+  // leads and the generic "domain must be…" trails. The two tests above only
+  // typo an optional field, where the second message never fires.
+  test("a typo on a required field reports both the unknown key and the missing field", () => {
+    const { domain, ...rest } = VALID_CONFIG;
+    const result = validateProductConfig({ ...rest, domian: "myapp.dot" });
+    assert.equal(result.ok, false, ">> FAIL: validateProductConfig required-field-typo: expected rejection");
+    assert.ok(
+      result.errors.some((e) => e.includes("unknown field 'domian'")),
+      `>> FAIL: validateProductConfig required-field-typo: expected an error naming the typo'd key 'domian'; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+    assert.ok(
+      result.errors.some((e) => e.includes("domain must be")),
+      `>> FAIL: validateProductConfig required-field-typo: expected the missing-required-field error alongside the unknown-key one, so the operator sees what the key should have been; errors: ${result.ok ? "" : result.errors.join("; ")}`,
+    );
+  });
+
+  // Regression guard: the new top-level-field check must not interfere with
+  // the pre-existing, RFC-required strictness *within* known fields on this
+  // (publish) side — icon.format (RFC line 337) and a trustedProducts grant
+  // value (RFC line 338) both still MUST fail validation here, same as
+  // before #1487.
+  test("still rejects an unrecognised icon.format (RFC line 337 — strict on the publishing side, unchanged)", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      icon: { path: "./icon.png", format: "webp" },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig icon-format-still-strict: publish-side icon.format strictness must be unaffected by the #1487 top-level-field fix",
+    );
+  });
+
+  test("still rejects an unrecognised trustedProducts grant value (RFC line 338 — strict on the publishing side, unchanged)", () => {
+    const result = validateProductConfig({
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["some-future-grant"] },
+    });
+    assert.equal(
+      result.ok,
+      false,
+      ">> FAIL: validateProductConfig grant-value-still-strict: publish-side trustedProducts grant strictness must be unaffected by the #1487 top-level-field fix",
+    );
   });
 
   // The read-side tolerance for an unrecognised icon.format does not extend
@@ -741,6 +876,264 @@ describe("pessimisticSizePreflight", () => {
     const report = pessimisticSizePreflight(config, 256);
     assert.equal(report.ok, false);
     assert.ok(report.checks.some(c => c.key.endsWith("#manifest") && !c.ok));
+  });
+
+  test("root check byte count agrees with composeRoot's own serialisation", () => {
+    // publish.ts and byte-budget.ts both compose the root manifest — this
+    // pins them to the same shared composer (src/manifest/compose.ts) so a
+    // future edit to one path can't silently drift from the other.
+    const report = pessimisticSizePreflight(VALID_CONFIG);
+    const rootCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(rootCheck);
+    const expectedBytes = Buffer.byteLength(
+      JSON.stringify(composeRoot(VALID_CONFIG, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    assert.equal(rootCheck.bytes, expectedBytes);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1484: composeRoot's normalizeTrustedProducts() decides what the host sees
+// as "no grants" (absence / {} / a per-key []), and pins the deterministic
+// key+grant ordering that keeps setTextRecord's skip-if-unchanged pre-check
+// working when a config is merely reordered, not substantively changed.
+// ---------------------------------------------------------------------------
+describe("composeRoot — trustedProducts (#1484)", () => {
+  test("includes an exact trustedProducts object when the config sets one", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: ["context"] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(manifest, {
+      $v: 1,
+      displayName: VALID_CONFIG.displayName,
+      description: VALID_CONFIG.description,
+      icon: { cid: PLACEHOLDER_CID, format: VALID_CONFIG.icon.format },
+      trustedProducts: { dim2: ["context"] },
+    });
+  });
+
+  test("omits trustedProducts entirely when the config doesn't set it", () => {
+    const manifest = composeRoot(VALID_CONFIG, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-absent: field must not appear on the manifest at all when the config never sets it",
+    );
+  });
+
+  test("omits trustedProducts when the config sets an empty object", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: {} };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-empty-object: {} must normalize to field-absent, not an empty-object literal",
+    );
+  });
+
+  test("omits trustedProducts when every key's grant array is empty", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: [] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-per-key-empty: a key with an empty grant array must be dropped, and dropping the only key must drop the field entirely",
+    );
+  });
+
+  test("de-duplicates grants within a key", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["context", "context"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(manifest.trustedProducts, { dim2: ["context"] });
+  });
+
+  test("sorts keys and grants so config ordering doesn't affect the serialised record", () => {
+    const configA = {
+      ...VALID_CONFIG,
+      trustedProducts: { zed: ["storage", "all"], alpha: ["context"] },
+    };
+    const configB = {
+      ...VALID_CONFIG,
+      trustedProducts: { alpha: ["context"], zed: ["all", "storage"] },
+    };
+    assert.equal(
+      JSON.stringify(composeRoot(configA, PLACEHOLDER_CID)),
+      JSON.stringify(composeRoot(configB, PLACEHOLDER_CID)),
+      ">> FAIL: composeRoot trustedProducts-ordering: differently-ordered but equivalent configs must serialise identically, or setTextRecord's skip-if-unchanged pre-check would bill a pointless on-chain write on every reorder",
+    );
+  });
+
+  // RFC line 142: "all" is a superset, not a peer — ["all", "storage"] IS
+  // ["all"]. Collapsing it both saves bytes against the only unbounded field
+  // in the 1024-byte budget, and keeps a purely cosmetic tidy-up from
+  // producing different bytes and defeating setTextRecord's
+  // skip-if-unchanged pre-check.
+  test("collapses a grant array containing 'all' down to exactly ['all']", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["all", "storage"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["all"] },
+      ">> FAIL: composeRoot trustedProducts-all-superset: ['all','storage'] must collapse to ['all'] per RFC 142",
+    );
+  });
+
+  test("leaves a grant array of just ['all'] unchanged", () => {
+    const config = { ...VALID_CONFIG, trustedProducts: { dim2: ["all"] } };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["all"] },
+      ">> FAIL: composeRoot trustedProducts-all-alone: ['all'] must stay ['all']",
+    );
+  });
+
+  test("leaves a grant array with no 'all' unchanged apart from sorting", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: { dim2: ["storage", "context"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { dim2: ["context", "storage"] },
+      ">> FAIL: composeRoot trustedProducts-no-all: a grant array without 'all' must keep every recognised value, just sorted",
+    );
+  });
+
+  // RFC line 143: "A product listing itself is ignored." composeRoot has the
+  // full ProductConfig in hand, so the product's own bare label — domain up
+  // to the first '.' — is knowable without a chain call.
+  test("drops a key equal to the product's own label", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"], wallet: ["storage"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { wallet: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing: a key equal to the product's own bare label must be dropped per RFC 143",
+    );
+  });
+
+  test("omits trustedProducts entirely when the only key is the self-listing", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.equal(
+      "trustedProducts" in manifest,
+      false,
+      ">> FAIL: composeRoot trustedProducts-self-listing-only-key: dropping the only key (the self-listing) must omit the field entirely, exactly like {}",
+    );
+  });
+
+  test("drops a self-listing key case-insensitively", () => {
+    const config = {
+      ...VALID_CONFIG, // domain: "demoapp.dot"
+      trustedProducts: { demoapp: ["all"], wallet: ["storage"] },
+    };
+    const upperDomainConfig = { ...config, domain: "DemoApp.dot" };
+    const manifest = composeRoot(upperDomainConfig, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { wallet: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing-case-insensitive: the self-listing match between config.domain's label and a trustedProducts key must be case-insensitive",
+    );
+  });
+
+  // Subname depth is deliberately unchecked (#1449), so a config domain can
+  // carry a modality subname. The product is then the label under the TLD,
+  // not the first one — reading the first segment would drop a grant issued
+  // to a different product that happens to share that subname's name.
+  test("takes the self-label from under the TLD, not the first segment, on a deep domain", () => {
+    const config = {
+      ...VALID_CONFIG,
+      domain: "worker.demoapp.dot",
+      trustedProducts: { worker: ["storage"], demoapp: ["all"] },
+    };
+    const manifest = composeRoot(config, PLACEHOLDER_CID);
+    assert.deepEqual(
+      manifest.trustedProducts,
+      { worker: ["storage"] },
+      ">> FAIL: composeRoot trustedProducts-self-listing-deep-domain: on 'worker.demoapp.dot' the product is 'demoapp', so only that key may be dropped — dropping 'worker' would silently lose a grant to an unrelated product of that name",
+    );
+  });
+});
+
+describe("pessimisticSizePreflight — trustedProducts (#1484)", () => {
+  // Many keys x all three grants each, so the composed root JSON grows well
+  // past a small explicit budget without relying on BULLETIN_TEXT_BUDGET.
+  function bigTrustedProducts(n) {
+    const out = {};
+    for (let i = 0; i < n; i++) {
+      out[`product${String(i).padStart(3, "0")}dim`] = [
+        "all",
+        "storage",
+        "context",
+      ];
+    }
+    return out;
+  }
+
+  test("a large trustedProducts pushes the #manifest check over budget", () => {
+    const config = {
+      ...VALID_CONFIG,
+      trustedProducts: bigTrustedProducts(20),
+    };
+    const bytesWithField = Buffer.byteLength(
+      JSON.stringify(composeRoot(config, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    const budget = bytesWithField - 1;
+
+    const report = pessimisticSizePreflight(config, budget);
+    const manifestCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(manifestCheck, ">> FAIL: pessimisticSizePreflight trustedProducts-over-budget: expected a '#manifest' check in the report");
+    assert.equal(
+      manifestCheck.ok,
+      false,
+      ">> FAIL: pessimisticSizePreflight trustedProducts-over-budget: composeRoot's shared use in the preflight must count trustedProducts bytes, but the #manifest check still passed",
+    );
+    assert.equal(report.ok, false);
+  });
+
+  test("the same budget passes once trustedProducts is absent (mirror)", () => {
+    const configWithField = {
+      ...VALID_CONFIG,
+      trustedProducts: bigTrustedProducts(20),
+    };
+    const bytesWithField = Buffer.byteLength(
+      JSON.stringify(composeRoot(configWithField, PLACEHOLDER_CID)),
+      "utf8",
+    );
+    const budget = bytesWithField - 1;
+
+    const configWithoutField = { ...VALID_CONFIG };
+    delete configWithoutField.trustedProducts;
+
+    const report = pessimisticSizePreflight(configWithoutField, budget);
+    const manifestCheck = report.checks.find((c) =>
+      c.key.endsWith("#manifest"),
+    );
+    assert.ok(manifestCheck, ">> FAIL: pessimisticSizePreflight trustedProducts-absent-mirror: expected a '#manifest' check in the report");
+    assert.equal(
+      manifestCheck.ok,
+      true,
+      ">> FAIL: pessimisticSizePreflight trustedProducts-absent-mirror: the same budget that failed with trustedProducts present must pass once it's absent",
+    );
   });
 });
 
@@ -1147,5 +1540,82 @@ describe("reconcileManifestDomain (#1572)", () => {
       () => reconcileManifestDomain("app.myapp.dot", "app.myapp", "dot", "/cfg/polkadot-app-deploy.config.mjs"),
       ">> FAIL: reconcileManifestDomain subdomain-shape-matches: a nested subname must normalize and compare the same as a top-level label",
     );
+  });
+});
+
+describe("manifestSignerOptions", () => {
+  const MNEMONIC = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+  test("passes the mnemonic through when no product name is set", () => {
+    assert.deepEqual(manifestSignerOptions({ mnemonic: MNEMONIC, derivationPath: "//a" }), { mnemonic: MNEMONIC, derivationPath: "//a" });
+  });
+
+  test("signs manifest writes as the product account under --product-name", () => {
+    const r = manifestSignerOptions({ mnemonic: MNEMONIC, productName: "uid.paseo" });
+    assert.equal(r.signerAddress, deriveProductSigner(MNEMONIC, "uid.paseo").ss58,
+      ">> FAIL: setResolver on the registry is owner-only; the manifest must be signed by the same account deploy() registered the name with");
+    assert.equal(r.mnemonic, undefined);
+    assert.equal(r.localSigner, true);
+  });
+});
+
+// Issue #1495. The manifest's icon and executables are billed to the storage account's Bulletin
+// quota, so they must be stored by the SAME account the content upload used — on a chain whose
+// shared pool holds no quota (no testnet authorizer), any divergence is a deploy that writes its
+// content and then fails, or silently skips, the manifest half.
+//
+// publishManifest cannot call deploy()'s resolution directly (it runs as a separate step, from
+// its own options), so the property under test is that both paths feed
+// selectStorageReconnect the same thing: this asserts manifestSignerOptions' output resolves to
+// the identical provider mode AND account as the options deploy() would hold at that point.
+describe("publishManifest — storage identity matches the content upload (#1495)", () => {
+  const PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
+
+  test("--mnemonic: both halves upload from the deployer's own account", () => {
+    const manifest = manifestSignerOptions({ mnemonic: PHRASE, derivationPath: "//deploy/3" });
+    // What deploy() holds for the same invocation: no product name, no slot, so the mnemonic
+    // passes through untouched (src/deploy.ts's resolveProductSigner returns null).
+    const content = { mnemonic: PHRASE, derivationPath: "//deploy/3" };
+    assert.equal(__selectStorageProviderModeForTest(manifest), "direct");
+    assert.equal(__selectStorageProviderModeForTest(manifest), __selectStorageProviderModeForTest(content));
+    assert.equal(manifest.mnemonic, content.mnemonic);
+    assert.equal(manifest.derivationPath, content.derivationPath);
+  });
+
+  test("--product-name: the manifest stores from the product account, not the root mnemonic", () => {
+    const manifest = manifestSignerOptions({ mnemonic: PHRASE, productName: "getcash" });
+    // deploy() applies exactly this before selecting storage:
+    //   options = { ...options, ...resolveProductSigner(options) }
+    const content = { mnemonic: PHRASE, ...resolveProductSigner({ productName: "getcash", mnemonic: PHRASE }) };
+    assert.equal(__selectStorageProviderModeForTest(manifest), "signer",
+      ">> FAIL: under --product-name deploy() stores content from the product account (it swaps the signer before selecting storage). A manifest that falls back to the mnemonic's root account needs a second Bulletin grant nobody provisions.");
+    assert.equal(__selectStorageProviderModeForTest(manifest), __selectStorageProviderModeForTest(content));
+    assert.equal(manifest.signerAddress, content.signerAddress,
+      ">> FAIL: the manifest's icon and executables must be stored by the same account as the content — the product account that owns the name.");
+    assert.equal(manifest.signerAddress, deriveProductSigner(PHRASE, "getcash").ss58);
+    assert.equal(manifest.mnemonic, undefined,
+      ">> FAIL: leaving the mnemonic set would let it win the storage precedence over the product signer.");
+  });
+
+  test("login session: the allowance slot carries over to the manifest", () => {
+    const slot = { storageSigner: { sign: () => {} }, storageSignerAddress: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY" };
+    const manifest = manifestSignerOptions({ ...slot });
+    assert.equal(__selectStorageProviderModeForTest(manifest), "storageSigner",
+      ">> FAIL: a signed-in deploy stores content on the user's own Bulletin allowance slot; without the slot here the manifest silently falls back to the shared pool.");
+    assert.equal(manifest.storageSignerAddress, slot.storageSignerAddress);
+  });
+
+  test("slot outranks the mnemonic, exactly as it does in deploy()", () => {
+    const manifest = manifestSignerOptions({
+      mnemonic: PHRASE,
+      storageSigner: { sign: () => {} },
+      storageSignerAddress: "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY",
+    });
+    assert.equal(__selectStorageProviderModeForTest(manifest), "storageSigner",
+      ">> FAIL: storage precedence is storageSigner > signer > mnemonic > pool on both paths; diverging here puts the two halves of one deploy on different accounts.");
+  });
+
+  test("no credentials at all: the shared pool is still the fallback", () => {
+    assert.equal(__selectStorageProviderModeForTest(manifestSignerOptions({})), "pool");
   });
 });

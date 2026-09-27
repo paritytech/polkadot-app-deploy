@@ -56,6 +56,7 @@ export type {
   FundingExecutableConfig,
   FundingManifest,
   FundingMode,
+  Granted,
   GraphicsRequirement,
   Icon,
   IconConfig,

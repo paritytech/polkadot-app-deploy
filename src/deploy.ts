@@ -3,6 +3,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { execSync } from "child_process";
 import { CLI_NAME } from "./cli-name.js";
+import { resolveEffectiveMnemonic } from "./mnemonic.js";
 import { hasPersistedSession, STALE_SESSION_MESSAGE, DOT_DAPP_ID, DOT_PRODUCT_ID, getPeopleChainEndpoints } from "./auth-config.js";
 import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
@@ -28,7 +29,7 @@ import type { DotnsAbiProfile } from "./dotns-protocol.js";
 import { subnameNestingLevels } from "./subname-depth.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet } from "./pool.js";
+import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
 import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
@@ -37,6 +38,7 @@ import { setDeployContext as setBugReportContext } from "./bug-report.js";
 import { getPolkadotSigner } from "polkadot-api/signer";
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { mnemonicToEntropy, entropyToMiniSecret, ss58Address } from "@polkadot-labs/hdkd-helpers";
+import { deriveProductSigner } from "./product-account.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { CarReader } from "@ipld/car/reader";
 import {
@@ -59,6 +61,18 @@ export interface DeployResult {
    * instead of recomputing a gateway URL from a hardcoded default.
    */
   browserUrl: string;
+  /**
+   * The Bulletin allowance-slot signer this deploy stored its content with, when it resolved
+   * one from a login session (`resolveStorageSigner`). Exposed so the CLI can hand the SAME
+   * identity to `publishManifest` immediately afterwards: the manifest's icon and executables
+   * are billed to the storage account's quota, and a session deploy whose manifest fell back
+   * to the shared pool would fail on any chain whose pool holds no quota. Undefined when
+   * storage ran on a mnemonic, an external signer, or the pool — those the manifest step
+   * resolves for itself from the options it is already given.
+   */
+  storageSigner?: PolkadotSigner;
+  /** SS58 address of that slot account. Set whenever `storageSigner` is. */
+  storageSignerAddress?: string;
 }
 
 export type DeployContent = string | Uint8Array | Uint8Array[];
@@ -114,7 +128,10 @@ let POOL_SIZE = DEFAULT_POOL_SIZE;
 // detectTestnet call decides from the declared env, not a chain spec_name
 // guess, whenever one is available. Module-level (like BULLETIN_ENDPOINTS/
 // POOL_SIZE above) because getProvider/getDirectProvider/getSignerProvider
-// run outside deploy()'s own scope.
+// run outside deploy()'s own scope. Also read by isPoolFallbackAllowed below
+// to gate whether a failed Bulletin allowance slot may fall back to the
+// shared pool — the pool is derived from the well-known dev phrase and holds
+// no grant on mainnet.
 let bulletinNetwork: string | undefined;
 
 /**
@@ -147,6 +164,24 @@ export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: st
  */
 export function setBulletinEndpoints(endpoints: string[]): void {
   BULLETIN_ENDPOINTS = endpoints;
+}
+
+/**
+ * Set the module-level `bulletinNetwork` context declared above. `manifest/publish.ts`
+ * opens its own storage provider and can run without a preceding in-process `deploy()`,
+ * in which case `bulletinNetwork` would still be undefined — the historical
+ * (testnet-shaped) fallback behavior, not a hard failure on mainnet, and detectTestnet's
+ * own spec_name guess would also be skipped. Same reasoning as `setBulletinEndpoints`:
+ * ESM named imports are read-only bindings, so a setter is the only way for another
+ * module to update this `let`.
+ */
+export function setBulletinNetworkContext(network: string | undefined): void {
+  bulletinNetwork = network;
+}
+
+/** The value above, for tests that assert the wiring without a chain connection. */
+export function __getBulletinNetworkContextForTest(): string | undefined {
+  return bulletinNetwork;
 }
 // Module-level flag: flipped by getWsProvider's onStatusChanged if papi
 // connects to a non-primary endpoint. Flushed into the deploy span at the end
@@ -431,8 +466,9 @@ async function getProvider(): Promise<ProviderResult> {
 
   try {
     await cryptoWaitReady();
-    const poolMnemonic = process.env.BULLETIN_POOL_MNEMONIC || undefined;
-    const poolAccounts = derivePoolAccounts(POOL_SIZE, poolMnemonic);
+    // One resolver, shared with bin/polkadot-app-bootstrap, so the accounts an operator authorizes
+    // are the accounts a deploy uploads from (see resolvePoolMnemonic's doc comment).
+    const poolAccounts = derivePoolAccounts(POOL_SIZE, resolvePoolMnemonic());
     const authorizations = await fetchPoolAuthorizations(unsafeApi, poolAccounts);
     const poolIndexEnv = process.env.BULLETIN_POOL_ACCOUNT_INDEX;
     let pinnedPoolIndex: number | undefined;
@@ -674,9 +710,9 @@ export function chooseSignerInput(opts: {
 // Gates both the up-front "phone ready" banner and the per-step "check your phone"
 // reminder — they must agree, so they read the same predicate.
 export function isPhoneSignerActive(
-  options: Pick<DeployOptions, "signer" | "signerAddress" | "transferTo">,
+  options: Pick<DeployOptions, "signer" | "signerAddress" | "transferTo" | "localSigner">,
 ): boolean {
-  return !!(options.signer && options.signerAddress && !options.transferTo);
+  return !!(options.signer && options.signerAddress && !options.transferTo && !options.localSigner);
 }
 
 /**
@@ -783,6 +819,35 @@ export function describeSlotFallbackReason(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * May a failed allowance slot fall back to the shared `//deploy/N` pool?
+ *
+ * Only off mainnet. The pool is derived from the well-known dev phrase, so on a mainnet chain it
+ * holds no authorization and the fallback cannot succeed — it just trades a precise slot error
+ * for an out-of-quota failure later in the upload, behind a warning that says the situation is
+ * fine. Keyed on the resolved env's declared `network`, the same field used elsewhere to
+ * distinguish testnet-vs-mainnet wording; an env that declares nothing (custom presets, library
+ * callers that never set it) keeps the historical fallback rather than newly hard-failing.
+ */
+export function isPoolFallbackAllowed(network?: string): boolean {
+  return network !== "mainnet";
+}
+
+/**
+ * The refusal itself, extracted so the mainnet branch is unit-testable without a WS connection
+ * (same reasoning as describeSlotFallbackReason). Returns normally when the fallback is allowed;
+ * throws on mainnet, carrying the slot's own failure reason so the message says what actually
+ * went wrong rather than only that storage is unavailable.
+ */
+export function assertPoolFallbackAllowed(network: string | undefined, reason: string): void {
+  if (isPoolFallbackAllowed(network)) return;
+  throw new NonRetryableError(
+    `Bulletin allowance slot not usable: ${reason}. ` +
+    `On mainnet storage must run on your own allowance — the shared pool account holds no ` +
+    `quota there, so there is nothing to fall back to. Run: ${CLI_NAME} logout && ${CLI_NAME} login`,
+  );
+}
+
 export function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
   // Delegate the mode decision to the pure, unit-tested selector (bulletin #1452) so this
   // function and __selectStorageProviderModeForTest can never disagree about which branch runs.
@@ -801,18 +866,19 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
       try {
         return await getSlotSignerProvider(options.storageSigner!, options.storageSignerAddress!);
       } catch (e) {
+        const reason = describeSlotFallbackReason(e);
+        // The pool cannot store on mainnet (dev-phrase accounts, no grant), so falling back
+        // would only defer the failure past the upload. Fail here, where the cause is known.
+        // Attribute first: the refusal throws, and the reason must reach telemetry either way.
+        setDeployAttribute("deploy.signer.fallback_reason", reason);
+        assertPoolFallbackAllowed(bulletinNetwork, reason);
         useSlot = false;
         setDeployAttribute("deploy.signer.mode", "pool-fallback");
-        const reason = describeSlotFallbackReason(e);
-        setDeployAttribute("deploy.signer.fallback_reason", reason);
         console.warn(
           `⚠  Bulletin allowance slot not usable: ${reason}\n` +
           `   Falling back to the shared pool account for storage (fine on testnet).\n` +
           `   To use your own allowance, run: ${CLI_NAME} logout && ${CLI_NAME} login`,
         );
-        // TODO (mainnet): hard-fail here instead of pool fallback when running against mainnet
-        // (tie to the open mainnet-storage-signer gap in src/CLAUDE.md). Env-gating deferred
-        // until mainnet is live.
         return getProvider();
       }
     };
@@ -2840,6 +2906,20 @@ export interface DeployOptions {
   mnemonic?: string;
   /** Optional derivation path applied to the mnemonic (e.g. "//deploy/3"). Defaults to "" (root key). */
   derivationPath?: string;
+  /**
+   * Deploy as this product's derived account (RFC-0022 host derivation,
+   * index 0) instead of the mnemonic's root account, so the deployed name is
+   * owned by the account a host hands the product at runtime. Needs a
+   * mnemonic; mutually exclusive with suri, derivationPath, and signer.
+   * CLI: --product-name <name>
+   */
+  productName?: string;
+  /**
+   * Internal: the injected signer signs locally in-process, so no phone
+   * ceremony gates its signatures. Set by the productName resolution;
+   * genuine QR/mobile injected signers leave it unset.
+   */
+  localSigner?: boolean;
   /** Pre-built signer — skips mnemonic derivation. Use for QR/mobile signing. */
   signer?: PolkadotSigner;
   /** SS58 address for the signer (required when signer is provided). */
@@ -2963,6 +3043,27 @@ export interface DeployOptions {
    * single-banner output.
    */
   manifestPending?: boolean;
+}
+
+// Shared by deploy() and publishManifest() so both derive the same key.
+export function resolveProductSigner(
+  options: Pick<DeployOptions, "productName" | "mnemonic" | "signer" | "signerAddress" | "suri" | "derivationPath">,
+): Pick<DeployOptions, "signer" | "signerAddress" | "mnemonic" | "localSigner"> | null {
+  if (!options.productName) return null;
+  if (options.signer || options.signerAddress || options.suri || options.derivationPath) {
+    throw new NonRetryableError("--product-name derives the signer itself; it cannot be combined with --suri, --derivation-path, or an external signer.");
+  }
+  const productMnemonic = resolveEffectiveMnemonic({
+    flagMnemonic: options.mnemonic,
+    envMnemonic: process.env.MNEMONIC,
+    envDotnsMnemonic: process.env.DOTNS_MNEMONIC,
+  });
+  if (!productMnemonic) {
+    throw new NonRetryableError("--product-name needs a mnemonic (--mnemonic or the MNEMONIC env var) to derive the product account from.");
+  }
+  const product = deriveProductSigner(productMnemonic, options.productName);
+  console.log(`   Product deployer: ${product.ss58} (product ${product.productName}, index 0)`);
+  return { signer: product.signer, signerAddress: product.ss58, mnemonic: undefined, localSigner: true };
 }
 
 // Resolve the DeployOptions that affect DotNS authentication into the shape
@@ -3289,6 +3390,12 @@ export async function deploy(content: DeployContent, domainName: string | null =
     throw new NonRetryableError("Pass either a mnemonic or an external signer, not both — they identify the signing account and only one can win.");
   }
   bulletinNetwork = undefined; // bulletin #1362/#1095: reset per-deploy; set from the resolved env below
+  // Product-name deploys resolve to an injected signer up front: the product
+  // account derived from the mnemonic per RFC-0022 signs storage and DotNS
+  // alike, so the deployed name is owned by the very account a host hands the
+  // product at runtime. Resolved here, before signer-choice, so the rest of
+  // the pipeline sees a plain injected signer and needs no product awareness.
+  options = { ...options, ...resolveProductSigner(options) };
   // Resolve the target environment. options.bulletinEndpoints / assetHubEndpoints
   // bypass the loader for tests and library callers.
   const envId = options.env ?? DEFAULT_ENV_ID;
@@ -4078,6 +4185,11 @@ export async function deploy(content: DeployContent, domainName: string | null =
         cid: cid as string,
         ipfsCid,
         browserUrl,
+        // Read off `options`, not the slot resolution above: `options` is what
+        // selectStorageReconnect actually consulted, so this reports the identity that
+        // stored the bytes even when the caller supplied storageSigner itself.
+        storageSigner: options.storageSigner,
+        storageSignerAddress: options.storageSignerAddress,
       };
     } finally {
       // Flush the module-level failover flag in case onStatusChanged fired after

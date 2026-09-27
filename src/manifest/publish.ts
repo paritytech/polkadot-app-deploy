@@ -12,14 +12,17 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { PolkadotSigner } from "polkadot-api";
 import {
   BLAKE2B_256_MULTIHASH_CODE,
   encodeContenthash,
   storeDirectory,
   storeFile,
   resolveDotnsConnectOptions,
+  resolveProductSigner,
   resolveBulletinEndpoints,
   setBulletinEndpoints,
+  setBulletinNetworkContext,
   selectStorageReconnect,
   type DeployOptions,
 } from "../deploy.js";
@@ -34,18 +37,9 @@ import {
   type PopSelfServeConfig,
 } from "../environments.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
+import { composeExecutable, composeRoot } from "./compose.js";
 import type { LoadedProductConfig } from "./config-load.js";
 import { verifyEmbeddedAppManifests } from "./product-preflight.js";
-import type {
-  AppManifest,
-  ExecutableConfig,
-  ExecutableManifest,
-  FundingManifest,
-  ProductConfig,
-  RootManifest,
-  WidgetManifest,
-  WorkerManifest,
-} from "./types.js";
 
 export interface PublishManifestOptions {
   /** Loaded + validated product config (call loadProductConfig first). */
@@ -70,6 +64,18 @@ export interface PublishManifestOptions {
   mnemonic?: string;
   /** Optional Substrate-style derivation path. */
   derivationPath?: string;
+  /** Sign as the RFC-0022 product account, the same key deploy() registers the name with. */
+  productName?: string;
+  /**
+   * The Bulletin allowance-slot signer deploy() resolved for the content upload, handed over
+   * in-process via DeployResult. Set when the deploy ran on a login session's own slot rather
+   * than a mnemonic: without it this step would store the manifest from the shared dev pool
+   * while the content it belongs to went to the user's slot, and on a chain whose pool holds
+   * no quota the manifest would be the only part that fails.
+   */
+  storageSigner?: PolkadotSigner;
+  /** SS58 address of the slot account. Required when storageSigner is set. */
+  storageSignerAddress?: string;
 }
 
 export interface PublishManifestResult {
@@ -133,6 +139,13 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   reconcileManifestDomain(config.domain, opts.domain, envTld, sourcePath);
   const popSelfServe = getPopSelfServeConfig(doc, envId);
   setBulletinEndpoints(resolveBulletinEndpoints(resolved.bulletin, opts.rpc));
+  // Same reasoning as the endpoints above, for the OTHER piece of env state
+  // selectStorageReconnect's mainnet pool-fallback gate reads: `bulletinNetwork` is
+  // module-level in deploy.ts and is set per-deploy inside deploy(). A library caller
+  // invoking publishManifest() on its own (no preceding in-process deploy()) would
+  // otherwise leave it undefined — the historical testnet-shaped fallback, not a hard
+  // failure on mainnet. Resolve it from the same env this function already resolved.
+  setBulletinNetworkContext(resolved.network);
 
   const iconAbs = path.resolve(configDir, config.icon.path);
   const iconBytes = await readFileOrThrow(iconAbs, "icon");
@@ -148,17 +161,22 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   console.log(`  Uploading icon (${iconBytes.length} B)…`);
 
   // Bulletin storage for the icon and executables must use the SAME identity
-  // that signs the DotNS writes below (connectDotNS resolves opts.mnemonic/
-  // derivationPath already) — reuse selectStorageReconnect's mnemonic>pool
-  // precedence (deploy() itself uses the same function) instead of an empty
-  // options object, which always fell back to the bare pool-mode provider.
-  // That fallback happened to look harmless on every existing manifest E2E
-  // scenario, because their pinned pool index was small enough to also be
-  // deploy()'s own default 10-account pool window — but a pool leg pinned
-  // outside that window (BULLETIN_POOL_ACCOUNT_INDEX >= 10) fails here even
-  // though the exact account is already authorized and just stored this
-  // deploy's own content, since pool mode never even derives it.
-  const reconnect = selectStorageReconnect({ mnemonic: opts.mnemonic, derivationPath: opts.derivationPath });
+  // that signs the DotNS writes below — reuse selectStorageReconnect's
+  // storageSigner > signer > mnemonic > pool precedence (deploy() itself uses
+  // the same function) instead of an empty options object, which always fell
+  // back to the bare pool-mode provider. That fallback happened to look
+  // harmless on every existing manifest E2E scenario, because their pinned
+  // pool index was small enough to also be deploy()'s own default 10-account
+  // pool window — but a pool leg pinned outside that window
+  // (BULLETIN_POOL_ACCOUNT_INDEX >= 10) fails here even though the exact
+  // account is already authorized and just stored this deploy's own content,
+  // since pool mode never even derives it.
+  //
+  // Resolved ONCE and shared with connectDotNS below: resolveProductSigner
+  // logs "Product deployer: …", and resolving twice would print the line
+  // twice under --product-name.
+  const signerOpts = manifestSignerOptions(opts);
+  const reconnect = selectStorageReconnect(signerOpts);
   const storage = await reconnect();
   let iconCid!: string;
   const executableCids: Record<string, string> = {};
@@ -185,7 +203,7 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
     try { storage.client.destroy(); } catch { /* already destroyed */ }
   }
 
-  const dotns = await connectDotNS(opts, resolved, popSelfServe, envId);
+  const dotns = await connectDotNS(signerOpts, resolved, popSelfServe, envId);
 
   try {
     const baseLabel = stripDotSuffix(config.domain, envTld);
@@ -268,16 +286,43 @@ async function readFileOrThrow(p: string, label: string): Promise<Uint8Array> {
   }
 }
 
+/**
+ * The identity this step signs DotNS with AND stores its Bulletin bytes from — one resolution,
+ * deliberately, because the two must never diverge: the icon and executables are paid for out of
+ * the storage account's quota, and the manifest records are written by the name's owner.
+ *
+ * Mirrors what deploy() feeds selectStorageReconnect / resolveDotnsConnectOptions, so both
+ * halves of a deploy resolve the same account:
+ *   - `productName` -> the RFC-0022 product account (see resolveProductSigner), which is what
+ *     deploy() stores content from too, since it swaps the signer before selecting storage.
+ *   - `storageSigner` -> the login session's Bulletin allowance slot, carried over from the
+ *     deploy that just ran. Kept alongside the signer fields rather than replacing them,
+ *     exactly as deploy() holds both, so selectStorageReconnect applies its own precedence.
+ *   - otherwise the mnemonic passthrough, unchanged.
+ *
+ * Call this ONCE per publish: resolveProductSigner logs "Product deployer: …" on every call.
+ */
+export function manifestSignerOptions(
+  opts: Pick<PublishManifestOptions, "mnemonic" | "derivationPath" | "productName" | "storageSigner" | "storageSignerAddress">,
+): Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress" | "localSigner" | "storageSigner" | "storageSignerAddress"> {
+  const product = resolveProductSigner({ productName: opts.productName, mnemonic: opts.mnemonic, derivationPath: opts.derivationPath });
+  const base = product ?? { mnemonic: opts.mnemonic, derivationPath: opts.derivationPath };
+  // Added only when actually set: an always-present `storageSigner: undefined` would make this
+  // object no longer deep-equal the plain mnemonic passthrough callers and tests compare against.
+  return opts.storageSigner && opts.storageSignerAddress
+    ? { ...base, storageSigner: opts.storageSigner, storageSignerAddress: opts.storageSignerAddress }
+    : base;
+}
+
+// Takes the ALREADY-RESOLVED signer options rather than the raw PublishManifestOptions: the
+// storage selection above needs the same resolution, and resolveProductSigner logs a line per
+// call, so the single caller resolves once and passes the result to both.
 async function connectDotNS(
-  opts: PublishManifestOptions,
+  deployOptsShim: ReturnType<typeof manifestSignerOptions>,
   resolved: ResolvedEndpoints,
   popSelfServe: PopSelfServeConfig | null,
   envId: string,
 ): Promise<DotNS> {
-  const deployOptsShim: Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress"> = {
-    mnemonic: opts.mnemonic,
-    derivationPath: opts.derivationPath,
-  };
   const connectOpts = resolveDotnsConnectOptions(
     deployOptsShim,
     resolved.assetHub,
@@ -293,42 +338,6 @@ async function connectDotNS(
   const dotns = new DotNS();
   await dotns.connect(connectOpts);
   return dotns;
-}
-
-function composeRoot(config: ProductConfig, iconCid: string): RootManifest {
-  return {
-    $v: 1,
-    displayName: config.displayName,
-    description: config.description,
-    icon: { cid: iconCid, format: config.icon.format },
-  };
-}
-
-function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
-  if (exec.kind === "app") {
-    return "manifest" in exec
-      ? exec.manifest
-      : ({ $v: 1, kind: "app", appVersion: exec.appVersion } as AppManifest);
-  }
-  if (exec.kind === "widget") {
-    return {
-      $v: 1,
-      kind: "widget",
-      appVersion: exec.appVersion,
-      dimensions: exec.dimensions,
-      ...(exec.description !== undefined ? { description: exec.description } : {}),
-    } as WidgetManifest;
-  }
-  if (exec.kind === "funding") {
-    return { $v: 1, kind: "funding", appVersion: exec.appVersion, modes: exec.modes } as FundingManifest;
-  }
-  return {
-    $v: 1,
-    kind: "worker",
-    appVersion: exec.appVersion,
-    entrypoint: exec.entrypoint,
-    includes: exec.includes,
-  } as WorkerManifest;
 }
 
 // tld is a required param: this function's single caller (below) always

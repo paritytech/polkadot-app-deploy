@@ -37,6 +37,7 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === "--pool-size") { flags.poolSize = parseInt(args[++i], 10); }
   else if (args[i] === "--mnemonic") { flags.mnemonic = args[++i]; }
   else if (args[i] === "--derivation-path") { flags.derivationPath = args[++i]; }
+  else if (args[i] === "--product-name") { flags.productName = args[++i]; }
   else if (args[i] === "--rpc") { flags.rpc = args[++i]; }
   else if (args[i] === "--env") { flags.env = args[++i]; }
   else if (args[i] === "--contract") {
@@ -246,6 +247,7 @@ Options:
                            --contract DOTNS_REGISTRY=0x.. --contract DOTNS_CONTENT_RESOLVER=0x..
   --mnemonic "..."         DotNS owner mnemonic (or set MNEMONIC env var)
   --derivation-path "..."  Optional Substrate-style path applied to --mnemonic (e.g. //deploy/3)
+  --product-name "..."     Deploy as this product's host-derived account (RFC-0022, index 0), so the name is owned by the account the product signs with at runtime
   --no-transfer-to-signedin-user
                            When signed in, sign every DotNS tx with your mobile
                            session (today's behavior) instead of the default:
@@ -500,6 +502,7 @@ try {
   const result = await deploy(buildDir, domain, {
     mnemonic: effectiveMnemonic,
     derivationPath: flags.derivationPath,
+    productName: flags.productName,
     suri: flags.suri,
     manifestPending: manifestWillPublish,
     rpc: flags.rpc,
@@ -617,6 +620,12 @@ try {
           rpc: flags.rpc,
           mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,
+          productName: flags.productName,
+          // The slot signer deploy() resolved from the login session, so the manifest's
+          // uploads are billed to the same allowance the content was. Undefined for every
+          // other signer shape, which publishManifest resolves from the options above.
+          storageSigner: result.storageSigner,
+          storageSignerAddress: result.storageSignerAddress,
         });
         // #1164: deploy() deferred the real completion banner (manifestPending
         // was set above) — print it now that the manifest phase actually

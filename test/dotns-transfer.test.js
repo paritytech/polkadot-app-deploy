@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient } from "../dist/dotns.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient, computeSubnodeIds } from "../dist/dotns.js";
 import { namehash, zeroAddress, decodeFunctionData } from "viem";
 
 test("weiToNative: zero stays zero", () => {
@@ -220,6 +222,72 @@ test("transferSubname: node derivation — parentNode/subnode/setSubnodeOwner al
   const [subnodeRecord] = d.__txCall[4];
   assert.equal(subnodeRecord.parentNode, expectedParentNode,
     ">> FAIL: transferSubname's setSubnodeOwner call must pass the paseo-tld parentNode, not a hardcoded .dot one");
+});
+
+// Source-scan guard (bulletin-deploy #1304 follow-up), belt-and-suspenders on
+// top of the behavioral pin above: every node derivation reachable from
+// transferSubname must route through computeSubnodeIds, which itself routes
+// through computeDomainNode(label, tld) — the sole caller of the shared
+// ensNode() primitive (see the guard in dotns-token-id.test.js, which pins
+// that primitive's uniqueness file-wide). This test's job is narrower and
+// complementary: it doesn't care how the primitive is reached, only that (1)
+// transferSubname routes through computeSubnodeIds and never bypasses it with
+// its own inline node-derivation call, and (2) computeSubnodeIds's own two
+// computeDomainNode(...) calls both forward the dynamic `tld` parameter,
+// never a hardcoded suffix.
+test("guard: transferSubname routes node derivation through computeSubnodeIds, which never hardcodes a TLD", () => {
+  const srcPath = fileURLToPath(new URL("../src/dotns.ts", import.meta.url));
+  const src = readFileSync(srcPath, "utf8");
+
+  const transferStart = src.indexOf("async transferSubname(");
+  assert.notEqual(transferStart, -1, ">> FAIL: guard transferSubname TLD hardcode: could not find 'async transferSubname(' in src/dotns.ts — has the method been renamed or moved?");
+  const transferRest = src.slice(transferStart);
+  const nextMethodOffset = transferRest.slice(1).search(/\n {2}(?:private\s+)?(?:async\s+)?[A-Za-z_]\w*\s*\(/);
+  const transferBody = nextMethodOffset === -1 ? transferRest : transferRest.slice(0, nextMethodOffset + 1);
+
+  assert.ok(
+    /computeSubnodeIds\(/.test(transferBody),
+    ">> FAIL: guard transferSubname TLD hardcode: transferSubname must derive its parent/subnode nodes via computeSubnodeIds(...), not an inline namehash(...)/computeDomainNode(...) call",
+  );
+  assert.ok(
+    !/\bnamehash\(/.test(transferBody),
+    ">> FAIL: guard transferSubname TLD hardcode: transferSubname must not call namehash(...) directly — a bare call here bypasses the single computeSubnodeIds derivation and can reintroduce a hardcoded TLD",
+  );
+  assert.ok(
+    !/\bcomputeDomainNode\(/.test(transferBody),
+    ">> FAIL: guard transferSubname TLD hardcode: transferSubname must not call computeDomainNode(...) directly either — that still reaches the shared primitive, but it bypasses computeSubnodeIds, the one place the sub/parent PAIR is supposed to be derived together",
+  );
+
+  const helperStart = src.indexOf("export function computeSubnodeIds(");
+  assert.notEqual(helperStart, -1, ">> FAIL: guard transferSubname TLD hardcode: could not find 'export function computeSubnodeIds(' in src/dotns.ts — has the helper been renamed or moved?");
+  const afterHelperStart = src.slice(helperStart);
+  const closingBraceMatch = afterHelperStart.match(/\n\}/);
+  assert.notEqual(
+    closingBraceMatch, null,
+    ">> FAIL: guard transferSubname TLD hardcode: could not find computeSubnodeIds's closing brace (a lone '}' at the start of a line) — has the helper's shape changed?",
+  );
+  const helperEnd = helperStart + closingBraceMatch.index + closingBraceMatch[0].length;
+  const helperBody = src.slice(helperStart, helperEnd);
+
+  assert.ok(
+    !/\bnamehash\(/.test(helperBody),
+    ">> FAIL: guard transferSubname TLD hardcode: computeSubnodeIds must not call namehash(...) directly any more — #1304 routes it through computeDomainNode(label, tld), the sole caller of the shared ensNode() primitive",
+  );
+
+  const calls = [...helperBody.matchAll(/computeDomainNode\(([^,]+),\s*([^)]+)\)/g)].map((m) => ({ label: m[1].trim(), tld: m[2].trim() }));
+  assert.ok(
+    calls.length >= 2,
+    `>> FAIL: guard transferSubname TLD hardcode: expected at least 2 computeDomainNode(...) calls (parentNode + subnode) in computeSubnodeIds's body, found ${calls.length} — did the node-derivation shape change?`,
+  );
+  const offenders = [];
+  for (const { label, tld } of calls) {
+    if (tld !== "tld") offenders.push(`computeDomainNode(${label}, ${tld}) does not forward the dynamic tld parameter`);
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    `>> FAIL: guard transferSubname TLD hardcode: ${JSON.stringify(offenders)} — every computeDomainNode(...) call in computeSubnodeIds must forward its tld parameter, never a hardcoded suffix like ".dot"`,
+  );
 });
 
 test("feeFloorFor: adds the transfer fee to the register floor", () => {

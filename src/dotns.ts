@@ -709,14 +709,28 @@ export function resolveTldFromRegistryResult(result: RegistryDryRunResult<string
   return normalizeOnChainTld(result.value);
 }
 
-// Pure consistency check for the tldNode() safety net: our own namehash(tld)
+// bulletin-deploy #1304: the ONLY place in this file that calls viem's
+// namehash() directly. Every node/tokenId derivation below — computeDomainNode,
+// computeDomainTokenId, computeSubnodeIds, and the tldNode() consistency check
+// right below — goes through this one primitive. That is what the guard test
+// in test/dotns-token-id.test.js pins: it asserts `namehash(` occurs in this
+// file exactly once, right here. A whitelist of previously-seen bad shapes
+// only catches a NEW bad derivation if it happens to repeat an old mistake;
+// routing every site through a single function makes a second, differently-
+// wrong derivation impossible to write in the first place — there is nowhere
+// else to write it.
+function ensNode(fullName: string): `0x${string}` {
+  return namehash(fullName);
+}
+
+// Pure consistency check for the tldNode() safety net: our own ensNode(tld)
 // must agree with the contract's tldNode(), or every node this run computes
 // targets the wrong on-chain record — a silent, total-corruption bug class.
 // `result.ok === false` means the registry doesn't support tldNode() (pre-#218)
 // or none is configured — nothing to check, not a failure.
 export function checkTldNodeConsistency(tld: string, result: RegistryDryRunResult<string>): void {
   if (!result.ok) return;
-  const localNode = namehash(tld).toLowerCase();
+  const localNode = ensNode(tld).toLowerCase();
   const onChainNode = result.value.toLowerCase();
   if (localNode !== onChainNode) {
     throw new Error(
@@ -1212,8 +1226,34 @@ export function convertWeiToNative(weiValue: bigint): bigint { return weiValue /
 // namehash("ssoqedtuwf.paseo"), but the post-register ownerOf lookup queried
 // namehash("ssoqedtuwf.dot") (the old hardcoded node) and reverted with
 // ERC721NonexistentToken — after the 11 PAS mint succeeded.
+// bulletin-deploy #1304 follow-up: routed through the shared ensNode()
+// primitive (see the comment above ensNode, near checkTldNodeConsistency) so
+// there's exactly one derivation to keep correct, not two.
+export function computeDomainNode(label: string, tld: string = DEFAULT_TLD): `0x${string}` {
+  return ensNode(`${label}.${tld}`);
+}
+
 export function computeDomainTokenId(label: string, tld: string = DEFAULT_TLD): bigint {
-  return BigInt(namehash(`${label}.${tld}`));
+  return BigInt(computeDomainNode(label, tld));
+}
+
+// Same rationale as computeDomainTokenId above: transferSubname,
+// registerSubdomain, and checkSubdomainOwnership each hand-derived the
+// sublabel.parentLabel.tld node and the parentLabel.tld node independently —
+// three copies of the exact identifier derivation whose divergence (a
+// hardcoded TLD vs. the templated `this._tld`) is what minted
+// "ssoqedtuwf.paseo" but then looked up "ssoqedtuwf.dot" and reverted after
+// the mint had already succeeded. Route every subname node computation
+// through computeDomainNode (itself built on the single ensNode() primitive)
+// so there is exactly one derivation to keep correct. subnode is expressed as
+// computeDomainNode of the compound "sublabel.parentLabel" label — identical
+// bytes to hashing the three-part string directly, one fewer place that could
+// diverge from computeDomainNode's own convention.
+export function computeSubnodeIds(sublabel: string, parentLabel: string, tld: string = DEFAULT_TLD): { parentNode: `0x${string}`; subnode: `0x${string}` } {
+  return {
+    parentNode: computeDomainNode(parentLabel, tld),
+    subnode: computeDomainNode(`${sublabel}.${parentLabel}`, tld),
+  };
 }
 
 // Shared by transferName and transferSubname (and the CLI's own --to
@@ -3574,8 +3614,7 @@ export class DotNS {
     this.ensureConnected();
     const fullName = `${sublabel}.${parentLabel}.${this._tld}`;
     assertNotZeroRecipient(toH160, fullName);
-    const parentNode = namehash(`${parentLabel}.${this._tld}`);
-    const subnode = namehash(fullName);
+    const { parentNode, subnode } = computeSubnodeIds(sublabel, parentLabel, this._tld);
 
     // Only the parent owner may reassign a subname. Check parent ownership up
     // front so the failure is actionable rather than a bare registry revert.
@@ -3657,7 +3696,7 @@ export class DotNS {
     // contractCall on DOTNS_REGISTRY.owner(node). This is only needed for
     // subdomain deploys which are a minority path.
     if (!this.clientWrapper) return { owned: false, owner: null };
-    const node = namehash(`${sublabel}.${parentLabel}.${this._tld}`);
+    const { subnode: node } = computeSubnodeIds(sublabel, parentLabel, this._tld);
     try {
       const owner = await withTimeout(this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [node]), 30000, "owner");
       if (!owner || owner === zeroAddress) return { owned: false, owner: null };
@@ -3670,8 +3709,7 @@ export class DotNS {
     return withSpan("deploy.dotns.register-subdomain", `2a. register ${sublabel}.${parentLabel}.${this._tld}`, {}, async () => {
       this.ensureConnected();
       console.log(`\n   Registering subdomain ${sublabel}.${parentLabel}.${this._tld}...`);
-      const parentNode = namehash(`${parentLabel}.${this._tld}`);
-      const subnodeNode = namehash(`${sublabel}.${parentLabel}.${this._tld}`);
+      const { parentNode, subnode: subnodeNode } = computeSubnodeIds(sublabel, parentLabel, this._tld);
       const subnodeRecord = { parentNode, subLabel: sublabel, parentLabel, owner: this.evmAddress! };
 
       // verifyEffect: mirrors setContenthash/setTextRecord. Guards the nonce-advance
@@ -3852,7 +3890,7 @@ export class DotNS {
       {},
       async () => {
         this.ensureConnected();
-        const node = namehash(`${domainName}.${this._tld}`);
+        const node = computeDomainNode(domainName, this._tld);
         const expectedContenthash = contenthashHex.toLowerCase();
 
         let contenthashSkipped = false;
@@ -3935,7 +3973,7 @@ export class DotNS {
   async setContenthash(domainName: string, contenthashHex: string, opts: { feeAsset?: "pgas" } = {}): Promise<{ node: string }> {
     return withSpan("deploy.dotns.set-contenthash", "2b. set-contenthash", {}, async () => {
       this.ensureConnected();
-      const node = namehash(`${domainName}.${this._tld}`);
+      const node = computeDomainNode(domainName, this._tld);
       // Decode the contenthash hex to the IPFS CID string the CLI expects.
       let ipfsCid: string | null = null;
       if (contenthashHex && contenthashHex !== "0x") {
@@ -4078,7 +4116,7 @@ export class DotNS {
    */
   async ensureContentResolver(domainName: string): Promise<{ changed: boolean }> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.${this._tld}`);
+    const node = computeDomainNode(domainName, this._tld);
     const target = this._contracts.DOTNS_CONTENT_RESOLVER;
     let current: unknown = null;
     try {
@@ -4112,7 +4150,7 @@ export class DotNS {
   /** Read a text record off `DOTNS_CONTENT_RESOLVER`. Returns `""` when unset. */
   async getTextRecord(domainName: string, key: string): Promise<string> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.${this._tld}`);
+    const node = computeDomainNode(domainName, this._tld);
     // #1060: an unset key legitimately returns empty `0x` — contractCallNullable
     // (not the throwing contractCall) so this keeps the "" contract the doc above
     // promises instead of throwing.
@@ -4133,7 +4171,7 @@ export class DotNS {
     return withSpan("deploy.dotns.set-text", `2c. set-text ${key}`, {}, async () => {
       this.ensureConnected();
       console.log(`   Setting text[${key}]: ${value}`);
-      const node = namehash(`${domainName}.${this._tld}`);
+      const node = computeDomainNode(domainName, this._tld);
 
       // Pre-check: skip the tx if already set to the same value (mirrors
       // setContenthash's pre-check above). Reuses getTextRecord, which
@@ -4236,7 +4274,7 @@ export class DotNS {
     }
     return withSpan("deploy.dotns.set-text-batch", `2c. set-text batch (${entries.length})`, {}, async () => {
       this.ensureConnected();
-      const node = namehash(`${domainName}.${this._tld}`);
+      const node = computeDomainNode(domainName, this._tld);
       const calls = entries.map((e) => {
         console.log(`   Setting text[${e.key}]: ${e.value}`);
         return {
@@ -4294,7 +4332,7 @@ export class DotNS {
 
   async getContenthash(domainName: string): Promise<string> {
     this.ensureConnected();
-    const node = namehash(`${domainName}.${this._tld}`);
+    const node = computeDomainNode(domainName, this._tld);
     // #1060: a first-time deploy (no contenthash ever set) legitimately reads
     // back empty `0x` here. getContenthash has callers with no try/catch around
     // this call (verifyEffect's poll loop and the final read-back in

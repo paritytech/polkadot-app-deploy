@@ -17,7 +17,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
@@ -12221,6 +12221,28 @@ describe("chunk-probe (incremental-upload-v2)", () => {
     const r = await probeChunks([PROBE_CID1, PROBE_CID2], { client });
     assert.equal(r[0].present, true);
     assert.equal(r[1].present, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// partitionFinalityProbe (bulletin #1445) — present: null is "could not
+// measure", not "absent". A probe that returned null for every chunk must
+// not be reported as a pass.
+// ---------------------------------------------------------------------------
+describe("partitionFinalityProbe (bulletin #1445)", () => {
+  const r = (cid, present, failureReason) => ({ cid, present, ...(failureReason ? { failureReason } : {}) });
+
+  test("an unmeasurable chunk is reported, not treated as absent", () => {
+    const { absent, indeterminate, reason } = partitionFinalityProbe(["a", "b", "c"].map((c) => r(c, null, "metadata_error")));
+    assert.deepStrictEqual(absent, [], ">> FAIL: null routed into absent would re-upload chunks nobody said were missing (bulletin #1445)");
+    assert.deepStrictEqual(indeterminate, ["a", "b", "c"], ">> FAIL: null must be reported, or the checkmark prints for a probe that never ran (bulletin #1445)");
+    assert.equal(reason, "metadata_error", ">> FAIL: the failure reason must survive for triage");
+  });
+
+  test("only a measured absence is absent", () => {
+    const { absent, indeterminate } = partitionFinalityProbe([r("a", true), r("b", false), r("c", null, "rpc_error")]);
+    assert.deepStrictEqual(absent, ["b"], ">> FAIL: only present === false may re-upload");
+    assert.deepStrictEqual(indeterminate, ["c"], ">> FAIL: only present === null is indeterminate");
   });
 });
 

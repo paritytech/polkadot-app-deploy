@@ -2027,6 +2027,22 @@ export function applyManifestFetchAttributes(fetched: { source: string; attempts
 //
 // Spec: docs-internal/superpowers/specs/2026-05-07-incremental-upload-v2-design.md
 // Plan: docs-internal/superpowers/plans/2026-05-07-incremental-upload-v2.md (Task 12)
+
+/**
+ * `present === null` is "could not measure", not "absent". Re-upload is the
+ * remedy for a chunk that is gone, not one we could not read (bulletin #1445).
+ */
+export function partitionFinalityProbe(
+  results: { cid: string; present: boolean | null; failureReason?: string }[],
+): { absent: string[]; indeterminate: string[]; reason?: string } {
+  const indeterminate = results.filter(r => r.present === null);
+  return {
+    absent: results.filter(r => r.present === false).map(r => r.cid),
+    indeterminate: indeterminate.map(r => r.cid),
+    reason: indeterminate[0]?.failureReason,
+  };
+}
+
 export async function storeDirectoryV2(
   directoryPath: string,
   opts: StoreDirectoryOptions = {}
@@ -2353,13 +2369,20 @@ export async function storeDirectoryV2(
     const grandpaCids = [...phaseB.chunkCids, storageCid];
     console.log(`   Finality check: probing ${grandpaCids.length} chunks at chain-finalised state (aka GRANDPA)...`);
     const finalityResults = await probeChunks(grandpaCids, { client: phaseALiveProvider.client!, atFinalized: true });
-    let missingCids = new Set(finalityResults.filter(r => r.present === false).map(r => r.cid));
+    const { absent, indeterminate, reason } = partitionFinalityProbe(finalityResults);
+    let missingCids = new Set(absent);
     setDeployAttribute("deploy.probe.finality_miss_count", missingCids.size);
+    setDeployAttribute("deploy.probe.finality_indeterminate_count", indeterminate.length);
+    if (indeterminate.length > 0) {
+      console.log(`   ${indeterminate.length} of ${grandpaCids.length} chunks could not be probed (${reason}); finality unverified for those`);
+    }
 
     let reuploadCount = 0;
     let laggingFinalityCount = 0;
     if (missingCids.size === 0) {
-      console.log(`   ✓ All ${grandpaCids.length} chunks finalised`);
+      console.log(indeterminate.length === 0
+        ? `   ✓ All ${grandpaCids.length} chunks finalised`
+        : `   ${grandpaCids.length - indeterminate.length} of ${grandpaCids.length} chunks finalised, ${indeterminate.length} unverified`);
     } else {
       // Step 2: wait for natural finalisation. Phase B's just-landed chunks
       // (and especially the root, which was the LAST extrinsic submitted)
@@ -2623,7 +2646,7 @@ export async function storeDirectoryV2(
   } else if (rootProbe[0]?.present === true) {
     console.log(`   ✓ Root finalised on chain`);
   } else {
-    console.log(`   Root re-check inconclusive (RPC error) — GRANDPA probe above already verified; continuing.`);
+    console.log(`   Root finality unverified (probe returned no answer); content is in best-block, continuing.`);
   }
 
   return { storageCid, ipfsCid: phaseB.cid, carBytes: phaseB.carBytes };

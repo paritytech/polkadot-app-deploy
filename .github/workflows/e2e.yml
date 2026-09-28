@@ -3149,7 +3149,7 @@ jobs:
 
   chain-call-encoding:
     name: Chain-call arg encoding (all extrinsics)
-    needs: detect-deps-change
+    needs: [detect-deps-change, select-env]
     # Runs on every trigger (PR / push / schedule / release / dispatch) EXCEPT
     # a release-only version bump on pull_request/push (#195) — same
     # skip-safe pattern as detect-noop-push: a skipped predecessor (every
@@ -3163,8 +3163,23 @@ jobs:
     # path filter used to skip entirely. The chain-free completeness guard
     # also runs in Unit Tests (npm test); this job adds the live-chain
     # encode check.
+    #
+    # needs.select-env.result == 'success' (#1595 follow-up, port of bulletin
+    # PR #1596): this job used to always default to paseo-next-v2 (PAD_ENV
+    # unset), so a dead primary-env endpoint (e.g. the People chain's RPC)
+    # hung/failed this job even though select-env's probe+fallback would have
+    # routed every other E2E job to a healthy env. Gating on select-env — the
+    # same pattern test-pr/dispatch-s-v060-unblock/nightly-* already use —
+    # folds in select-env's own gating (including the noop-push skip) for
+    # free, while the explicit detect-deps-change check directly below keeps
+    # that property independently verifiable on this job too, exactly as
+    # before. NOTE: this repo has only one e2eEligible env (paseo-next-v2),
+    # so it cannot actually fall back yet — wired anyway to stay in sync with
+    # bulletin-deploy; this job stays red during a People outage until a
+    # second eligible env exists here.
     if: |
       always() &&
+      needs.select-env.result == 'success' &&
       (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -3185,8 +3200,17 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: npm ci
+      # Step-level safety net (#1595): every RPC call in the test is already
+      # bounded by its own timeout (30s connect / 20s request), but
+      # --test-timeout is a second line of defense in case some future call
+      # slips through unbounded. Its own timeout-minutes stays below the
+      # job's 10 so a runaway step is caught here, not by the job cancelling
+      # the whole run.
       - name: Assert every extrinsic encodes against the live chain
-        run: E2E=1 node --test test/e2e-chain-calls.test.js
+        timeout-minutes: 5
+        env:
+          PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
+        run: E2E=1 node --test --test-timeout=60000 test/e2e-chain-calls.test.js
 
   # Authoritative daily drift detector: are the DotNS contract addresses in
   # assets/environments.json still in sync with paritytech/dotns DEPLOYMENTS.md?

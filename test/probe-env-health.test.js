@@ -49,6 +49,12 @@ function makeNoContractsFixtureDir() {
       chains: [
         { id: "asset-hub", endpoints: { "no-contracts": { wss: "wss://asset-hub.example" } } },
         { id: "bulletin", endpoints: { "no-contracts": { wss: "wss://bulletin.example" } } },
+        // #1595 follow-up: loadEnv() now requires a people RPC too (see
+        // probe-env-health.mjs), so this synthetic fixture must declare one
+        // or every test using it would fail on a missing-people-RPC
+        // config_error before ever reaching the dotns_not_configured check
+        // this fixture exists to exercise.
+        { id: "people", endpoints: { "no-contracts": { wss: "wss://people.example" } } },
       ],
     }),
   );
@@ -118,8 +124,59 @@ const DOTNS_HANGS = `
   };
 `;
 
+// People probe (#1595 follow-up, port of bulletin PR #1596-follow-up):
+// distinguishes behavior by connection URL, since a real env's
+// asset-hub/bulletin/people endpoints differ (see assets/environments.json's
+// paseo-next-v2 entry — e.g. "paseo-asset-hub-next-rpc" vs
+// "paseo-people-next-system-rpc"). Asset Hub + Bulletin stay healthy; only
+// the People connection errors or hangs, proving the probe attributes the
+// failure to the right chain rather than needing all three down to notice.
+// One factory (same pattern as wsWithStorage() above) instead of two
+// hand-copied mock classes that would otherwise repeat the
+// system_chain/state_call/state_getStorage response ternary a second and
+// third time.
+function wsPeopleFails(mode) {
+  // NOTE: no trailing "//" comment on these single-line guards — the
+  // generated code is a single template line, and a line comment there would
+  // silently swallow the constructor's closing brace, breaking the class in
+  // a way that crashes the probe process (a false-positive "non-zero exit"
+  // that looks like the intended failure but isn't).
+  const openGuard =
+    mode === "timeout"
+      ? `if (!this.url.includes("people")) setTimeout(() => this.onopen?.(), 0);` // People never opens — must hit the probe timeout, not hang.
+      : `setTimeout(() => this.onopen?.(), 0);`;
+  const errorBranch =
+    mode === "rpc_error"
+      ? `
+      if (this.url.includes("people")) {
+        setTimeout(() => this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "People RPC bork" } }) }), 0);
+        return;
+      }`
+      : "";
+  return (
+    `
+  globalThis.WebSocket = class {
+    constructor(url) { this.url = url; ${openGuard} }
+    send(msg) {
+      const { id, method } = JSON.parse(msg);${errorBranch}
+      const result = method === "system_chain"    ? "Mock Chain"
+                   : method === "state_call"       ? "0x" + "ab".repeat(20)
+                   : method === "state_getStorage" ? "0x00806e6f6465"
+                   : null;
+      setTimeout(() => this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id, result }) }), 0);
+    }
+    close() { this.onclose?.(); }
+  };
+` + FETCH_OK
+  );
+}
+const PEOPLE_RPC_ERROR = wsPeopleFails("rpc_error");
+const PEOPLE_TIMEOUT = wsPeopleFails("timeout");
+
 const MOCKS = {
   healthy: WS_HEALTHY + FETCH_OK,
+  people_rpc_error: PEOPLE_RPC_ERROR,
+  people_timeout: PEOPLE_TIMEOUT,
   ws_connect_error: `
     globalThis.WebSocket = class {
       constructor(url) { setTimeout(() => this.onerror?.({ message: "ECONNREFUSED" }), 0); }
@@ -172,6 +229,34 @@ describe("probe-env-health", () => {
     const { code, stdout } = await runProbe({ env: "paseo-next-v2", scenario: "healthy" });
     assert.strictEqual(code, 0, `expected exit 0, got ${code}; stdout: ${stdout}`);
     assert.match(stdout, /healthy/i);
+    // #1595 follow-up: the People chain is still probed and reported even
+    // though it's advisory-only now — this just isn't gating.
+    assert.match(stdout, /people=Mock Chain/, ">> FAIL: probe-env-health: healthy output must report the People chain's system_chain result");
+  });
+
+  // #1595 follow-up (reverted from gating, per maintainer; port of bulletin
+  // PR #1596-follow-up): a People-only failure must NOT flip env health.
+  // select-env gates every E2E job in the workflow — including ones that
+  // never touch the People chain — and this repo has only one e2eEligible
+  // env, so there is nothing to fall back to: gating on People here would
+  // fail every job outright. Chains that DO need People now fall back at
+  // the test level instead (test/e2e-chain-calls.test.js's
+  // connectChainWithFallback()). This probe still reports People's status
+  // for visibility, just doesn't gate on it.
+  describe("People is advisory-only, not gating (#1595 follow-up)", () => {
+    test("a People-only RPC error still exits 0 (healthy), with People reported down", async () => {
+      const { code, stdout, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "people_rpc_error" });
+      assert.strictEqual(code, 0, `>> FAIL: people-advisory: a People-only RPC error must not fail the env — got exit ${code}, stderr: ${stderr}`);
+      assert.match(stdout, /healthy/i);
+      assert.match(stdout, /people=DOWN/, ">> FAIL: people-advisory: healthy output must still report People as DOWN when its own probe fails");
+      assert.match(stderr, /advisory: people/, ">> FAIL: people-advisory: the People failure must still be logged (to stderr) even though it doesn't gate");
+    });
+
+    test("a People-only RPC hang still exits 0 after the bound (healthy), with People reported down", async () => {
+      const { code, stdout } = await runProbe({ env: "paseo-next-v2", scenario: "people_timeout", timeoutMs: 500 });
+      assert.strictEqual(code, 0, ">> FAIL: people-advisory: a People-only timeout must not fail the env");
+      assert.match(stdout, /people=DOWN/, ">> FAIL: people-advisory: healthy output must report People as DOWN when its probe times out");
+    });
   });
 
   test("exits non-zero on WS connect error", async () => {

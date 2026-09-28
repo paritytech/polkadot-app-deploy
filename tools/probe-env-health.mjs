@@ -5,10 +5,21 @@
 // every external surface a deploy actually depends on:
 //   1. Asset Hub RPC — WS + system_chain + state_call(ReviveApi.address)
 //   2. Bulletin RPC  — WS + system_chain (Bulletin has no Revive; liveness only)
-//   3. Bulletin gateway (HTTP) — fetch the env's `ipfs` URL; any HTTP status
+//   3. People RPC    — WS + system_chain (no Revive on People; liveness only).
+//      ADVISORY ONLY (#1595 follow-up, reverted from gating; port of bulletin
+//      PR #1596-follow-up): still probed and reported, but a People failure
+//      does NOT flip the env's overall health. select-env gates every E2E
+//      job in the workflow, including ones that never touch the People
+//      chain — gating on it meant a People-only outage on the primary env
+//      failed select-env outright, and on THIS repo (only one e2eEligible
+//      env) failed EVERY job with no fallback target at all. Per-chain
+//      fallback for the chains that DO need People now lives at the test
+//      level instead (test/e2e-chain-calls.test.js's candidateEndpoints()/
+//      connectChainWithFallback()).
+//   4. Bulletin gateway (HTTP) — fetch the env's `ipfs` URL; any HTTP status
 //      means the gateway server is up (404 at "/" is fine — the gateway
 //      doesn't serve a root index but proves it's reachable).
-//   4. DotNS contract presence (issue #1329 in bulletin-deploy) — a chain can
+//   5. DotNS contract presence (issue #1329 in bulletin-deploy) — a chain can
 //      be RPC-live with zero deployable DotNS contracts. DotNS deploys
 //      through a CREATE3 factory, so contract addresses are IDENTICAL across
 //      every env and stable across a chain reset — a configured address can
@@ -100,12 +111,16 @@ export function loadEnv(envId) {
       },
     };
   }
-  // Resolve both chain endpoints. Asset Hub hosts the Revive pallet (and
-  // therefore ReviveApi.address); the Bulletin chain hosts content storage.
-  // A healthy E2E env needs both reachable. Match how
+  // Resolve every chain endpoint this probe touches. Asset Hub hosts the
+  // Revive pallet (and therefore ReviveApi.address) and Bulletin hosts
+  // content storage — both GATE env health below. People is resolved too
+  // (advisory reporting only, see the module comment above) but is
+  // deliberately NOT required here: an env with no people entry at all is
+  // just "people not configured", reported the same as a live People probe
+  // failure, not a config_error that would gate health. Match how
   // src/environments.ts::resolveEndpoints reads it (chains is an array of
-  // chain objects, each with an `id` and an `endpoints` map keyed by env id) —
-  // see the module-level comment above for why this stays a hand-parse
+  // chain objects, each with an `id` and an `endpoints` map keyed by env id)
+  // — see the module-level comment above for why this stays a hand-parse
   // instead of importing resolveEndpoints itself.
   const pickWss = (chainId) => {
     const chain = (doc.chains || []).find((c) => c.id === chainId);
@@ -114,6 +129,7 @@ export function loadEnv(envId) {
   };
   const assetHubRpc = pickWss("asset-hub");
   const bulletinRpc = pickWss("bulletin");
+  const peopleRpc = pickWss("people"); // advisory only — may be undefined
   const gatewayUrl = entry.ipfs;
   if (!assetHubRpc) {
     return { error: { kind: "config_error", message: `no asset-hub RPC for env "${envId}"` } };
@@ -124,7 +140,7 @@ export function loadEnv(envId) {
   if (!gatewayUrl) {
     return { error: { kind: "config_error", message: `no gateway (ipfs) URL for env "${envId}"` } };
   }
-  return { entry, assetHubRpc, bulletinRpc, gatewayUrl };
+  return { entry, assetHubRpc, bulletinRpc, peopleRpc, gatewayUrl };
 }
 
 // Probe a single chain over WebSocket. Returns { ok: true, result } on success
@@ -245,7 +261,7 @@ async function probe({ env, timeoutMs }) {
   if (loaded.error) {
     fail(loaded.error.kind, loaded.error.message, Date.now() - t0);
   }
-  const { assetHubRpc, bulletinRpc, gatewayUrl } = loaded;
+  const { assetHubRpc, bulletinRpc, peopleRpc, gatewayUrl } = loaded;
 
   // DotNS config check first — it needs no network, so a misconfigured env
   // fails before we open a socket.
@@ -282,7 +298,28 @@ async function probe({ env, timeoutMs }) {
   });
   if (!bul.ok) fail(bul.kind, `bulletin ${bul.message}`, Date.now() - t0);
 
-  // 3. Gateway: HTTP fetch. Any HTTP response = gateway server up (a 404 at
+  // 3. People: WS + system_chain — ADVISORY ONLY (#1595 follow-up). Probed
+  // and reported, but never gates env health (see the module comment above
+  // for why gating on it was reverted). A missing config entry and a live
+  // probe failure are reported identically as "DOWN" — from a health-gating
+  // perspective they mean the same thing: this env cannot serve the People
+  // chain right now.
+  let peopleStatus = "not configured";
+  if (peopleRpc) {
+    const ppl = await probeChain({
+      url: peopleRpc,
+      timeoutMs,
+      calls: [{ id: 1, method: "system_chain", params: [], errorKind: "rpc_error" }],
+    });
+    peopleStatus = ppl.ok ? ppl.result.system_chain : "DOWN";
+    if (!ppl.ok) {
+      console.error(`advisory: people ${ppl.kind} ${ppl.message} — not gating env health`);
+    }
+  } else {
+    console.error(`advisory: people no RPC configured for env "${env}" — not gating env health`);
+  }
+
+  // 4. Gateway: HTTP fetch. Any HTTP response = gateway server up (a 404 at
   // "/" is fine — gateways route by CID, not by a root index). Only network
   // errors (DNS, refused, timeout) classify as unhealthy.
   let gatewayStatus;
@@ -298,9 +335,10 @@ async function probe({ env, timeoutMs }) {
 
   const duration = Date.now() - t0;
   console.log(
-    `healthy: ${env} (asset-hub=${ah.result.system_chain}, bulletin=${bul.result.system_chain}, gateway=${gatewayStatus}, dotns=ok, ${duration}ms)`,
+    `healthy: ${env} (asset-hub=${ah.result.system_chain}, bulletin=${bul.result.system_chain}, people=${peopleStatus}, gateway=${gatewayStatus}, dotns=ok, ${duration}ms)`,
   );
   emitOutput("outcome", "healthy");
+  emitOutput("people_status", peopleStatus);
   emitOutput("duration_ms", String(duration));
   process.exit(0);
 }

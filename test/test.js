@@ -11685,8 +11685,40 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     test("chain-call-encoding keeps its E2E=1 live-chain assertion after gating", () => {
       const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
       const block = jobBlock(wf, "chain-call-encoding");
-      assert.match(block, /E2E=1 node --test test\/e2e-chain-calls\.test\.js/,
+      // Allows an optional --test-timeout=<ms> safety net (#1595) between
+      // `--test` and the target file, without tolerating the E2E=1 gate or
+      // the target file itself being weakened or dropped.
+      assert.match(block, /E2E=1 node --test(?: --test-timeout=\d+)? test\/e2e-chain-calls\.test\.js/,
         ">> FAIL: deps-discriminator: chain-call-encoding must still run with E2E=1 — cause: the live-chain assertion step was weakened or dropped while adding the gate");
+    });
+
+    // #1595 follow-up (port of bulletin PR #1596): the job used to always
+    // default to paseo-next-v2 (PAD_ENV unset), so a dead primary-env
+    // endpoint hung/failed this job even when select-env's probe+fallback
+    // would have routed every other E2E job to a healthy env. Same pattern
+    // as the analogous BULLETIN_DEPLOY_ENV test in bulletin-deploy's test.js.
+    test("chain-call-encoding reads PAD_ENV from select-env, not hardcoded paseo-next-v2", () => {
+      const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+      const block = jobBlock(wf, "chain-call-encoding");
+      const needsLine = block.match(/^\s{4}needs:\s*\[([^\]]*)\]/m);
+      assert.ok(needsLine, "chain-call-encoding must declare a needs: [...] array");
+      const needsRefs = needsLine[1].split(",").map((s) => s.trim());
+      assert.ok(needsRefs.includes("select-env"), "chain-call-encoding must declare select-env as a need");
+      assert.match(
+        block,
+        /needs\.select-env\.result == 'success'/,
+        "chain-call-encoding's if: must gate on needs.select-env.result == 'success'",
+      );
+      assert.match(
+        block,
+        /PAD_ENV:\s*\$\{\{\s*needs\.select-env\.outputs\.selected_env\s*\}\}/,
+        "chain-call-encoding's PAD_ENV must reference needs.select-env.outputs.selected_env",
+      );
+      assert.doesNotMatch(
+        block,
+        /PAD_ENV:\s*paseo-next-v2/,
+        "chain-call-encoding must NOT hardcode PAD_ENV=paseo-next-v2",
+      );
     });
 
     // ---- Classification logic: extract the real embedded script from the

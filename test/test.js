@@ -18,6 +18,13 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { execSync } from "node:child_process";
+import { createRequire } from "node:module";
+
+// The shared CI classifier script (.github/scripts/classify-version-bump.cjs)
+// is CommonJS by design (it's invoked standalone by both workflows via plain
+// `node`), so it's loaded here via createRequire rather than converted to
+// ESM just for this test file.
+const require = createRequire(import.meta.url);
 import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
@@ -11721,40 +11728,13 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       );
     });
 
-    // ---- Classification logic: extract the real embedded script from the
-    // live workflow (not a parallel re-implementation) and execute it
-    // against fixture package.json/package-lock.json pairs, so a change to
-    // the actual shipped logic is what gets tested.
-    function extractClassifyScript(wf) {
-      const block = jobBlock(wf, "detect-deps-change");
-      const scriptMatch = block.match(/cat > classify-deps-change\.cjs <<'JSEOF'\n([\s\S]*?)\n\s*JSEOF/);
-      assert.ok(scriptMatch, ">> FAIL: deps-discriminator: could not find the classify-deps-change.cjs heredoc in detect-deps-change — cause: heredoc markers renamed or removed");
-      return scriptMatch[1];
-    }
-
-    function runClassifier({ basePkg, headPkg, baseLock, headLock }) {
-      const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
-      const script = extractClassifyScript(wf);
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "deps-classify-"));
-      const write = (name, val) => fs.writeFileSync(path.join(dir, name), val === undefined ? "" : JSON.stringify(val));
-      write("base_pkg.json", basePkg);
-      write("head_pkg.json", headPkg);
-      write("base_lock.json", baseLock);
-      write("head_lock.json", headLock);
-      fs.writeFileSync(path.join(dir, "classify-deps-change.cjs"), script);
-      const outputFile = path.join(dir, "github_output");
-      fs.writeFileSync(outputFile, "");
-      execSync("node classify-deps-change.cjs", { cwd: dir, env: { ...process.env, GITHUB_OUTPUT: outputFile } });
-      const outText = fs.readFileSync(outputFile, "utf-8");
-      const outputs = Object.fromEntries(
-        outText.trim().split("\n").filter(Boolean).map((line) => {
-          const idx = line.indexOf("=");
-          return [line.slice(0, idx), line.slice(idx + 1)];
-        }),
-      );
-      fs.rmSync(dir, { recursive: true, force: true });
-      return outputs;
-    }
+    // ---- Classification logic: the classifier is no longer an inline
+    // heredoc — it lives in the shared .github/scripts/classify-version-bump.cjs,
+    // which both e2e.yml's detect-deps-change and tests.yml's
+    // classify-version-bump job invoke (see the describe block below for the
+    // wiring assertions). Exercise the actual shipped module directly rather
+    // than re-extracting a heredoc or reimplementing the logic in the test.
+    const { classifyVersionBump } = require("../.github/scripts/classify-version-bump.cjs");
 
     const PKG_V1 = { name: "@parity/polkadot-app-deploy", version: "0.16.0-rc.3", dependencies: { viem: "^2.30.5" } };
     const LOCK_V1 = {
@@ -11767,17 +11747,17 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     test("classifier: version field only (package.json + lockfile) -> is_version_only=true", () => {
       const headPkg = { ...PKG_V1, version: "0.16.0" };
       const headLock = { ...LOCK_V1, version: "0.16.0", packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0" } } };
-      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.is_version_only, "true",
-        `>> FAIL: deps-classifier: a pure version bump was classified as is_version_only=${out.is_version_only} — cause: version-field stripping did not neutralize the diff`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(result, true,
+        `>> FAIL: deps-classifier: a pure version bump was classified as is_version_only=${result} — cause: version-field stripping did not neutralize the diff`);
     });
 
     test("classifier: dependency version bump (viem ^2.30.5 -> ^2.55.10) -> is_version_only=false", () => {
       const headPkg = { ...PKG_V1, dependencies: { viem: "^2.55.10" } };
       const headLock = { ...LOCK_V1, packages: { "": { ...LOCK_V1.packages[""], dependencies: { viem: "^2.55.10" } } } };
-      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${out.is_version_only} — cause: dependency-field diff not detected, this is the exact #190 regression`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: a viem dependency bump was classified as is_version_only=${result} — cause: dependency-field diff not detected, this is the exact #190 regression`);
     });
 
     test("classifier: mixed version bump + dependency change in the same diff -> is_version_only=false (not safe to skip)", () => {
@@ -11787,9 +11767,9 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
         version: "0.16.0",
         packages: { "": { ...LOCK_V1.packages[""], version: "0.16.0", dependencies: { viem: "^2.55.10" } } },
       };
-      const out = runClassifier({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as is_version_only=${out.is_version_only} — cause: mixed changes must never be treated as safe-to-skip`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: a version bump mixed with a dependency change was classified as is_version_only=${result} — cause: mixed changes must never be treated as safe-to-skip`);
     });
 
     test("classifier: lockfile-tree-only change (no package.json diff, resolved tree changed) -> is_version_only=false", () => {
@@ -11800,15 +11780,107 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
           "node_modules/viem": { version: "2.30.6", resolved: "https://registry.npmjs.org/viem/-/viem-2.30.6.tgz" },
         },
       };
-      const out = runClassifier({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock });
-      assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as is_version_only=${out.is_version_only} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: a lockfile-tree-only change (package.json untouched) was classified as is_version_only=${result} — cause: classifier only compared package.json, ignoring the lockfile's resolved tree`);
+    });
+
+    test("classifier: nested lockfile package's own version field changes (node_modules/viem 2.30.5 -> 2.30.6, packages[\"\"] untouched) -> is_version_only=false", () => {
+      // stripVersionFields only deletes .version at the document root and
+      // packages[""].version — a nested package's own .version must never
+      // be stripped, or a real dependency version bump recorded only in the
+      // resolved tree would be silently neutralized the same way the
+      // release version bump is meant to be.
+      const baseLock = {
+        ...LOCK_V1,
+        packages: { "": LOCK_V1.packages[""], "node_modules/viem": { version: "2.30.5" } },
+      };
+      const headLock = {
+        ...LOCK_V1,
+        packages: { "": LOCK_V1.packages[""], "node_modules/viem": { version: "2.30.6" } },
+      };
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock, headLock });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: a nested lockfile package's own version bump was classified as is_version_only=${result} — cause: version-field stripping must be scoped to the document root + packages[""] only, never a nested package`);
     });
 
     test("classifier: neither file changed (ordinary source PR) -> is_version_only=false, never gates off a normal PR", () => {
-      const out = runClassifier({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock: LOCK_V1 });
-      assert.strictEqual(out.is_version_only, "false",
-        `>> FAIL: deps-classifier: an untouched package.json/lock pair was classified as is_version_only=${out.is_version_only} — cause: "no diff" must not be conflated with "version-only diff", or every ordinary source PR would skip E2E`);
+      const result = classifyVersionBump({ basePkg: PKG_V1, headPkg: PKG_V1, baseLock: LOCK_V1, headLock: LOCK_V1 });
+      assert.strictEqual(result, false,
+        `>> FAIL: deps-classifier: an untouched package.json/lock pair was classified as is_version_only=${result} — cause: "no diff" must not be conflated with "version-only diff", or every ordinary source PR would skip E2E`);
+    });
+  });
+
+  // Unit-Tests-gating follow-up (port of bulletin-deploy's #1307 follow-up):
+  // "Unit Tests" is a required status check here too, and package.json/
+  // package-lock.json were never path-filtered for it (see the "runs on all
+  // paths" test above) — a dependency bump must still run Unit Tests. That
+  // meant every version-only release/RC bump PR paid for a full `npm ci` +
+  // `npm test` too. tests.yml now carries its own classify-version-bump job
+  // — same shape as e2e.yml's detect-deps-change, same shared script — and
+  // unit-tests gates on it the same way the heavy E2E jobs gate on
+  // detect-deps-change. This does NOT reintroduce a paths-ignore (still
+  // absent, still asserted above) — it's a job-level `if:` on a
+  // content-aware classification, which reports 'skipped' rather than
+  // never running, so the required check still resolves.
+  describe("tests.yml: Unit Tests gates on the shared version-bump classifier", () => {
+    test("defines a classify-version-bump job, gated to pull_request/push, exposing is_version_only via the shared script", () => {
+      const wf = fs.readFileSync(".github/workflows/tests.yml", "utf-8");
+      const block = jobBlock(wf, "classify-version-bump");
+      assert.match(block, /if:\s*github\.event_name == 'pull_request' \|\| github\.event_name == 'push'/,
+        ">> FAIL: unit-tests-gating: classify-version-bump must run only on pull_request/push — cause: missing or widened `if:` guard");
+      assert.match(block, /is_version_only:\s*\$\{\{\s*steps\.classify\.outputs\.is_version_only\s*\}\}/,
+        ">> FAIL: unit-tests-gating: classify-version-bump must expose an is_version_only output — cause: outputs: block missing or renamed");
+      assert.match(block, /node \.github\/scripts\/classify-version-bump\.cjs/,
+        ">> FAIL: unit-tests-gating: classify-version-bump must invoke the shared .github/scripts/classify-version-bump.cjs, not a re-inlined copy of the classifier");
+    });
+
+    test("unit-tests needs classify-version-bump and gates via the skipped-or-not-version-only pattern", () => {
+      const wf = fs.readFileSync(".github/workflows/tests.yml", "utf-8");
+      const block = jobBlock(wf, "unit-tests");
+      const needsMatch = block.match(/^\s{4}needs:\s*(?:\[([^\]]*)\]|(\S+))\s*$/m);
+      assert.ok(needsMatch, ">> FAIL: unit-tests-gating: unit-tests has no needs: — cause: needs: line missing or mis-indented");
+      const refs = (needsMatch[1] ?? needsMatch[2]).split(",").map((s) => s.trim());
+      assert.ok(refs.includes("classify-version-bump"),
+        ">> FAIL: unit-tests-gating: unit-tests's needs: does not include classify-version-bump — cause: gate not wired, a version-only bump would still run Unit Tests");
+      assert.match(block, /always\(\)/,
+        ">> FAIL: unit-tests-gating: unit-tests's if: must start with always() — otherwise GitHub auto-skips it whenever classify-version-bump is itself skipped (workflow_dispatch)");
+      assert.match(block, /needs\.classify-version-bump\.result == 'skipped'/,
+        ">> FAIL: unit-tests-gating: unit-tests's if: does not treat a skipped classify-version-bump (workflow_dispatch) as pass-through");
+      assert.match(block, /needs\.classify-version-bump\.outputs\.is_version_only != 'true'/,
+        ">> FAIL: unit-tests-gating: unit-tests's if: does not gate on is_version_only — cause: missing or misspelled output reference, a version-only bump would not be skipped");
+    });
+
+    // Branch protection here requires a status check literally named
+    // "Unit Tests" (same convention as bulletin-deploy). GitHub's own docs
+    // confirm a job skipped via `if:` reports conclusion 'success' for
+    // required-check purposes ("A job that is skipped will report its
+    // status as 'Success'. It will not prevent a pull request from merging,
+    // even if it is a required check." — Actions docs, "Using conditions to
+    // control job execution"), so gating this job's `if:` is safe — but only
+    // as long as the job keeps this exact display name.
+    test("unit-tests keeps its job name exactly \"Unit Tests\" (required status check name)", () => {
+      const wf = fs.readFileSync(".github/workflows/tests.yml", "utf-8");
+      const block = jobBlock(wf, "unit-tests");
+      assert.match(block, /^ {4}name: Unit Tests\s*$/m,
+        ">> FAIL: unit-tests-gating: unit-tests's name: must stay exactly \"Unit Tests\" — renaming it breaks the required-status-check match on branch protection");
+    });
+
+    test("e2e.yml's detect-deps-change still exposes is_version_only via the shared script (not reimplemented separately from tests.yml's copy)", () => {
+      const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+      const block = jobBlock(wf, "detect-deps-change");
+      assert.match(block, /is_version_only:\s*\$\{\{\s*steps\.classify\.outputs\.is_version_only\s*\}\}/,
+        ">> FAIL: unit-tests-gating: e2e.yml's detect-deps-change must still expose is_version_only — cause: output dropped while extracting the shared script");
+      assert.match(block, /node \.github\/scripts\/classify-version-bump\.cjs/,
+        ">> FAIL: unit-tests-gating: e2e.yml's detect-deps-change must invoke the shared .github/scripts/classify-version-bump.cjs");
+    });
+
+    test("the shared classifier script file exists and exports classifyVersionBump", () => {
+      assert.ok(fs.existsSync(".github/scripts/classify-version-bump.cjs"),
+        ">> FAIL: unit-tests-gating: .github/scripts/classify-version-bump.cjs is missing");
+      const mod = require("../.github/scripts/classify-version-bump.cjs");
+      assert.strictEqual(typeof mod.classifyVersionBump, "function",
+        ">> FAIL: unit-tests-gating: .github/scripts/classify-version-bump.cjs must export classifyVersionBump as a function");
     });
   });
 

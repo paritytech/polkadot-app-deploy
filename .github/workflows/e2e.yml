@@ -258,6 +258,11 @@ jobs:
   # unified diff: GitHub omits `patch` for large files, and a lockfile is
   # exactly the file most likely to hit that ceiling as the dependency tree
   # grows. Comparing full content is correct regardless of file size.
+  #
+  # The classification logic itself lives in the shared
+  # .github/scripts/classify-version-bump.cjs, not inline here — tests.yml's
+  # own classify job (gating Unit Tests) uses the identical script, so the
+  # two workflows can never disagree on what counts as version-only.
   detect-deps-change:
     name: Classify package.json/lock diff (version bump vs dependency change)
     if: github.event_name == 'pull_request' || github.event_name == 'push'
@@ -268,6 +273,15 @@ jobs:
     outputs:
       is_version_only: ${{ steps.classify.outputs.is_version_only }}
     steps:
+      # This job deliberately does NOT check out the full repo (it fetches
+      # both sides of the diff via the contents API instead, so it works for
+      # a PR from any ref) — just the shared classifier script, via sparse
+      # checkout, plus Node to run it.
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
@@ -295,65 +309,7 @@ jobs:
           fetch "$HEAD_SHA" package.json head_pkg.json
           fetch "$BASE_SHA" package-lock.json base_lock.json
           fetch "$HEAD_SHA" package-lock.json head_lock.json
-          cat > classify-deps-change.cjs <<'JSEOF'
-          const fs = require("fs");
-
-          function loadJSON(path) {
-            try {
-              const raw = fs.readFileSync(path, "utf8");
-              if (!raw.trim()) return null;
-              return JSON.parse(raw);
-            } catch (e) {
-              return null;
-            }
-          }
-
-          function stripVersionFields(obj, isLockfile) {
-            if (!obj || typeof obj !== "object") return obj;
-            const clone = JSON.parse(JSON.stringify(obj));
-            delete clone.version;
-            if (isLockfile && clone.packages && typeof clone.packages === "object" &&
-                clone.packages[""] && typeof clone.packages[""] === "object") {
-              delete clone.packages[""].version;
-            }
-            return clone;
-          }
-
-          const basePkgRaw = loadJSON("base_pkg.json");
-          const headPkgRaw = loadJSON("head_pkg.json");
-          const baseLockRaw = loadJSON("base_lock.json");
-          const headLockRaw = loadJSON("head_lock.json");
-
-          // Did either file change at all (including a pure version bump)?
-          const anyPackageFileChanged =
-            JSON.stringify(basePkgRaw) !== JSON.stringify(headPkgRaw) ||
-            JSON.stringify(baseLockRaw) !== JSON.stringify(headLockRaw);
-
-          const basePkg = stripVersionFields(basePkgRaw, false);
-          const headPkg = stripVersionFields(headPkgRaw, false);
-          const baseLock = stripVersionFields(baseLockRaw, true);
-          const headLock = stripVersionFields(headLockRaw, true);
-
-          // Is there any diff left once version fields are stripped out?
-          const nonVersionDiff =
-            JSON.stringify(basePkg) !== JSON.stringify(headPkg) ||
-            JSON.stringify(baseLock) !== JSON.stringify(headLock);
-
-          // version-only iff something changed AND the only thing that
-          // changed was a version field. Neither-file-touched (ordinary
-          // source PR) must NOT count as version-only, or this job would
-          // gate off heavy E2E for every normal source change too.
-          const isVersionOnly = anyPackageFileChanged && !nonVersionDiff;
-
-          console.log(`anyPackageFileChanged=${anyPackageFileChanged}`);
-          console.log(`nonVersionDiff=${nonVersionDiff}`);
-          console.log(`is_version_only=${isVersionOnly}`);
-          console.log(`deps_changed=${!isVersionOnly}`); // trivial negation, logged only — not exposed as a job output (nothing reads it)
-
-          const out = process.env.GITHUB_OUTPUT;
-          fs.appendFileSync(out, `is_version_only=${isVersionOnly}\n`);
-          JSEOF
-          node classify-deps-change.cjs
+          node .github/scripts/classify-version-bump.cjs
 
   # ---- Env selector ----------------------------------------------------
   #

@@ -5,10 +5,17 @@
 // every external surface a deploy actually depends on:
 //   1. Asset Hub RPC — WS + system_chain + state_call(ReviveApi.address)
 //   2. Bulletin RPC  — WS + system_chain (Bulletin has no Revive; liveness only)
-//   3. Bulletin gateway (HTTP) — fetch the env's `ipfs` URL; any HTTP status
+//   3. People RPC    — WS + system_chain (no Revive on People; liveness only).
+//      Added #1595 follow-up (port of bulletin PR #1596/#1596-follow-up):
+//      test/e2e-chain-calls.test.js and the personhood bind/reprove E2E
+//      scenarios both depend on the People chain, but this probe didn't
+//      check it, so a dead People RPC (e.g. the 2026-09-27 paseo-next-v2
+//      outage on wss://paseo-people-next-system-rpc.polkadot.io) slipped
+//      through as "healthy" and select-env never fell back.
+//   4. Bulletin gateway (HTTP) — fetch the env's `ipfs` URL; any HTTP status
 //      means the gateway server is up (404 at "/" is fine — the gateway
 //      doesn't serve a root index but proves it's reachable).
-//   4. DotNS contract presence (issue #1329 in bulletin-deploy) — a chain can
+//   5. DotNS contract presence (issue #1329 in bulletin-deploy) — a chain can
 //      be RPC-live with zero deployable DotNS contracts. DotNS deploys
 //      through a CREATE3 factory, so contract addresses are IDENTICAL across
 //      every env and stable across a chain reset — a configured address can
@@ -100,13 +107,15 @@ export function loadEnv(envId) {
       },
     };
   }
-  // Resolve both chain endpoints. Asset Hub hosts the Revive pallet (and
-  // therefore ReviveApi.address); the Bulletin chain hosts content storage.
-  // A healthy E2E env needs both reachable. Match how
-  // src/environments.ts::resolveEndpoints reads it (chains is an array of
-  // chain objects, each with an `id` and an `endpoints` map keyed by env id) —
-  // see the module-level comment above for why this stays a hand-parse
-  // instead of importing resolveEndpoints itself.
+  // Resolve every chain endpoint the E2E suites depend on. Asset Hub hosts
+  // the Revive pallet (and therefore ReviveApi.address); the Bulletin chain
+  // hosts content storage; the People chain hosts personal-id binding
+  // (test/e2e-chain-calls.test.js's People.set_personal_id_account, and the
+  // personhood bind/reprove E2E scenarios). A healthy E2E env needs all three
+  // reachable. Match how src/environments.ts::resolveEndpoints reads it
+  // (chains is an array of chain objects, each with an `id` and an
+  // `endpoints` map keyed by env id) — see the module-level comment above for
+  // why this stays a hand-parse instead of importing resolveEndpoints itself.
   const pickWss = (chainId) => {
     const chain = (doc.chains || []).find((c) => c.id === chainId);
     const wss = chain?.endpoints?.[envId]?.wss;
@@ -114,6 +123,7 @@ export function loadEnv(envId) {
   };
   const assetHubRpc = pickWss("asset-hub");
   const bulletinRpc = pickWss("bulletin");
+  const peopleRpc = pickWss("people");
   const gatewayUrl = entry.ipfs;
   if (!assetHubRpc) {
     return { error: { kind: "config_error", message: `no asset-hub RPC for env "${envId}"` } };
@@ -121,10 +131,13 @@ export function loadEnv(envId) {
   if (!bulletinRpc) {
     return { error: { kind: "config_error", message: `no bulletin RPC for env "${envId}"` } };
   }
+  if (!peopleRpc) {
+    return { error: { kind: "config_error", message: `no people RPC for env "${envId}"` } };
+  }
   if (!gatewayUrl) {
     return { error: { kind: "config_error", message: `no gateway (ipfs) URL for env "${envId}"` } };
   }
-  return { entry, assetHubRpc, bulletinRpc, gatewayUrl };
+  return { entry, assetHubRpc, bulletinRpc, peopleRpc, gatewayUrl };
 }
 
 // Probe a single chain over WebSocket. Returns { ok: true, result } on success
@@ -245,7 +258,7 @@ async function probe({ env, timeoutMs }) {
   if (loaded.error) {
     fail(loaded.error.kind, loaded.error.message, Date.now() - t0);
   }
-  const { assetHubRpc, bulletinRpc, gatewayUrl } = loaded;
+  const { assetHubRpc, bulletinRpc, peopleRpc, gatewayUrl } = loaded;
 
   // DotNS config check first — it needs no network, so a misconfigured env
   // fails before we open a socket.
@@ -274,15 +287,26 @@ async function probe({ env, timeoutMs }) {
   });
   if (!ah.ok) fail(ah.kind, `asset-hub ${ah.message}`, Date.now() - t0);
 
-  // 2. Bulletin: WS + system_chain (no Revive on Bulletin; just liveness).
-  const bul = await probeChain({
-    url: bulletinRpc,
-    timeoutMs,
-    calls: [{ id: 1, method: "system_chain", params: [], errorKind: "rpc_error" }],
-  });
-  if (!bul.ok) fail(bul.kind, `bulletin ${bul.message}`, Date.now() - t0);
+  // 2-3. Bulletin + People: WS + system_chain (neither has Revive; liveness
+  // only). #1595 follow-up added the People probe — it hosts personal-id
+  // binding (People.set_personal_id_account) and the personhood bind/reprove
+  // E2E scenarios depend on it, but nothing probed it before, so a dead
+  // People RPC wasn't a signal select-env's fallback could see. Looped
+  // (rather than a third hand-copied probeChain() block) so a future
+  // liveness-only chain is a one-line addition — the same reasoning as
+  // dotnsStorageCalls() above for not hand-copying repeated probe logic.
+  const liveness = {};
+  for (const [label, url] of [["bulletin", bulletinRpc], ["people", peopleRpc]]) {
+    const r = await probeChain({
+      url,
+      timeoutMs,
+      calls: [{ id: 1, method: "system_chain", params: [], errorKind: "rpc_error" }],
+    });
+    if (!r.ok) fail(r.kind, `${label} ${r.message}`, Date.now() - t0);
+    liveness[label] = r;
+  }
 
-  // 3. Gateway: HTTP fetch. Any HTTP response = gateway server up (a 404 at
+  // 4. Gateway: HTTP fetch. Any HTTP response = gateway server up (a 404 at
   // "/" is fine — gateways route by CID, not by a root index). Only network
   // errors (DNS, refused, timeout) classify as unhealthy.
   let gatewayStatus;
@@ -298,7 +322,7 @@ async function probe({ env, timeoutMs }) {
 
   const duration = Date.now() - t0;
   console.log(
-    `healthy: ${env} (asset-hub=${ah.result.system_chain}, bulletin=${bul.result.system_chain}, gateway=${gatewayStatus}, dotns=ok, ${duration}ms)`,
+    `healthy: ${env} (asset-hub=${ah.result.system_chain}, bulletin=${liveness.bulletin.result.system_chain}, people=${liveness.people.result.system_chain}, gateway=${gatewayStatus}, dotns=ok, ${duration}ms)`,
   );
   emitOutput("outcome", "healthy");
   emitOutput("duration_ms", String(duration));

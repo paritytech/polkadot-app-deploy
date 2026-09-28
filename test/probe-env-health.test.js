@@ -49,6 +49,12 @@ function makeNoContractsFixtureDir() {
       chains: [
         { id: "asset-hub", endpoints: { "no-contracts": { wss: "wss://asset-hub.example" } } },
         { id: "bulletin", endpoints: { "no-contracts": { wss: "wss://bulletin.example" } } },
+        // #1595 follow-up: loadEnv() now requires a people RPC too (see
+        // probe-env-health.mjs), so this synthetic fixture must declare one
+        // or every test using it would fail on a missing-people-RPC
+        // config_error before ever reaching the dotns_not_configured check
+        // this fixture exists to exercise.
+        { id: "people", endpoints: { "no-contracts": { wss: "wss://people.example" } } },
       ],
     }),
   );
@@ -118,8 +124,54 @@ const DOTNS_HANGS = `
   };
 `;
 
+// People probe (#1595 follow-up, port of bulletin PR #1596-follow-up):
+// distinguishes behavior by connection URL, since a real env's
+// asset-hub/bulletin/people endpoints differ (see assets/environments.json's
+// paseo-next-v2 entry — e.g. "paseo-asset-hub-next-rpc" vs
+// "paseo-people-next-system-rpc"). Asset Hub + Bulletin stay healthy; only
+// the People connection errors or hangs, proving the probe attributes the
+// failure to the right chain rather than needing all three down to notice.
+// One factory (same pattern as wsWithStorage() above) instead of two
+// hand-copied mock classes that would otherwise repeat the
+// system_chain/state_call/state_getStorage response ternary a second and
+// third time.
+function wsPeopleFails(mode) {
+  const openGuard =
+    mode === "timeout"
+      ? `if (!this.url.includes("people")) setTimeout(() => this.onopen?.(), 0); // People never opens — must hit the probe timeout, not hang.`
+      : `setTimeout(() => this.onopen?.(), 0);`;
+  const errorBranch =
+    mode === "rpc_error"
+      ? `
+      if (this.url.includes("people")) {
+        setTimeout(() => this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32000, message: "People RPC bork" } }) }), 0);
+        return;
+      }`
+      : "";
+  return (
+    `
+  globalThis.WebSocket = class {
+    constructor(url) { this.url = url; ${openGuard} }
+    send(msg) {
+      const { id, method } = JSON.parse(msg);${errorBranch}
+      const result = method === "system_chain"    ? "Mock Chain"
+                   : method === "state_call"       ? "0x" + "ab".repeat(20)
+                   : method === "state_getStorage" ? "0x00806e6f6465"
+                   : null;
+      setTimeout(() => this.onmessage?.({ data: JSON.stringify({ jsonrpc: "2.0", id, result }) }), 0);
+    }
+    close() { this.onclose?.(); }
+  };
+` + FETCH_OK
+  );
+}
+const PEOPLE_RPC_ERROR = wsPeopleFails("rpc_error");
+const PEOPLE_TIMEOUT = wsPeopleFails("timeout");
+
 const MOCKS = {
   healthy: WS_HEALTHY + FETCH_OK,
+  people_rpc_error: PEOPLE_RPC_ERROR,
+  people_timeout: PEOPLE_TIMEOUT,
   ws_connect_error: `
     globalThis.WebSocket = class {
       constructor(url) { setTimeout(() => this.onerror?.({ message: "ECONNREFUSED" }), 0); }
@@ -172,6 +224,28 @@ describe("probe-env-health", () => {
     const { code, stdout } = await runProbe({ env: "paseo-next-v2", scenario: "healthy" });
     assert.strictEqual(code, 0, `expected exit 0, got ${code}; stdout: ${stdout}`);
     assert.match(stdout, /healthy/i);
+    // #1595 follow-up: the People chain must actually be probed, not just
+    // silently assumed healthy alongside Asset Hub/Bulletin.
+    assert.match(stdout, /people=Mock Chain/, ">> FAIL: probe-env-health: healthy output must report the People chain's system_chain result");
+  });
+
+  // #1595 follow-up (port of bulletin PR #1596-follow-up): the People chain
+  // hosts personal-id binding (People.set_personal_id_account) and the
+  // personhood bind/reprove E2E scenarios depend on it — a dead People RPC
+  // (like the 2026-09-27 paseo-next-v2 outage on
+  // wss://paseo-people-next-system-rpc.polkadot.io) must mark the env
+  // unhealthy even when Asset Hub and Bulletin are fine.
+  test("exits non-zero when the People chain RPC errors (Asset Hub + Bulletin healthy)", async () => {
+    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "people_rpc_error" });
+    assert.notStrictEqual(code, 0, ">> FAIL: people-rpc-error: expected non-zero exit when only the People RPC errors");
+    assert.match(stderr, /rpc_error/, `>> FAIL: people-rpc-error: expected rpc_error classification, got: ${stderr}`);
+    assert.match(stderr, /people /, ">> FAIL: people-rpc-error: message must name the people chain as the failing probe, not asset-hub/bulletin");
+  });
+
+  test("exits non-zero when the People chain RPC hangs (must time out, not hang)", async () => {
+    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "people_timeout", timeoutMs: 500 });
+    assert.notStrictEqual(code, 0, ">> FAIL: people-timeout: a stalled People connect must fail, not hang — this is the exact class of bug #1595 fixed in test/e2e-chain-calls.test.js");
+    assert.match(stderr, /timeout/, `>> FAIL: people-timeout: expected timeout classification, got: ${stderr}`);
   });
 
   test("exits non-zero on WS connect error", async () => {

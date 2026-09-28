@@ -6,12 +6,16 @@
 //   1. Asset Hub RPC — WS + system_chain + state_call(ReviveApi.address)
 //   2. Bulletin RPC  — WS + system_chain (Bulletin has no Revive; liveness only)
 //   3. People RPC    — WS + system_chain (no Revive on People; liveness only).
-//      Added #1595 follow-up (port of bulletin PR #1596/#1596-follow-up):
-//      test/e2e-chain-calls.test.js and the personhood bind/reprove E2E
-//      scenarios both depend on the People chain, but this probe didn't
-//      check it, so a dead People RPC (e.g. the 2026-09-27 paseo-next-v2
-//      outage on wss://paseo-people-next-system-rpc.polkadot.io) slipped
-//      through as "healthy" and select-env never fell back.
+//      ADVISORY ONLY (#1595 follow-up, reverted from gating; port of bulletin
+//      PR #1596-follow-up): still probed and reported, but a People failure
+//      does NOT flip the env's overall health. select-env gates every E2E
+//      job in the workflow, including ones that never touch the People
+//      chain — gating on it meant a People-only outage on the primary env
+//      failed select-env outright, and on THIS repo (only one e2eEligible
+//      env) failed EVERY job with no fallback target at all. Per-chain
+//      fallback for the chains that DO need People now lives at the test
+//      level instead (test/e2e-chain-calls.test.js's candidateEndpoints()/
+//      connectChainWithFallback()).
 //   4. Bulletin gateway (HTTP) — fetch the env's `ipfs` URL; any HTTP status
 //      means the gateway server is up (404 at "/" is fine — the gateway
 //      doesn't serve a root index but proves it's reachable).
@@ -107,15 +111,17 @@ export function loadEnv(envId) {
       },
     };
   }
-  // Resolve every chain endpoint the E2E suites depend on. Asset Hub hosts
-  // the Revive pallet (and therefore ReviveApi.address); the Bulletin chain
-  // hosts content storage; the People chain hosts personal-id binding
-  // (test/e2e-chain-calls.test.js's People.set_personal_id_account, and the
-  // personhood bind/reprove E2E scenarios). A healthy E2E env needs all three
-  // reachable. Match how src/environments.ts::resolveEndpoints reads it
-  // (chains is an array of chain objects, each with an `id` and an
-  // `endpoints` map keyed by env id) — see the module-level comment above for
-  // why this stays a hand-parse instead of importing resolveEndpoints itself.
+  // Resolve every chain endpoint this probe touches. Asset Hub hosts the
+  // Revive pallet (and therefore ReviveApi.address) and Bulletin hosts
+  // content storage — both GATE env health below. People is resolved too
+  // (advisory reporting only, see the module comment above) but is
+  // deliberately NOT required here: an env with no people entry at all is
+  // just "people not configured", reported the same as a live People probe
+  // failure, not a config_error that would gate health. Match how
+  // src/environments.ts::resolveEndpoints reads it (chains is an array of
+  // chain objects, each with an `id` and an `endpoints` map keyed by env id)
+  // — see the module-level comment above for why this stays a hand-parse
+  // instead of importing resolveEndpoints itself.
   const pickWss = (chainId) => {
     const chain = (doc.chains || []).find((c) => c.id === chainId);
     const wss = chain?.endpoints?.[envId]?.wss;
@@ -123,16 +129,13 @@ export function loadEnv(envId) {
   };
   const assetHubRpc = pickWss("asset-hub");
   const bulletinRpc = pickWss("bulletin");
-  const peopleRpc = pickWss("people");
+  const peopleRpc = pickWss("people"); // advisory only — may be undefined
   const gatewayUrl = entry.ipfs;
   if (!assetHubRpc) {
     return { error: { kind: "config_error", message: `no asset-hub RPC for env "${envId}"` } };
   }
   if (!bulletinRpc) {
     return { error: { kind: "config_error", message: `no bulletin RPC for env "${envId}"` } };
-  }
-  if (!peopleRpc) {
-    return { error: { kind: "config_error", message: `no people RPC for env "${envId}"` } };
   }
   if (!gatewayUrl) {
     return { error: { kind: "config_error", message: `no gateway (ipfs) URL for env "${envId}"` } };
@@ -287,23 +290,33 @@ async function probe({ env, timeoutMs }) {
   });
   if (!ah.ok) fail(ah.kind, `asset-hub ${ah.message}`, Date.now() - t0);
 
-  // 2-3. Bulletin + People: WS + system_chain (neither has Revive; liveness
-  // only). #1595 follow-up added the People probe — it hosts personal-id
-  // binding (People.set_personal_id_account) and the personhood bind/reprove
-  // E2E scenarios depend on it, but nothing probed it before, so a dead
-  // People RPC wasn't a signal select-env's fallback could see. Looped
-  // (rather than a third hand-copied probeChain() block) so a future
-  // liveness-only chain is a one-line addition — the same reasoning as
-  // dotnsStorageCalls() above for not hand-copying repeated probe logic.
-  const liveness = {};
-  for (const [label, url] of [["bulletin", bulletinRpc], ["people", peopleRpc]]) {
-    const r = await probeChain({
-      url,
+  // 2. Bulletin: WS + system_chain (no Revive on Bulletin; just liveness).
+  const bul = await probeChain({
+    url: bulletinRpc,
+    timeoutMs,
+    calls: [{ id: 1, method: "system_chain", params: [], errorKind: "rpc_error" }],
+  });
+  if (!bul.ok) fail(bul.kind, `bulletin ${bul.message}`, Date.now() - t0);
+
+  // 3. People: WS + system_chain — ADVISORY ONLY (#1595 follow-up). Probed
+  // and reported, but never gates env health (see the module comment above
+  // for why gating on it was reverted). A missing config entry and a live
+  // probe failure are reported identically as "DOWN" — from a health-gating
+  // perspective they mean the same thing: this env cannot serve the People
+  // chain right now.
+  let peopleStatus = "not configured";
+  if (peopleRpc) {
+    const ppl = await probeChain({
+      url: peopleRpc,
       timeoutMs,
       calls: [{ id: 1, method: "system_chain", params: [], errorKind: "rpc_error" }],
     });
-    if (!r.ok) fail(r.kind, `${label} ${r.message}`, Date.now() - t0);
-    liveness[label] = r;
+    peopleStatus = ppl.ok ? ppl.result.system_chain : "DOWN";
+    if (!ppl.ok) {
+      console.error(`advisory: people ${ppl.kind} ${ppl.message} — not gating env health`);
+    }
+  } else {
+    console.error(`advisory: people no RPC configured for env "${env}" — not gating env health`);
   }
 
   // 4. Gateway: HTTP fetch. Any HTTP response = gateway server up (a 404 at
@@ -322,9 +335,10 @@ async function probe({ env, timeoutMs }) {
 
   const duration = Date.now() - t0;
   console.log(
-    `healthy: ${env} (asset-hub=${ah.result.system_chain}, bulletin=${liveness.bulletin.result.system_chain}, people=${liveness.people.result.system_chain}, gateway=${gatewayStatus}, dotns=ok, ${duration}ms)`,
+    `healthy: ${env} (asset-hub=${ah.result.system_chain}, bulletin=${bul.result.system_chain}, people=${peopleStatus}, gateway=${gatewayStatus}, dotns=ok, ${duration}ms)`,
   );
   emitOutput("outcome", "healthy");
+  emitOutput("people_status", peopleStatus);
   emitOutput("duration_ms", String(duration));
   process.exit(0);
 }

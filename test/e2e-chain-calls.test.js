@@ -47,7 +47,7 @@ const ENABLED = process.env.E2E === "1";
 // ---------------------------------------------------------------------------
 
 const ENV_ID = process.env.PAD_ENV ?? "paseo-next-v2";
-const endpoints = {}; // chainId → wss, populated in before()
+let ENV_DOC; // the loaded environments.json doc, populated in before()
 
 // ---------------------------------------------------------------------------
 // Timeouts (#1595) — every client connect, metadata/runtime fetch, and
@@ -58,17 +58,6 @@ const endpoints = {}; // chainId → wss, populated in before()
 
 const CONNECT_TIMEOUT_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 20_000;
-
-function wssFor(doc, chainId) {
-  const entry = doc.chains.find((c) => c.id === chainId)?.endpoints?.[ENV_ID];
-  const wss = Array.isArray(entry?.wss) ? entry.wss[0] : entry?.wss;
-  if (!wss) {
-    throw new Error(
-      `>> FAIL: chain-call-encoding: no '${chainId}' endpoint for env '${ENV_ID}' in environments.json`,
-    );
-  }
-  return wss;
-}
 
 // ---------------------------------------------------------------------------
 // Dummy values (representative; trigger real papi isCompat checks)
@@ -110,35 +99,122 @@ function isChainCallTimeout(err) {
 }
 
 /**
- * Create a client for `chainId` and bound the ready-check (first metadata
- * fetch) with CONNECT_TIMEOUT_MS. On timeout — or any setup failure — destroy
- * the client so a stalled/half-open socket never keeps the process alive.
+ * Build the ordered fallback candidate list for `chainId`: the selected
+ * env's own endpoint first, then the same chain's endpoints from the OTHER
+ * e2eEligible envs (in environments.json order), then any other env that
+ * declares this chain at all (also in file order). Read entirely from the
+ * loaded environments doc — never a hardcoded wss literal.
+ *
+ * #1595 follow-up: People going down on the selected env must not fail
+ * chains that don't need it, and select-env itself no longer gates on
+ * People (see probe-env-health.mjs's advisory-only comment) — a repo with
+ * only one e2eEligible env has nowhere for select-env to fall back TO, so
+ * env-level gating there just fails every job outright. Fallback happens
+ * per-chain, at the point of use, instead.
+ *
+ * This repo has only one e2eEligible env (paseo-next-v2), so the only
+ * fallback candidate is "devnet" (not e2eEligible, last-resort). Its People
+ * chain runtime was verified compatible by actually running this suite
+ * against it (`PAD_ENV=devnet E2E=1 node --test test/e2e-chain-calls.test.js`)
+ * — People.set_personal_id_account encodes cleanly there, so it's a
+ * meaningful fallback target, not a different-runtime false pass.
  */
-async function setupClient(chainId) {
-  const wss = endpoints[chainId];
-  const client = makeClient(wss);
-  try {
-    const api = client.getUnsafeApi();
-    await chainCall(api.constants.System.Version(), {
-      chain: chainId,
-      endpoint: wss,
-      step: "connect",
-      timeoutMs: CONNECT_TIMEOUT_MS,
-    });
-    return { client, api };
-  } catch (err) {
-    try {
-      client.destroy();
-    } catch {
-      // best-effort — the client may already be in a bad/half-open state
-    }
-    throw err;
+function candidateEndpoints(doc, chainId, selectedEnvId) {
+  const chain = doc.chains.find((c) => c.id === chainId);
+  if (!chain) {
+    throw new Error(`>> FAIL: chain-call-encoding: no '${chainId}' chain declared in environments.json`);
   }
+  const pickWss = (envId) => {
+    const wss = chain.endpoints?.[envId]?.wss;
+    return Array.isArray(wss) ? wss[0] : wss;
+  };
+  const eligibleIds = doc.environments.filter((e) => e.e2eEligible).map((e) => e.id);
+  const allIds = doc.environments.map((e) => e.id);
+  const seen = new Set();
+  const candidates = [];
+  const add = (envId) => {
+    if (seen.has(envId)) return;
+    const url = pickWss(envId);
+    if (!url) return;
+    seen.add(envId);
+    candidates.push({ envId, url });
+  };
+  add(selectedEnvId);
+  for (const envId of eligibleIds) add(envId);
+  for (const envId of allIds) add(envId);
+  return candidates;
 }
 
-/** Shared per-chain (chain, endpoint) pair for chainCall()'s failure message, keyed off `endpoints` populated by the top-level before(). */
+/** Real connector: builds a client + unsafe API for a candidate URL. Overridden by unit tests with a stub. */
+function defaultConnect(url) {
+  const client = makeClient(url);
+  return { client, api: client.getUnsafeApi() };
+}
+
+/**
+ * Connect to `chainId`, trying the selected env's endpoint first, then
+ * falling through candidateEndpoints() until one answers within
+ * `timeoutMs`. Uses the first endpoint that answers; only when EVERY
+ * candidate fails does this throw the named ">> FAIL: chain-call <chain>:
+ * no reachable endpoint" error. The caller is a per-chain before() hook, so
+ * that throw cancels only that chain's describe subtree (#1595) — every
+ * other chain's tests still run.
+ *
+ * `connect`/`log`/`timeoutMs` are overridable so the fallback logic itself
+ * can be unit-tested with stubbed connectors, no live chain required.
+ */
+async function connectChainWithFallback(
+  chainId,
+  selectedEnvId,
+  doc,
+  { connect = defaultConnect, log = console.log, timeoutMs = CONNECT_TIMEOUT_MS } = {},
+) {
+  const candidates = candidateEndpoints(doc, chainId, selectedEnvId);
+  if (candidates.length === 0) {
+    throw new Error(`>> FAIL: chain-call ${chainId}: no reachable endpoint (tried: no candidate endpoints configured for this chain)`);
+  }
+  const attempts = [];
+  for (const { envId, url } of candidates) {
+    let client;
+    try {
+      const conn = connect(url);
+      client = conn.client;
+      await chainCall(conn.api.constants.System.Version(), {
+        chain: chainId,
+        endpoint: url,
+        step: "connect",
+        timeoutMs,
+      });
+      if (attempts.length === 0) {
+        log(`chain-call ${chainId}: using ${envId} ${url}`);
+      } else {
+        const reason = attempts.map((a) => `${a.envId} ${a.url}: ${a.error.message}`).join("; ");
+        log(`chain-call ${chainId}: using ${envId} ${url} (fallback from ${selectedEnvId}: ${reason})`);
+      }
+      return { client, api: conn.api, envId, url };
+    } catch (err) {
+      try {
+        client?.destroy?.();
+      } catch {
+        // best-effort — the client may already be in a bad/half-open state
+      }
+      attempts.push({ envId, url, error: err });
+    }
+  }
+  throw new Error(
+    `>> FAIL: chain-call ${chainId}: no reachable endpoint (tried: ${attempts.map((a) => `${a.envId} ${a.url}`).join(", ")})`,
+  );
+}
+
+// Per-chain endpoint actually connected (populated by connectChainWithFallback
+// via each describe's before() hook) — may differ from ENV_ID's own endpoint
+// when a fallback occurred. chainCtx() reads it so later per-call timeout
+// messages name the REAL endpoint in use, not the originally-selected one.
+const resolvedEndpoint = {};
+
+/** Shared per-chain (chain, endpoint) pair for chainCall()'s failure message. */
 function chainCtx(chain) {
-  return { chain, endpoint: endpoints[chain] };
+  return { chain, endpoint: resolvedEndpoint[chain] };
 }
 
 /** Destroy a client best-effort — a stalled/half-open client's destroy() can itself throw, and teardown must never fail the suite over that. */
@@ -169,10 +245,7 @@ async function tryEncode(api, pallet, call, args, { chain, endpoint, timeoutMs =
 
 describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !ENABLED }, () => {
   before(async () => {
-    const { doc } = await loadEnvironments();
-    for (const chainId of ["asset-hub", "people", "bulletin"]) {
-      endpoints[chainId] = wssFor(doc, chainId);
-    }
+    ({ doc: ENV_DOC } = await loadEnvironments());
   });
 
   // ------------------------------------------------------------------
@@ -189,7 +262,11 @@ describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !E
     // TypeError, no misleading wrapper. Mirrors the after()-based teardown
     // below (#1595).
     before(async () => {
-      ({ client: ahClient, api: ahApi } = await setupClient("asset-hub"));
+      ({ client: ahClient, api: ahApi, url: resolvedEndpoint["asset-hub"] } = await connectChainWithFallback(
+        "asset-hub",
+        ENV_ID,
+        ENV_DOC,
+      ));
     });
 
     // 1. AliasAccounts.reprove_alias_account
@@ -321,7 +398,11 @@ describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !E
     let peopleApi;
 
     before(async () => {
-      ({ client: peopleClient, api: peopleApi } = await setupClient("people"));
+      ({ client: peopleClient, api: peopleApi, url: resolvedEndpoint["people"] } = await connectChainWithFallback(
+        "people",
+        ENV_ID,
+        ENV_DOC,
+      ));
     });
 
     // 4. People.set_personal_id_account
@@ -352,7 +433,11 @@ describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !E
     let bulletinApi;
 
     before(async () => {
-      ({ client: bulletinClient, api: bulletinApi } = await setupClient("bulletin"));
+      ({ client: bulletinClient, api: bulletinApi, url: resolvedEndpoint["bulletin"] } = await connectChainWithFallback(
+        "bulletin",
+        ENV_ID,
+        ENV_DOC,
+      ));
     });
 
     // 8. TransactionStorage.authorize_account
@@ -502,6 +587,143 @@ describe("chain-call timeout guard — unit (no chain)", () => {
       !src.includes(suspectPattern),
       ">> FAIL: chain-call-encoding: a per-chain client setup was written as a test() again instead of a before() hook — a stalled connect would then leave every later test in that describe block seeing an undefined api instead of being cleanly cancelled by node:test (#1595).",
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-chain endpoint fallback — unit (no chain), #1595 follow-up.
+// Proves candidateEndpoints() ordering and connectChainWithFallback()'s
+// fallback selection without any live chain, by stubbing the connector.
+// ---------------------------------------------------------------------------
+
+describe("chain fallback — unit (no chain)", () => {
+  // Fixture doc: "primary-env" and "fallback-env" are the two e2eEligible
+  // envs (in that file order); "other-env" is NOT e2eEligible but still
+  // declares the chain, so it's only ever reached as a last resort;
+  // "no-chain-env" declares no endpoint for "test-chain" at all and must
+  // never appear in the candidate list.
+  const FIXTURE_DOC = {
+    environments: [
+      { id: "primary-env", e2eEligible: true },
+      { id: "fallback-env", e2eEligible: true },
+      { id: "other-env" },
+      { id: "no-chain-env" },
+    ],
+    chains: [
+      {
+        id: "test-chain",
+        endpoints: {
+          "primary-env": { wss: "wss://primary.example" },
+          "fallback-env": { wss: "wss://fallback.example" },
+          "other-env": { wss: "wss://other.example" },
+        },
+      },
+    ],
+  };
+
+  describe("candidateEndpoints() ordering", () => {
+    test("selected env first, then other e2eEligible envs (file order), then any other env declaring the chain", () => {
+      const candidates = candidateEndpoints(FIXTURE_DOC, "test-chain", "fallback-env");
+      assert.deepEqual(
+        candidates.map((c) => c.envId),
+        ["fallback-env", "primary-env", "other-env"],
+        ">> FAIL: candidate-ordering: expected selected env first, then the other e2eEligible env, then the last-resort env — got a different order",
+      );
+      assert.deepEqual(
+        candidates.map((c) => c.url),
+        ["wss://fallback.example", "wss://primary.example", "wss://other.example"],
+      );
+    });
+
+    test("an env declaring no endpoint for the chain is never a candidate", () => {
+      const candidates = candidateEndpoints(FIXTURE_DOC, "test-chain", "primary-env");
+      assert.ok(
+        !candidates.some((c) => c.envId === "no-chain-env"),
+        ">> FAIL: candidate-ordering: no-chain-env has no 'test-chain' endpoint and must never be offered as a candidate",
+      );
+    });
+  });
+
+  describe("connectChainWithFallback() selection", () => {
+    // A stub connect() keyed by URL, returning a controllable api.constants.System.Version()
+    // per URL: "ok" resolves immediately, "stall" never resolves (must hit timeoutMs).
+    function stubConnect(behaviorByUrl) {
+      const destroyed = [];
+      const connect = (url) => ({
+        client: { destroy: () => destroyed.push(url) },
+        api: {
+          constants: {
+            System: {
+              Version: () =>
+                behaviorByUrl[url] === "stall" ? new Promise(() => {}) : Promise.resolve("mock-version"),
+            },
+          },
+        },
+      });
+      return { connect, destroyed };
+    }
+
+    test("primary stalls → falls back to the next candidate, and destroys the stalled primary's client", async () => {
+      const { connect, destroyed } = stubConnect({
+        "wss://primary.example": "stall",
+        "wss://fallback.example": "ok",
+      });
+      const logs = [];
+      const result = await connectChainWithFallback("test-chain", "primary-env", FIXTURE_DOC, {
+        connect,
+        log: (msg) => logs.push(msg),
+        timeoutMs: 50,
+      });
+      assert.equal(result.envId, "fallback-env", ">> FAIL: fallback-selection: must use the second candidate once the primary stalls out");
+      assert.equal(result.url, "wss://fallback.example");
+      assert.ok(
+        logs.some((l) => l.includes("using fallback-env wss://fallback.example") && l.includes("(fallback from primary-env:")),
+        `>> FAIL: fallback-selection: expected a "using ... (fallback from ...)" log line, got: ${JSON.stringify(logs)}`,
+      );
+      assert.ok(
+        destroyed.includes("wss://primary.example"),
+        ">> FAIL: fallback-selection: the stalled primary's client must still be destroyed, not leaked",
+      );
+    });
+
+    test("every candidate stalls → named failure naming every endpoint tried", async () => {
+      const { connect } = stubConnect({
+        "wss://primary.example": "stall",
+        "wss://fallback.example": "stall",
+        "wss://other.example": "stall",
+      });
+      await assert.rejects(
+        () =>
+          connectChainWithFallback("test-chain", "primary-env", FIXTURE_DOC, {
+            connect,
+            log: () => {},
+            timeoutMs: 50,
+          }),
+        (err) => {
+          assert.equal(
+            err.message,
+            ">> FAIL: chain-call test-chain: no reachable endpoint (tried: primary-env wss://primary.example, fallback-env wss://fallback.example, other-env wss://other.example)",
+          );
+          return true;
+        },
+      );
+    });
+
+    test("primary ok → no fallback attempted, plain 'using' log with no fallback clause", async () => {
+      const { connect } = stubConnect({ "wss://primary.example": "ok" });
+      const logs = [];
+      const result = await connectChainWithFallback("test-chain", "primary-env", FIXTURE_DOC, {
+        connect,
+        log: (msg) => logs.push(msg),
+        timeoutMs: 50,
+      });
+      assert.equal(result.envId, "primary-env");
+      assert.deepEqual(logs, ["chain-call test-chain: using primary-env wss://primary.example"]);
+      assert.ok(
+        !logs.some((l) => l.includes("fallback from")),
+        ">> FAIL: fallback-selection: the primary succeeding must not log a fallback clause",
+      );
+    });
   });
 });
 

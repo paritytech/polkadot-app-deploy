@@ -136,9 +136,14 @@ const DOTNS_HANGS = `
 // system_chain/state_call/state_getStorage response ternary a second and
 // third time.
 function wsPeopleFails(mode) {
+  // NOTE: no trailing "//" comment on these single-line guards — the
+  // generated code is a single template line, and a line comment there would
+  // silently swallow the constructor's closing brace, breaking the class in
+  // a way that crashes the probe process (a false-positive "non-zero exit"
+  // that looks like the intended failure but isn't).
   const openGuard =
     mode === "timeout"
-      ? `if (!this.url.includes("people")) setTimeout(() => this.onopen?.(), 0); // People never opens — must hit the probe timeout, not hang.`
+      ? `if (!this.url.includes("people")) setTimeout(() => this.onopen?.(), 0);` // People never opens — must hit the probe timeout, not hang.
       : `setTimeout(() => this.onopen?.(), 0);`;
   const errorBranch =
     mode === "rpc_error"
@@ -224,28 +229,34 @@ describe("probe-env-health", () => {
     const { code, stdout } = await runProbe({ env: "paseo-next-v2", scenario: "healthy" });
     assert.strictEqual(code, 0, `expected exit 0, got ${code}; stdout: ${stdout}`);
     assert.match(stdout, /healthy/i);
-    // #1595 follow-up: the People chain must actually be probed, not just
-    // silently assumed healthy alongside Asset Hub/Bulletin.
+    // #1595 follow-up: the People chain is still probed and reported even
+    // though it's advisory-only now — this just isn't gating.
     assert.match(stdout, /people=Mock Chain/, ">> FAIL: probe-env-health: healthy output must report the People chain's system_chain result");
   });
 
-  // #1595 follow-up (port of bulletin PR #1596-follow-up): the People chain
-  // hosts personal-id binding (People.set_personal_id_account) and the
-  // personhood bind/reprove E2E scenarios depend on it — a dead People RPC
-  // (like the 2026-09-27 paseo-next-v2 outage on
-  // wss://paseo-people-next-system-rpc.polkadot.io) must mark the env
-  // unhealthy even when Asset Hub and Bulletin are fine.
-  test("exits non-zero when the People chain RPC errors (Asset Hub + Bulletin healthy)", async () => {
-    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "people_rpc_error" });
-    assert.notStrictEqual(code, 0, ">> FAIL: people-rpc-error: expected non-zero exit when only the People RPC errors");
-    assert.match(stderr, /rpc_error/, `>> FAIL: people-rpc-error: expected rpc_error classification, got: ${stderr}`);
-    assert.match(stderr, /people /, ">> FAIL: people-rpc-error: message must name the people chain as the failing probe, not asset-hub/bulletin");
-  });
+  // #1595 follow-up (reverted from gating, per maintainer; port of bulletin
+  // PR #1596-follow-up): a People-only failure must NOT flip env health.
+  // select-env gates every E2E job in the workflow — including ones that
+  // never touch the People chain — and this repo has only one e2eEligible
+  // env, so there is nothing to fall back to: gating on People here would
+  // fail every job outright. Chains that DO need People now fall back at
+  // the test level instead (test/e2e-chain-calls.test.js's
+  // connectChainWithFallback()). This probe still reports People's status
+  // for visibility, just doesn't gate on it.
+  describe("People is advisory-only, not gating (#1595 follow-up)", () => {
+    test("a People-only RPC error still exits 0 (healthy), with People reported down", async () => {
+      const { code, stdout, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "people_rpc_error" });
+      assert.strictEqual(code, 0, `>> FAIL: people-advisory: a People-only RPC error must not fail the env — got exit ${code}, stderr: ${stderr}`);
+      assert.match(stdout, /healthy/i);
+      assert.match(stdout, /people=DOWN/, ">> FAIL: people-advisory: healthy output must still report People as DOWN when its own probe fails");
+      assert.match(stderr, /advisory: people/, ">> FAIL: people-advisory: the People failure must still be logged (to stderr) even though it doesn't gate");
+    });
 
-  test("exits non-zero when the People chain RPC hangs (must time out, not hang)", async () => {
-    const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "people_timeout", timeoutMs: 500 });
-    assert.notStrictEqual(code, 0, ">> FAIL: people-timeout: a stalled People connect must fail, not hang — this is the exact class of bug #1595 fixed in test/e2e-chain-calls.test.js");
-    assert.match(stderr, /timeout/, `>> FAIL: people-timeout: expected timeout classification, got: ${stderr}`);
+    test("a People-only RPC hang still exits 0 after the bound (healthy), with People reported down", async () => {
+      const { code, stdout } = await runProbe({ env: "paseo-next-v2", scenario: "people_timeout", timeoutMs: 500 });
+      assert.strictEqual(code, 0, ">> FAIL: people-advisory: a People-only timeout must not fail the env");
+      assert.match(stdout, /people=DOWN/, ">> FAIL: people-advisory: healthy output must report People as DOWN when its probe times out");
+    });
   });
 
   test("exits non-zero on WS connect error", async () => {

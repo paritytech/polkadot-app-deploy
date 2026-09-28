@@ -11637,7 +11637,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
   // gone, (2) the discriminator job exists and is wired the same skip-safe way
   // as detect-noop-push, (3) every heavy job's `if:` actually references its
   // output, and (4) the discriminator's classification logic itself is
-  // correct — extracted from the live workflow file and executed against
+  // correct — imported from .github/scripts/classify-version-bump.cjs (the
+  // same script the workflows run) and executed against
   // fixtures, not re-implemented as a parallel copy that could drift from
   // what actually ships.
   for (const file of [".github/workflows/e2e.yml"]) {

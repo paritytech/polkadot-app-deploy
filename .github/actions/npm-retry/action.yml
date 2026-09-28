@@ -25,6 +25,27 @@ runs:
         retry_wait_seconds: ${{ inputs.retry_wait_seconds }}
         # Explicit rather than relying on the default (see bulletin-deploy #1417).
         retry_on: any
+        # pipefail so a failure inside the group is the pipeline's exit code,
+        # not tee's (which always succeeds). The tee'd log is what
+        # on_retry_command below inspects. `run` is on its own line (not
+        # `{ ${{ inputs.run }}; }`) so a trailing `#comment` in a caller's
+        # multi-line run body can't swallow the closing brace.
         command: |
-          set -e
+          set -eo pipefail
+          {
           ${{ inputs.run }}
+          } 2>&1 | tee "${RUNNER_TEMP}/npm-retry-output.log"
+        # #214: a restored actions/setup-node npm cache can already contain a
+        # corrupted tarball (cache HIT, not a fresh-download truncation). npm
+        # then fails `npm ci`/`npm install` with EINTEGRITY, "seems to be
+        # corrupted", or ENOENT stat'ing its own _cacache content file. A bare
+        # retry re-reads the same poisoned cache entry and fails identically.
+        # Only clear the cache when the failed attempt's output actually looks
+        # like this — a plain registry timeout doesn't need it, and `run` is
+        # not always npm (this action stays generic), so grep gates the clean.
+        on_retry_command: |
+          LOG="${RUNNER_TEMP}/npm-retry-output.log"
+          if [ -f "$LOG" ] && grep -Eiq 'EINTEGRITY|seems to be corrupted|_cacache|tarball data .* corrupted' "$LOG"; then
+            echo "::warning::npm-retry: detected a corrupted npm cache entry, running npm cache clean --force before the next attempt"
+            npm cache clean --force || true
+          fi

@@ -14,7 +14,11 @@ run-name: >-
 # Runs on every PR and every push to main, with no path filter: "Unit Tests"
 # is a required status check on main, so it must always report — a paths-ignore
 # would skip the check on docs-only PRs and leave the required check pending,
-# deadlocking the merge.
+# deadlocking the merge. The classify-version-bump job below (ported from
+# bulletin-deploy's #1307 follow-up) still lets a version-only release/RC bump
+# PR skip Unit Tests, without a path filter: it's a job-level `if:` gate on a
+# content-aware classification, not a trigger-level path exclusion, so it
+# reports 'skipped' (not "never ran") and the required check still resolves.
 on:
   pull_request:
     branches: [main]
@@ -31,8 +35,79 @@ permissions:
   contents: read
 
 jobs:
+  # ---- Version-bump discriminator (port of bulletin-deploy #1307 follow-up)
+  #
+  # Same shape and same shared script as e2e.yml's detect-deps-change job:
+  # fetches package.json/package-lock.json at the PR/push base and head SHAs
+  # via the Contents API and classifies the diff as version-only or not (see
+  # .github/scripts/classify-version-bump.cjs for the exact rule). A
+  # version-only release/RC bump PR skips Unit Tests; a dependency bump
+  # (mixed or not) still runs it.
+  #
+  # Only runs on pull_request/push, matching detect-deps-change — a
+  # workflow_dispatch run has no base/head SHA pair to diff, and unit-tests
+  # below treats this job's 'skipped' result as pass-through, so a manual
+  # dispatch always runs Unit Tests in full.
+  classify-version-bump:
+    name: Classify package.json/lock diff (version bump vs dependency change)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    outputs:
+      is_version_only: ${{ steps.classify.outputs.is_version_only }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - id: classify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          fetch() {
+            # $1=sha $2=path $3=outfile. Missing/404 → empty outfile, treated
+            # as "file did not exist at that ref" by the classifier below.
+            curl -fsSL -H "Authorization: bearer $GH_TOKEN" -H "Accept: application/vnd.github.raw+json" \
+              "https://api.github.com/repos/$REPO/contents/$2?ref=$1" -o "$3" 2>/dev/null || : > "$3"
+          }
+          if [[ -z "${BASE_SHA:-}" || "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "No base SHA to diff against (branch creation) — treating as dependency-affecting to be safe."
+            echo "is_version_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          fetch "$BASE_SHA" package.json base_pkg.json
+          fetch "$HEAD_SHA" package.json head_pkg.json
+          fetch "$BASE_SHA" package-lock.json base_lock.json
+          fetch "$HEAD_SHA" package-lock.json head_lock.json
+          node .github/scripts/classify-version-bump.cjs
+
   unit-tests:
     name: Unit Tests
+    needs: classify-version-bump
+    # always() so a skipped classify-version-bump (workflow_dispatch, which
+    # has no base/head SHA pair) still lets Unit Tests run — same
+    # skipped-predecessor-passes-through pattern e2e.yml's heavy jobs use
+    # against detect-deps-change. A classifier FAILURE also lets Unit Tests
+    # run: needs.result is 'failure' (not 'skipped'), so the first OR-arm is
+    # false, but outputs.is_version_only is then unset/empty, which is
+    # != 'true', making the second OR-arm true — the only value that skips
+    # Unit Tests is a successful classification of 'true'. Fails safe: a
+    # broken classifier costs an unnecessary Unit Tests run, never a missed
+    # one.
+    if: |
+      always() &&
+      (needs.classify-version-bump.result == 'skipped' || needs.classify-version-bump.outputs.is_version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

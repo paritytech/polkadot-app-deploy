@@ -656,7 +656,7 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // `unknown` with the message ending `"type": "AncientBirth`.
   [/AncientBirth/i, 'chain.extrinsic_expired'],
   [/Bulletin quota exhausted/i, 'chain.quota_exhausted'],
-  [/Mobile signing (?:failed|rejected).*message too big/i, 'signer.message_too_large'],
+  [/Mobile (?:transaction )?signing (?:failed|rejected).*message too big/i, 'signer.message_too_large'],
   [/^INVARIANT FAILED:/i, 'tool.invariant'],
 ];
 

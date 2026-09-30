@@ -50,6 +50,9 @@ export async function runWhoami(envId: string): Promise<void> {
         if (e?.name === "SignerNotAvailableError") {
             // Expected: session file exists but no usable signer — treat as stale.
             console.error(STALE_SESSION_MESSAGE);
+        } else if (e?.name === "NonRetryableError") {
+            // Signed in, but the phone did not return this env's account key.
+            console.error(e.message);
         } else {
             // Unexpected error (WS failure, People chain unavailable, etc.).
             console.log(`Could not reach login service: ${e?.message ?? String(err)}`);

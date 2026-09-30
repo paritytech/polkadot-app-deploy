@@ -64,9 +64,9 @@ const QR_TIMEOUT_MS = 60_000;
  *   the mobile app sent over the SSO handshake (bare-mnemonic sr25519 root on
  *   current mobile builds). Keyed by `Resources.Consumers` on the People
  *   parachain, so it's the right input for `lookupUsername`.
- * - `productAddress` — SS58 of the product account derived via
- *   `product/{productId}/{index}` from `rootAccountId`. This is what actually
- *   signs on-chain transactions from the CLI.
+ * - `productAddress`: SS58 of the RFC-0022 product account
+ *   `//product//{productId}/{index}`. This is what actually signs on-chain
+ *   transactions from the CLI.
  * - `productH160` — the same product pubkey as a 20-byte EVM address (Revive /
  *   contracts view). Derived from the SAME pubkey as `productAddress`.
  */
@@ -104,6 +104,8 @@ export interface LoginHandle {
 export interface SessionHandle {
     address: string;
     addresses: SessionAddresses;
+    /** Product id the account, signer and allowances are scoped to. */
+    productId: string;
     signer: PolkadotSigner;
     userSession: UserSession;
     adapter: TerminalAdapter;
@@ -145,6 +147,8 @@ export interface AuthClient {
  */
 export function createAuthClient(config: AuthConfig): AuthClient {
     const ref = { productId: config.productId, derivationIndex: config.derivationIndex };
+    // Keep the subtree cache under the `${dappId}_` prefix so logout removes it.
+    const subtreeOptions = { appId: config.dappId };
 
     function createAdapter(): TerminalAdapter {
         return createTerminalAdapter({
@@ -159,23 +163,18 @@ export function createAuthClient(config: AuthConfig): AuthClient {
         });
     }
 
-    /**
-     * Compute the three display addresses from a paired session. Shares
-     * `deriveProductPublicKey` with `createSessionSigner` so the signing key and
-     * the display SS58/H160 are computed by exactly one function.
-     */
-    function deriveSessionAddresses(session: UserSession): SessionAddresses {
+    /** The product account key plus the three display addresses built from it. */
+    async function deriveSessionAccount(session: UserSession): Promise<{ publicKey: Uint8Array; addresses: SessionAddresses }> {
         const rootBytes = sessionRootPublicKey(session);
-        const productPubkey = deriveProductPublicKey(rootBytes, ref);
+        const publicKey = await deriveProductPublicKey(session, ref, subtreeOptions);
         return {
-            rootAddress: ss58Encode(rootBytes),
-            productAddress: ss58Encode(productPubkey),
-            productH160: deriveH160(productPubkey),
+            publicKey,
+            addresses: {
+                rootAddress: ss58Encode(rootBytes),
+                productAddress: ss58Encode(publicKey),
+                productH160: deriveH160(publicKey),
+            },
         };
-    }
-
-    function createSigner(session: UserSession): PolkadotSigner {
-        return createSessionSigner(session, ref);
     }
 
     function sessionRemoteAddress(session: UserSession): string | null {
@@ -184,11 +183,14 @@ export function createAuthClient(config: AuthConfig): AuthClient {
         return accountId.length === 32 ? ss58Encode(accountId) : null;
     }
 
-    function sessionLogoutAddress(session: UserSession): string {
+    /** Display label only, so it does not wait for the phone on a cold subtree cache. */
+    async function sessionLogoutAddress(session: UserSession): Promise<string> {
+        const fallback = sessionRemoteAddress(session) ?? "(stored session)";
+        const timeout = new Promise<string>((resolve) => setTimeout(() => resolve(fallback), 5_000).unref());
         try {
-            return deriveSessionAddresses(session).productAddress;
+            return await Promise.race([deriveSessionAccount(session).then((a) => a.addresses.productAddress), timeout]);
         } catch {
-            return sessionRemoteAddress(session) ?? "(stored session)";
+            return fallback;
         }
     }
 
@@ -203,13 +205,16 @@ export function createAuthClient(config: AuthConfig): AuthClient {
 
         const sessions = await waitForSessions(adapter);
         if (sessions.length > 0) {
-            const addresses = deriveSessionAddresses(sessions[0]);
             // Destroy adapter-A: the kind:"existing" path doesn't need it after
             // address derivation (getSessionSigner creates a fresh adapter-B for
             // the actual signing session). Without this the WS keeps the event loop
             // alive and the process never exits after "Already signed in".
-            adapter.destroy().catch(() => {});
-            return { kind: "existing", address: addresses.productAddress, addresses };
+            try {
+                const { addresses } = await deriveSessionAccount(sessions[0]);
+                return { kind: "existing", address: addresses.productAddress, addresses };
+            } finally {
+                adapter.destroy().catch(() => {});
+            }
         }
 
         // Start authenticate — this triggers the pairing flow and QR emission.
@@ -300,9 +305,17 @@ export function createAuthClient(config: AuthConfig): AuthClient {
                 if (sessions.length > 0) {
                     // Build the handle on adapter-A (the live pairing adapter) so the
                     // caller can request allowances without a second adapter or disk-read race.
-                    handle = buildSessionHandle(adapter, sessions[0]);
-                    const { address, addresses } = handle;
-                    onStatus({ step: "success", address, addresses });
+                    try {
+                        handle = await buildSessionHandle(adapter, sessions[0]);
+                        const { address, addresses } = handle;
+                        onStatus({ step: "success", address, addresses });
+                    } catch (err) {
+                        // The session is already on disk. Drop it, or the next login
+                        // takes the existing-session path and never requests allowances.
+                        await Promise.resolve(adapter.sessions.disconnect(sessions[0])).catch(() => {});
+                        await clearLocalAppStorage();
+                        onStatus({ step: "error", message: err instanceof Error ? err.message : String(err) });
+                    }
                 } else {
                     onStatus({
                         step: "error",
@@ -326,9 +339,10 @@ export function createAuthClient(config: AuthConfig): AuthClient {
      * The handle's destroy() is idempotent and swallows the DestroyedError /
      * "Not connected" teardown noise that polkadot-api emits from finalizers.
      */
-    function buildSessionHandle(adapter: TerminalAdapter, session: UserSession): SessionHandle {
-        const signer = createSigner(session);
-        const addresses = deriveSessionAddresses(session);
+    async function buildSessionHandle(adapter: TerminalAdapter, session: UserSession): Promise<SessionHandle> {
+        const { publicKey, addresses } = await deriveSessionAccount(session);
+        // Passing the key stops the signer from deriving it a second time.
+        const signer = await createSessionSigner(session, { ...ref, publicKey }, subtreeOptions);
 
         let destroyed = false;
         const destroy = () => {
@@ -340,6 +354,7 @@ export function createAuthClient(config: AuthConfig): AuthClient {
         return {
             address: addresses.productAddress,
             addresses,
+            productId: config.productId,
             signer,
             userSession: session,
             adapter,
@@ -362,7 +377,12 @@ export function createAuthClient(config: AuthConfig): AuthClient {
             return null;
         }
 
-        return buildSessionHandle(adapter, sessions[0]);
+        try {
+            return await buildSessionHandle(adapter, sessions[0]);
+        } catch (err) {
+            adapter.destroy().catch(() => {});
+            throw err;
+        }
     }
 
     /**
@@ -381,7 +401,7 @@ export function createAuthClient(config: AuthConfig): AuthClient {
         resources: AllocatableResource[] = DEFAULT_RESOURCES,
         onExisting: OnExistingAllowancePolicy = "Ignore",
     ): Promise<AllocationOutcome[]> {
-        return requestResourceAllocation(session, adapter, resources, onExisting);
+        return requestResourceAllocation(session, adapter, config.productId, resources, onExisting);
     }
 
     /**
@@ -401,14 +421,14 @@ export function createAuthClient(config: AuthConfig): AuthClient {
             return null;
         }
         const session = sessions[0];
-        const address = sessionLogoutAddress(session);
+        const address = await sessionLogoutAddress(session);
         return { adapter, address, session };
     }
 
     /**
      * Disconnect the given session. Sends a `Disconnected` statement so the
-     * paired mobile app drops its side, then clears the local `${dappId}_*`
-     * files. Always releases the adapter before returning.
+     * paired mobile app drops its side, then clears the local `${dappId}_*` and
+     * `${dappId}.*` files. Always releases the adapter before returning.
      */
     async function waitForLogout(
         handle: LogoutHandle,
@@ -452,8 +472,9 @@ export function createAuthClient(config: AuthConfig): AuthClient {
 
     /**
      * Best-effort removal of this app's persisted state under `~/.polkadot-apps/`.
-     * Scoped by `${dappId}_` prefix so files belonging to other polkadot apps
-     * sharing the directory are left alone. Errors are swallowed.
+     * Scoped by the `${dappId}_` prefix and by `${dappId}.`, which covers each
+     * environment's `${dappId}.<tld>` product id (the allowance cache is named
+     * after it). Files of other polkadot apps are left alone. Errors are swallowed.
      */
     async function clearLocalAppStorage(
         dir: string = join(homedir(), ".polkadot-apps"),
@@ -464,10 +485,10 @@ export function createAuthClient(config: AuthConfig): AuthClient {
         } catch {
             return;
         }
-        const prefix = `${config.dappId}_`;
+        const prefixes = [`${config.dappId}_`, `${config.dappId}.`];
         await Promise.all(
             entries
-                .filter((entry) => entry.isFile() && entry.name.startsWith(prefix))
+                .filter((entry) => entry.isFile() && prefixes.some((p) => entry.name.startsWith(p)))
                 .map((entry) =>
                     unlink(join(dir, entry.name)).catch(() => {
                         // best-effort

@@ -48,6 +48,7 @@
   ],
   "scripts": {
     "build": "tsup",
+    "typecheck": "tsc --noEmit -p .",
     "postinstall": "patch-package || true",
     "prepare": "npm run build",
     "test": "npm run build && node scripts/run-unit-tests.mjs && npm run test:vendor",
@@ -63,8 +64,8 @@
     "@ipld/dag-pb": "^4.1.3",
     "@noble/hashes": "^1.7.2",
     "@parity/product-sdk-address": "^0.1.1",
-    "@parity/product-sdk-keys": "^0.3.8",
-    "@parity/product-sdk-terminal": "^0.5.1",
+    "@parity/product-sdk-keys": "^0.4.1",
+    "@parity/product-sdk-terminal": "^0.10.1",
     "@parity/product-sdk-tx": "^0.2.12",
     "@polkadot-api/metadata-builders": "^0.14.2",
     "@polkadot-api/substrate-bindings": "^0.20.2",
@@ -78,7 +79,7 @@
     "jiti": "^2.4.2",
     "multiformats": "^13.4.1",
     "patch-package": "^8.0.1",
-    "polkadot-api": "^2.1.3",
+    "polkadot-api": "^2.1.8",
     "verifiablejs": "1.3.0-beta.4",
     "viem": "^2.55.10",
     "ws": "^8.21.0"
@@ -92,11 +93,6 @@
   },
   "overrides": {
     "@polkadot-api/json-rpc-provider": "^0.2.0",
-    "@novasamatech/host-api": "0.8.6",
-    "@novasamatech/host-papp": "0.8.6",
-    "@novasamatech/scale": "0.8.6",
-    "@novasamatech/statement-store": "0.8.6",
-    "@novasamatech/storage-adapter": "0.8.6",
     "nanoid": "^5.1.16",
     "postcss": {
       "nanoid": "^3.3.18"

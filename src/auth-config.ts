@@ -1,11 +1,12 @@
 /**
  * Auth configuration builder for the sign-in integration.
  *
- * Identity is unified under one id: DOT_DAPP_ID === DOT_PRODUCT_ID === DOT_HOST_NAME
- * === "polkadot-app-deploy". The wallet pairs, funds PGAS, and keys all allowances
- * (Bulletin / statement-store / smart-contract) under this single id, and the product
- * account the deploy signer derives from (`product/{id}/{index}`) lives there too —
- * so one identity covers pairing, allowances, and the signing/owning account.
+ * DOT_DAPP_ID scopes the session files on disk. The product id is
+ * `polkadot-app-deploy.<network suffix>` (RFC-0022): the wallet derives the
+ * signing account `//product//{productId}/{index}` from it, funds PGAS there,
+ * and keys the Bulletin / statement-store allowances by it. Android only
+ * answers for a product id whose suffix matches its People chain's
+ * `NetworkSuffix`.
  */
 
 import { existsSync, readdirSync } from "fs";
@@ -17,22 +18,13 @@ import type { AuthConfig } from "./auth/index.js";
 import { VERSION } from "./telemetry.js";
 import { CLI_NAME } from "./cli-name.js";
 
-/** dApp identity: scopes the SSO session namespace + terminal allowance cache on disk
- *  and the wallet pairing product. Aligned to the app's dedicated id "polkadot-app-deploy". */
+/** Scopes the SSO session files on disk and prefixes the per-env product ids. */
 export const DOT_DAPP_ID = "polkadot-app-deploy";
-
-/** Product id used for product-account derivation (`/product/{productId}/{index}`).
- *  UNIFIED with DOT_DAPP_ID (#885): the wallet funds PGAS to product/{appId}/{index},
- *  so deriving the signer/owner under the same id lands the account where PGAS sits —
- *  one account is owner + AH signer + PGAS-funded. Requires a fresh re-pairing so the
- *  Bulletin/statement allowance is also claimed under this id (verify the wallet serves
- *  "polkadot-app-deploy"; that's the open mobile-side question). */
-export const DOT_PRODUCT_ID = DOT_DAPP_ID;
 
 /** Derivation index (0 = default product account). */
 export const DOT_DERIVATION_INDEX = 0;
 
-/** Wallet-facing app name shown on the Sign-In screen. Aligned to the unified identity. */
+/** Wallet-facing app name shown on the Sign-In screen. */
 export const DOT_HOST_NAME = "polkadot-app-deploy";
 
 /**
@@ -83,6 +75,7 @@ export function hasPersistedSession(): boolean {
 export function buildAuthConfig(
     doc: EnvironmentsDoc,
     envId: string,
+    networkSuffix?: string | null,
 ): AuthConfig {
     const peopleChain = doc.chains.find((c) => c.id === "people");
     if (!peopleChain) {
@@ -101,9 +94,13 @@ export function buildAuthConfig(
     // Normalize string | string[] to string[]
     const peopleEndpoints = Array.isArray(endpoint.wss) ? endpoint.wss : [endpoint.wss];
 
+    // Envs without a `tld` use the People chain's suffix if the caller read it,
+    // else "dot", the same default as DEFAULT_TLD in src/dotns.ts.
+    const tld = doc.environments.find((e) => e.id === envId)?.tld ?? networkSuffix ?? "dot";
+
     return {
         dappId: DOT_DAPP_ID,
-        productId: DOT_PRODUCT_ID,
+        productId: `${DOT_DAPP_ID}.${tld}`,
         derivationIndex: DOT_DERIVATION_INDEX,
         hostName: DOT_HOST_NAME,
         hostVersion: VERSION,
@@ -145,11 +142,31 @@ export async function getPeopleChainEndpoints(envId: string): Promise<string[]> 
 }
 
 /**
+ * The People chain's `NetworkSuffix`, which the phone checks the product id
+ * against. Null when the chain has none or the read fails.
+ */
+export async function readNetworkSuffix(peopleEndpoints: string[]): Promise<string | null> {
+    const { Storage, str } = await import("@polkadot-api/substrate-bindings");
+    const { readStorageValue } = await import("./sss-allowance.js");
+    const value = await readStorageValue(Storage("NetworkSuffix")("NetworkSuffix").enc(), peopleEndpoints);
+    if (!value) return null;
+    try {
+        return str.dec(value) || null;
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Lazily create an auth client for the given environment. Imports the facade
  * only when called so the SSO deps don't load in headless/mnemonic paths.
  */
 export async function getAuthClient(envId: string) {
     const { createAuthClient } = await import("./auth/index.js");
     const { doc } = await loadEnvironments();
-    return createAuthClient(buildAuthConfig(doc, envId));
+    const config = buildAuthConfig(doc, envId);
+    // Bundled tlds match their chain's suffix (test/auth-config.test.js), so only
+    // envs without one, like devnet, pay for the chain read.
+    if (doc.environments.find((e) => e.id === envId)?.tld) return createAuthClient(config);
+    return createAuthClient(buildAuthConfig(doc, envId, await readNetworkSuffix(config.peopleEndpoints)));
 }

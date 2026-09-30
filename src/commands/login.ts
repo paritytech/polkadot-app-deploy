@@ -18,7 +18,7 @@
 
 import { renderLoginStatus, requestResourceAllocation, DEFAULT_RESOURCES, summarizeOutcomes, createSlotAccountSigner, BULLETIN_RESOURCE } from "../auth/index.js";
 import type { AllocationSummary } from "../auth/index.js";
-import { getAuthClient, DOT_PRODUCT_ID, DOT_DAPP_ID, resolveBulletinEndpoints, getPeopleChainEndpoints } from "../auth-config.js";
+import { getAuthClient, resolveBulletinEndpoints, getPeopleChainEndpoints } from "../auth-config.js";
 import { CLI_NAME } from "../cli-name.js";
 import { statementSigningAccount } from "../sss-allowance.js";
 import { preflightSssAllowance } from "../sss-allowance-cache.js";
@@ -242,7 +242,7 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
                     await Promise.race([
                         Promise.resolve(
                             sessionHandle.adapter.allowance
-                                .getBulletinSigner(sessionHandle.userSession.id, DOT_PRODUCT_ID),
+                                .getBulletinSigner(sessionHandle.userSession.id, sessionHandle.productId),
                         ).then((r: { isOk: () => boolean; isErr: () => boolean }) => {
                             if (r.isErr()) {
                                 console.warn(
@@ -294,8 +294,8 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
 
     // RFC-0010: obtain the Bulletin storage slot signer via the terminal cache.
     // Use handle (adapter-A) directly — no getSessionSigner() call, no fresh adapter, no race.
-    // Step 1 (batched claim) uses DOT_PRODUCT_ID (unified with DOT_DAPP_ID, #885) so the
-    // allowances land on the same product account the deploy signer derives from.
+    // Step 1 (batched claim) is scoped to handle.productId so the allowances land on
+    // the same product account the deploy signer derives from.
     // Step 2 reads from the same terminal cache file — no second wallet prompt.
     //
     // Step 1: claim ALL deploy allowances (Bulletin + SSS + PGAS) in one batched request
@@ -307,7 +307,7 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
         console.log("\nAllocating deploy resources — check your phone to approve.");
         const resources = DEFAULT_RESOURCES;
         const outcomes = await withTimeout(
-            requestResourceAllocation(handle.userSession, handle.adapter, resources),
+            requestResourceAllocation(handle.userSession, handle.adapter, handle.productId, resources),
             ALLOCATION_TIMEOUT_MS,
             `Allocation request timed out after ${Math.round(ALLOCATION_TIMEOUT_MS / 1000)}s — ` +
                 `the wallet did not respond to the approval request.`,
@@ -323,17 +323,17 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
         }
 
         // Step 2: read the Bulletin slot signer from the terminal cache written by step 1.
-        // createSlotAccountSigner reads the same {appId}_AllowanceKeys.json file that
+        // createSlotAccountSigner reads the same {productId}_AllowanceKeys.json file that
         // requestResourceAllocation wrote — guaranteed cache-hit, no phone prompt.
         // Falls back to getBulletinSigner() only on a rare cache miss (e.g. first install
         // before a terminal-cache write).
-        let slotSigner = await createSlotAccountSigner(handle.adapter, BULLETIN_RESOURCE);
+        let slotSigner = await createSlotAccountSigner(handle.adapter, BULLETIN_RESOURCE, handle.productId);
         if (!slotSigner) {
             // Cache miss (uncommon after a successful batched allocation above).
             // getBulletinSigner goes through host-papp's in-process cache; on a miss
             // it may prompt the phone. Wrap in withTimeout as a safety net.
             const fallbackResult = await withTimeout(
-                handle.adapter.allowance.getBulletinSigner(handle.userSession.id, DOT_PRODUCT_ID),
+                handle.adapter.allowance.getBulletinSigner(handle.userSession.id, handle.productId),
                 ALLOCATION_TIMEOUT_MS,
                 `Bulletin slot read timed out after ${Math.round(ALLOCATION_TIMEOUT_MS / 1000)}s — ` +
                     `the wallet did not respond.`,

@@ -25,9 +25,6 @@ import {
 import type { TerminalAdapter } from "@parity/product-sdk-terminal";
 import type { UserSession } from "@parity/product-sdk-terminal";
 
-// Compile-time SDK-drift detection lives in allocations.ts (_SDK_COMPAT_PIN);
-// importing it here means a drift fails this suite's compile step too.
-
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------
@@ -68,7 +65,7 @@ describe("requestResourceAllocation (terminal-facet wrapper)", () => {
         terminalMock.mockClear();
     });
 
-    test("forwards session, adapter, resources, and onExisting to terminal", async () => {
+    test("forwards session, adapter, resources, onExisting and productId to terminal", async () => {
         const terminalMock = await getTerminalMock();
         const expectedOutcomes: AllocationOutcome[] = [
             { tag: "Allocated", value: {} },
@@ -76,17 +73,17 @@ describe("requestResourceAllocation (terminal-facet wrapper)", () => {
         terminalMock.mockResolvedValueOnce(expectedOutcomes);
 
         const session = fakeSession();
-        const adapter = fakeAdapter("my-product.dot");
+        const adapter = fakeAdapter("my-product");
         const resources: AllocatableResource[] = [{ tag: "BulletInAllowance", value: undefined }];
 
-        const result = await requestResourceAllocation(session, adapter, resources, "Ignore");
+        const result = await requestResourceAllocation(session, adapter, "my-product.paseo", resources, "Ignore");
 
         expect(terminalMock).toHaveBeenCalledOnce();
         const [calledSession, calledAdapter, calledResources, calledOptions] = terminalMock.mock.calls[0];
         expect(calledSession).toBe(session);
         expect(calledAdapter).toBe(adapter);
         expect(calledResources).toBe(resources);
-        expect(calledOptions).toEqual({ onExisting: "Ignore" });
+        expect(calledOptions).toEqual({ onExisting: "Ignore", productId: "my-product.paseo" });
         expect(result).toEqual(expectedOutcomes);
     });
 
@@ -94,7 +91,7 @@ describe("requestResourceAllocation (terminal-facet wrapper)", () => {
         const terminalMock = await getTerminalMock();
         terminalMock.mockResolvedValueOnce([]);
 
-        await requestResourceAllocation(fakeSession(), fakeAdapter());
+        await requestResourceAllocation(fakeSession(), fakeAdapter(), "test-app.paseo");
 
         const [, , calledResources] = terminalMock.mock.calls[0];
         expect(calledResources).toBe(DEFAULT_RESOURCES);
@@ -104,7 +101,7 @@ describe("requestResourceAllocation (terminal-facet wrapper)", () => {
         const terminalMock = await getTerminalMock();
         terminalMock.mockResolvedValueOnce([]);
 
-        await requestResourceAllocation(fakeSession(), fakeAdapter());
+        await requestResourceAllocation(fakeSession(), fakeAdapter(), "test-app.paseo");
 
         const [, , , calledOptions] = terminalMock.mock.calls[0];
         expect(calledOptions?.onExisting).toBe("Ignore");
@@ -115,9 +112,9 @@ describe("requestResourceAllocation (terminal-facet wrapper)", () => {
         terminalMock.mockRejectedValueOnce(new Error("mobile timed out"));
 
         await expect(
-            requestResourceAllocation(fakeSession(), fakeAdapter()),
-        ).rejects.toThrow("mobile timed out",
-            ">> FAIL: requestResourceAllocation: terminal errors must propagate to caller");
+            requestResourceAllocation(fakeSession(), fakeAdapter(), "test-app.paseo"),
+            ">> FAIL: requestResourceAllocation: terminal errors must propagate to caller",
+        ).rejects.toThrow("mobile timed out");
     });
 });
 
@@ -129,7 +126,7 @@ describe("summarizeOutcomes", () => {
     const resources: AllocatableResource[] = [
         { tag: "BulletInAllowance", value: undefined },
         { tag: "StatementStoreAllowance", value: undefined },
-        { tag: "SmartContractAllowance", value: 0 },
+        { tag: "SmartContractAllowance", value: { tag: "Index", value: 0 } },
     ];
 
     test("buckets outcomes by tag, mapping outcomes[i] → resources[i]", () => {
@@ -175,9 +172,16 @@ describe("summarizeOutcomes", () => {
         // codec in host-papp (reached via product-sdk-terminal) retains 'BulletInAllowance'.
         // Ours must match the codec or the SCALE encoder silently mis-encodes the variant.
         const bulletinEntry = DEFAULT_RESOURCES.find((r) => r.tag.startsWith("Bullet"));
-        expect(bulletinEntry?.tag).toBe(
-            "BulletInAllowance",
+        expect(
+            bulletinEntry?.tag,
             ">> FAIL: allocations tag: must match the SSO codec spelling in product-sdk-terminal (BulletInAllowance — host-api's v0.8 'BulletinAllowance' rename does NOT apply to the SSO surface)",
-        );
+        ).toBe("BulletInAllowance");
+    });
+
+    test("DEFAULT_RESOURCES funds PGAS to the default product account with a tagged Index", () => {
+        // A bare number reaches the phone but breaks the terminal's allowance
+        // cache key, which reads `value.tag`.
+        const pgas = DEFAULT_RESOURCES.find((r) => r.tag === "SmartContractAllowance");
+        expect(pgas?.value).toEqual({ tag: "Index", value: 0 });
     });
 });

@@ -78,7 +78,7 @@ describe("hasPersistedSession", () => {
 
 // ── Inline fixture doc (avoids loading environments.json from disk) ──────────
 const FIXTURE_DOC = {
-    environments: [],
+    environments: [{ id: "paseo-next-v2", tld: "paseo" }],
     chains: [
         {
             id: "people",
@@ -105,9 +105,8 @@ describe("buildAuthConfig", async () => {
 
     test("paseo-next-v2 → expected const fields + people endpoint", () => {
         const config = buildAuthConfig(FIXTURE_DOC, "paseo-next-v2");
-        // Identity unified under one id (#885): dappId === productId === hostName === "polkadot-app-deploy".
         assert.equal(config.dappId, "polkadot-app-deploy", ">> FAIL: auth-config: dappId mismatch");
-        assert.equal(config.productId, "polkadot-app-deploy", ">> FAIL: auth-config: productId must equal dappId (unified identity, #885)");
+        assert.equal(config.productId, "polkadot-app-deploy.paseo", ">> FAIL: auth-config: productId must carry the env's TLD (RFC-0022)");
         assert.equal(config.derivationIndex, 0, ">> FAIL: auth-config: derivationIndex mismatch");
         assert.equal(config.hostName, "polkadot-app-deploy", ">> FAIL: buildAuthConfig: hostName must be the wallet-facing app name (unified identity)");
         assert.ok(!("metadataUrl" in config), ">> FAIL: buildAuthConfig: metadataUrl must be gone — v0.8 removed the wallet-fetched metadata document");
@@ -117,6 +116,31 @@ describe("buildAuthConfig", async () => {
             ["wss://paseo-people-next-system-rpc.polkadot.io"],
             ">> FAIL: auth-config: paseo-next-v2 people endpoint mismatch",
         );
+    });
+
+    test("env without a tld → productId uses the default .dot TLD", () => {
+        const config = buildAuthConfig(FIXTURE_DOC, "multi-env");
+        assert.equal(config.productId, "polkadot-app-deploy.dot",
+            ">> FAIL: auth-config: an env with no tld must fall back to .dot, like DotNS names");
+    });
+
+    test("env without a tld → productId uses the People chain's suffix when given", () => {
+        assert.equal(buildAuthConfig(FIXTURE_DOC, "multi-env", "testnet").productId, "polkadot-app-deploy.testnet",
+            ">> FAIL: auth-config: the chain's NetworkSuffix must fill in for a missing tld");
+        assert.equal(buildAuthConfig(FIXTURE_DOC, "paseo-next-v2", "testnet").productId, "polkadot-app-deploy.paseo",
+            ">> FAIL: auth-config: an env's own tld must win over the chain suffix");
+    });
+
+    test("bundled environments give the TLD each phone network reports", async () => {
+        // The phone reads NetworkSuffix.NetworkSuffix from its People chain ("paseo" on
+        // paseo-next-v2, "dot" on devnet's People chain) and Android drops
+        // ProductSubtreeRequest when the product id's TLD differs.
+        const { readFile } = await import("node:fs/promises");
+        const doc = JSON.parse(await readFile(new URL("../assets/environments.json", import.meta.url), "utf8"));
+        assert.equal(buildAuthConfig(doc, "paseo-next-v2").productId, "polkadot-app-deploy.paseo",
+            ">> FAIL: auth-config: paseo-next-v2 product id must end in .paseo");
+        assert.equal(buildAuthConfig(doc, "devnet").productId, "polkadot-app-deploy.dot",
+            ">> FAIL: auth-config: devnet has no tld, so its fallback must match its chain's .dot");
     });
 
     test("string[] wss → peopleEndpoints is array", () => {
@@ -153,6 +177,33 @@ describe("buildAuthConfig", async () => {
             /people/i,
             ">> FAIL: auth-config: should throw when env has no people endpoint",
         );
+    });
+});
+
+describe("readNetworkSuffix", async () => {
+    const { readNetworkSuffix } = await import("../dist/auth-config.js");
+    const { WebSocketServer } = await import("ws");
+
+    async function withStorageServer(result, fn) {
+        const server = new WebSocketServer({ port: 0 });
+        await new Promise((r) => server.once("listening", r));
+        server.on("connection", (ws) => ws.on("message", () => ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, result }))));
+        try {
+            return await fn(`ws://127.0.0.1:${server.address().port}`);
+        } finally {
+            await new Promise((r) => server.close(r));
+        }
+    }
+
+    test("decodes the SCALE string the People chain stores", async () => {
+        // "testnet" as stored on previewnet: compact length 7 (0x1c) + bytes.
+        const suffix = await withStorageServer("0x1c746573746e6574", (url) => readNetworkSuffix([url]));
+        assert.equal(suffix, "testnet", ">> FAIL: readNetworkSuffix must decode the stored suffix");
+    });
+
+    test("null when the chain has no suffix", async () => {
+        const suffix = await withStorageServer(null, (url) => readNetworkSuffix([url]));
+        assert.equal(suffix, null, ">> FAIL: readNetworkSuffix must return null when NetworkSuffix is unset");
     });
 });
 

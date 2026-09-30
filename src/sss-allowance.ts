@@ -75,22 +75,43 @@ export function sssStorageKey(pubkey: Uint8Array): string {
  *   - `false` — allowance absent / expired (user must re-login)
  *   - `null`  — could not determine (network error or timeout; caller decides whether to block)
  */
-export function checkSSSAllowance(
+export async function checkSSSAllowance(
     pubkey: Uint8Array,
     peopleEndpoints: string[],
     timeoutMs = 5000,
 ): Promise<boolean | null> {
+    let storageKey: string;
+    try {
+        storageKey = sssStorageKey(pubkey);
+    } catch {
+        return null;
+    }
+    const value = await readStorageValue(storageKey, peopleEndpoints, timeoutMs);
+    return value === undefined ? null : value !== null;
+}
+
+/**
+ * One `state_getStorage` call against the first endpoint.
+ *
+ * @returns the hex value, `null` when the key is absent or empty, or
+ *   `undefined` when the read failed or timed out.
+ */
+export function readStorageValue(
+    storageKey: string,
+    endpoints: string[],
+    timeoutMs = 5000,
+): Promise<string | null | undefined> {
     return new Promise((resolve) => {
-        const endpoint = peopleEndpoints[0];
+        const endpoint = endpoints[0];
         if (!endpoint) {
-            resolve(null);
+            resolve(undefined);
             return;
         }
 
         let settled = false;
         let timer: ReturnType<typeof setTimeout> | null = null;
 
-        function done(value: boolean | null) {
+        function done(value: string | null | undefined) {
             if (settled) return;
             settled = true;
             if (timer !== null) clearTimeout(timer);
@@ -102,22 +123,15 @@ export function checkSSSAllowance(
         try {
             ws = new WebSocket(endpoint);
         } catch {
-            resolve(null);
+            resolve(undefined);
             return;
         }
 
-        timer = setTimeout(() => done(null), timeoutMs);
+        timer = setTimeout(() => done(undefined), timeoutMs);
 
-        ws.on("error", () => done(null));
+        ws.on("error", () => done(undefined));
 
         ws.on("open", () => {
-            let storageKey: string;
-            try {
-                storageKey = sssStorageKey(pubkey);
-            } catch {
-                done(null);
-                return;
-            }
             const request = JSON.stringify({
                 jsonrpc: "2.0",
                 id: 1,
@@ -125,19 +139,16 @@ export function checkSSSAllowance(
                 params: [storageKey],
             });
             ws.send(request, (err?: Error) => {
-                if (err) done(null);
+                if (err) done(undefined);
             });
         });
 
         ws.on("message", (data: Buffer | string) => {
             try {
                 const msg = JSON.parse(data.toString()) as { result?: string | null };
-                const result = msg.result;
-                // Non-null and not "0x" means the key is present in storage.
-                const present = result != null && result !== "0x";
-                done(present);
+                done(msg.result && msg.result !== "0x" ? msg.result : null);
             } catch {
-                done(null);
+                done(undefined);
             }
         });
     });

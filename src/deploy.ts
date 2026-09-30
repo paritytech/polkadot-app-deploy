@@ -4,7 +4,7 @@ import * as path from "path";
 import { execSync } from "child_process";
 import { CLI_NAME } from "./cli-name.js";
 import { resolveEffectiveMnemonic } from "./mnemonic.js";
-import { hasPersistedSession, STALE_SESSION_DEPLOY_MESSAGE, DOT_DAPP_ID, DOT_PRODUCT_ID, getPeopleChainEndpoints } from "./auth-config.js";
+import { hasPersistedSession, STALE_SESSION_DEPLOY_MESSAGE, getPeopleChainEndpoints } from "./auth-config.js";
 import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
@@ -46,7 +46,7 @@ import {
   BulletinSlotAuthError,
 } from "./storage-signer.js";
 import { resolveStorageSigner } from "./deploy-actors.js";
-import { requestResourceAllocation, createSlotAccountSigner, BULLETIN_RESOURCE } from "./auth/index.js";
+import { requestResourceAllocation, createSlotAccountSigner, BULLETIN_RESOURCE, SESSION_EXPIRED_MESSAGE } from "./auth/index.js";
 
 export interface DeployResult {
   domainName: string;
@@ -3591,11 +3591,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       // through to the authoritative read on a miss. See sss-allowance-cache.ts.
       const allowed = await preflightSssAllowance(statementAccount, () => getPeopleChainEndpoints(envId));
       if (allowed === false) {
-        throw new NonRetryableError(
-          "Session signing allowance has expired (~2-3 days after login). " +
-          `Run \`${CLI_NAME} logout\`, then \`${CLI_NAME} login\`, to renew ` +
-          "(login alone won't refresh a stale session).",
-        );
+        throw new NonRetryableError(SESSION_EXPIRED_MESSAGE);
       }
       // allowed === null → People chain unreachable; don't block the deploy.
     } catch (e) {

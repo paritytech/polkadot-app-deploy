@@ -24,7 +24,7 @@
  *   - sending the AP request to the paired mobile wallet
  *   - the `onExisting` policy (default auto-picks "Ignore" unless all requested
  *     resources are already slot-table cached, then "Increase")
- *   - caching granted key material to disk as `{appId}_AllowanceKeys.json`
+ *   - caching granted key material to disk as `{productId}_AllowanceKeys.json`
  *     (the same file our storage-signer reads — verified compat-stable in PR #855)
  *
  * Wire format (SCALE-derived, mirrors host-papp's
@@ -41,34 +41,12 @@ import type { TerminalAdapter } from "@parity/product-sdk-terminal";
 import {
     requestResourceAllocation as terminalRequestResourceAllocation,
     createSlotAccountSigner as terminalCreateSlotAccountSigner,
+    type AllocatableResource,
+    type OnExistingAllowancePolicy,
 } from "@parity/product-sdk-terminal/host";
 
-/**
- * Structural mirror of host-papp's `ApAllocatableResource` codec type. We
- * declare it locally because host-papp's package root doesn't re-export the
- * codec types yet — when it does (and product-sdk-terminal threads them
- * through) this can be replaced with a direct import.
- *
- *   StatementStoreAllowance — write to the SSS (host_chat, allowance ring).
- *   BulletInAllowance       — write to Bulletin (TransactionStorage.store).
- *   SmartContractAllowance  — PGAS sponsoring for Revive contract calls.
- *                             The `value` is the derivation index of the
- *                             product account (0 for the default account).
- *   AutoSigning             — surrender the product-account signing key to
- *                             the host so it can sign on the user's behalf
- *                             without per-call prompts. Not used today.
- *
- * NOTE: host-api v0.8 renamed this variant to 'BulletinAllowance', but the
- * SSO resource-allocation codec (host-papp, which this path reaches via
- * product-sdk-terminal) retains the old 'BulletInAllowance' spelling as of
- * host-papp 0.8.5 / terminal 0.3.1. Ours must match the SSO codec — the
- * _SDK_COMPAT_PIN below fails the build if the SDK's spelling ever changes.
- */
-export type AllocatableResource =
-    | { tag: "StatementStoreAllowance"; value: undefined }
-    | { tag: "BulletInAllowance"; value: undefined }
-    | { tag: "SmartContractAllowance"; value: number }
-    | { tag: "AutoSigning"; value: undefined };
+// The SSO codec spells it `BulletInAllowance`; host-api's `BulletinAllowance` does not apply here.
+export type { AllocatableResource, OnExistingAllowancePolicy } from "@parity/product-sdk-terminal/host";
 
 /**
  * Outcome of one allocation. We don't read the inner `Allocated` payload
@@ -84,8 +62,6 @@ export type AllocationOutcome =
 /** Tag-only view, handy for downstream code that doesn't care about payloads. */
 export type ResourceTag = AllocatableResource["tag"];
 
-export type OnExistingAllowancePolicy = "Ignore" | "Increase";
-
 /**
  * Default mobile-granted resource set for a CLI product account: write access
  * to the statement store + Bulletin, plus PGAS sponsoring for the default
@@ -94,17 +70,8 @@ export type OnExistingAllowancePolicy = "Ignore" | "Increase";
 export const DEFAULT_RESOURCES: AllocatableResource[] = [
     { tag: "BulletInAllowance", value: undefined },
     { tag: "StatementStoreAllowance", value: undefined },
-    // derivation index 0 = the default product account.
-    { tag: "SmartContractAllowance", value: 0 },
+    { tag: "SmartContractAllowance", value: { tag: "Index", value: 0 } },
 ];
-
-// Compile-time pin: DEFAULT_RESOURCES must be assignable to the SDK's own
-// resource type derived from UserSession["requestResourceAllocation"]. If this
-// assignment ever fails to compile, our spelling has drifted from the SSO codec
-// — fix ours, not the SDK's. Same derivation as product-sdk-terminal/dist/host.d.ts:53.
-type _SdkResource = Parameters<UserSession["requestResourceAllocation"]>[0]["resources"][number];
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
-const _SDK_COMPAT_PIN: _SdkResource[] = DEFAULT_RESOURCES;
 
 /**
  * The BulletInAllowance resource singleton. Callers that only need this one
@@ -117,7 +84,7 @@ export const BULLETIN_RESOURCE: AllocatableResource = { tag: "BulletInAllowance"
  * Send a `host_request_resource_allocation` request over the user's active
  * session. The host (mobile wallet) prompts the user to approve and returns
  * one outcome per requested resource in order. Granted key material is cached
- * to disk by the terminal facet (`{appId}_AllowanceKeys.json`) so subsequent
+ * to disk by the terminal facet (`{productId}_AllowanceKeys.json`) so subsequent
  * calls (and the storage-signer reader) find it without a second wallet prompt.
  *
  * Throws on transport-level failures (Statement Store unreachable, encryption
@@ -131,10 +98,11 @@ export const BULLETIN_RESOURCE: AllocatableResource = { tag: "BulletInAllowance"
 export async function requestResourceAllocation(
     session: UserSession,
     adapter: TerminalAdapter,
+    productId: string,
     resources: AllocatableResource[] = DEFAULT_RESOURCES,
     onExisting: OnExistingAllowancePolicy = "Ignore",
 ): Promise<AllocationOutcome[]> {
-    const outcomes = await terminalRequestResourceAllocation(session, adapter, resources, { onExisting });
+    const outcomes = await terminalRequestResourceAllocation(session, adapter, resources, { onExisting, productId });
     return outcomes as AllocationOutcome[];
 }
 
@@ -167,7 +135,7 @@ export function summarizeOutcomes(
 
 /**
  * Read a previously allocated slot signer from the terminal cache
- * (`{appId}_AllowanceKeys.json`) written by `requestResourceAllocation`.
+ * (`{productId}_AllowanceKeys.json`) written by `requestResourceAllocation`.
  *
  * Returns `null` on a cache miss — never triggers a phone prompt. Use this
  * instead of `adapter.allowance.getBulletinSigner()` when the allocation has
@@ -182,6 +150,7 @@ export function summarizeOutcomes(
 export async function createSlotAccountSigner(
     adapter: TerminalAdapter,
     resource: AllocatableResource,
+    productId: string,
 ): Promise<import("polkadot-api").PolkadotSigner | null> {
-    return terminalCreateSlotAccountSigner(adapter, resource);
+    return terminalCreateSlotAccountSigner(adapter, resource, productId);
 }

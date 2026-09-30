@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { resolveDeployActors, MainnetDefaultWorkerError } from "../dist/deploy-actors.js";
 import { SignerNotAvailableError } from "../dist/auth/index.js";
+import { NonRetryableError } from "../dist/errors.js";
 
 // Fake authClient: getSessionSigner returns a handle with addresses + destroy.
 // Includes `signer` + `userSession` so the session branch of resolveSigner
@@ -65,6 +66,18 @@ test("session present on disk but not loadable (#234, was #35): FAILS FAST, does
     ),
     SignerNotAvailableError,
     ">> FAIL: #234: an unloadable session must fail fast (throw), not silently fall back to a no-transfer deploy on the default dev key",
+  );
+});
+
+test("transfer mode: a phone that does not return the account key surfaces that error, not a stale-session one", async () => {
+  const phoneError = new NonRetryableError('The phone did not return the account key for "polkadot-app-deploy.testnet"');
+  await assert.rejects(
+    () => resolveDeployActors(
+      { getSessionSigner: async () => { throw phoneError; } },
+      { suri: undefined, transferEnabled: true, isTestnet: true, sessionPresent: true },
+    ),
+    (e) => e === phoneError,
+    ">> FAIL: transfer mode must pass the phone/network error through instead of reporting a stale session",
   );
 });
 

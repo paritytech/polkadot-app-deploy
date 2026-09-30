@@ -5,8 +5,8 @@ import { resolveSigner, SignerNotAvailableError } from "./auth/index.js";
 import type { ResolvedSigner, AuthClient, AllocatableResource } from "./auth/index.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { BULLETIN_RESOURCE } from "./auth/index.js";
-import { DOT_PRODUCT_ID } from "./auth-config.js";
 import { DEFAULT_MNEMONIC } from "./dotns.js";
+import { NonRetryableError } from "./errors.js";
 
 /** Default worker on testnet when no --mnemonic/--suri is supplied: the repo's
  *  default dev mnemonic. Its bare root (no derivation) is the funded, PopFull,
@@ -49,14 +49,15 @@ export async function resolveDeployActors(
     // Worker is a LOCAL dev/mnemonic signer (Alice by default) — it signs the
     // whole deploy, so the mobile never signs.
     const worker = await resolveSigner(authClient, { suri: suri ?? DEFAULT_WORKER_SURI });
-    // Recipient = signed-in product H160, derived locally (no mobile popup).
-    // The on-disk probe (hasPersistedSession) said a session exists, but the SSO
-    // stack is what actually loads it — and the two can disagree.
+    // Recipient = signed-in product H160. The on-disk probe (hasPersistedSession)
+    // said a session exists, but the SSO stack is what actually loads it, and the
+    // two can disagree.
     let handle: Awaited<ReturnType<AuthClient["getSessionSigner"]>> = null;
     try {
       handle = await authClient.getSessionSigner();
-    } catch {
-      // An errored load is treated the same as an unloadable session (below).
+    } catch (e) {
+      // Pass the phone's error through; any other failed load counts as unloadable (below).
+      if (e instanceof NonRetryableError) throw e;
       handle = null;
     }
     if (!handle) {
@@ -129,6 +130,7 @@ export interface StorageSignerDeps {
   requestResourceAllocation: (
     userSession: any,
     adapter: any,
+    productId: string,
     resources: AllocatableResource[],
   ) => Promise<{ tag: string; value?: unknown }[]>;
 
@@ -136,7 +138,7 @@ export interface StorageSignerDeps {
    * Read the cached slot account signer written by requestResourceAllocation.
    * Returns null on a miss (graceful fallback).
    */
-  createSlotAccountSigner?: (adapter: any, resource: AllocatableResource) => Promise<PolkadotSigner | null>;
+  createSlotAccountSigner?: (adapter: any, resource: AllocatableResource, productId: string) => Promise<PolkadotSigner | null>;
 
   /** Encode a public key as SS58. */
   ss58Encode: (publicKey: Uint8Array) => string;
@@ -165,22 +167,22 @@ export interface StorageSignerDeps {
  * no --suri), this function returns null immediately without touching the SSO stack.
  *
  * @param session  The resolved session object from resolveDeployActors (or null when
- *                 no session is present). Must have { userSession, adapter } shape.
+ *                 no session is present). Must have { userSession, adapter, productId } shape.
  * @param deps     Injectable dependencies for testing. Production callers pass
  *                 undefined to use the real auth functions.
  * @returns        A { signer, slotAddress, owned: true } result or null (→ pool).
  */
 export async function resolveStorageSigner(
-  session: { userSession: { id: string }; adapter: any } | null | undefined,
+  session: { userSession: { id: string }; adapter: any; productId: string } | null | undefined,
   deps: StorageSignerDeps,
 ): Promise<StorageSignerResult | null> {
   if (!session?.userSession || !session?.adapter) return null;
 
-  const { userSession, adapter } = session;
+  const { userSession, adapter, productId } = session;
 
   try {
     // Step 3: cache-hit — getBulletinSigner reads the AES-encrypted terminal cache.
-    const signerResult = await deps.getBulletinSigner(userSession.id, DOT_PRODUCT_ID, adapter);
+    const signerResult = await deps.getBulletinSigner(userSession.id, productId, adapter);
 
     if (signerResult.isOk() && signerResult.value) {
       const signer = signerResult.value;
@@ -204,6 +206,7 @@ export async function resolveStorageSigner(
     const outcomes = await deps.requestResourceAllocation(
       userSession,
       adapter,
+      productId,
       [BULLETIN_RESOURCE],
     );
 
@@ -217,7 +220,7 @@ export async function resolveStorageSigner(
     // Use createSlotAccountSigner to read from the terminal cache written by
     // requestResourceAllocation (guaranteed cache-hit, no second phone prompt).
     if (deps.createSlotAccountSigner) {
-      const slotSigner = await deps.createSlotAccountSigner(adapter, BULLETIN_RESOURCE);
+      const slotSigner = await deps.createSlotAccountSigner(adapter, BULLETIN_RESOURCE, productId);
       if (slotSigner) {
         const slotAddress = deps.ss58Encode(slotSigner.publicKey);
         return { signer: slotSigner, slotAddress, owned: true };

@@ -13,6 +13,7 @@ export {
     DEFAULT_RESOURCES,
     createSlotAccountSigner,
     BULLETIN_RESOURCE,
+    SESSION_EXPIRED_MESSAGE,
 } from "./vendor/index.js";
 export type {
     AuthConfig,

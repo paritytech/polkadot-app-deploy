@@ -1,4 +1,4 @@
-import { test, describe, beforeEach, afterEach } from "node:test";
+import { test, describe, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { collectUnitTestFiles } from "../scripts/run-unit-tests.mjs";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
@@ -2035,6 +2035,13 @@ describe("classifyErrorKind", () => {
       "signer.message_too_large",
     );
   });
+  test("signer.message_too_large matches product-sdk-terminal 0.10's transaction signing error", () => {
+    assert.strictEqual(
+      classifyErrorKind("Chunk 2 failed after 3 retries: chunk(nonce:0) subscription error: Mobile transaction signing rejected: message too big"),
+      "signer.message_too_large",
+      ">> FAIL: telemetry: the SDK's signTx error text must still classify as signer.message_too_large",
+    );
+  });
 
   // chain.tx_timeout now matches embedded occurrences (no ^ anchor)
   test("chain.tx_timeout: commit timed out embedded in chunk failure", () => {
@@ -2212,24 +2219,23 @@ describe("classifyErrorKind", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 8d. createSessionSigner — PAPI-native signRaw routing
+// 8d. createSessionSigner: transactions via createTransaction, bytes via signRaw
 // ---------------------------------------------------------------------------
 describe("createSessionSigner (vendored)", () => {
-  // DEV phrase gives a stable, valid Ristretto point for rootAccountId so that
-  // sessionRootPublicKey + deriveProductPublicKey don't throw in curve math.
+  // DEV phrase gives a stable, valid Ristretto point for the subtree key the
+  // stub phone returns, so the product-account soft derivation succeeds.
   const DEV_PHRASE = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
-
-  async function getRootPublicKey() {
-    const { seedToAccount } = await import("@parity/product-sdk-keys");
-    return seedToAccount(DEV_PHRASE, "").publicKey;
-  }
+  // The SDK caches the subtree key on disk; keep it out of the real ~/.polkadot-apps.
+  const subtreeOptions = { storageDir: fs.mkdtempSync(path.join(os.tmpdir(), "bd-subtree-")) };
+  after(() => fs.rmSync(subtreeOptions.storageDir, { recursive: true, force: true }));
 
   async function makeStubSession(opts = {}) {
-    const rootAccountId = await getRootPublicKey();
+    const { seedToAccount } = await import("@parity/product-sdk-keys");
+    const subtreeKey = seedToAccount(DEV_PHRASE, "").publicKey;
     const captured = { signRaw: [], signPayload: [] };
     return {
-      rootAccountId,
-      remoteAccount: { accountId: rootAccountId },
+      id: `stub-${Math.random()}`,
+      getProductSubtree: async () => ({ isErr: () => false, value: subtreeKey }),
       signRaw: async (req) => {
         captured.signRaw.push(req);
         return opts.signRawResult ?? { isErr: () => false, value: { signature: new Uint8Array(64) } };
@@ -2245,17 +2251,12 @@ describe("createSessionSigner (vendored)", () => {
   test("signTx never routes through signPayload (anti-regression: message-too-big)", async () => {
     // Core regression guard: the old PJS-based path called session.signPayload,
     // sending the full 2 MB chunk calldata as the 'method' field. Android rejects
-    // that with "message too big". The new path (getPolkadotSigner + signRaw Payload)
-    // must never call signPayload regardless of how signTx is invoked.
-    //
-    // NOTE: verifying session.signRaw IS called requires valid PAPI metadata
-    // (decAnyMetadata throws on empty bytes). That contract is covered by the
-    // Payload-tag unit in makeTxSignCallback: the sign callback passed to
-    // getPolkadotSigner always routes to session.signRaw({ tag: "Payload", ... }).
-    // The signBytes test below verifies the tag pattern on the sibling callback.
+    // that with "message too big". signTx goes through session.createTransaction
+    // and must never call signPayload. Empty metadata makes signTx throw before
+    // it sends anything, which is enough to check signPayload stays unused.
     const { createSessionSigner } = await import("../dist/auth/vendor/index.js");
     const session = await makeStubSession();
-    const signer = createSessionSigner(session, { productId: "test", derivationIndex: 0 });
+    const signer = await createSessionSigner(session, { productId: "test", derivationIndex: 0 }, subtreeOptions);
 
     try {
       await signer.signTx(new Uint8Array(300), {}, new Uint8Array(0), 0);
@@ -2267,7 +2268,7 @@ describe("createSessionSigner (vendored)", () => {
   test("signBytes routes through signRaw with Bytes tag", async () => {
     const { createSessionSigner } = await import("../dist/auth/vendor/index.js");
     const session = await makeStubSession();
-    const signer = createSessionSigner(session, { productId: "test", derivationIndex: 0 });
+    const signer = await createSessionSigner(session, { productId: "test", derivationIndex: 0 }, subtreeOptions);
 
     try {
       await signer.signBytes(new Uint8Array([1, 2, 3]));
@@ -2277,6 +2278,11 @@ describe("createSessionSigner (vendored)", () => {
     const rawCalls = session.captured.signRaw;
     assert.ok(rawCalls.length > 0);
     assert.strictEqual(rawCalls[rawCalls.length - 1].data.tag, "Bytes");
+    assert.deepStrictEqual(
+      rawCalls[rawCalls.length - 1].productAccountId,
+      ["test", { tag: "Index", value: 0 }],
+      ">> FAIL: signBytes: host-papp 0.10 needs a tagged derivation index in productAccountId",
+    );
   });
 
   test("mobile rejection surfaces as 'Mobile signing rejected:' prefix", async () => {
@@ -2284,7 +2290,7 @@ describe("createSessionSigner (vendored)", () => {
     const session = await makeStubSession({
       signRawResult: { isErr: () => true, error: { message: "user declined" } },
     });
-    const signer = createSessionSigner(session, { productId: "test", derivationIndex: 0 });
+    const signer = await createSessionSigner(session, { productId: "test", derivationIndex: 0 }, subtreeOptions);
 
     await assert.rejects(
       () => signer.signBytes(new Uint8Array([1])),
@@ -25540,11 +25546,13 @@ describe("resolveStorageSigner (user-first storage signer, #19)", () => {
   const fakeSigner = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(64), signBytes: async () => new Uint8Array(64) };
   const SLOT_ADDR = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
   const SESSION_ID = "test-session-id";
+  const PRODUCT_ID = "polkadot-app-deploy.paseo";
 
   // Helper: build a minimal session mock
   function makeSession() {
     return {
       userSession: { id: SESSION_ID },
+      productId: PRODUCT_ID,
       adapter: {
         allowance: {
           getBulletinSigner: async () => ({ isOk: () => true, isErr: () => false, value: fakeSigner }),
@@ -25581,6 +25589,7 @@ describe("resolveStorageSigner (user-first storage signer, #19)", () => {
     const result = await resolveStorageSigner(session, {
       getBulletinSigner: async (sessionId, productId) => {
         assert.strictEqual(sessionId, SESSION_ID, ">> FAIL: resolveStorageSigner cache-hit: must call getBulletinSigner with correct sessionId");
+        assert.strictEqual(productId, PRODUCT_ID, ">> FAIL: resolveStorageSigner cache-hit: must read the slot under the session's product id");
         return ok(fakeSigner);
       },
       requestResourceAllocation: async () => { throw new Error("should not be called on cache-hit"); },
@@ -25603,13 +25612,19 @@ describe("resolveStorageSigner (user-first storage signer, #19)", () => {
     const session = makeSession();
     const result = await resolveStorageSigner(session, {
       getBulletinSigner: async () => err("NotAvailable"),
-      requestResourceAllocation: async (userSession, adapter, resources) => {
+      requestResourceAllocation: async (userSession, adapter, productId, resources) => {
+        assert.strictEqual(productId, PRODUCT_ID,
+          ">> FAIL: resolveStorageSigner miss+approve: allocation must be scoped to the session's product id");
         assert.ok(resources.some(r => r.tag === "BulletInAllowance"),
           ">> FAIL: resolveStorageSigner miss+approve: requestResourceAllocation must request BulletInAllowance");
         return [{ tag: "Allocated", value: { slotAccountKey: new Uint8Array(64) } }];
       },
       ss58Encode: () => SLOT_ADDR,
-      createSlotAccountSigner: async () => fakeSigner,
+      createSlotAccountSigner: async (adapter, resource, productId) => {
+        assert.strictEqual(productId, PRODUCT_ID,
+          ">> FAIL: resolveStorageSigner miss+approve: slot cache read must use the session's product id");
+        return fakeSigner;
+      },
       promptBeforeAllocation: () => { promptCalled = true; },
     });
     assert.ok(promptCalled,

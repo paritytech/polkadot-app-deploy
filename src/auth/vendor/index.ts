@@ -38,6 +38,7 @@ export {
     deriveProductPublicKey,
     sessionRootPublicKey,
     INCOMPLETE_SESSION_MESSAGE,
+    SESSION_EXPIRED_MESSAGE,
 } from "./sessionSigner.js";
 export type { ProductAccountRef } from "./sessionSigner.js";
 

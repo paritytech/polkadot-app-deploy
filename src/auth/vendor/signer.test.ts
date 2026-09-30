@@ -75,9 +75,11 @@ describe("resolveSigner", () => {
     test("no suri + a session → session signer (source 'session')", async () => {
         const fakeHandle = {
             address: "5SESSION",
-            addresses: { rootAddress: "r", productAddress: "5SESSION", productH160: "0xabc" },
+            addresses: { rootAddress: "r", productAddress: "5SESSION", productH160: "0xabc" as const },
+            productId: "polkadot-app-deploy.paseo",
             signer: {} as never,
             userSession: {} as never,
+            adapter: {} as never,
             destroy() {},
         };
         const r = await resolveSigner(stubAuthClient(fakeHandle));

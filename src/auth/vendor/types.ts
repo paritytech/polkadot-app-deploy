@@ -26,7 +26,8 @@ export interface AuthConfig {
      *  (`~/.polkadot-apps/${dappId}_*`) and the SSO pairing — each product
      *  gets its own, independently-revocable session. */
     dappId: string;
-    /** Product id used to derive the product account (`/product/{productId}/{index}`). */
+    /** RFC-0022 product id `${dappId}.<network suffix>`; the account is `//product//{productId}/{index}`.
+     *  Logout relies on this shape to clear `${dappId}.*` files. */
     productId: string;
     /** Derivation index of the product account (0 = default). */
     derivationIndex: number;

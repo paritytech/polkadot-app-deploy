@@ -134,6 +134,7 @@ jobs:
       - uses: ./.github/actions/npm-retry
         with:
           run: npm ci
+      - run: npm run typecheck
       - run: npm test
 
       # Static-check the workflows themselves. `yaml.safe_load` only proves a

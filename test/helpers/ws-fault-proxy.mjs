@@ -74,8 +74,11 @@ export async function startFaultProxy(opts = {}) {
   // Global storm deadline for bounded `rapid` mode — set once at proxy start so
   // reconnects can't restart the storm. After this, all rapid drops stop.
   let stormOver = false;
+  let stormTimer = null;
   if (mode === "rapid" && dropDurationMs !== Infinity) {
-    setTimeout(() => { stormOver = true; }, initialDelayMs + dropDurationMs);
+    stormTimer = setTimeout(() => { stormOver = true; }, initialDelayMs + dropDurationMs);
+    // Never the thing that keeps the harness alive; close() also clears it (#1620).
+    stormTimer.unref();
   }
 
   server.on("connection", (clientWs) => {
@@ -200,6 +203,7 @@ try { clientWs.terminate(); } catch { /* socket already gone */ }
     url: `ws://127.0.0.1:${port}`,
     stats,
     async close() {
+      if (stormTimer) { clearTimeout(stormTimer); stormTimer = null; }
       for (const ws of liveSockets) {
         try { ws.close(); } catch {}
       }

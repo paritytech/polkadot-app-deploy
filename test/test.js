@@ -36,7 +36,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   sanitizeRepo, setDeploySentryTag, sampleMemory, initTelemetry,
   setDeployAttribute, __setDeployRootSpanForTest, markDeployFatal,
   flush, closeTelemetry, __setSentryForTest,
-  classifyErrorKind, sanitizeErrorMessage, setDeployError,
+  classifyErrorKind, ERROR_KIND_CATEGORY, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
 import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests, resolvePoolMnemonic, describeIgnoredPoolMnemonicEnv } from "../dist/pool.js";
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
@@ -137,6 +137,19 @@ const NO_FAUCET_SELFSERVE = {
 // ---------------------------------------------------------------------------
 // 1. createCID
 // ---------------------------------------------------------------------------
+// Parses the DeployErrorKind union out of src/telemetry.ts (shared by the kind guards).
+function parseDeployErrorKindUnion() {
+  const src = fs.readFileSync("src/telemetry.ts", "utf8");
+  // Strip `//` comments first: the union is interleaved with them and one
+  // carries a semicolon, which would otherwise end the slice early.
+  const union = src.slice(src.indexOf("export type DeployErrorKind =")).replace(/\/\/[^\n]*/g, "");
+  const kinds = union.slice(0, union.indexOf(";")).match(/'[^']+'/g).map((k) => k.slice(1, -1));
+  // Parse sanity: a broken slice must fail loudly rather than pass vacuously.
+  assert.ok(kinds.length >= 20, `>> FAIL: kind-union parse: only ${kinds.length} DeployErrorKind members parsed from src/telemetry.ts — the parse broke, so the guard was not checking anything`);
+  assert.ok(kinds.includes("unknown"), ">> FAIL: kind-union parse: parsed union does not include 'unknown' — wrong slice of src/telemetry.ts");
+  return kinds;
+}
+
 describe("createCID", () => {
   test("produces a valid CIDv1 for known input", () => {
     const data = new TextEncoder().encode("hello world");
@@ -1816,10 +1829,14 @@ describe("classifyErrorKind", () => {
       "naming.already_owned",
     );
   });
-  test("naming.already_owned: 'owned by' without 'already' does not match", () => {
+  // Since the category is derived from the kind, the looser "owned by" phrasing
+  // must carry a kind (it used to be user-classified by a separate legacy regex).
+  // It lands on the looser trailing rule, not the strict "already owned by 0x..." one.
+  test("naming.already_owned: 'owned by' without 'already' is caught only by the looser rule", () => {
     assert.strictEqual(
       classifyErrorKind("Domain mysite.dot is owned by 0xabc."),
-      "unknown",
+      "naming.already_owned",
+      ">> FAIL: 'owned by' phrasing lost its kind, so it would surface as unknown_error again",
     );
   });
 
@@ -1839,10 +1856,11 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(classifyErrorKind(msg), "naming.governance_reserved",
       `>> FAIL: naming.governance_reserved: owned-by-another variant should classify the same way (uniform 'cannot register it' phrase); got ${classifyErrorKind(msg)}`);
   });
-  test("naming.governance_reserved: message without 'cannot register it' does not match", () => {
+  test("naming.governance_reserved: bare 'Base name is N chars' message is caught only by the looser rule", () => {
     assert.strictEqual(
       classifyErrorKind("Base name is 4 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules)."),
-      "unknown",
+      "naming.governance_reserved",
+      ">> FAIL: bare base-name-length message lost its kind, so it would surface as unknown_error again",
     );
   });
 
@@ -1853,10 +1871,11 @@ describe("classifyErrorKind", () => {
       "naming.subdomain_orphan",
     );
   });
-  test("naming.subdomain_orphan: similar message without 'Cannot deploy' does not match", () => {
+  test("naming.subdomain_orphan: similar message without 'Cannot deploy' is not subdomain_orphan", () => {
     assert.strictEqual(
       classifyErrorKind("parent mysite.dot is owned by 0xabc"),
-      "unknown",
+      "naming.already_owned",
+      ">> FAIL: a bare 'owned by' message must fall to the looser ownership rule, never subdomain_orphan",
     );
   });
   test("naming.subdomain_orphan: 'owned by no one' variant (#1061)", () => {
@@ -2265,14 +2284,7 @@ describe("classifyErrorKind", () => {
   // invisible. Masking is on content, not key, and short enum-like values are
   // masked exactly like long prose. Any new kind must avoid these substrings.
   test("no DeployErrorKind literal contains a Sentry-scrubbed substring", () => {
-    const src = fs.readFileSync("src/telemetry.ts", "utf8");
-    // Strip `//` comments first: the union is interleaved with them and one
-    // carries a semicolon, which would otherwise end the slice early.
-    const union = src.slice(src.indexOf("export type DeployErrorKind =")).replace(/\/\/[^\n]*/g, "");
-    const kinds = union.slice(0, union.indexOf(";")).match(/'[^']+'/g).map(k => k.slice(1, -1));
-    // Parse sanity: a broken slice must fail loudly rather than pass vacuously.
-    assert.ok(kinds.length >= 20, `>> FAIL: kind-scrub guard: parsed only ${kinds.length} DeployErrorKind members from src/telemetry.ts — the union parse broke, so this guard was not actually checking anything`);
-    assert.ok(kinds.includes("unknown"), ">> FAIL: kind-scrub guard: parsed union does not include 'unknown' — wrong slice of src/telemetry.ts");
+    const kinds = parseDeployErrorKindUnion();
     const scrubbed = kinds.filter(k => /auth|secret|credential|password/i.test(k));
     assert.deepStrictEqual(scrubbed, [],
       `>> FAIL: kind-scrub guard: ${scrubbed.join(", ")} contain(s) a substring Sentry's relayPiiConfig masks — the value would render as asterisks in every dashboard grouped by deploy.error_kind. Rename the kind (e.g. storage.rejected, not storage.not_authorized).`);
@@ -2578,6 +2590,140 @@ describe("a missing contract is classified by WHOSE config is wrong", () => {
     const msg = "Could not determine the DotNS ABI profile: contract code is present at POP_RULES, but neither pricingVersion() (v0.5.8-rc1) nor startingPrice() (poprules-startingPrice) answered.";
     assert.equal(classifyDeployError(msg), "environment",
       ">> FAIL: an unsupported chain generation counted as a tool failure");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8e. deploy.error_category / deploy.outcome derive from the kind classifier
+// ---------------------------------------------------------------------------
+describe("error category follows the mechanism classifier", () => {
+  const FUNDING = "DotNS signer 5DfXvJ3K has 6.0323 PAS free; needs \u226516.1000 PAS for register. Testnet auto-top-up via Alice/Bob failed (both also low). Top up at https://faucet.polkadot.io.";
+  const TRANSFER_FAILED = 'Transaction failed: {"type":"Module","value":{"type":"Revive","value":{"type":"TransferFailed"}}}';
+  const CASES = [
+    ["funding.insufficient_balance", FUNDING],
+    ["user.aborted", "aborted by user"],
+    ["funding.transfer_failed", TRANSFER_FAILED],
+  ];
+
+  for (const [kind, msg] of CASES) {
+    test(`${kind}: kind, category, expected flag and outcome agree on a user error`, () => {
+      assert.strictEqual(classifyErrorKind(msg), kind,
+        `>> FAIL: category-from-kind: ${kind}: message classified to a different kind: "${msg}"`);
+      assert.strictEqual(classifyDeployError(msg), "user",
+        `>> FAIL: category-from-kind: ${kind}: category is not 'user', so the Deploy Outcomes widget shows unknown_error for an operator-fixable failure`);
+      assert.strictEqual(isExpectedError(msg), true,
+        `>> FAIL: category-from-kind: ${kind}: not expected, so deploy.sad=true and the span errors for an operator-fixable failure`);
+      assert.strictEqual(computeDeployOutcome(classifyDeployError(msg), false, "other"), "user_error",
+        `>> FAIL: category-from-kind: ${kind}: outcome is not user_error`);
+    });
+  }
+
+  // The kinds added with the single classifier, one verbatim sample each (the table
+  // upstream's classifyErrorKind block carries; p-a-d has no such table).
+  test("kinds added with the single classifier classify their verbatim messages", () => {
+    const SAMPLES = [
+      ["naming.invalid_label", "Invalid domain label: cannot start or end with hyphen"],
+      ["naming.name_unavailable", "Contract reverted: NameNotAvailable(my-domain)"],
+      ["signer.invalid_mnemonic", "Invalid bip39 mnemonic specified"],
+      ["storage.allowance_insufficient", "Account 5CXg... has insufficient Bulletin authorization quota (need 12 txs / 40.0MB, have 60 txs / 30.0MB)"],
+      ["tool.ipfs_missing", "IPFS CLI not installed. Install from: https://docs.ipfs.tech/install/"],
+      ["tool.out_of_memory", "JavaScript heap out of memory"],
+      ["tool.external_signer_unsupported", "External signer mode is not supported with dotns-cli subprocess"],
+      ["chain.chunk_failed", "Chunk 3 failed after 3 retries: upload aborted by user"],
+      ["chain.tx_dropped", "Chunk 3 failed after 3 retries: tx dropped from best chain 5 times"],
+      ["chain.tx_invalid", 'subscription error: {"type":"Invalid","value":{"type":"Custom"}}'],
+      ["chain.not_finalised", "extrinsic not finalised after 120s"],
+      ["dotns.register_failed", "dotns register failed (exit null)"],
+      ["network.endpoints_failed", "All promises were rejected"],
+      ["funding.transfer_failed", 'Transaction failed: {"type":"Module","value":{"type":"Revive","value":{"type":"TransferFailed"}}}'],
+    ];
+    for (const [kind, msg] of SAMPLES) {
+      assert.strictEqual(classifyErrorKind(msg), kind, `>> FAIL: kind-samples: "${msg}" did not classify as ${kind}`);
+    }
+  });
+
+  test("every DeployErrorKind has a category; only unclassified or context-dependent kinds map to 'unknown'", () => {
+    const MAY_BE_UNKNOWN = ["unknown", "naming.contract_unavailable", "naming.contract_function_removed", "dotns.abi_decode_empty"];
+    const valid = new Set(["user", "environment", "internal", "unknown"]);
+    for (const k of parseDeployErrorKindUnion()) {
+      assert.ok(Object.hasOwn(ERROR_KIND_CATEGORY, k),
+        `>> FAIL: kind-category-map: kind "${k}" is missing from ERROR_KIND_CATEGORY`);
+      const v = ERROR_KIND_CATEGORY[k];
+      assert.ok(valid.has(v), `>> FAIL: kind-category-map: kind "${k}" has invalid category ${v}`);
+      if (!MAY_BE_UNKNOWN.includes(k)) {
+        assert.notStrictEqual(v, "unknown", `>> FAIL: kind-category-map: kind "${k}" maps to 'unknown' — classify it or add it to the deliberate list`);
+      }
+    }
+  });
+
+  test("a user-pattern message keeps winning over a generic contract-revert kind", () => {
+    assert.strictEqual(classifyDeployError("Contract reverted: PopError(Name must be lowercase ASCII DNS label)"), "user",
+      ">> FAIL: category-from-kind: contract-revert kind overrode the existing user-error pattern");
+  });
+});
+
+// Regression guard for the ONE classifier. The corpus is every message the
+// classifier tests exercise plus the distinct real deploy errors Sentry saw in a
+// 30-day window (addresses normalised), each with the kind/category/expected the
+// classifier produced when the legacy category regexes were removed. Anything
+// that moves must be justified here, so a classifier edit cannot silently
+// re-attribute fault for real traffic.
+describe("error classification corpus", () => {
+  const corpus = JSON.parse(fs.readFileSync("test/fixtures/error-classification-corpus.json", "utf8"));
+  // Entries whose category/expected or a KNOWN kind changed. unknown -> new kind
+  // with the same category/expected needs no entry (newly classified).
+  const ALLOWED_CHANGES = [
+    { prefix: "Contract reverted: NameNotAvailable(", kind: "naming.name_unavailable", category: "user", expected: true,
+      reason: "NameNotAvailable reverts are the operator's naming problem: own kind, same user category as before" },
+    { prefix: "Contract reverted: PopError(Name must be lowercase", kind: "naming.invalid_label", category: "user", expected: true,
+      reason: "PopError label reverts are the operator's typo: own kind, same user category as before" },
+    { prefix: "Cannot auto-refresh: signer balance", kind: "funding.insufficient_balance", category: "user", expected: true,
+      reason: "signer cannot pay the refresh fee: newly classified as funding, was unknown_error" },
+  ];
+
+  // p-a-d adaptations: its classifier does not thread the InvalidTransaction
+  // variant (bulletin #1256/#1386) and lacks the contract_unavailable /
+  // contract_function_removed split of bulletin #1345 (only its ABI-profile rule
+  // is ported), so entries that depend on either are skipped; the corpus's
+  // "shipped with bulletin-deploy" origin phrase is rewritten to p-a-d's own.
+  const KINDS = new Set(parseDeployErrorKindUnion());
+  const portable = corpus.filter((e) => !e.variant && KINDS.has(e.snapshot.kind) && e.snapshot.kind !== "naming.contract_function_removed");
+  const own = (m) => m.replaceAll("shipped with bulletin-deploy", "shipped with polkadot-app-deploy");
+
+  test("every corpus message keeps its classification unless the change is allow-listed", () => {
+    for (const e of portable) {
+      const now = {
+        kind: classifyErrorKind(own(e.message)),
+        category: classifyDeployError(own(e.message)),
+        expected: isExpectedError(own(e.message)),
+      };
+      const old = e.snapshot;
+      if (now.kind === old.kind && now.category === old.category && now.expected === old.expected) continue;
+      const newlyClassified = old.kind === "unknown" && now.category === old.category && now.expected === old.expected;
+      if (newlyClassified) continue;
+      const allow = ALLOWED_CHANGES.find((a) => e.message.startsWith(a.prefix));
+      assert.ok(allow && allow.kind === now.kind && allow.category === now.category && allow.expected === now.expected,
+        `>> FAIL: corpus: "${e.message.slice(0, 160)}" changed ${old.kind}/${old.category}/${old.expected} -> ${now.kind}/${now.category}/${now.expected} and is not allow-listed with exactly that result`);
+    }
+  });
+
+  test("the allow-list has no stale entries", () => {
+    for (const a of ALLOWED_CHANGES) {
+      assert.ok(corpus.some((e) => e.message.startsWith(a.prefix)),
+        `>> FAIL: corpus: allow-list entry "${a.prefix}" (${a.reason}) matches no corpus message — remove it`);
+    }
+  });
+
+  test("the corpus covers the real Sentry traffic and the classifier tests", () => {
+    assert.ok(corpus.filter((e) => e.sources.includes("sentry")).length >= 400, ">> FAIL: corpus: lost the Sentry-derived messages");
+    assert.ok(corpus.filter((e) => e.sources.includes("test")).length >= 150, ">> FAIL: corpus: lost the test-derived messages");
+  });
+
+  test("contract-address kinds attribute fault by whose config is wrong", () => {
+    const base = "No contract deployed at 0xabc (POP_RULES) env=gamingnet.";
+    assert.strictEqual(classifyDeployError(`${base} This address came from /home/ops/envs.json (environment gamingnet).`), "user");
+    assert.strictEqual(classifyDeployError(`${base} This address came from assets/environments.json shipped with polkadot-app-deploy (environment gamingnet).`), "unknown");
+    assert.strictEqual(classifyDeployError(base), "unknown");
   });
 });
 

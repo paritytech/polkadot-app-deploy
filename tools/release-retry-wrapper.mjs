@@ -52,6 +52,14 @@ export const FLAKE_PATTERNS = [
   // failed. A contract that is genuinely absent answers false and produces a
   // different message, so retrying this cannot mask a missing contract.
   "Code presence at this address could not be verified",
+  // Promise.any AggregateError message: every RPC endpoint in the list failed.
+  // The only Promise.any in src/ is fetchNonce (src/dotns.ts), whose per-endpoint
+  // rejections are all transport-level (WS error/close, 8s timeout, malformed
+  // frame, RPC error) — contract reads and reverts never go through it, so a
+  // deterministic failure cannot produce this string. Evidence (#1627): red s1
+  // direct/js (bulletin 09-29), s-subdomain (p-a-d 10-01), s-inc/kubo (p-a-d
+  // 09-23), each green the next night with no code change.
+  "All promises were rejected",
 ];
 
 // output: combined stdout+stderr text from the child. Any flake pattern

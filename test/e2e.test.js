@@ -878,6 +878,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       // derivation), giving us a distinct signer identity with zero CLI
       // plumbing changes.
       const t = await runBulletinDeploy({
+        expectFail: true,
         args: ["transfer", target, "--to", RECIPIENT_H160, ...envArgs],
         env: { DOTNS_KEY_URI: `${DEFAULT_MNEMONIC}//Bob` },
         timeoutMs: DEPLOY_TIMEOUT_MS,
@@ -946,6 +947,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
+          expectFail: true,
           // S3 needs a label owned by a DIFFERENT account from the deploy signer.
           // `e2eowned.dot` was the historical fixture for PopFull signers but its
           // chain ownership drifted to Alice (see e2e run 26648857693 / v0.7.30-rc.1
@@ -2131,6 +2133,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       const { fixtureDir } = await mutateFixture(RUN_TAG + "-sub-orphan");
       try {
         const { code, stderr } = await runBulletinDeploy({
+          expectFail: true,
           args: buildArgs(fixtureDir, target),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });
@@ -2743,6 +2746,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       // anything itself.
       try {
         const { code, stdout, stderr } = await runBulletinDeploy({
+          expectFail: true,
           args: buildArgs(fixtureDir, `${label}.${tld}`),
           timeoutMs: DEPLOY_TIMEOUT_MS,
         });

@@ -7,7 +7,7 @@
 import "../dist/suppress-localstorage-warning.js";
 
 import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner } from "../dist/deploy.js";
-import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
+import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, markDeployFatal, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion, isInteractive } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
 import { loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
@@ -352,9 +352,6 @@ if (!flags.help && !flags.version) {
     if (finalizing) return;
     finalizing = true;
     try {
-      setDeployAttribute("deploy.status", "killed");
-      setDeployAttribute("deploy.killed", reason);
-      setDeployAttribute("deploy.sad", "true");
       captureWarning(`deploy process terminated: ${reason}`);
     } catch { /* telemetry best-effort */ }
     try { await closeTelemetry(1000); } catch { /* ignore */ }
@@ -387,7 +384,7 @@ if (!flags.help && !flags.version) {
       } catch { /* telemetry best-effort */ }
       return;
     }
-    try { setDeployAttribute("deploy.error", msgStr.slice(0, 200)); } catch {}
+    try { markDeployFatal(e); } catch {}
     finalize(kind, 2);
   };
   process.on("uncaughtException", (e) => handleUnhandled(e, "uncaught"));
@@ -397,9 +394,16 @@ if (!flags.help && !flags.version) {
   // and are retryable from the consumer's perspective. Contrast with
   // NonRetryableError exits (code 78, POSIX EX_CONFIG) which callers must
   // NOT retry — see EXIT_CODE_NO_RETRY in src/errors.ts.
-  process.on("SIGINT", () => finalize("SIGINT", 130));
-  process.on("SIGTERM", () => finalize("SIGTERM", 143));
-  process.on("SIGHUP", () => finalize("SIGHUP", 129));
+  const onSignal = (sig, exitCode) => {
+    try {
+      setDeployAttribute("deploy.status", "killed");
+      setDeployAttribute("deploy.killed", sig);
+    } catch { /* telemetry best-effort */ }
+    finalize(sig, exitCode);
+  };
+  process.on("SIGINT", () => onSignal("SIGINT", 130));
+  process.on("SIGTERM", () => onSignal("SIGTERM", 143));
+  process.on("SIGHUP", () => onSignal("SIGHUP", 129));
 }
 
 try {

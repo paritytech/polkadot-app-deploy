@@ -719,6 +719,11 @@ jobs:
       # so nightly exercises whatever just merged. Release + dispatch with an
       # explicit version → install from npm to test the actual published artifact.
       polkadot-app-deploy-ref: ${{ steps.version.outputs.polkadot-app-deploy-ref }}
+      # Tag whose test harness (test/, tools/, package.json) the published-version
+      # legs run (bulletin #1621): `v<test-version>`, EMPTY on the source-build path. Keyed
+      # off the resolved version, never the cron string. A harness from HEAD
+      # imports internals that an older published dist does not export.
+      harness-ref: ${{ steps.version.outputs.harness-ref }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -772,10 +777,24 @@ jobs:
           else
             REF=""
           fi
+          # Published-version path: the scenario jobs run the test harness from
+          # the tag of the version under test (bulletin #1621), not from this run's HEAD.
+          # Fail here, once, if that tag is missing — otherwise every leg would
+          # die later with an opaque checkout error.
+          if [ -n "$V" ]; then
+            HARNESS_REF="v$V"
+            if ! git ls-remote --exit-code --tags origin "refs/tags/$HARNESS_REF" >/dev/null 2>&1; then
+              echo "::error::git tag $HARNESS_REF not found on origin — the published-version tier runs the test harness from the tag of the version under test (bulletin #1621), so @parity/polkadot-app-deploy@$V cannot be tested without it. Push the tag, or dispatch with a version that has one." >&2
+              exit 1
+            fi
+          else
+            HARNESS_REF=""
+          fi
           echo "test-version=$V" >> "$GITHUB_OUTPUT"
           echo "deploy-tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "polkadot-app-deploy-ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "Resolved: test-version='$V', deploy-tag='$TAG', polkadot-app-deploy-ref='$REF' (event=$EVENT)"
+          echo "harness-ref=$HARNESS_REF" >> "$GITHUB_OUTPUT"
+          echo "Resolved: test-version='$V', deploy-tag='$TAG', polkadot-app-deploy-ref='$REF', harness-ref='$HARNESS_REF' (event=$EVENT)"
       - name: Wait for publish.yml to complete
         # Only on release: publish.yml fires on `release: created` (the same event
         # that fired us) but it pauses behind a `environment: release` human-
@@ -926,6 +945,66 @@ jobs:
           PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
         run: node scripts/e2e-ensure-authorized.mjs --env "$PAD_ENV"
 
+  # Policy (bulletin #1621): a published-version run exercises the scenarios AS OF that tag
+  # (harness + dist versioned together); scenarios added on main since are covered
+  # by the source-build tier, not this one.
+  # ---- Harness-import smoke: published-version tier only. The scenario
+  # jobs below run the test harness from the tag of the version under test
+  # against that version's installed dist. If the harness cannot even load
+  # against it (a missing export, a renamed module), every leg would die with the
+  # same SyntaxError; this job reds ONCE with that error and the jobs that
+  # `needs:` it skip. With E2E unset every scenario is skipped, but node still
+  # evaluates the harness's whole static import graph, which is the point.
+  nightly-harness-smoke:
+    name: Nightly harness-import smoke (${{ needs.build-nightly.outputs.test-version }})
+    needs: [build-nightly]
+    if: always() && needs.build-nightly.result == 'success' && needs.build-nightly.outputs.harness-ref != '' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      BULLETIN_DEPLOY_VERSION: ${{ needs.build-nightly.outputs.test-version }}
+      HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: Use the test harness from the tag under test (#1621)
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
+      - name: Install polkadot-app-deploy from npm
+        uses: ./.github/actions/npm-retry
+        with:
+          run: |
+            # Same setup as the scenario jobs: the harness resolves ../dist.
+            npm install --no-save "@parity/polkadot-app-deploy@${BULLETIN_DEPLOY_VERSION}" ws
+            ln -sfn node_modules/@parity/polkadot-app-deploy/dist dist
+      - name: Import the harness against the installed dist
+        run: |
+          unset E2E
+          set +e
+          node --test test/e2e.test.js > /tmp/harness-smoke.log 2>&1
+          RC=$?
+          set -e
+          cat /tmp/harness-smoke.log
+          if [ "$RC" != "0" ]; then
+            CAUSE="$(grep -aE 'SyntaxError|ERR_MODULE_NOT_FOUND|ERR_PACKAGE_PATH_NOT_EXPORTED' /tmp/harness-smoke.log | head -n 1 | tr -d '\r')"
+            echo ">> FAIL: harness-import smoke: $HARNESS_REF harness cannot load against @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION (exit $RC): ${CAUSE:-see log above}"
+            exit 1
+          fi
+          echo "harness from $HARNESS_REF imports cleanly against @parity/polkadot-app-deploy@$BULLETIN_DEPLOY_VERSION"
+
   # ---- Nightly @ HEAD: coverage for the 11 scenarios that left the PR matrix
   #
   # Runs on ubuntu-latest (GitHub-hosted, free for public repos). These test
@@ -947,10 +1026,11 @@ jobs:
     # Per-leg pool account pinning (#863): each pool leg is pinned to a disjoint
     # //deploy/N account via BULLETIN_POOL_ACCOUNT_INDEX, eliminating intra-matrix
     # nonce collisions without requiring a separate mnemonic provisioning step.
-    needs: [build-nightly, select-env, nightly-s-ext-signer, ensure-e2e-authorized]
+    needs: [build-nightly, select-env, nightly-s-ext-signer, ensure-e2e-authorized, nightly-harness-smoke]
     if: |
       always() && needs.ensure-e2e-authorized.result == 'success' &&
       needs.build-nightly.result == 'success' &&
+      contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) &&
       (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1054,6 +1134,19 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       # On release (and a pinned workflow_dispatch), build-nightly resolves
       # test-version to the RC being gated and this leg must exercise the
       # published tarball's bytes, not a source build of the tag (issue #270 —
@@ -1321,6 +1414,8 @@ jobs:
           # memory-pressure behaviour. At job-level it leaks into npm ci's
           # prepare hook (see PR #408).
           NODE_OPTIONS: --max-old-space-size=512
+          # bulletin #1626: this deploy is asserted to fail; tag its spans deploy.expected_error.
+          PAD_E2E_EXPECT_FAIL: "1"
         run: |
           set +e
           "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build "$S3_LABEL" > /tmp/s3.log 2>&1
@@ -1661,8 +1756,8 @@ jobs:
     # Uses the checked-out source so the WS fault proxy and test helpers are
     # available; polkadot-app-deploy binary is built from source (or from the RC
     # ref when BULLETIN_DEPLOY_REF is set).
-    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's8')))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's8')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1698,6 +1793,19 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
         uses: ./.github/actions/npm-retry
@@ -1737,8 +1845,8 @@ jobs:
     # Two parallel deploys from the same direct-signer key; proves nonce-advance
     # defense works under concurrent chunk-upload contention.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's9')))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's9')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 35
     permissions:
@@ -1774,6 +1882,19 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
         uses: ./.github/actions/npm-retry
@@ -1804,8 +1925,8 @@ jobs:
     # Proxy holds stale chain_getFinalizedHead for 15s (> 10s natural wait),
     # forcing the missing-chunk re-upload path to fire and succeed.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-grandpa-reupload')))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-grandpa-reupload')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 25
     permissions:
@@ -1841,6 +1962,19 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
         uses: ./.github/actions/npm-retry
@@ -1872,8 +2006,8 @@ jobs:
     # to expire before inclusion on congested blocks, exercising the
     # isValid:false → expiry-retry path in storeChunkedContent.
     # Runs after nightly-s1-direct to avoid nonce races on the direct signer label.
-    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-mortality')))
+    needs: [build-nightly, nightly-s1-direct, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-mortality')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 35
     permissions:
@@ -1909,6 +2043,19 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
         uses: ./.github/actions/npm-retry
@@ -2474,8 +2621,8 @@ jobs:
     # nightly-s* job). Port of bulletin-deploy #1588: BULLETIN_POOL_ACCOUNT_INDEX
     # IS pinned below (to pool account 0) even though this scenario never
     # writes — see that env var's own comment for why.
-    needs: [build-nightly, select-env, ensure-e2e-authorized]
-    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-reserved-invariant')))
+    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-harness-smoke]
+    if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.nightly-harness-smoke.result) && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-reserved-invariant')))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
@@ -2511,6 +2658,19 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+      - name: Use the test harness from the tag under test (#1621)
+        if: env.BULLETIN_DEPLOY_REF == ''
+        env:
+          HARNESS_REF: ${{ needs.build-nightly.outputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$HARNESS_REF" ]; then
+            echo "::error::published-version path but build-nightly emitted no harness-ref" >&2
+            exit 1
+          fi
+          git fetch --no-tags --depth=1 origin "refs/tags/$HARNESS_REF:refs/tags/$HARNESS_REF"
+          git checkout "$HARNESS_REF" -- . ':(exclude).github'
+          echo "Harness (test/, tools/, package.json) from $HARNESS_REF ($(git rev-parse "$HARNESS_REF^{commit}")); workflow + .github from $GITHUB_SHA"
       - name: Install polkadot-app-deploy from npm
         if: env.BULLETIN_DEPLOY_REF == ''
         uses: ./.github/actions/npm-retry
@@ -2562,7 +2722,7 @@ jobs:
 
   nightly-report:
     name: Nightly E2E Report
-    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-s-reserved-invariant, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
+    needs: [build-nightly, select-env, ensure-e2e-authorized, nightly-s1-pool, nightly-s1-direct, nightly-s2-fresh, nightly-s3, nightly-s5, nightly-s6, nightly-s7, nightly-s8, nightly-s9, nightly-s-grandpa-reupload, nightly-s-mortality, nightly-s-reprove, nightly-s-car, nightly-s-inc, nightly-s-ext-signer, nightly-s-reserved-invariant, nightly-harness-smoke, nightly-verify-telemetry, nightly-verify-pool-distribution, nightly-pr-coverage, nightly-code-path-coverage]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -2612,7 +2772,7 @@ jobs:
             {
               name = $1; conclusion = $2
               meta = (index(name,"telemetry assertions")>0) || (index(name,"pool selection")>0) || \
-                     (index(name,"code-path")>0) || (index(name,"E2E Report")>0) || (index(name,"DotNS address drift")>0)
+                     (index(name,"code-path")>0) || (index(name,"harness-import smoke")>0) || (index(name,"E2E Report")>0) || (index(name,"DotNS address drift")>0)
               env_tag = "META"
               if (!meta) {
                 env_tag = selected
@@ -2672,6 +2832,7 @@ jobs:
           NIGHTLY_S_INC:          ${{ needs.nightly-s-inc.result }}
           NIGHTLY_S_EXT_SIGNER:   ${{ needs.nightly-s-ext-signer.result }}
           NIGHTLY_S_RESERVED_INVARIANT: ${{ needs.nightly-s-reserved-invariant.result }}
+          NIGHTLY_HARNESS_SMOKE:  ${{ needs.nightly-harness-smoke.result }}
           NIGHTLY_TELEMETRY:      ${{ needs.nightly-verify-telemetry.result }}
           NIGHTLY_POOL_DIST:      ${{ needs.nightly-verify-pool-distribution.result }}
           NIGHTLY_PR_COVERAGE:    ${{ needs.nightly-pr-coverage.result }}
@@ -2762,6 +2923,7 @@ jobs:
             echo "| S-INC scenarios (5 legs: s-inc js/kubo, roundtrip, portability, asset-rotation) | $(emoji "$NIGHTLY_S_INC") |"
             echo "| S-ext-signer external PolkadotSigner | $(emoji "$NIGHTLY_S_EXT_SIGNER") |"
             echo "| S-RESERVED-INVARIANT base names <=5 chars stay Reserved | $(emoji "$NIGHTLY_S_RESERVED_INVARIANT") |"
+            echo "| Harness-import smoke (published-version tier; skipped on source builds) | $(emoji "$NIGHTLY_HARNESS_SMOKE") |"
             echo "| Telemetry assertions | $(emoji "$NIGHTLY_TELEMETRY") |"
             echo "| Pool selection distribution | $(emoji "$NIGHTLY_POOL_DIST") |"
             echo "| Nightly @ HEAD PR-coverage (11 legs) | $(emoji "$NIGHTLY_PR_COVERAGE") |"

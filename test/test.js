@@ -80,6 +80,16 @@ function jobBlock(text, jobName) {
   return getJobBlock(text, jobName);
 }
 
+// Parses a job block's `needs:` line (either bracketed list or bare single
+// job name) into an array of referenced job names. Shared so a `needs:`
+// membership assertion (order-independent — a job can sit between two
+// others) isn't reimplemented at every call site.
+function parseNeedsRefs(block, missingMessage = "job has no needs: — needs: line missing or mis-indented") {
+  const needsMatch = block.match(/^\s{4}needs:\s*(?:\[([^\]]*)\]|(\S+))\s*$/m);
+  assert.ok(needsMatch, missingMessage);
+  return (needsMatch[1] ?? needsMatch[2]).split(",").map((s) => s.trim());
+}
+
 // Pulls a single `key: |` block-scalar body (e.g. `command`, `on_retry_command`)
 // out of an arbitrary slice of workflow/action YAML treated as text, dedenting
 // it the same way getJobBlock's own step parsing does.
@@ -9018,6 +9028,82 @@ describe("nightly verify_pool_distribution wiring (#516)", () => {
       assert.match(line, pattern,
         `>> FAIL: e2e.yml signatures: the report's grep misses "${line}", so the issue body reads "no failure signature found"`);
     }
+  });
+});
+
+describe("e2e.yml published-version tier (bulletin #1621)", () => {
+  // #1621: the published-version tier ran main HEAD's harness against an older
+  // published dist, so any new export on HEAD redded every leg. The harness must
+  // come from the tag of the version under test; a smoke job reds once if it
+  // cannot load.
+  describe("e2e.yml: harness comes from the tag under test (#1621)", () => {
+    const wf = fs.readFileSync(".github/workflows/e2e.yml", "utf8");
+    const HARNESS_STEP = "Use the test harness from the tag under test (#1621)";
+    const jobNames = [...wf.slice(wf.search(/^jobs:\s*$/m)).matchAll(/^ {2}([\w-]+):\s*$/gm)].map((m) => m[1]);
+    const jobIf = (block) => (block.match(/^ {4}if:[\s\S]*?(?=^ {4}[\w-]+:)/m) ?? [""])[0];
+    // Jobs that run the harness against an installed (published) dist.
+    const installedDistJobs = jobNames.filter((j) =>
+      /ln -sfn? node_modules\/@parity\/polkadot-app-deploy\/dist dist/.test(jobBlock(wf, j)));
+
+    test("build-nightly emits harness-ref=v<version> only for a resolved version, and fails if the tag is missing", () => {
+      const b = jobBlock(wf, "build-nightly");
+      assert.match(b, /harness-ref: \$\{\{ steps\.version\.outputs\.harness-ref \}\}/,
+        ">> FAIL: harness-at-tag: build-nightly must expose harness-ref as a job output");
+      assert.match(b, /if \[ -n "\$V" \]; then\s+HARNESS_REF="v\$V"/,
+        ">> FAIL: harness-at-tag: harness-ref must be keyed off the resolved version $V, not the cron string");
+      assert.match(b, /else\s+HARNESS_REF=""\s+fi/,
+        ">> FAIL: harness-at-tag: the source-build path (empty $V) must leave harness-ref empty");
+      assert.match(b, /git ls-remote --exit-code --tags origin "refs\/tags\/\$HARNESS_REF"/,
+        ">> FAIL: harness-at-tag: build-nightly must verify the tag exists on origin");
+      assert.match(b, /::error::git tag \$HARNESS_REF not found[^\n]*\n\s+exit 1/,
+        ">> FAIL: harness-at-tag: a missing tag must fail build-nightly loudly");
+    });
+
+    test("every harness-on-installed-dist job is the expected one, and each overlays the tag before installing", () => {
+      assert.deepEqual([...installedDistJobs].sort(), [
+        "nightly-harness-smoke", "nightly-pr-coverage", "nightly-s-grandpa-reupload",
+        "nightly-s-mortality", "nightly-s-reserved-invariant", "nightly-s8", "nightly-s9",
+      ].sort(),
+      ">> FAIL: harness-at-tag: the set of jobs symlinking an installed dist changed — a new one must overlay the tag harness (and be added here)");
+      for (const j of installedDistJobs) {
+        const b = jobBlock(wf, j);
+        const at = b.indexOf(`- name: ${HARNESS_STEP}`);
+        assert.ok(at !== -1, `>> FAIL: harness-at-tag: ${j} runs the harness against an installed dist but has no "${HARNESS_STEP}" step`);
+        assert.ok(at < b.indexOf("npm install --no-save"), `>> FAIL: harness-at-tag: ${j} must overlay the tag harness BEFORE npm install (the install reads the tag's package.json)`);
+        const step = b.slice(at, b.indexOf("\n      - name:", at + 1));
+        assert.match(step, /git checkout "\$HARNESS_REF" -- \. ':\(exclude\)\.github'/,
+          `>> FAIL: harness-at-tag: ${j} must check out the tag tree but keep .github (workflow + composite actions) at HEAD`);
+        assert.match(b, /HARNESS_REF: \$\{\{ needs\.build-nightly\.outputs\.harness-ref \}\}/,
+          `>> FAIL: harness-at-tag: ${j} must take its ref from build-nightly's harness-ref`);
+      }
+    });
+
+    test("the smoke job runs the harness with E2E unset and the scenario jobs gate on it without a matrix ref in job-level if:", () => {
+      const smoke = jobBlock(wf, "nightly-harness-smoke");
+      assert.match(smoke, /unset E2E\b[\s\S]*node --test test\/e2e\.test\.js/,
+        ">> FAIL: harness-at-tag: the smoke job must import the harness with E2E unset");
+      assert.match(smoke, /needs\.build-nightly\.outputs\.harness-ref != ''/,
+        ">> FAIL: harness-at-tag: the smoke job must run only on the published-version path");
+      assert.match(smoke, />> FAIL: harness-import smoke:/,
+        ">> FAIL: harness-at-tag: the smoke job must end with a >> FAIL: signature line");
+      for (const j of installedDistJobs.filter((n) => n !== "nightly-harness-smoke")) {
+        const b = jobBlock(wf, j);
+        assert.ok(parseNeedsRefs(b).includes("nightly-harness-smoke"), `>> FAIL: harness-at-tag: ${j} must need nightly-harness-smoke`);
+        assert.match(jobIf(b), /contains\(fromJSON\('\["success","skipped"\]'\), needs\.nightly-harness-smoke\.result\)/,
+          `>> FAIL: harness-at-tag: ${j} must skip when the smoke job failed (always() would otherwise run it)`);
+      }
+      for (const j of jobNames) {
+        assert.ok(!/\bmatrix\./.test(jobIf(jobBlock(wf, j))), `>> FAIL: harness-at-tag: ${j} references matrix in a job-level if:, which GitHub rejects for the whole workflow`);
+      }
+    });
+
+    test("nightly-report lists the smoke job and classifies it as a non-env row", () => {
+      const r = jobBlock(wf, "nightly-report");
+      assert.ok(parseNeedsRefs(r).includes("nightly-harness-smoke"), ">> FAIL: harness-at-tag: nightly-report must need nightly-harness-smoke");
+      assert.match(r, /NIGHTLY_HARNESS_SMOKE:\s+\$\{\{ needs\.nightly-harness-smoke\.result \}\}/, ">> FAIL: harness-at-tag: report must read the smoke result");
+      assert.match(r, /\| Harness-import smoke[^\n]*\$NIGHTLY_HARNESS_SMOKE/, ">> FAIL: harness-at-tag: report must render a smoke row");
+      assert.match(r, /index\(name,"harness-import smoke"\)>0/, ">> FAIL: harness-at-tag: the smoke job must classify as META, not as an env");
+    });
   });
 });
 

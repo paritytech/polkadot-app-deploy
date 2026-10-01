@@ -164,8 +164,15 @@ export function markRelaunchOomHintShown(): void {
 
 // Awaitable Sentry flush-and-close. Exposed so the CLI signal handlers can
 // await the flush before calling process.exit — fire-and-forget loses the
-// trace when the process exits before the transport completes.
+// trace when the process exits before the transport completes. An open root
+// span is ended first: a span that never ends is never sent.
 export async function closeTelemetry(timeoutMs: number): Promise<void> {
+  if (deployRootSpan) {
+    // No sampleMemory: it would overwrite the run-state lastStage with "end".
+    if (deployRootSpan === deploySpan) deployRootSpan.setAttribute("deploy.outcome", computeDeployOutcome(currentErrorCategory, currentDeploySad, currentSadReason));
+    deployRootSpan.end();
+    deployRootSpan = null;
+  }
   if (!Sentry) return;
   try {
     await Sentry.close(timeoutMs);
@@ -193,6 +200,9 @@ export function initTelemetry(): void {
     // Sentry Node SDK captures os.hostname() by default, which leaks personal
     // machine names (e.g. "Mac.fritz.box"). Override to something anonymous.
     serverName: process.env.CI ? (process.env.RUNNER_NAME ?? "ci") : "local",
+    // Library mode registers no uncaughtException listener, so Sentry's fatal
+    // handler is what exits the process; report the deploy as failed first.
+    integrations: [Sentry.onUncaughtExceptionIntegration({ onFatalError: exitOnFatalError })],
     beforeSend(event) {
       if (event.server_name) event.server_name = process.env.CI ? (process.env.RUNNER_NAME ?? "ci") : "local";
       if (event.message) event.message = scrubPaths(event.message);
@@ -764,6 +774,8 @@ let memoryPeak: RawMemorySample | null = null;
 // unreliable for attributes set late in the deploy lifecycle).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let deployRootSpan: any | null = null;
+// The open withDeploySpan span; deployRootSpan can instead be a manifest span.
+let deploySpan: any | null = null;
 // Per-stage memory snapshots kept alongside the peak. Flushed to the
 // threshold-triggered memory report (memory-report.ts) if the deploy
 // exceeded the threshold AND we're in an internal context.
@@ -861,6 +873,7 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
   try {
     return await Sentry.startSpan({ op: "deploy", name: `deploy ${domain}`, attributes: attrs }, async (span) => {
       deployRootSpan = span;
+      deploySpan = span;
       // Redundant with the getDeployAttributes() seed — kept so wrapper code
       // that overrides `attrs` can't accidentally drop the tool version.
       span.setAttribute("deploy.tool_version", VERSION);
@@ -888,27 +901,7 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
         span.setAttribute("deploy.status", "ok");
         return result;
       } catch (error) {
-        const msg = (error as Error).message ?? String(error);
-        span.setAttribute("deploy.status", "error");
-        // Mechanism classification (how it failed, not whose fault).
-        // Propagated from the leaf chain-op span up to the root deploy span so
-        // dashboards can group by deploy.error_kind without drilling into child spans.
-        setDeployErrorOnSpan(span, msg);
-        const errorCategory = classifyDeployError(msg);
-        span.setAttribute("deploy.error_category", errorCategory);
-        currentErrorCategory = errorCategory;
-        // Expected refusals (owned-by, reserved label, insufficient balance…)
-        // are product rules, not tool friction: keep sad="false" so dashboards
-        // filtering `deploy.sad:true` (and `NOT deploy.expected:true` on error
-        // widgets) reflect the tool's health, not the user's typing. A later
-        // captureWarning during the refusal flow will still flip sad back to
-        // "true" — intentional, friction during a refusal is still friction.
-        const isExpected = isExpectedError(msg);
-        span.setAttribute("deploy.expected", isExpected ? "true" : "false");
-        span.setAttribute("deploy.sad", isExpected ? "false" : "true");
-        if (!isExpected) {
-          span.setStatus({ code: 2, message: "internal_error" });
-        }
+        recordDeployFailure(span, error);
         throw error;
       } finally {
         // sampleMemory folds the "end" point into the running peak and writes
@@ -960,6 +953,7 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
   } finally {
     memoryPeak = null;
     deployRootSpan = null;
+    deploySpan = null;
     stageSamples = {};
     reportContext = {};
     currentErrorCategory = null;
@@ -984,9 +978,8 @@ export function setDeployAttribute(key: string, value: string | number | boolean
 
 // Sets `deploy.error` + its classification (`deploy.error_kind`,
 // `deploy.error_message`, `deploy.error_pattern_signature`) on `span` in one
-// call. Used by withDeploySpan's catch block; also exported (see
-// setDeployError below) as the choke point any future error-ending path
-// should route through instead of setting deploy.error alone.
+// call. Used by recordDeployFailure, and by setDeployError for the active root
+// span; route error recording through it rather than setting deploy.error alone.
 function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | number | boolean) => void }, msg: string): void {
   const { kind, message, pattern } = classifyErrorForSpan(msg);
   span.setAttribute("deploy.error", msg.slice(0, 500));
@@ -995,16 +988,46 @@ function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | numb
   span.setAttribute("deploy.error_pattern_signature", pattern);
 }
 
-// Global-root-span convenience wrapper for setDeployErrorOnSpan, mirroring
-// setDeployAttribute's calling convention (no explicit span argument — writes
-// to the currently active deploy's root span, no-op outside a deploy). Exists
-// so a future caller outside a withDeploySpan callback (e.g. a process-level
-// uncaughtException/unhandledRejection handler) can record deploy.error
-// without bypassing classification, instead of calling setDeployAttribute
-// directly with the raw message.
+// setDeployErrorOnSpan on the active deploy's root span; no-op outside a deploy.
 export function setDeployError(msg: string): void {
   if (!deployRootSpan) return;
   setDeployErrorOnSpan(deployRootSpan, msg);
+}
+
+function recordDeployFailure(span: any, error: unknown): void {
+  const msg = (error as Error)?.message ?? String(error);
+  span.setAttribute("deploy.status", "error");
+  // Mechanism classification (how it failed, not whose fault).
+  // Propagated from the leaf chain-op span up to the root deploy span so
+  // dashboards can group by deploy.error_kind without drilling into child spans.
+  setDeployErrorOnSpan(span, msg);
+  const errorCategory = classifyDeployError(msg);
+  span.setAttribute("deploy.error_category", errorCategory);
+  currentErrorCategory = errorCategory;
+  // Expected refusals (owned-by, reserved label, insufficient balance…)
+  // are product rules, not tool friction: keep sad="false" so dashboards
+  // filtering `deploy.sad:true` (and `NOT deploy.expected:true` on error
+  // widgets) reflect the tool's health, not the user's typing. A later
+  // captureWarning during the refusal flow will still flip sad back to
+  // "true". That is intended: friction during a refusal is still friction.
+  const isExpected = isExpectedError(msg);
+  span.setAttribute("deploy.expected", isExpected ? "true" : "false");
+  span.setAttribute("deploy.sad", isExpected ? "false" : "true");
+  if (!isExpected) {
+    span.setStatus({ code: 2, message: "internal_error" });
+  }
+}
+
+// A manifest span reports its own result, so only a deploy span is marked.
+export function markDeployFatal(error: unknown): void {
+  if (deployRootSpan && deployRootSpan === deploySpan) recordDeployFailure(deployRootSpan, error);
+}
+
+// Runs after Sentry has captured the fatal event.
+function exitOnFatalError(error: Error): void {
+  console.error(error);
+  markDeployFatal(error);
+  void closeTelemetry(2000).finally(() => process.exit(1));
 }
 
 // @internal — test hook: injects a fake root span so unit tests can assert

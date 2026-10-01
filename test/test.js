@@ -34,7 +34,7 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
   isTelemetryDisabled, scrubPaths, truncateAddress, sanitizeBranch,
   sanitizeRepo, setDeploySentryTag, sampleMemory, initTelemetry,
-  setDeployAttribute, __setDeployRootSpanForTest,
+  setDeployAttribute, __setDeployRootSpanForTest, markDeployFatal,
   flush, closeTelemetry, __setSentryForTest,
   classifyErrorKind, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
@@ -1610,6 +1610,67 @@ describe("captureWarning", () => {
   });
 });
 
+describe("deploy span on a forced exit", () => {
+  // atEnd is what Sentry sends: the attributes at the moment the span ends.
+  const fakeRoot = () => ({ attrs: new Map(), ended: 0, atEnd: null, setAttribute(k, v) { this.attrs.set(k, v); }, setStatus() {}, end() { this.ended++; this.atEnd ??= new Map(this.attrs); } });
+  const stubSentry = (root) => ({
+    startSpan: async (_opts, fn) => fn(root), setTags() {}, setTag() {}, getActiveSpan: () => null,
+    captureMessage() {}, addBreadcrumb() {}, captureException() {}, withScope() {}, flush: async () => true, close: async () => true,
+  });
+
+  test("a fatal crash mid-deploy is sent as a failed deploy with its outcome", async () => {
+    const root = fakeRoot();
+    const prev = __setSentryForTest(stubSentry(root));
+    try {
+      await withDeploySpan("crash.dot", async () => {
+        markDeployFatal(new SyntaxError("Unexpected end of JSON input"));
+        await closeTelemetry(0);
+        await closeTelemetry(0);
+      });
+      assert.equal(root.ended, 1, ">> FAIL: closeTelemetry: an open deploy span must end exactly once; an unended span is never sent");
+      assert.equal(root.atEnd.get("deploy.status"), "error", ">> FAIL: markDeployFatal: a fatal crash must report deploy.status=error");
+      assert.equal(root.atEnd.get("deploy.sad"), "true", ">> FAIL: markDeployFatal: a fatal crash must set deploy.sad=true");
+      assert.match(root.atEnd.get("deploy.error"), /Unexpected end of JSON input/, ">> FAIL: markDeployFatal: deploy.error must carry the crash message");
+      assert.equal(root.atEnd.get("deploy.outcome"), "unknown_error", ">> FAIL: closeTelemetry: the ended span must carry the crash's deploy.outcome, which the Health dashboard groups by");
+    } finally {
+      __setSentryForTest(prev);
+    }
+  });
+
+  test("a crash during manifest publish ends the manifest span without deploy attributes", async () => {
+    const root = fakeRoot();
+    __setDeployRootSpanForTest(root);
+    try {
+      markDeployFatal(new Error("boom"));
+      await closeTelemetry(0);
+      assert.equal(root.ended, 1, ">> FAIL: closeTelemetry: an open root span must be ended so it is sent");
+      assert.equal(root.atEnd.has("deploy.outcome"), false, ">> FAIL: closeTelemetry: deploy.outcome belongs on deploy spans only");
+      assert.equal(root.atEnd.has("deploy.status"), false, ">> FAIL: markDeployFatal: a manifest span reports through deploy.manifest.status, not deploy.status");
+    } finally {
+      __setDeployRootSpanForTest(null);
+    }
+  });
+
+  test("markDeployFatal does not throw on a non-Error throw value", async () => {
+    const root = fakeRoot();
+    const prev = __setSentryForTest(stubSentry(root));
+    try {
+      await withDeploySpan("crash.dot", async () => {
+        markDeployFatal(null);
+        assert.equal(root.attrs.get("deploy.status"), "error", ">> FAIL: markDeployFatal: a null throw is still a failed deploy");
+      });
+    } finally {
+      __setSentryForTest(prev);
+    }
+  });
+
+  test("source: Sentry.init routes fatal errors through exitOnFatalError", () => {
+    const src = fs.readFileSync("src/telemetry.ts", "utf-8");
+    assert.match(src, /onFatalError:\s*exitOnFatalError/,
+      ">> FAIL: initTelemetry: Sentry.init must route fatal errors through exitOnFatalError, or a library-mode crash sends no span");
+  });
+});
+
 describe("initTelemetry ambient mode", () => {
   test("source: initTelemetry checks PAD_USE_AMBIENT_SENTRY before calling Sentry.init", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
@@ -2435,17 +2496,12 @@ describe("withSpan error attribute propagation", () => {
 
   test("source: withDeploySpan catch also sets deploy.error_kind on the root span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    // #1061: the catch now routes error recording through the single
-    // setDeployErrorOnSpan choke point instead of inlining each setAttribute —
-    // so the invariant (catch sets deploy.error_kind on the root span) is
-    // preserved *via the helper*. Verify BOTH the delegation and that the
-    // helper writes the attribute, so no path can record deploy.error without it.
-    const deploySpanCatch = src.match(/setAttribute\("deploy\.status",\s*"error"\)[\s\S]*?throw error;/);
-    assert.ok(deploySpanCatch, "withDeploySpan catch block must exist");
-    assert.ok(
-      /setDeployErrorOnSpan\(/.test(deploySpanCatch[0]),
-      "withDeploySpan catch must route error recording through setDeployErrorOnSpan",
-    );
+    // The catch records through recordDeployFailure, which goes through setDeployErrorOnSpan.
+    assert.match(src, /catch \(error\) \{\s*recordDeployFailure\(span, error\);\s*throw error;/,
+      ">> FAIL: withDeploySpan: the catch must record the failure through recordDeployFailure");
+    const recorder = src.match(/function recordDeployFailure\([\s\S]*?\n}/);
+    assert.ok(recorder && /setDeployErrorOnSpan\(/.test(recorder[0]),
+      ">> FAIL: recordDeployFailure: error recording must go through setDeployErrorOnSpan");
     const helper = src.match(/function setDeployErrorOnSpan\([\s\S]*?\n}/);
     assert.ok(helper, "setDeployErrorOnSpan helper must exist");
     assert.ok(
@@ -2456,12 +2512,11 @@ describe("withSpan error attribute propagation", () => {
 
   test("source: withDeploySpan catch also sets deploy.error_message on the root span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    const deploySpanCatch = src.match(/setAttribute\("deploy\.status",\s*"error"\)[\s\S]*?throw error;/);
-    assert.ok(deploySpanCatch, "withDeploySpan catch block must exist");
-    assert.ok(
-      /setDeployErrorOnSpan\(/.test(deploySpanCatch[0]),
-      "withDeploySpan catch must route error recording through setDeployErrorOnSpan",
-    );
+    assert.match(src, /catch \(error\) \{\s*recordDeployFailure\(span, error\);\s*throw error;/,
+      ">> FAIL: withDeploySpan: the catch must record the failure through recordDeployFailure");
+    const recorder = src.match(/function recordDeployFailure\([\s\S]*?\n}/);
+    assert.ok(recorder && /setDeployErrorOnSpan\(/.test(recorder[0]),
+      ">> FAIL: recordDeployFailure: error recording must go through setDeployErrorOnSpan");
     const helper = src.match(/function setDeployErrorOnSpan\([\s\S]*?\n}/);
     assert.ok(helper, "setDeployErrorOnSpan helper must exist");
     assert.ok(

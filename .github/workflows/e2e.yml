@@ -470,7 +470,7 @@ jobs:
         run: |
           if [ ! -f ~/.cache/kubo/ipfs ]; then
             mkdir -p ~/.cache/kubo
-            curl -fsSL -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
+            curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
             tar -xf /tmp/kubo.tar.gz -C /tmp
             cp /tmp/kubo/ipfs ~/.cache/kubo/ipfs
             rm -rf /tmp/kubo /tmp/kubo.tar.gz
@@ -1039,7 +1039,7 @@ jobs:
         run: |
           if [ ! -f ~/.cache/kubo/ipfs ]; then
             mkdir -p ~/.cache/kubo
-            curl -fsSL -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
+            curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
             tar -xf /tmp/kubo.tar.gz -C /tmp
             cp /tmp/kubo/ipfs ~/.cache/kubo/ipfs
             rm -rf /tmp/kubo /tmp/kubo.tar.gz
@@ -2248,6 +2248,31 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: cd polkadot-app-deploy-src && npm ci
+      # Kubo legs need the ipfs binary on PATH, or the scenario's Kubo-merkleizer
+      # assertion fails the leg. Gated on the source-build ref: it is empty on
+      # release / stable-cron / test-version runs, which skip the scenario, so a
+      # failed download must not red those runs. Port of bulletin-deploy #1606.
+      - name: Restore Kubo from cache
+        if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/kubo
+          key: kubo-v0.33.0-linux-amd64
+      - name: Setup IPFS Kubo
+        if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
+        run: |
+          if [ ! -f ~/.cache/kubo/ipfs ]; then
+            mkdir -p ~/.cache/kubo
+            curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
+            tar -xf /tmp/kubo.tar.gz -C /tmp
+            cp /tmp/kubo/ipfs ~/.cache/kubo/ipfs
+            rm -rf /tmp/kubo /tmp/kubo.tar.gz
+          fi
+          sudo cp ~/.cache/kubo/ipfs /usr/local/bin/ipfs
+          ipfs version
+      - name: Initialize IPFS
+        if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
+        run: ipfs init
       - name: Run S-INC scenario (one retry on transient testnet failures)
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0

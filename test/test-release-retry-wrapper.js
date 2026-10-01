@@ -155,6 +155,11 @@ test("classifyForRetry: IPFS gateway roundtrip budget exhaustion is retry-eligib
     ">> FAIL: retry-classify: gateway roundtrip timeout must be retry-eligible (75) — the deploy already finalised on-chain, only the HTTP readback failed");
 });
 
+test("classifyForRetry: Promise.any exhaustion (every RPC endpoint failed) is retry-eligible", () => {
+  assert.strictEqual(classifyForRetry("Deployment failed: All promises were rejected", 1), 75,
+    ">> FAIL: retry-classify: 'All promises were rejected' must be retry-eligible (75) — every endpoint failing is a network window, #1627");
+});
+
 test("classifyForRetry: a manifest CONTENT mismatch must NOT be retry-eligible", () => {
   const out = "S-INC-ROUNDTRIP: manifest content mismatch: expected bafy... got bafk...";
   assert.notStrictEqual(classifyForRetry(out, 1), 75,

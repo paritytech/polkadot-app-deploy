@@ -99,6 +99,11 @@ describe("e2e-failure: classifyDeployStderr", () => {
     assert.match(out.summary, /budget|reconnect/i);
   });
 
+  test("classifies Promise.any exhaustion as all_endpoints_failed", () => {
+    const out = classifyDeployStderr("Deployment failed: All promises were rejected");
+    assert.strictEqual(out.class, "all_endpoints_failed");
+  });
+
   test("classifies Connection lost as connection_lost", () => {
     const out = classifyDeployStderr("WebSocket: Connection lost mid-deploy");
     assert.strictEqual(out.class, "connection_lost");

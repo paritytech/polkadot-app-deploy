@@ -3294,6 +3294,44 @@ describe("getDeployAttributes", () => {
     assert.strictEqual(attrs["deploy.dotns_pop_source"], "personhood-precompile");
     assert.ok(!("deploy.dotns_cli_version" in attrs), "deploy.dotns_cli_version must not be emitted after removing deploy-time dotns-cli");
   });
+
+  describe("#1626: deploy.expected_error", () => {
+    function withExpectFail(value, fn) {
+      const prior = process.env.PAD_E2E_EXPECT_FAIL;
+      if (value === undefined) delete process.env.PAD_E2E_EXPECT_FAIL; else process.env.PAD_E2E_EXPECT_FAIL = value;
+      try {
+        fn();
+      } finally {
+        if (prior === undefined) delete process.env.PAD_E2E_EXPECT_FAIL; else process.env.PAD_E2E_EXPECT_FAIL = prior;
+      }
+    }
+
+    test("defaults to the string \"false\" on every span (both-values rule)", () => {
+      withExpectFail(undefined, () => {
+        assert.strictEqual(getDeployAttributes("test-domain")["deploy.expected_error"], "false", ">> FAIL: deploy.expected_error default: must be the string \"false\" with PAD_E2E_EXPECT_FAIL unset");
+      });
+    });
+
+    test("is the string \"true\" when PAD_E2E_EXPECT_FAIL=1", () => {
+      withExpectFail("1", () => {
+        assert.strictEqual(getDeployAttributes("test-domain")["deploy.expected_error"], "true", ">> FAIL: deploy.expected_error: must be \"true\" when the harness sets PAD_E2E_EXPECT_FAIL=1");
+      });
+    });
+
+    test("stays \"false\" for any value other than 1", () => {
+      for (const v of ["", "0", "true", "false"]) {
+        withExpectFail(v, () => {
+          assert.strictEqual(getDeployAttributes("test-domain")["deploy.expected_error"], "false", `>> FAIL: deploy.expected_error for PAD_E2E_EXPECT_FAIL="${v}": only "1" opts in`);
+        });
+      }
+    });
+
+    test("is a tag only: no src file but telemetry.ts reads the env var", async () => {
+      const { execFileSync } = await import("node:child_process");
+      const hits = execFileSync("grep", ["-rl", "PAD_E2E_EXPECT_FAIL", "src", "bin"], { encoding: "utf8" }).trim().split("\n").sort();
+      assert.deepStrictEqual(hits, ["src/telemetry.ts"], ">> FAIL: PAD_E2E_EXPECT_FAIL must be read only by src/telemetry.ts so it can never change deploy behavior");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3370,6 +3408,7 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.tool_version",
     "deploy.runner",
     "deploy.runner_type",
+    "deploy.expected_error",
     // deploy.pr, deploy.host_app, deploy.host_app_version are conditional — not checked here
   ];
 

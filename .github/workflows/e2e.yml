@@ -1321,6 +1321,8 @@ jobs:
           # memory-pressure behaviour. At job-level it leaks into npm ci's
           # prepare hook (see PR #408).
           NODE_OPTIONS: --max-old-space-size=512
+          # bulletin #1626: this deploy is asserted to fail; tag its spans deploy.expected_error.
+          PAD_E2E_EXPECT_FAIL: "1"
         run: |
           set +e
           "$PAD_BIN" --js-merkle --tag "$DEPLOY_TAG" --env "$PAD_ENV" build "$S3_LABEL" > /tmp/s3.log 2>&1

@@ -410,6 +410,11 @@ export function getDeployAttributes(domain: string): Record<string, string | num
     "deploy.tool_version": VERSION,
     "deploy.runner": resolveRunner(),
     "deploy.runner_type": resolveRunnerType(),
+    // bulletin #1626: the E2E harness sets PAD_E2E_EXPECT_FAIL=1 on a deploy it
+    // asserts will fail (S3 owned-elsewhere, governance-reserved, subdomain
+    // orphan…), so the E2E dashboard can exclude those deliberate error spans.
+    // A tag only: nothing else reads the var. Unconditional (both-values rule).
+    "deploy.expected_error": String(process.env.PAD_E2E_EXPECT_FAIL === "1"),
   };
   if (hostApp) attrs["deploy.host_app"] = hostApp;
   const hostAppVersion = process.env.PAD_HOST_APP_VERSION;

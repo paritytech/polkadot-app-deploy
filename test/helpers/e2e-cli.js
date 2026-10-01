@@ -19,7 +19,9 @@ function openLog() {
   return { stream, path: logPath };
 }
 
-export function runBulletinDeploy({ args = [], env = {}, timeoutMs = 15 * 60 * 1000 } = {}) {
+// expectFail: the caller asserts this deploy fails. Tags its spans
+// deploy.expected_error=true (bulletin #1626) so the E2E dashboard can exclude them.
+export function runBulletinDeploy({ args = [], env = {}, timeoutMs = 15 * 60 * 1000, expectFail = false } = {}) {
   const quiet = process.env.E2E_QUIET === "1";
   const log = openLog();
   return new Promise((resolve) => {
@@ -29,7 +31,7 @@ export function runBulletinDeploy({ args = [], env = {}, timeoutMs = 15 * 60 * 1
     }
     const started = Date.now();
     const child = spawn(process.execPath, [CLI_PATH, ...args], {
-      env: { ...process.env, ...env },
+      env: { ...process.env, ...(expectFail ? { PAD_E2E_EXPECT_FAIL: "1" } : {}), ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });
 

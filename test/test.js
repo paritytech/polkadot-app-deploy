@@ -3386,6 +3386,8 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.pool.nonce_collision_count": 0,
     "deploy.pool.nonce_collision_missing": 0,
     "deploy.pool.nonce_collision_reupload_count": 0,
+    // pool health (#1637)
+    "deploy.pool.stuck_skipped": "none",
     // manifest (string "0" per @sentry/node EAP numeric-attribute caveat)
     "deploy.manifest.fetch_source": "none",
     "deploy.manifest.fetch_attempts": "0",
@@ -11742,6 +11744,44 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     return [...pathsMatch[1].matchAll(/^ {6}- (.+)$/gm)].map(match => match[1].trim().replace(/^['"](.*)['"]$/, "$1"));
   }
 
+  // Port of bulletin #1638 (#1622): a lost runner used to file a "nothing to fix" issue
+  // each time. nightly-report now classifies the run (shared script) and skips
+  // the issue on a first-attempt SCHEDULED all-runner-loss run; the re-run is
+  // issued by e2e-runner-loss-rerun.yml because rerun-failed-jobs is refused
+  // for a run still in progress, and nightly-report is part of that run.
+  test(".github/workflows: runner-loss re-run is gated on schedule + attempt 1 + the classifier verdict, and the issue is skipped when it fires (bulletin #1622)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const steps = report.split(/\n(?= {6}- )/);
+    const classifyStep = steps.find((step) => /- name: Classify runner loss$/m.test(step));
+    const openStep = steps.find((step) => /- name: Open failure issue$/m.test(step));
+    assert.ok(classifyStep, ">> FAIL: runner-loss: nightly-report must have a 'Classify runner loss' step");
+    assert.match(classifyStep, /id: runner-loss/, ">> FAIL: runner-loss: the classify step must expose id runner-loss");
+    assert.match(classifyStep, /node \.github\/scripts\/classify-runner-loss\.cjs/,
+      ">> FAIL: runner-loss: nightly-report must use the shared classifier script, not a re-inlined copy");
+    assert.match(classifyStep, /continue-on-error: true/,
+      ">> FAIL: runner-loss: a classifier failure must never block the failure issue");
+    assert.match(openStep,
+      /!\(github\.event_name == 'schedule' && github\.run_attempt == 1 && steps\.runner-loss\.outputs\.verdict == 'all-runner-loss'\)/,
+      ">> FAIL: runner-loss: Open failure issue must be skipped only on schedule + run_attempt 1 + all-runner-loss");
+    assert.doesNotMatch(report, /actions\/runs\/[^\s"]*rerun-failed-jobs/,
+      ">> FAIL: runner-loss: nightly-report must not POST rerun-failed-jobs itself — GitHub refuses it for a run still in progress");
+
+    const rr = fs.readFileSync(".github/workflows/e2e-runner-loss-rerun.yml", "utf-8");
+    assert.match(rr, /workflow_run:\s*\n\s*workflows: \["E2E \(Paseo Bulletin\)"\]\s*\n\s*types: \[completed\]/,
+      ">> FAIL: runner-loss: the re-run workflow must trigger on completion of the E2E workflow");
+    assert.match(rr, /github\.event\.workflow_run\.event == 'schedule'/, ">> FAIL: runner-loss: re-run must be schedule-only (never release)");
+    assert.match(rr, /github\.event\.workflow_run\.run_attempt == 1/, ">> FAIL: runner-loss: attempt >= 2 must never auto-re-run");
+    assert.match(rr, /github\.event\.workflow_run\.conclusion == 'failure'/, ">> FAIL: runner-loss: re-run only fires for a failed run");
+    assert.match(rr, /steps\.classify\.outputs\.verdict == 'all-runner-loss'/, ">> FAIL: runner-loss: the POST must be gated on the all-runner-loss verdict");
+    assert.match(rr, /node \.github\/scripts\/classify-runner-loss\.cjs/, ">> FAIL: runner-loss: re-run workflow must use the shared classifier script");
+    assert.match(rr, /actions\/runs\/\$RUN_ID\/rerun-failed-jobs/, ">> FAIL: runner-loss: re-run workflow must POST rerun-failed-jobs");
+    assert.match(rr, /actions: write/, ">> FAIL: runner-loss: re-run workflow needs actions: write");
+    assert.match(rr, /steps\.rerun\.outcome == 'failure'/,
+      ">> FAIL: runner-loss: a failed re-run POST must file the issue nightly-report skipped");
+    assert.match(rr, /dry_run:[\s\S]*?default: true/, ">> FAIL: runner-loss: workflow_dispatch dry_run must default to true");
+  });
+
   // Port of bulletin #1427/#1392: a registry ECONNRESET during an install
   // reds a leg before any product code runs. Every npm install/ci step in
   // this repo's workflows must go through the pinned retry mechanism.
@@ -12357,8 +12397,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     // not here.
     assert.match(
       job,
-      /scenario:\s*s-content-only,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*8\s*}/,
-      "nightly-pr-coverage must wire scenario s-content-only to signer pool, merkle js, poolIndex 8",
+      /scenario:\s*s-content-only,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*13\s*}/,
+      "nightly-pr-coverage must wire scenario s-content-only to signer pool, merkle js, poolIndex 13 (not 8: bulletin #1637)",
     );
 
     // #1094: manifest publish on a non-default env (PAD_ENV is always set
@@ -17403,11 +17443,11 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       /startFaultProxy\(\{[\s\S]{0,260}mode: "rapid"[\s\S]{0,260}upstream: await resolveE2eBulletinRpc\(\)/.test(e2e),
       "S8 rapid proxy must target the selected environment's Bulletin RPC",
     );
-    // S8 uses a fresh per-run label picked once at describe scope, so both
-    // deploys reference the same `label` binding rather than re-calling
-    // pickDirectLabel(). Verify: one fresh-label pick + two buildArgs calls.
-    assert.match(e2e, /describe\("S8[\s\S]{0,300}const label = pickFreshRunLabel\("s8smoke"\)/,
-      "S8 must pick a fresh per-run label once at describe scope");
+    // S8 picks its label once at describe scope (the tier's fixed label since
+    // bulletin #1623), so both deploys reference the same `label` binding rather than
+    // re-calling pickDirectLabel(). Verify: one label pick + two buildArgs calls.
+    assert.match(e2e, /describe\("S8[\s\S]{0,300}const label = tieredLabel\("s8"\)/,
+      "S8 must pick its tier label once at describe scope");
     // #paseo-tld: the suffix is now the env's resolved tld (bare "dot" was
     // hardcoded pre-#1240; the CLI's wrong-TLD guard would reject that on a
     // .paseo env), so this regex accepts any `.${tld}`-shaped interpolation
@@ -17423,7 +17463,9 @@ describe("paseo-next-v2 E2E harness wiring", () => {
   test("PR/source E2E harness uses NoStatus labels when the signer has no PoP status", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
 
-    for (const label of ["e2epoolns01", "e2edirect01", "e2eincpool01", "e2erotpool01", "e2escarpool01"]) {
+    // S-CAR's old e2escarpool01 fallback is gone (bulletin #1623): it deploys to a
+    // per-tier label, each pinned NoStatus on every profile in test/e2e-fixtures.test.js.
+    for (const label of ["e2epoolns01", "e2edirect01", "e2eincpool01", "e2erotpool01"]) {
       assertNoStatusLabel(label);
       assert.match(e2e, new RegExp(label), `source E2E harness must include NoStatus fallback label ${label}.dot`);
     }
@@ -17442,8 +17484,10 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
     assert.match(
       e2e,
-      /describe\("S-INC-CROSSLABEL[\s\S]{0,1200}const labelA = pickFreshRunLabel\(`e2exlbla\$\{MERKLE\}`\);[\s\S]{0,200}const labelB = pickFreshRunLabel\(`e2exlblb\$\{MERKLE\}`\);/,
-      ">> FAIL: crosslabel-leg-collision: S-INC-CROSSLABEL must fold MERKLE into both labelA's and labelB's prefix so the js and kubo matrix legs (which share RUN_TAG) can't pick the same fresh label.",
+      // bulletin #1623: label A is the per-merkle tier label; label B is a subname of A,
+      // so it inherits the merkle discriminator.
+      /describe\("S-INC-CROSSLABEL[\s\S]{0,2000}const labelA = tieredLabel\(`s-inc-crosslabel-a-\$\{MERKLE\}`\);[\s\S]{0,200}const labelB = `[^`]*\.\$\{labelA\}`;/,
+      ">> FAIL: crosslabel-leg-collision: S-INC-CROSSLABEL must fold MERKLE into label A (and derive label B from A) so the js and kubo matrix legs (which share RUN_TAG) can't pick the same labels.",
     );
   });
 
@@ -17519,7 +17563,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     for (const label of [
       "e2es525829471478a1x00",
       "e2epoolns01",
-      "e2escar25829471478a1x00",
     ]) {
       assertNoStatusLabel(label);
     }
@@ -17527,7 +17570,12 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.match(workflowJobBlock(workflow, "nightly-s5"), /LABEL:\s*"e2es5\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00"/, "nightly S5 must use a dynamic NoStatus label");
     assert.match(workflowJobBlock(workflow, "nightly-s6"), /build e2epoolns01\b(?!\.)/, "nightly S6 must deploy the NoStatus pool label as a BARE label — a \".dot\" suffix is rejected on a .paseo environment");
     assert.match(workflowJobBlock(workflow, "nightly-s7"), /LABEL:\s*e2epoolns01/, "nightly S7 must use the v2 NoStatus pool label");
-    assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00$/m, "nightly S-CAR must use a dynamic NoStatus label");
+    // bulletin #1623: S-CAR deploys to the tier's fixed label from tools/lib/e2e-fixtures.mjs
+    // on both paths; a per-run LABEL here would register a fresh name every run.
+    const sCar = workflowJobBlock(workflow, "nightly-s-car");
+    assert.doesNotMatch(sCar, /^\s*LABEL:/m, ">> FAIL: S-CAR: the job must not set LABEL; it would override the provisioned per-tier label");
+    assert.match(sCar, /tieredFixtureLabel\("s-car", process\.env\.DEPLOY_TAG\)/, ">> FAIL: S-CAR: the npm-path script must take its label from tools/lib/e2e-fixtures.mjs");
+    assert.match(sCar, /DEPLOY_TAG: \$\{\{ needs\.build-nightly\.outputs\.deploy-tag \}\}/, ">> FAIL: S-CAR: the label tier comes from DEPLOY_TAG, so the job must set it");
 
     const sExt = workflowJobBlock(workflow, "nightly-s-ext-signer");
     assert.match(sExt, /setContenthash\("e2epoolns01", expected\)/, "nightly S-ext-signer must write the v2 NoStatus pool label");
@@ -26650,8 +26698,9 @@ describe("e2e-ensure-authorized: DRIFT GUARD — signer list derived from e2e.ym
     const expected = [
       "//e2e-direct", "//e2e-fresh-direct", "//e2e-fresh-pool", "//e2e-s9", "//e2e-sgrandpa",
       "//deploy/0", "//deploy/1", "//deploy/2", "//deploy/3", "//deploy/4", "//deploy/5",
-      "//deploy/6", "//deploy/7", "//deploy/8", "//deploy/9", "//deploy/10", "//deploy/11",
-      "//deploy/12",
+      // No pinned //deploy/8: s-content-only moved to 13 (bulletin #1637).
+      "//deploy/6", "//deploy/7", "//deploy/9", "//deploy/10", "//deploy/11",
+      "//deploy/12", "//deploy/13",
     ];
     assert.deepStrictEqual(labels, expected,
       `>> FAIL: e2e-signer-drift-guard: the derived signer set no longer matches the pinned expectation (derived: ${JSON.stringify(labels)}). ` +
@@ -27213,5 +27262,42 @@ describe("Bulletin network context is settable from outside deploy() (#1496, min
     } finally {
       setBulletinNetworkContext(saved);
     }
+  });
+});
+
+// bulletin #1628 (port of bulletin #1636): the daily funding check must stay
+// read-only and minimally privileged.
+describe("e2e-funding-check workflow (bulletin #1628)", () => {
+  const wf = fs.readFileSync(".github/workflows/e2e-funding-check.yml", "utf8");
+  // Strip comments so the explanatory header cannot satisfy or trip an assertion.
+  const code = wf.replace(/^\s*#.*$/gm, "");
+
+  test("runs daily before the 15:00 nightly, can be dispatched, and uses ubuntu-latest", () => {
+    assert.match(code, /schedule:\s*\n\s*- cron: "17 14 \* \* \*"/, ">> FAIL: funding-check: must be scheduled at 14:17 UTC, before the 15:00 nightly");
+    assert.match(code, /^ {2}workflow_dispatch:/m, ">> FAIL: funding-check: must allow workflow_dispatch");
+    assert.match(code, /runs-on: ubuntu-latest/, ">> FAIL: funding-check: this public repo runs on ubuntu-latest");
+    assert.doesNotMatch(code, /parity-default/, ">> FAIL: funding-check: parity-default is upstream's private-repo runner, not this repo's");
+  });
+
+  test("permissions are minimal: read contents, write issues only", () => {
+    const perms = [...code.matchAll(/^\s*permissions:\s*\n((?:\s+[\w-]+: \w+\n)+)/gm)].map((m) => m[1].trim().split(/\s*\n\s*/).sort().join(","));
+    assert.ok(perms.length >= 1, ">> FAIL: funding-check: permissions block missing");
+    for (const p of perms) {
+      assert.ok(["contents: read", "contents: read,issues: write"].includes(p), `>> FAIL: funding-check: unexpected permissions '${p}'`);
+    }
+    assert.ok(perms.includes("contents: read,issues: write"), ">> FAIL: funding-check: the job needs issues: write to file the funding issue");
+  });
+
+  test("never moves money: no transfer calls in the workflow or the tools it runs", () => {
+    const TRANSFER = /transfer_allow_death|transferKeepAlive|transfer_keep_alive|Balances\.transfer|attemptTestnetTopUp|signAndSubmit|\.tx\./;
+    for (const file of [".github/workflows/e2e-funding-check.yml", "tools/funding-check.mjs", "tools/funding-verdict.mjs", "tools/check-balances.mjs"]) {
+      const text = fs.readFileSync(file, "utf8").replace(/^\s*(#|\/\/|\*|\/\*).*$/gm, "");
+      assert.doesNotMatch(text, TRANSFER, `>> FAIL: funding-check: ${file} must stay read-only (no transfer/submit calls)`);
+    }
+  });
+
+  test("files a single issue labelled funding", () => {
+    assert.match(code, /labels: 'funding'/, ">> FAIL: funding-check: dedup must list open issues by the funding label");
+    assert.match(code, /labels: \['funding'\]/, ">> FAIL: funding-check: new issues must carry the funding label");
   });
 });

@@ -29,7 +29,7 @@ import type { DotnsAbiProfile } from "./dotns-protocol.js";
 import { subnameNestingLevels } from "./subname-depth.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { derivePoolAccounts, fetchPoolAuthorizations, selectAccount, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
+import { derivePoolAccounts, fetchPoolAuthorizations, selectHealthyPoolAccount, checkPoolAccountNonceHealth, StuckPoolAccountError, stuckQueueMessage, parsePoolDerivationIndex, NONCE_HEALTH_SAMPLES, type NonceHealth, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
 import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
@@ -455,7 +455,28 @@ function toHashingEnum(mhCode: number): { type: string; value: undefined } {
   }
 }
 
-async function getProvider(): Promise<ProviderResult> {
+// bulletin #1637: reads for checkPoolAccountNonceHealth. The on-chain nonce comes from the deploy's own
+// client at the BEST block. Each nextIndex sample goes through fetchNonce, which opens a fresh
+// WebSocket per call (a new load-balancer backend pick), the same path chunk nonces are read
+// through. Samples are spread round-robin over the endpoints.
+async function checkSignerQueue(unsafeApi: any, who: string, address: string): Promise<NonceHealth> {
+  const h = await checkPoolAccountNonceHealth(address, {
+    readOnchainNonce: async (a: string) => Number((await unsafeApi.query.System.Account.getValue(a, { at: "best" })).nonce),
+    readNextIndex: (a: string, sample: number) => fetchNonce(BULLETIN_ENDPOINTS[sample % BULLETIN_ENDPOINTS.length], a),
+    samples: NONCE_HEALTH_SAMPLES * BULLETIN_ENDPOINTS.length,
+  });
+  console.log(h.verdict === "unknown"
+    ? `   Could not check ${who}'s pending-tx queue (${h.reason}); continuing`
+    : `   Pending-tx queue (${who}): on-chain nonce ${h.onchain}, nextIndex samples [${h.samples.join(", ")}] -> ${h.verdict}`);
+  return h;
+}
+
+// bulletin #1637: which accounts a deploy refused because their queue was stuck. Seeded "none".
+function recordStuckSkipped(ids: Array<number | string>): void {
+  if (ids.length > 0) setDeployAttribute("deploy.pool.stuck_skipped", ids.join(","));
+}
+
+async function getProvider({ checkQueue = true }: { checkQueue?: boolean } = {}): Promise<ProviderResult> {
   const primary = BULLETIN_ENDPOINTS[0];
   console.log(`   Connecting to Bulletin: ${primary}`);
   const client = createPolkadotClient(getWsProvider(
@@ -479,9 +500,22 @@ async function getProvider(): Promise<ProviderResult> {
       }
       pinnedPoolIndex = n;
     }
-    const selectionResult = selectAccount(authorizations, Math.random, pinnedPoolIndex);
+    // bulletin #1637: skip (or, when pinned, fail fast on) an account whose pending-tx queue is stuck.
+    let selectionResult;
+    try {
+      selectionResult = await selectHealthyPoolAccount(authorizations, {
+        pinnedIndex: pinnedPoolIndex,
+        checkHealth: checkQueue
+          ? (a) => checkSignerQueue(unsafeApi, `pool account ${a.index}`, a.address)
+          : async () => ({ verdict: "unknown", samples: [], reason: "skipped on reconnect" }),
+      });
+    } catch (e) {
+      if (e instanceof StuckPoolAccountError) recordStuckSkipped(e.skippedStuck.map((s) => s.index));
+      throw e;
+    }
     const selectedAccount = selectionResult.account;
     const eligibleCount = selectionResult.eligibleCount;
+    recordStuckSkipped(selectionResult.skippedStuck.map((s) => s.index));
     await ensureAuthorized(unsafeApi, selectedAccount.address, `pool account ${selectedAccount.index}`, { network: bulletinNetwork });
 
     console.log(`   Using pool account ${selectedAccount.index}: ${selectedAccount.address}`);
@@ -496,7 +530,7 @@ async function getProvider(): Promise<ProviderResult> {
   }
 }
 
-async function getDirectProvider(mnemonic: string, derivationPath: string = ""): Promise<ProviderResult> {
+async function getDirectProvider(mnemonic: string, derivationPath: string = "", { checkQueue = true }: { checkQueue?: boolean } = {}): Promise<ProviderResult> {
   const primary = BULLETIN_ENDPOINTS[0];
   console.log(`   Connecting to Bulletin: ${primary}`);
   const client = createPolkadotClient(getWsProvider(
@@ -508,10 +542,25 @@ async function getDirectProvider(mnemonic: string, derivationPath: string = ""):
 
   console.log(`   Using direct signer: ${ss58}${derivationPath ? ` (path: ${derivationPath})` : ""}`);
 
+  // bulletin #1637: a direct signer has no other account to fall back to, so a stuck queue fails fast
+  // instead of 3 x 180 s chunk timeouts. "unknown" (RPC trouble) proceeds as before. The check
+  // never rejects and runs alongside the authorization read; it is awaited before ensureAuthorized.
+  const queueCheck: Promise<NonceHealth> = checkQueue
+    ? checkSignerQueue(unsafeApi, "direct signer", ss58)
+    : Promise.resolve({ verdict: "unknown", samples: [] });
   let [auth, currentBlock] = await Promise.all([
     readAccountAuthorization(unsafeApi, ss58),
     client.getFinalizedBlock(),
   ]);
+  const queue = await queueCheck;
+  if (queue.verdict === "stuck") {
+    client.destroy();
+    recordStuckSkipped([parsePoolDerivationIndex(derivationPath) ?? "direct"]);
+    throw new NonRetryableError(stuckQueueMessage(
+      `Direct signer${derivationPath ? ` ${derivationPath}` : ""}`, ss58, queue,
+      "Deploy with another signer or derivation path, or wait for the queue to clear.",
+    ));
+  }
   let now = currentBlock.number;
   if (!isAuthorizationSufficient(auth, now)) {
     try {
@@ -848,10 +897,23 @@ export function assertPoolFallbackAllowed(network: string | undefined, reason: s
   );
 }
 
+// bulletin #1637: the pending-tx queue check costs 8 fresh connections per endpoint (plus a 12 s confirm
+// wait on a large gap), and behind a halted endpoint each sample waits out fetchNonce's 8 s timer.
+// Run it on the first provider a deploy creates, not on every mid-upload reconnect (S8's budget).
+function firstCallChecksQueue(make: (checkQueue: boolean) => Promise<ProviderResult>): () => Promise<ProviderResult> {
+  let first = true;
+  return () => {
+    const checkQueue = first;
+    first = false;
+    return make(checkQueue);
+  };
+}
+
 export function selectStorageReconnect(options: DeployOptions): () => Promise<ProviderResult> {
   // Delegate the mode decision to the pure, unit-tested selector (bulletin #1452) so this
   // function and __selectStorageProviderModeForTest can never disagree about which branch runs.
   const mode = __selectStorageProviderModeForTest(options);
+  const pool = firstCallChecksQueue((checkQueue) => getProvider({ checkQueue }));
   if (mode === "storageSigner") {
     // Committed-signer: once the slot provider fails on the first attempt,
     // every subsequent reconnect uses pool. Prevents signer drift mid-upload
@@ -862,7 +924,7 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
     // unavailable (or retries were exhausted) — not a single WS blip.
     let useSlot = true;
     return async () => {
-      if (!useSlot) return getProvider();
+      if (!useSlot) return pool();
       try {
         return await getSlotSignerProvider(options.storageSigner!, options.storageSignerAddress!);
       } catch (e) {
@@ -879,7 +941,7 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
           `   Falling back to the shared pool account for storage (fine on testnet).\n` +
           `   To use your own allowance, run: ${CLI_NAME} logout && ${CLI_NAME} login`,
         );
-        return getProvider();
+        return pool();
       }
     };
   }
@@ -892,8 +954,8 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
   if (mode === "signer")
     return () => getSignerProvider(options.signer!, options.signerAddress!);
   if (mode === "direct")
-    return () => getDirectProvider(options.mnemonic!, options.derivationPath);
-  return () => getProvider();
+    return firstCallChecksQueue((checkQueue) => getDirectProvider(options.mnemonic!, options.derivationPath, { checkQueue }));
+  return pool;
 }
 
 function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuccess: (event?: any) => T, { label = "transaction", rpc, senderSS58, expectedNonce, timeoutMs, fetchNonce: fetchNonceOverride }: WatchTransactionOptions = {}): Promise<WatchResult<T>> {

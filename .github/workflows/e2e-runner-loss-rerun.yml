@@ -1,0 +1,127 @@
+name: E2E runner-loss re-run
+
+# Port of bulletin #1638 (#1622). Upstream: 31 red nightly legs in 30 days were
+# a lost parity-default runner
+# ("The self-hosted runner lost communication with the server", "received a
+# shutdown signal", "The operation was canceled", or no log at all), each
+# filing a failure issue that a human closed as "runner lost, nothing to fix".
+# When EVERY red leg of a first-attempt scheduled nightly is a lost runner,
+# re-run the failed jobs once. The re-run's own nightly-report then files (or
+# does not file) the issue as usual.
+#
+# Why a separate workflow: rerun-failed-jobs is refused for a run that is still
+# in progress, and e2e.yml's nightly-report job is part of that run. This
+# workflow fires once the run has COMPLETED. nightly-report skips its failure
+# issue under the same condition, using the same classifier script
+# (.github/scripts/classify-runner-loss.cjs), so the two cannot disagree.
+#
+# Safety net: nightly-report skips its issue only when this workflow is about
+# to re-run. If the re-run POST fails, this workflow files the issue itself, so
+# a skipped issue always means "re-run issued" or "issue filed".
+#
+# Schedule events only. Release gates are judged by a human/controller, who
+# decides on a re-run.
+# Attempt >= 2 never auto-re-runs, so there is at most one automatic re-run.
+#
+# workflow_run only fires for the copy of this file on the default branch, so
+# the workflow_dispatch trigger exists to classify a past run (dry_run=true,
+# the default, never POSTs).
+
+on:
+  workflow_run:
+    workflows: ["E2E (Paseo Bulletin)"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "E2E run ID to classify"
+        required: true
+        type: string
+      dry_run:
+        description: "Print the verdict only; do not re-run"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  rerun:
+    name: Re-run failed jobs on runner loss
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.event == 'schedule' &&
+       github.event.workflow_run.run_attempt == 1 &&
+       github.event.workflow_run.conclusion == 'failure')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # actions:write — POST /actions/runs/{id}/rerun-failed-jobs
+      actions: write
+      # checks:read — GET /check-runs/{id}/annotations (classifier input)
+      checks: read
+      # contents:read — sparse checkout of .github/scripts
+      contents: read
+      # issues:write — failure issue when the re-run POST fails (safety net)
+      issues: write
+    env:
+      RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Classify runner loss
+        id: classify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: |
+          node .github/scripts/classify-runner-loss.cjs | tee /tmp/verdict.txt
+          {
+            echo "### Runner-loss verdict for run ${RUN_ID}"
+            echo '```'
+            cat /tmp/verdict.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Re-run failed jobs
+        id: rerun
+        if: >
+          steps.classify.outputs.verdict == 'all-runner-loss' &&
+          (github.event_name == 'workflow_run' || !inputs.dry_run)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+        run: |
+          code=$(curl -sS --max-time 30 -o /tmp/rerun.json -w '%{http_code}' -X POST \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPO/actions/runs/$RUN_ID/rerun-failed-jobs")
+          if [ "$code" != 201 ]; then
+            echo "::error::rerun-failed-jobs returned HTTP $code: $(head -c 300 /tmp/rerun.json)"
+            exit 1
+          fi
+          echo "Every red leg of run $RUN_ID was a lost runner: re-ran the failed jobs once (attempt 2)." | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Dry run
+        if: steps.classify.outputs.verdict == 'all-runner-loss' && github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          echo "dry_run=true: would re-run the failed jobs of run $RUN_ID." | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: File the failure issue when the re-run could not be issued
+        if: always() && steps.rerun.outcome == 'failure' && github.event_name == 'workflow_run'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+        run: |
+          BODY=$(printf 'Every red leg of the nightly run %s was a lost runner, but the automatic re-run could not be issued (see this workflow run: %s/%s/actions/runs/%s). nightly-report skipped its own failure issue expecting that re-run, so this issue stands in for it.\n\nRe-run the failed jobs by hand.' \
+            "$RUN_URL" "${{ github.server_url }}" "$REPO" "${{ github.run_id }}")
+          curl -fsSL --max-time 30 -X POST \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPO/issues" \
+            -d "$(jq -n --arg title "Nightly E2E failure: runner lost and automatic re-run failed (run $RUN_ID)" --arg body "$BODY" '{title: $title, body: $body}')"

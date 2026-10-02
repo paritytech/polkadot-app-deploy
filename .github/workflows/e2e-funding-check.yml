@@ -1,0 +1,125 @@
+name: E2E Funding Check
+
+# Daily balance check (port of bulletin #1636 / #1628). Runs at 14:17 UTC, ahead
+# of the 15:00 nightly E2E, so a signer that would hit the funds gate shows up as
+# ONE `funding` issue instead of a red matrix. Read-only on chain: tools/funding-check.mjs never sends
+# a transaction, and money movement stays a human step.
+#
+# Verdict rules live in tools/funding-verdict.mjs. The floor is the deploy's own
+# feeFloorFor("register", ...) plus a margin. Thresholds can be overridden on a
+# manual dispatch.
+#
+# Runs on ubuntu-latest like the rest of this public repo (upstream uses
+# parity-default because of a private-repo billing block).
+
+on:
+  schedule:
+    - cron: "17 14 * * *"
+  workflow_dispatch:
+    inputs:
+      margin_pct:
+        description: "Percent headroom above the register floor"
+        default: "20"
+      root_warn_pas:
+        description: "WARN when Alice ROOT is below this many PAS (burn headroom)"
+        default: "1000"
+      refill_min_pas:
+        description: "FAIL when the refill source //Alice is below this many PAS"
+        default: "500"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-funding-check
+  cancel-in-progress: false
+
+jobs:
+  funding-check:
+    name: Check E2E signer balances
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+      # Node 22 bundles npm 10, which cannot install this repo's npm 11
+      # lockfile (see #1216). Keep in sync with packageManager in package.json.
+      - name: npm install -g npm@11.17.0
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm install -g npm@11.17.0
+      - name: npm ci
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Check balances
+        id: check
+        continue-on-error: true
+        env:
+          MARGIN_PCT: ${{ inputs.margin_pct || '20' }}
+          ROOT_WARN_PAS: ${{ inputs.root_warn_pas || '1000' }}
+          REFILL_MIN_PAS: ${{ inputs.refill_min_pas || '500' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          node tools/funding-check.mjs --out-dir funding-out --run-url "$RUN_URL" \
+            --margin-pct "$MARGIN_PCT" --root-warn-pas "$ROOT_WARN_PAS" --refill-min-pas "$REFILL_MIN_PAS"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ -f funding-out/funding-table.md ]; then
+            { echo "### E2E signer balances"; echo; cat funding-out/funding-table.md; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $code
+      - name: Open or update the funding issue
+        if: always() && steps.check.outputs.exit_code != '' && steps.check.outputs.exit_code != '2'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const verdict = fs.readFileSync('funding-out/funding-verdict.txt', 'utf8').trim();
+            const body = fs.readFileSync('funding-out/funding-body.md', 'utf8');
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const open = (await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, labels: 'funding', state: 'open', per_page: 100,
+            })).filter((i) => !i.pull_request);
+            const issue = open[0];
+            if (verdict === 'FAIL') {
+              if (issue) {
+                await github.rest.issues.createComment({ owner, repo, issue_number: issue.number, body });
+              } else {
+                await github.rest.issues.create({
+                  owner, repo, labels: ['funding'],
+                  title: 'E2E signer balance below the funds-gate floor',
+                  body,
+                });
+              }
+            } else if (issue) {
+              const comments = await github.rest.issues.listComments({ owner, repo, issue_number: issue.number, per_page: 100 });
+              const last = comments.data[comments.data.length - 1];
+              if (!last || !last.body.startsWith('Funding check recovered')) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issue.number,
+                  body: `Funding check recovered: no signer is below its floor (overall ${verdict}). Leaving this open for a human to close.\n\nRun: ${runUrl}`,
+                });
+              }
+            }
+      - name: Fail the job if the check did not pass
+        if: steps.check.outputs.exit_code != '0'
+        env:
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        run: |
+          if [ "$EXIT_CODE" = "1" ]; then
+            echo ">> FAIL: E2E funding check: a signer is below its floor; see the funding issue and the job summary."
+          else
+            echo ">> FAIL: E2E funding check: could not read every balance (exit $EXIT_CODE); nothing was judged. See the step log."
+          fi
+          exit 1

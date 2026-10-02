@@ -489,6 +489,9 @@ jobs:
         env:
           E2E: "1"
           E2E_SCENARIO: s1-smoke
+          # bulletin #1623: each PR deploys to its own label (registered on its first
+          # run). Empty on push/dispatch, which use the provisioned pr-tier label.
+          E2E_PR_NUMBER: ${{ github.event.pull_request.number }}
           E2E_SIGNER: ${{ matrix.signer }}
           E2E_MERKLE: ${{ matrix.merkle }}
           PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
@@ -1067,7 +1070,10 @@ jobs:
           - { scenario: s-inc-portability,        signer: pool,   merkle: js,   poolIndex: 5 }
           - { scenario: s-inc-asset-rotation,     signer: pool,   merkle: js,   poolIndex: 6 }
           - { scenario: s-subdomain,              signer: pool,   merkle: js,   poolIndex: 7 }
-          - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 8 }
+          # Pinned to 13, not 8 (bulletin #1637): //deploy/8's nonce is stuck behind
+          # immortal third-party txs in one RPC backend's pool. Any unused index would
+          # do — the pin only keeps this leg's nonces apart from the concurrent pinned legs.
+          - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 13 }
           - { scenario: s-manifest-env,           signer: pool,   merkle: js,   poolIndex: 9 }
           # No poolIndex: --product-name derives its own signer and refuses a
           # derivation path, so this leg cannot be pinned to a //deploy/N account.
@@ -2141,12 +2147,12 @@ jobs:
 
   nightly-s-car:
     name: Nightly S-CAR --input-car deploy from pre-built CAR (${{ matrix.env }})
-    # Runs after nightly-s1-pool since it deploys a fresh per-run domain
-    # (no conflict with e2epoolns01.dot), but we still wait so the pool mnemonic
-    # isn't racing S1's Asset Hub transactions.
+    # Runs after nightly-s1-pool. It deploys its own per-tier fixed label
+    # (bulletin #1623; no conflict with e2epoolns01), but we still wait so the pool
+    # mnemonic isn't racing S1's Asset Hub transactions.
     needs: [build-nightly, nightly-s1-pool, select-env, ensure-e2e-authorized]
     if: always() && needs.ensure-e2e-authorized.result == 'success' && needs.build-nightly.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && (github.event_name != 'workflow_dispatch' || inputs.scenarios == '' || contains(format(',{0},', inputs.scenarios), format(',{0},', 's-car')))
-    # Two consecutive deploys (normal + --input-car) to a fresh per-run label.
+    # Two consecutive deploys (normal + --input-car) to the tier's fixed label.
     # Runs on both paths: source-build uses node --test test/e2e.test.js;
     # npm-install path writes an inline script so test/ is not required.
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
@@ -2200,9 +2206,8 @@ jobs:
           E2E_SIGNER: pool
           E2E_MERKLE: js
           PAD_ENV: ${{ matrix.env }}
-          # x00 forces NoStatus classification on both e2eEligible envs without
-          # depending on POP_RULES self-attestation.
-          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00
+          # No LABEL: the test deploys to the tier's fixed label from
+          # tools/lib/e2e-fixtures.mjs (bulletin #1623), keyed on DEPLOY_TAG.
         with:
           timeout_minutes: 40
           max_attempts: 2
@@ -2235,13 +2240,16 @@ jobs:
           import path from "path";
           import fs from "fs";
           import { spawnSync } from "child_process";
-          import { fileURLToPath } from "url";
+          import { fileURLToPath, pathToFileURL } from "url";
 
           const __dirname = path.dirname(fileURLToPath(import.meta.url));
           const BIN = path.join(__dirname, "node_modules", ".bin", "polkadot-app-deploy");
 
           const PAD_ENV = process.env.PAD_ENV ?? process.env.DOTNS_ENV ?? "paseo-next-v2";
-          const LABEL = process.env.LABEL || "e2escar00default";
+          // bulletin #1623: the tier's fixed Alice-ROOT-owned label, from the same
+          // table the source-path test uses.
+          const { tieredFixtureLabel } = await import(pathToFileURL(path.join(process.env.GITHUB_WORKSPACE, "tools/lib/e2e-fixtures.mjs")).href);
+          const LABEL = process.env.LABEL || tieredFixtureLabel("s-car", process.env.DEPLOY_TAG);
           const MNEMONIC = process.env.MNEMONIC || "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
           const DEPLOY_TAG = process.env.DEPLOY_TAG || undefined;
           const SENTRY_DSN = process.env.SENTRY_DSN || undefined;
@@ -2312,9 +2320,8 @@ jobs:
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
           PAD_ENV: ${{ matrix.env }}
-          # x00 forces NoStatus classification on both e2eEligible envs without
-          # depending on POP_RULES self-attestation.
-          LABEL: e2escar${{ github.run_id }}a${{ github.run_attempt }}x00
+          # No LABEL: the script reads the tier's fixed label from the
+          # checkout's tools/lib/e2e-fixtures.mjs (bulletin #1623), keyed on DEPLOY_TAG.
         with:
           timeout_minutes: 38
           max_attempts: 2
@@ -2731,6 +2738,10 @@ jobs:
       actions: read
       # issues:write — needed to open failure issues on schedule/release triggers
       issues: write
+      # checks:read — GET /check-runs/{id}/annotations for the runner-loss classifier (bulletin #1622)
+      checks: read
+      # contents:read — sparse checkout of .github/scripts for the runner-loss classifier (bulletin #1622)
+      contents: read
     steps:
       - name: Fetch per-leg job results
         env:
@@ -3069,6 +3080,48 @@ jobs:
             echo "DEDUP_LABEL=$DEDUP_LABEL"
           } >> "$GITHUB_ENV"
 
+      # Runner-loss verdict (port of bulletin #1638 / #1622). Logs on every event;
+      # on a first-attempt SCHEDULED run whose every red leg is a lost runner, the
+      # failure issue below is skipped because e2e-runner-loss-rerun.yml will
+      # re-run the failed jobs. This job cannot issue that re-run itself:
+      # rerun-failed-jobs is refused while the run (which contains this job) is
+      # still in progress. Both workflows use the same classifier script, so
+      # they agree about the run; if the re-run POST fails, that workflow files
+      # the issue itself. Release runs are never skipped or auto-re-run: the
+      # release gate is judged by a human.
+      # continue-on-error on all three steps: a classifier hiccup must never
+      # suppress an issue, because anything but "all-runner-loss" files as before.
+      - name: Check out the runner-loss classifier
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Set up Node for the runner-loss classifier
+        if: always()
+        continue-on-error: true
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Classify runner loss
+        id: runner-loss
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          node .github/scripts/classify-runner-loss.cjs | tee /tmp/runner-loss.txt
+          if [ "$EVENT" = schedule ] && [ "$ATTEMPT" = 1 ] && grep -q 'verdict=all-runner-loss' /tmp/runner-loss.txt; then
+            echo "Every red leg is a lost runner: failure issue skipped on this attempt; e2e-runner-loss-rerun.yml re-runs the failed jobs once (bulletin #1622)." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
       # workflow_dispatch runs are manual — skip auto-issue for those (maintainer
       # is already watching). schedule + release get an issue because failures
       # there indicate drift nobody was watching for. `contains(needs.*.result, …)`
@@ -3083,7 +3136,8 @@ jobs:
         if: >
           always() &&
           (github.event_name == 'schedule' || github.event_name == 'release') &&
-          (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+          (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) &&
+          !(github.event_name == 'schedule' && github.run_attempt == 1 && steps.runner-loss.outputs.verdict == 'all-runner-loss')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

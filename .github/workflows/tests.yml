@@ -134,6 +134,14 @@ jobs:
       - uses: ./.github/actions/npm-retry
         with:
           run: npm ci
+      # Kubo makes the "merkle backends — JS vs Kubo" parity tests in
+      # test/test.js actually run (hasIPFS() was false here, so they skipped).
+      # Same fallback script as the E2E jobs (primary host, then the GitHub
+      # release, sha512-verified).
+      - name: Setup IPFS Kubo
+        uses: ./.github/actions/setup-kubo
+      - name: Initialize IPFS
+        run: ipfs init
       - run: npm run typecheck
       - run: npm test
 
@@ -160,11 +168,27 @@ jobs:
       #     deliberate and must stay off, not be "fixed" by removing the guard.
       # All three are scoped by exact phrase so they cannot mask a real
       # expression error like the matrix-context bug above.
+      # Pinned release downloaded from GitHub Releases and verified against a
+      # sha256 pinned HERE (not a checksums file fetched from the same host).
+      # GitHub is the only host: pin plus checksum, no alternate. Previously
+      # this piped the unpinned `main` branch installer into bash. No cache:
+      # the ~5 MB download costs about what a cache restore does.
       - name: Lint workflows (actionlint)
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
           set -euo pipefail
-          bash <(curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
-          ./actionlint -color \
+          TARBALL="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          WORK="$(mktemp -d)"
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 10 --max-time 120 -o "$WORK/$TARBALL" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${TARBALL}"
+          echo "${ACTIONLINT_SHA256}  $WORK/$TARBALL" | sha256sum --check --strict -
+          tar -xzf "$WORK/$TARBALL" -C "$WORK" actionlint
+          BIN="$WORK/actionlint"
+          "$BIN" -version
+          "$BIN" -color \
             -ignore 'shellcheck reported issue in this script' \
             -ignore 'is potentially untrusted' \
             -ignore 'constant expression "false" in condition'

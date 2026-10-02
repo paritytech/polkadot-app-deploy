@@ -181,34 +181,85 @@ jobs:
           echo "cid=$(cat .deploy-cache/cid)" >> "$GITHUB_OUTPUT"
           echo "::notice::Found cached CID: $(cat .deploy-cache/cid)"
 
-      - name: Setup IPFS Kubo
-        # Inline download with retry. `ipfs/download-ipfs-distribution-action@v1`
-        # wraps curl in a single composite action that can't be wrapped by
-        # `nick-fields/retry`, so occasional HTTP/2 INTERNAL_ERROR failures
-        # from dist.ipfs.tech fail a whole deploy (e.g. release run
-        # 24624209590's pool/kubo ubuntu-latest leg). 3 attempts × 30s
-        # backoff is sufficient in practice.
+      - name: Restore Kubo from cache
         if: steps.cache.outputs.cache-hit != 'true' && inputs.js-merkle != true
-        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/kubo
+          key: kubo-v0.33.0-linux-amd64
+
+      - name: Setup IPFS Kubo
+        # INLINE on purpose: this is a reusable workflow, so a
+        # repo-local script path would resolve against the CALLER's checkout.
+        # The marked blocks below mirror .github/scripts/install-kubo.sh and
+        # test/install-kubo.test.js fails if they drift apart.
+        # dist.ipfs.tech first, then the GitHub release asset, each verified
+        # against the .sha512 published next to it (paritytech/polkadot-app-deploy#303).
+        # Per-source retries live in the curl flags, so no outer retry wrapper.
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.js-merkle != true
         env:
           KUBO_VERSION: v0.33.0
-        with:
-          timeout_minutes: 5
-          max_attempts: 3
-          retry_wait_seconds: 30
-          command: |
-            set -euo pipefail
-            ARCH="linux-amd64"
-            TARBALL="kubo_${KUBO_VERSION}_${ARCH}.tar.gz"
-            URL="https://dist.ipfs.tech/kubo/${KUBO_VERSION}/${TARBALL}"
-            echo "Downloading ${URL}"
-            curl --fail --retry 5 --retry-all-errors --retry-delay 2 \
-                 --connect-timeout 30 --max-time 300 \
-                 --no-progress-meter --output "${TARBALL}" "${URL}"
-            tar -xzf "${TARBALL}"
-            sudo install -m 0755 kubo/ipfs /usr/local/bin/ipfs
-            rm -rf kubo "${TARBALL}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          KUBO_ARCH="linux-amd64"
+          CACHE_DIR="$HOME/.cache/kubo"
+          if [ -x "$CACHE_DIR/ipfs" ] && "$CACHE_DIR/ipfs" --version 2>/dev/null | grep -qF "${KUBO_VERSION#v}"; then
+            echo "::notice::Kubo ${KUBO_VERSION} restored from cache (no download)"
+            sudo install -m 0755 "$CACHE_DIR/ipfs" /usr/local/bin/ipfs
             ipfs --version
+            exit 0
+          fi
+          WORK="$(mktemp -d)"
+          trap 'rm -rf "$WORK"' EXIT
+          # BEGIN install-kubo-sources
+          TARBALL="kubo_${KUBO_VERSION}_${KUBO_ARCH}.tar.gz"
+          KUBO_SOURCES=(
+            "https://dist.ipfs.tech/kubo/${KUBO_VERSION}"
+            "https://github.com/ipfs/kubo/releases/download/${KUBO_VERSION}"
+          )
+          # END install-kubo-sources
+
+          # BEGIN install-kubo-fetch
+          sha512_of() {
+            if command -v sha512sum >/dev/null 2>&1; then sha512sum "$1" | cut -d' ' -f1; else shasum -a 512 "$1" | cut -d' ' -f1; fi
+          }
+          KUBO_CURL=(curl --fail --silent --show-error --location --retry 2 --retry-all-errors --retry-delay 1 --connect-timeout 10 --max-time 180)
+          KUBO_USED=""
+          for src in "${KUBO_SOURCES[@]}"; do
+            rm -f "$WORK/$TARBALL" "$WORK/$TARBALL.sha512"
+            if ! "${KUBO_CURL[@]}" -o "$WORK/$TARBALL.sha512" "$src/$TARBALL.sha512"; then
+              echo "::warning::Kubo source $src failed (checksum file unreachable); trying next source"
+              continue
+            fi
+            expected="$(awk 'NR==1 {print tolower($1)}' "$WORK/$TARBALL.sha512")"
+            if ! [[ "$expected" =~ ^[0-9a-f]{128}$ ]]; then
+              echo "::warning::Kubo source $src failed (malformed .sha512 file); trying next source"
+              continue
+            fi
+            if ! "${KUBO_CURL[@]}" -o "$WORK/$TARBALL" "$src/$TARBALL"; then
+              echo "::warning::Kubo source $src failed (tarball download); trying next source"
+              continue
+            fi
+            actual="$(sha512_of "$WORK/$TARBALL")"
+            if [ "$actual" != "$expected" ]; then
+              echo "::warning::Kubo source $src failed (checksum mismatch: expected $expected, got $actual); trying next source"
+              continue
+            fi
+            KUBO_USED="$src"
+            break
+          done
+          if [ -z "$KUBO_USED" ]; then
+            echo "::error::Kubo ${KUBO_VERSION} could not be downloaded and verified: all sources failed (${KUBO_SOURCES[*]})"
+            exit 1
+          fi
+          echo "::notice::Kubo ${KUBO_VERSION} downloaded from $KUBO_USED (sha512 verified)"
+          # END install-kubo-fetch
+          tar -xzf "$WORK/$TARBALL" -C "$WORK"
+          mkdir -p "$CACHE_DIR"
+          install -m 0755 "$WORK/kubo/ipfs" "$CACHE_DIR/ipfs"
+          sudo install -m 0755 "$CACHE_DIR/ipfs" /usr/local/bin/ipfs
+          ipfs --version
 
       - name: Initialize IPFS
         if: steps.cache.outputs.cache-hit != 'true' && inputs.js-merkle != true

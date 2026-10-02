@@ -562,16 +562,7 @@ jobs:
           key: kubo-v0.33.0-linux-amd64
       - name: Setup IPFS Kubo
         if: matrix.merkle == 'kubo'
-        run: |
-          if [ ! -f ~/.cache/kubo/ipfs ]; then
-            mkdir -p ~/.cache/kubo
-            curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
-            tar -xf /tmp/kubo.tar.gz -C /tmp
-            cp /tmp/kubo/ipfs ~/.cache/kubo/ipfs
-            rm -rf /tmp/kubo /tmp/kubo.tar.gz
-          fi
-          sudo cp ~/.cache/kubo/ipfs /usr/local/bin/ipfs
-          ipfs version
+        run: bash .github/scripts/install-kubo.sh v0.33.0
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo'
         run: ipfs init
@@ -1220,16 +1211,7 @@ jobs:
           key: kubo-v0.33.0-linux-amd64
       - name: Setup IPFS Kubo
         if: matrix.merkle == 'kubo'
-        run: |
-          if [ ! -f ~/.cache/kubo/ipfs ]; then
-            mkdir -p ~/.cache/kubo
-            curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
-            tar -xf /tmp/kubo.tar.gz -C /tmp
-            cp /tmp/kubo/ipfs ~/.cache/kubo/ipfs
-            rm -rf /tmp/kubo /tmp/kubo.tar.gz
-          fi
-          sudo cp ~/.cache/kubo/ipfs /usr/local/bin/ipfs
-          ipfs version
+        run: bash .github/scripts/install-kubo.sh v0.33.0
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo'
         run: ipfs init
@@ -2672,16 +2654,7 @@ jobs:
           key: kubo-v0.33.0-linux-amd64
       - name: Setup IPFS Kubo
         if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
-        run: |
-          if [ ! -f ~/.cache/kubo/ipfs ]; then
-            mkdir -p ~/.cache/kubo
-            curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 300 -o /tmp/kubo.tar.gz https://dist.ipfs.tech/kubo/v0.33.0/kubo_v0.33.0_linux-amd64.tar.gz
-            tar -xf /tmp/kubo.tar.gz -C /tmp
-            cp /tmp/kubo/ipfs ~/.cache/kubo/ipfs
-            rm -rf /tmp/kubo /tmp/kubo.tar.gz
-          fi
-          sudo cp ~/.cache/kubo/ipfs /usr/local/bin/ipfs
-          ipfs version
+        run: bash .github/scripts/install-kubo.sh v0.33.0
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
         run: ipfs init

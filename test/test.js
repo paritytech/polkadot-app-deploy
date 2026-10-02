@@ -27225,3 +27225,40 @@ describe("Bulletin network context is settable from outside deploy() (#1496, min
     }
   });
 });
+
+// bulletin #1628 (port of bulletin #1636): the daily funding check must stay
+// read-only and minimally privileged.
+describe("e2e-funding-check workflow (bulletin #1628)", () => {
+  const wf = fs.readFileSync(".github/workflows/e2e-funding-check.yml", "utf8");
+  // Strip comments so the explanatory header cannot satisfy or trip an assertion.
+  const code = wf.replace(/^\s*#.*$/gm, "");
+
+  test("runs daily before the 15:00 nightly, can be dispatched, and uses ubuntu-latest", () => {
+    assert.match(code, /schedule:\s*\n\s*- cron: "17 14 \* \* \*"/, ">> FAIL: funding-check: must be scheduled at 14:17 UTC, before the 15:00 nightly");
+    assert.match(code, /^ {2}workflow_dispatch:/m, ">> FAIL: funding-check: must allow workflow_dispatch");
+    assert.match(code, /runs-on: ubuntu-latest/, ">> FAIL: funding-check: this public repo runs on ubuntu-latest");
+    assert.doesNotMatch(code, /parity-default/, ">> FAIL: funding-check: parity-default is upstream's private-repo runner, not this repo's");
+  });
+
+  test("permissions are minimal: read contents, write issues only", () => {
+    const perms = [...code.matchAll(/^\s*permissions:\s*\n((?:\s+[\w-]+: \w+\n)+)/gm)].map((m) => m[1].trim().split(/\s*\n\s*/).sort().join(","));
+    assert.ok(perms.length >= 1, ">> FAIL: funding-check: permissions block missing");
+    for (const p of perms) {
+      assert.ok(["contents: read", "contents: read,issues: write"].includes(p), `>> FAIL: funding-check: unexpected permissions '${p}'`);
+    }
+    assert.ok(perms.includes("contents: read,issues: write"), ">> FAIL: funding-check: the job needs issues: write to file the funding issue");
+  });
+
+  test("never moves money: no transfer calls in the workflow or the tools it runs", () => {
+    const TRANSFER = /transfer_allow_death|transferKeepAlive|transfer_keep_alive|Balances\.transfer|attemptTestnetTopUp|signAndSubmit|\.tx\./;
+    for (const file of [".github/workflows/e2e-funding-check.yml", "tools/funding-check.mjs", "tools/funding-verdict.mjs", "tools/check-balances.mjs"]) {
+      const text = fs.readFileSync(file, "utf8").replace(/^\s*(#|\/\/|\*|\/\*).*$/gm, "");
+      assert.doesNotMatch(text, TRANSFER, `>> FAIL: funding-check: ${file} must stay read-only (no transfer/submit calls)`);
+    }
+  });
+
+  test("files a single issue labelled funding", () => {
+    assert.match(code, /labels: 'funding'/, ">> FAIL: funding-check: dedup must list open issues by the funding label");
+    assert.match(code, /labels: \['funding'\]/, ">> FAIL: funding-check: new issues must carry the funding label");
+  });
+});

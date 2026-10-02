@@ -25,7 +25,7 @@ import { createRequire } from "node:module";
 // `node`), so it's loaded here via createRequire rather than converted to
 // ESM just for this test file.
 const require = createRequire(import.meta.url);
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
@@ -42,6 +42,7 @@ import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, en
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
+import { Twox128 } from "@polkadot-api/substrate-bindings";
 import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest, classifyFinalityGap, probeFinalityGap, getBestBlockNumber } from "../dist/chunk-probe.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
@@ -11034,6 +11035,25 @@ describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/wa
   });
 });
 
+// probeChunks client for the #1656 chain-evidence fallback: every
+// TransactionByContentHash key is present at the best block (block 500), every
+// other key (cross-validation's Transactions[block] read) is absent. Callers
+// must _resetProbeSession() + _bypassMetadataCheckForTest() first.
+const CONTENT_HASH_KEY_PREFIX = "0x" + Buffer.concat([
+  Buffer.from(Twox128(new TextEncoder().encode("TransactionStorage"))),
+  Buffer.from(Twox128(new TextEncoder().encode("TransactionByContentHash"))),
+]).toString("hex");
+function presentProbeClient() {
+  const present = (() => { const b = Buffer.alloc(8); b.writeUInt32LE(500, 0); b.writeUInt32LE(1, 4); return "0x" + b.toString("hex"); })();
+  return {
+    destroy() {},
+    _request: async (method, params) => {
+      if (method !== "state_queryStorageAt") throw new Error(`stub: ${method}`);
+      return [{ changes: params[0].map((k) => [k, k.startsWith(CONTENT_HASH_KEY_PREFIX) ? present : null]) }];
+    },
+  };
+}
+
 describe("watchTransaction found:false handling", () => {
   test("normal success: reconnect NOT called", async () => {
     let reconnectCalled = false;
@@ -11077,37 +11097,44 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT be called when waiting events are followed by success");
   });
 
-  // isValid:false + nonce advanced: tx was actually included even though the
-  // pool said invalid (peer disagreement). tryNonceFallback resolves the
-  // chunk; reconnect is NOT called because the WS subscription itself was
-  // healthy — only the tx was a problem.
-  test("isValid:false + nonce advanced: chunk resolves via fallback, no reconnect", async () => {
+  // isValid:false + CID present at best: tx was actually included even though
+  // the pool said invalid (peer disagreement). The best-block probe resolves
+  // the chunk; reconnect is NOT called because the WS subscription itself was
+  // healthy — only the tx was a problem. Pre-#1656 this was decided by the
+  // nonce advancing, which counts the pool's own pending tx: a false positive.
+  test("isValid:false + CID present at best: chunk resolves via the chain fallback, no reconnect", async () => {
+    _resetProbeSession(); _bypassMetadataCheckForTest();
     let reconnectCalled = false;
     const reconnect = async () => {
       reconnectCalled = true;
-      return { client: { destroy() {} }, unsafeApi: makeStubApi(normalSubscribable), signer: stubSigner, ss58: STUB_SS58 };
+      return { client: presentProbeClient(), unsafeApi: makeStubApi(normalSubscribable), signer: stubSigner, ss58: STUB_SS58 };
     };
 
-    let nonceCalls = 0;
-    const fakeFetchNonce = async () => {
-      nonceCalls++;
-      // call 1 = startNonce query; call 2+ = nonce advanced → chunk "included"
-      return nonceCalls === 1 ? 100 : 101;
-    };
+    let txCalls = 0;
+    const api = makeSequencedStubApi(poolRejectSubscribable, normalSubscribable);
+    const origStore = api.tx.TransactionStorage.store_with_cid_config;
+    api.tx.TransactionStorage.store_with_cid_config = (...a) => { txCalls++; return origStore(...a); };
+    const fakeFetchNonce = async () => 100;
 
     await storeChunkedContent([ONE_BYTE_CHUNK], {
-      client: { destroy() {} },
-      unsafeApi: makeSequencedStubApi(poolRejectSubscribable, normalSubscribable),
+      client: presentProbeClient(),
+      unsafeApi: api,
       signer: stubSigner,
       ss58: STUB_SS58,
       reconnect,
       fetchNonce: fakeFetchNonce,
+      skipRootStore: true,
     });
 
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT fire on a tx-level rejection — the WS sub was healthy");
+    assert.strictEqual(txCalls, 1, ">> FAIL: chain fallback: the chunk was found at best, so it must not be resubmitted");
   });
 
-  test("connection error + nonce advanced marks failed chunk stored without retrying it again", async () => {
+  // Pre-#1656 the consumed nonce alone marked chunk 2 stored. Now it only
+  // routes chunk 2 to the post-batch verify loop, which accepts it because the
+  // best-block probe finds it (so still no resubmit).
+  test("connection error + nonce advanced: failed chunk goes to verification and is accepted on a best-block probe, without a resubmit", async () => {
+    _resetProbeSession(); _bypassMetadataCheckForTest();
     let reconnectCalled = false;
     let txCalls = 0;
     const countingApi = () => makeStubApi(() => {
@@ -11117,7 +11144,7 @@ describe("watchTransaction found:false handling", () => {
     });
     const reconnect = async () => {
       reconnectCalled = true;
-      return { client: { destroy() {} }, unsafeApi: countingApi(), signer: stubSigner, ss58: STUB_SS58 };
+      return { client: presentProbeClient(), unsafeApi: countingApi(), signer: stubSigner, ss58: STUB_SS58 };
     };
 
     let nonceCalls = 0;
@@ -11129,7 +11156,7 @@ describe("watchTransaction found:false handling", () => {
     };
 
     await storeChunkedContent([new Uint8Array([0x41]), new Uint8Array([0x42])], {
-      client: { destroy() {} },
+      client: presentProbeClient(),
       unsafeApi: countingApi(),
       signer: stubSigner,
       ss58: STUB_SS58,
@@ -11138,7 +11165,7 @@ describe("watchTransaction found:false handling", () => {
     });
 
     assert.strictEqual(reconnectCalled, true, "connection failure should reconnect once");
-    assert.strictEqual(txCalls, 3, "must submit chunk 1, chunk 2, and root only; chunk 2 must not be retried after nonce fallback stores it");
+    assert.strictEqual(txCalls, 2, "must submit chunk 1 and chunk 2 only (the root is found at best); chunk 2 must not be retried once the verify probe finds it");
   });
 
   test("authorization read reconnects when stale client passes System.Number but account_authorization is disjointed", async () => {
@@ -11568,13 +11595,18 @@ describe("verifyNonceAdvanced source structure (issue #153, AC#1)", () => {
     },
   );
 
-  test("src/deploy.ts: tryNonceFallback uses verifyNonceAdvanced (not bare fetchNonce for verify sites)",
+  // #1656: the Bulletin watcher used verifyNonceAdvanced as its timeout
+  // fallback. system_accountNextIndex counts the deploy's own pending tx, so a
+  // pending chunk read as included. The fallback is now a best-block CID probe;
+  // verifyNonceAdvanced stays for the DotNS path (dotns.ts), which pairs it
+  // with an effect check.
+  test("src/deploy.ts: the Bulletin watcher falls back to a best-block CID probe, never to the pool-aware nonce",
     () => {
       const src = fs.readFileSync("src/deploy.ts", "utf-8");
-      assert.ok(
-        src.includes("verifyNonceAdvanced"),
-        "tryNonceFallback must use verifyNonceAdvanced for cross-RPC nonce verification",
-      );
+      assert.ok(!src.includes("verifyNonceAdvanced"),
+        ">> FAIL: #1656: deploy.ts must not decide Bulletin inclusion with verifyNonceAdvanced (system_accountNextIndex counts pending txs)");
+      assert.match(src, /tryChainFallback/, ">> FAIL: #1656: watchTransaction must keep a chain-evidence fallback");
+      assert.match(src, /cidPresentAtBest\(/, ">> FAIL: #1656: chunk and root watches must probe their CID at the best block");
     },
   );
 
@@ -14398,38 +14430,80 @@ describe("getBestBlockNumber (#1051)", () => {
 // ---------------------------------------------------------------------------
 // reconcileTimedOutChunk (#1051) — pure reconcile-before-resubmit decision.
 // ---------------------------------------------------------------------------
-describe("reconcileTimedOutChunk (#1051)", () => {
+describe("reconcileTimedOutChunk (#1051, #1641)", () => {
+  // #1641 item 2: "nonce advanced" used to mean "included". The nonce is read
+  // from system_accountNextIndex, which counts pool txs, so it now only routes
+  // the chunk to the post-batch verify loop ("verify"); inclusion needs the CID.
   test("CID present at best-block alone is sufficient, even if nonce heuristic is invalid", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: false, cidPresentAtBest: true,
-    }), true, ">> FAIL: reconcileTimedOutChunk: CID-present must short-circuit to included regardless of nonce state");
+    }), "included", ">> FAIL: reconcileTimedOutChunk: CID-present must short-circuit to included regardless of nonce state");
   });
 
-  test("nonce advance alone is sufficient when the heuristic is valid", () => {
+  test("nonce advance alone is NOT inclusion: it routes the chunk to verification (#1641)", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 101, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), true);
+    }), "verify", ">> FAIL: reconcileTimedOutChunk: a consumed nonce must route to verification, never report included (#1641 item 2)");
   });
 
   test("nonce advance is ignored when the heuristic is invalid (#951 account rotation)", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 101, nonceHeuristicValid: false, cidPresentAtBest: null,
-    }), false, ">> FAIL: reconcileTimedOutChunk: nonce heuristic must be ignored after an account rotation, else #951 false-positive returns");
+    }), "resubmit", ">> FAIL: reconcileTimedOutChunk: nonce heuristic must be ignored after an account rotation, else #951 false-positive returns");
   });
 
-  test("neither signal present -> not included, resubmit is warranted", () => {
+  test("neither signal present -> resubmit", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: true, cidPresentAtBest: false,
-    }), false);
+    }), "resubmit");
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), false);
+    }), "resubmit");
   });
 
-  test("undefined originalNonce never falsely reports inclusion via the nonce path", () => {
+  test("undefined originalNonce never routes via the nonce path", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: undefined, currentNonce: 5, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), false);
+    }), "resubmit");
+  });
+});
+
+describe("readBoundedChunkNonce (#1641)", () => {
+  const quiet = { log: () => {} };
+  const seq = (...xs) => { let i = 0; return async () => { const x = xs[Math.min(i++, xs.length - 1)]; if (x instanceof Error) throw x; return x; }; };
+
+  test("an in-bound nextIndex is used as-is (a shared signer stacks above pending txs)", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(105), ...quiet }), 105);
+  });
+
+  test("exactly the bound above the on-chain nonce is accepted", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(108), bound: 8, ...quiet }), 108);
+  });
+
+  test("a lagging backend (nextIndex below the on-chain nonce) yields the on-chain nonce", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(97), ...quiet }), 100);
+  });
+
+  test("a stuck backend's read is rejected and re-read; the in-bound re-read wins", async () => {
+    const logs = [];
+    const n = await readBoundedChunkNonce({ readOnchainNonce: async () => 13063, readNextIndex: seq(13114, 13063), bound: 8, log: (m) => logs.push(m) });
+    assert.strictEqual(n, 13063, ">> FAIL: readBoundedChunkNonce: the out-of-bound (stuck backend) read must not be used");
+    assert.ok(logs.some((l) => l.includes("stuck backend") && l.includes("13114")), ">> FAIL: readBoundedChunkNonce: the rejected read must be logged");
+  });
+
+  test("every read out of bound: falls back to the on-chain nonce after `reads` attempts", async () => {
+    let calls = 0;
+    const n = await readBoundedChunkNonce({ readOnchainNonce: async () => 50, readNextIndex: async () => { calls++; return 200; }, reads: 3, ...quiet });
+    assert.strictEqual(n, 50);
+    assert.strictEqual(calls, 3, ">> FAIL: readBoundedChunkNonce: exactly `reads` nextIndex reads, then the on-chain fallback");
+  });
+
+  test("nextIndex reads all fail: the on-chain nonce is used", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 7, readNextIndex: seq(new Error("ws down")), ...quiet }), 7);
+  });
+
+  test("on-chain read fails: degrades to the unbounded nextIndex (pre-#1641 behaviour; inclusion is still probe-gated)", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => { throw new Error("no System.Account"); }, readNextIndex: seq(321), ...quiet }), 321);
   });
 });
 
@@ -15328,7 +15402,7 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: chunk-numbering: the mortal-expiry note must use 1-based `${fail.index + 1}`");
     assert.match(src, /Retrying chunk \$\{fail\.index \+ 1\} \(attempt/,
       ">> FAIL: chunk-numbering: the retry-progress line must use 1-based `${fail.index + 1}`");
-    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: reconcile found it already included/,
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: reconcile found its CID at the best block/,
       ">> FAIL: chunk-numbering: the reconcile-found line must use 1-based `${fail.index + 1}`");
     assert.match(src, /Chunk \$\{fail\.index \+ 1\}: chain still frozen/,
       ">> FAIL: chunk-numbering: the frozen-chain-wait line must use 1-based `${fail.index + 1}`");
@@ -16271,22 +16345,28 @@ describe("storeChunkedContent post-upload chunk verification", () => {
     });
   });
 
-  test("probe-failed chain response (present:null) does not throw", async () => {
+  // #1657: an unanswered probe used to skip the upload, keeping the chunk on
+  // no evidence. Now the chunk is uploaded like an absent one (a duplicate
+  // store is harmless; a missing chunk is not), and the deploy still succeeds.
+  test("probe-failed chain response (present:null) is not treated as stored: the chunk is uploaded, no throw", async () => {
     _resetProbeSession(); _bypassMetadataCheckForTest();
     const chunk = new Uint8Array([0x45]);
     const chunkCid = createCID(chunk).toString();
+    let txCalls = 0;
+    const api = makeStubApi(() => { txCalls++; return normalSubscribable(); });
 
     await storeChunkedContent([chunk], {
       client: {
         destroy() {},
         _request: async () => { throw new Error("RPC timeout"); },
       },
-      unsafeApi: makeStubApi(normalSubscribable),
+      unsafeApi: api,
       signer: stubSigner,
       ss58: STUB_SS58,
       fetchNonce: async () => 100,
       skipCids: new Set([chunkCid]),
     });
+    assert.ok(txCalls >= 1, ">> FAIL: #1657: a chunk whose skip probe never answered must be uploaded, not kept as stored");
   });
 
   test("skipCids chunk absent is uploaded and deploy succeeds", async () => {

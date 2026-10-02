@@ -416,7 +416,7 @@ export function nonceGapVerdict(onchain: number, nextIndex: number, threshold: n
 }
 
 // Calls `fn` inside the race so a synchronous throw becomes a rejection too.
-function withTimeout<T>(fn: () => Promise<T>, ms: number, what: string): Promise<T> {
+export function withTimeout<T>(fn: () => Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   return Promise.race([
     Promise.resolve().then(fn),

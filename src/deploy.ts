@@ -21,15 +21,15 @@ import { merkleizeJS, merkleizeWithStableOrder, rebuildOrderedCarFromBytes } fro
 import { extractManifestFromCar, fetchPreviousManifest, writePersistentLocalManifest } from "./manifest-fetch.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./manifest-embed.js";
 import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, CONTENT_HASH_RE, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
-import { probeChunks, probeFinalityGap, getBestBlockNumber } from "./chunk-probe.js";
+import { probeChunks, probeFinalityGap, getBestBlockNumber, type ChunkProbeResult } from "./chunk-probe.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
-import { DotNS, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode, topUpTargetFor, AUTO_MAP_RENT_HEADROOM } from "./dotns.js";
+import { DotNS, fetchNonce, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode, topUpTargetFor, AUTO_MAP_RENT_HEADROOM } from "./dotns.js";
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions, DotnsSuccessAction } from "./dotns.js";
 import type { DotnsAbiProfile } from "./dotns-protocol.js";
 import { subnameNestingLevels } from "./subname-depth.js";
 export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { derivePoolAccounts, fetchPoolAuthorizations, selectHealthyPoolAccount, checkPoolAccountNonceHealth, StuckPoolAccountError, stuckQueueMessage, parsePoolDerivationIndex, NONCE_HEALTH_SAMPLES, type NonceHealth, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
+import { derivePoolAccounts, fetchPoolAuthorizations, selectHealthyPoolAccount, checkPoolAccountNonceHealth, StuckPoolAccountError, STUCK_NONCE_GAP_THRESHOLD, withTimeout, stuckQueueMessage, parsePoolDerivationIndex, NONCE_HEALTH_SAMPLES, type NonceHealth, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
 import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
@@ -112,8 +112,12 @@ interface ExistingProvider { client?: any; unsafeApi?: any; signer?: PolkadotSig
   skipRootStore?: boolean;
 }
 interface ChainReceipt { txHash: string; blockHash: string; blockNumber: number; }
+// viaFallback: not confirmed by a watch event (a best-block CID probe, or provisional pending the
+// post-batch verify loop, which every such chunk must pass before storeChunkedContent returns).
 interface StoredChunk { cid: CID; len: number; viaFallback?: boolean; receipt?: ChainReceipt; }
-interface WatchTransactionOptions { label?: string; rpc?: string | string[]; senderSS58?: string; expectedNonce?: number; timeoutMs?: number; fetchNonce?: (rpc: string | string[], ss58: string) => Promise<number>; }
+// confirmIncluded: positive on-chain evidence for the tx's effect at the BEST block (a CID probe),
+// asked when the watch gives up. Only `true` resolves the watch; anything else is a rejection.
+interface WatchTransactionOptions { label?: string; timeoutMs?: number; confirmIncluded?: () => Promise<boolean>; }
 interface WatchResult<T> { value: T; viaFallback: boolean; receipt?: ChainReceipt; }
 
 export const DEFAULT_BULLETIN_RPC = "wss://paseo-bulletin-rpc.polkadot.io";
@@ -958,9 +962,8 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
   return pool;
 }
 
-function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuccess: (event?: any) => T, { label = "transaction", rpc, senderSS58, expectedNonce, timeoutMs, fetchNonce: fetchNonceOverride }: WatchTransactionOptions = {}): Promise<WatchResult<T>> {
+function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuccess: (event?: any) => T, { label = "transaction", timeoutMs, confirmIncluded }: WatchTransactionOptions = {}): Promise<WatchResult<T>> {
   const timeout = timeoutMs ?? TX_TIMEOUT_MS;
-  const _fetchNonce = fetchNonceOverride ?? fetchNonce;
   return new Promise<WatchResult<T>>((resolve, reject) => {
     let settled = false;
     let sub: any;
@@ -971,31 +974,31 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
       try { sub?.unsubscribe(); } catch {}
       fn(...args);
     };
-    // Nonce-based fallback: check whether nonce advanced (tx actually got
-    // included) even though the subscription can't confirm it. Uses
-    // verifyNonceAdvanced (allSettled + any-peer-advanced) when multiple
-    // endpoints are provided — prevents a fast-but-stale primary from masking
-    // confirmation seen by a backup peer (AC#1 from #153).
-    const tryNonceFallback = async (): Promise<boolean> => {
-      if (!rpc || !senderSS58 || expectedNonce == null) return false;
+    // Chain-evidence fallback (#1656): when the subscription cannot confirm the
+    // tx, ask the chain whether its effect (the stored CID) is at the best
+    // block. The old fallback compared system_accountNextIndex with the tx's
+    // nonce; nextIndex counts the pool, including this very tx while it is
+    // still pending, so a pending chunk read as "included".
+    const tryChainFallback = async (): Promise<boolean> => {
+      if (!confirmIncluded) return false;
       try {
-        const endpoints = Array.isArray(rpc) ? rpc : [rpc];
-        const verified = await verifyNonceAdvanced(endpoints, senderSS58, expectedNonce);
+        const present = await confirmIncluded();
         if (settled) return true;
-        if (verified.advanced) {
-          console.log(`      ${label}: nonce advanced past ${expectedNonce} (witnessed by ${verified.witnessRpc}), tx was included`);
+        if (present) {
+          console.log(`      ${label}: found at the best block by a content-hash probe, tx was included`);
           settle(resolve)({ value: onSuccess(), viaFallback: true });
           return true;
         }
+        console.log(`      ${label}: not found at the best block`);
       } catch (e: any) {
         if (settled) return true;
-        console.log(`      ${label}: nonce fallback failed: ${e.message?.slice(0, 80)}`);
+        console.log(`      ${label}: best-block probe failed: ${e.message?.slice(0, 80)}`);
       }
       return false;
     };
     const timer = setTimeout(async () => {
       if (settled) return;
-      if (await tryNonceFallback()) return;
+      if (await tryChainFallback()) return;
       settle(reject)(new Error(`${label} timed out after ${timeout / 1000}s waiting for block confirmation`));
     }, timeout);
     sub = tx.signSubmitAndWatch(signer, txOpts).subscribe({
@@ -1017,7 +1020,7 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
         //                   reorged out and waiting to re-include). Normal pre-
         //                   inclusion state — keep waiting.
         //   isValid:false → tx has been rejected by the pool and will never
-        //                   include. Run the nonce fallback (in case the chain
+        //                   include. Probe the best block (in case the chain
         //                   actually included it but a peer disagrees) then
         //                   reject so the retry loop can reissue with a fresh
         //                   nonce. The previous code counted every isValid:true
@@ -1025,8 +1028,8 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
         //                   spurious `tx dropped from best chain 5 times`
         //                   failures on slow blocks.
         if (event.isValid === false) {
-          console.log(`      ${label}: tx rejected by pool (isValid:false), checking nonce fallback...`);
-          if (await tryNonceFallback()) return;
+          console.log(`      ${label}: tx rejected by pool (isValid:false), probing the best block...`);
+          if (await tryChainFallback()) return;
           settle(reject)(new Error(`${label} tx rejected by pool (isValid:false)`));
         }
       },
@@ -1039,30 +1042,139 @@ function watchTransaction<T>(tx: any, signer: PolkadotSigner, txOpts: any, onSuc
 }
 
 /**
- * Reconcile-before-resubmit (#1051). Pure decision function — no chain I/O —
- * so it's directly unit-testable. Decides whether a timed-out chunk tx
- * should be treated as already included (skip the resubmit, avoid a
- * duplicate content write) based on two independent signals:
- *   - nonce advance: the account's nonce moved past the chunk's assigned
- *     nonce. Only meaningful when `nonceHeuristicValid` — false after a pool
- *     account rotation, where the old nonce baseline belongs to a different
- *     account (#951).
- *   - CID presence at best-block: a direct probe of the chunk's own content
- *     hash, independent of account/nonce bookkeeping entirely. Catches
- *     inclusion the nonce heuristic can miss (e.g. the endpoint used for the
- *     nonce fetch is briefly behind a peer that already saw the tx land).
- * Either signal alone is sufficient.
+ * Reconcile-before-resubmit (#1051), decided by chain evidence only (#1641,
+ * #1656). Pure, no chain I/O. Three outcomes for a timed-out chunk tx:
+ *   - "included": its CID is present at the best block. The only signal that
+ *     counts as stored.
+ *   - "verify": the account's nonce moved past the chunk's nonce, but its CID
+ *     is not at best. The nonce was read from system_accountNextIndex, which
+ *     counts pool txs: the chunk's own pending tx, or a sibling deploy's tx on
+ *     the same signer (S9), moves it too. So this is a ROUTING signal, never
+ *     inclusion: the chunk is marked provisional and the post-batch verify
+ *     loop probes it, re-uploading at a fresh nonce if it is absent. Only
+ *     meaningful when `nonceHeuristicValid`, false after a pool account
+ *     rotation, where the old nonce belongs to another account (#951).
+ *   - "resubmit": neither.
  */
+export type ReconcileDecision = "included" | "verify" | "resubmit";
 export function reconcileTimedOutChunk(opts: {
   originalNonce: number | undefined;
   currentNonce: number;
   nonceHeuristicValid: boolean;
   cidPresentAtBest: boolean | null;
-}): boolean {
+}): ReconcileDecision {
   const { originalNonce, currentNonce, nonceHeuristicValid, cidPresentAtBest } = opts;
-  if (cidPresentAtBest === true) return true;
-  if (nonceHeuristicValid && originalNonce !== undefined && originalNonce < currentNonce) return true;
-  return false;
+  if (cidPresentAtBest === true) return "included";
+  if (nonceHeuristicValid && originalNonce !== undefined && originalNonce < currentNonce) return "verify";
+  return "resubmit";
+}
+
+/**
+ * Bounded nonce read for every Bulletin nonce a chunk/root tx is signed with
+ * (#1641). system_accountNextIndex is pool-aware, which a shared signer needs
+ * (S9: a second deploy must stack above the first one's pending txs), but a
+ * load-balanced backend holding a stuck, never-gossiped run reports a future
+ * nonce. The first read goes over the deploy's own connection (the backend its
+ * txs are submitted to, so its pool view is the one that matters); re-reads
+ * use fresh connections (a new backend pick). The floor is the on-chain nonce
+ * at the BEST block:
+ *   - nextIndex at most `bound` (STUCK_NONCE_GAP_THRESHOLD, the #1640 in-flight
+ *     bound) above it is accepted;
+ *   - below it (a lagging backend) the on-chain nonce is used;
+ *   - further ahead is a stuck backend: re-read on a fresh connection (a new
+ *     backend pick), up to `reads` times, then sign from the on-chain nonce.
+ * If the on-chain read itself fails, the nextIndex read is used unbounded, as
+ * before #1641: correctness never rests on the nonce, every chunk is accepted
+ * only on chain evidence, so the worst case is timeouts, not a false success.
+ */
+export async function readBoundedChunkNonce(deps: {
+  readOnchainNonce: () => Promise<number>;
+  /** `attempt` is 1-based. */
+  readNextIndex: (attempt: number) => Promise<number>;
+  bound?: number;
+  reads?: number;
+  log?: (msg: string) => void;
+}): Promise<number> {
+  const bound = deps.bound ?? STUCK_NONCE_GAP_THRESHOLD;
+  const reads = deps.reads ?? 3;
+  const log = deps.log ?? ((m: string) => console.log(m));
+  // The on-chain read and the first nextIndex read are independent: run them together.
+  const [onchainRes, firstRes] = await Promise.allSettled([
+    Promise.resolve().then(deps.readOnchainNonce).then((v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) throw new Error(`not a number: ${v}`);
+      return n;
+    }),
+    Promise.resolve().then(() => deps.readNextIndex(1)),
+  ]);
+  if (onchainRes.status === "rejected") {
+    const e = onchainRes.reason;
+    log(`   Could not read the on-chain nonce at best (${String(e?.message ?? e).slice(0, 80)}); using system_accountNextIndex unbounded`);
+    if (firstRes.status === "rejected") throw firstRes.reason;
+    return Number(firstRes.value);
+  }
+  const onchain = onchainRes.value;
+  const read = (i: number): Promise<number> => i > 1 ? deps.readNextIndex(i)
+    : firstRes.status === "fulfilled" ? Promise.resolve(firstRes.value) : Promise.reject(firstRes.reason);
+  for (let i = 1; i <= reads; i++) {
+    let n: number;
+    try {
+      n = Number(await read(i));
+    } catch (e: any) {
+      log(`   system_accountNextIndex read failed (${String(e?.message ?? e).slice(0, 80)}) (${i}/${reads})`);
+      continue;
+    }
+    if (n <= onchain) return onchain;
+    if (n - onchain <= bound) return n;
+    log(`   system_accountNextIndex ${n} is ${n - onchain} above the on-chain nonce ${onchain} at best (bound ${bound}): stuck backend, re-reading (${i}/${reads})`);
+  }
+  log(`   No in-bound system_accountNextIndex read; signing from the on-chain nonce ${onchain} at best`);
+  return onchain;
+}
+
+/**
+ * readBoundedChunkNonce bound to a live Bulletin connection. Getters, because
+ * the client, api and account change on reconnect and pool rotation. The
+ * first nextIndex read goes over the deploy's own connection (the backend its
+ * txs are submitted to); re-reads open fresh connections via `fetchNonceFn`.
+ * Both reads carry their own ceiling: a stalled-but-open socket would
+ * otherwise wait out the 300 s heartbeat.
+ */
+function boundedNonceReader(p: {
+  client: () => any; unsafeApi: () => any; ss58: () => string;
+  fetchNonceFn: (rpc: string | string[], ss58: string) => Promise<number>;
+}): () => Promise<number> {
+  return () => readBoundedChunkNonce({
+    readOnchainNonce: async () => Number((await withTimeout<any>(() => p.unsafeApi().query.System.Account.getValue(p.ss58(), { at: "best" }), 10_000, "on-chain nonce read")).nonce),
+    readNextIndex: async (attempt: number) => {
+      if (attempt === 1) {
+        try {
+          const n = await withTimeout(() => p.client()._request("system_accountNextIndex", [p.ss58()]), 8_000, "system_accountNextIndex");
+          if (typeof n === "number") return n;
+        } catch { /* fall back to a fresh connection */ }
+      }
+      return p.fetchNonceFn(BULLETIN_ENDPOINTS, p.ss58());
+    },
+  });
+}
+
+/** Re-probes the present:null results once and merges the answers by CID. */
+async function reprobeUnanswered(results: ChunkProbeResult[], client: any): Promise<ChunkProbeResult[]> {
+  const unknown = results.filter(r => r.present === null).map(r => r.cid);
+  if (unknown.length === 0) return results;
+  const again = new Map((await probeChunks(unknown, { client })).map(r => [r.cid, r]));
+  return results.map(r => (r.present === null ? (again.get(r.cid) ?? r) : r));
+}
+
+/** #1656/#1657: a chunk's on-chain presence could not be established at the best block. */
+export class ChunkInclusionUnverifiedError extends Error {
+  constructor(message: string) { super(message); this.name = "ChunkInclusionUnverifiedError"; }
+}
+
+/** Best-block presence of one CID, as a watch fallback: true only on a positive probe. */
+async function cidPresentAtBest(client: any, cid: string): Promise<boolean> {
+  const [probe] = await probeChunks([cid], { client });
+  return probe?.present === true;
 }
 
 /**
@@ -1093,14 +1205,15 @@ async function waitForChainLiveness(client: any, lastHeight: number | null, time
 /** Test-only alias — exported for unit tests that inject a short timeout/poll. */
 export const __waitForChainLivenessForTest = waitForChainLiveness;
 
-async function storeChunk(unsafeApi: any, signer: PolkadotSigner, chunkBytes: Uint8Array, nonce: number, ss58: string, opts: { fetchNonce?: WatchTransactionOptions["fetchNonce"] } = {}): Promise<StoredChunk> {
+// `opts.client` is a getter: the caller's client is reassigned on reconnect and destroyed on a WS halt.
+async function storeChunk(unsafeApi: any, signer: PolkadotSigner, chunkBytes: Uint8Array, nonce: number, opts: { client?: () => any } = {}): Promise<StoredChunk> {
   const cid = createCID(chunkBytes, CID_CONFIG.codec, CID_CONFIG.hashCode);
   const tx = unsafeApi.tx.TransactionStorage.store_with_cid_config({ cid: { codec: BigInt(CID_CONFIG.codec), hashing: toHashingEnum(CID_CONFIG.hashCode) }, data: chunkBytes });
   const txOpts = { mortality: { mortal: true, period: CHUNK_MORTALITY_PERIOD }, nonce };
   const { value, viaFallback, receipt } = await watchTransaction(tx, signer, txOpts, () => {
     console.log(`      CID: ${cid.toString()}`);
     return { cid, len: chunkBytes.length };
-  }, { label: `chunk(nonce:${nonce})`, rpc: BULLETIN_ENDPOINTS, senderSS58: ss58, expectedNonce: nonce, timeoutMs: CHUNK_TIMEOUT_MS, fetchNonce: opts.fetchNonce });
+  }, { label: `chunk(nonce:${nonce})`, timeoutMs: CHUNK_TIMEOUT_MS, confirmIncluded: opts.client ? () => cidPresentAtBest(opts.client!(), cid.toString()) : undefined });
   return { ...value, viaFallback, receipt };
 }
 
@@ -1331,9 +1444,16 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     try { client.destroy(); } catch { /* already destroyed; safe */ }
   });
 
+  // Every nonce a chunk/root tx is signed with is bounded by the on-chain
+  // nonce at best (#1641). Reads the CURRENT client/account: both change on
+  // reconnect and pool rotation.
+  const readChunkNonce = boundedNonceReader({ client: () => client, unsafeApi: () => unsafeApi, ss58: () => ss58 as string, fetchNonceFn: _fetchNonce });
+  // storeChunk's best-block probe must follow `client` across reconnects.
+  const chunkOpts = { client: () => client };
+
   try {
 
-    let startNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+    let startNonce = await readChunkNonce();
     console.log(`   Starting nonce: ${startNonce}`);
     // Two-mode batching (#216 d): start with 2 in flight to amortise round-
     // trip latency, but drop to 1 once we've burned a reconnect — halves
@@ -1359,6 +1479,45 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     // callers (e.g. storeDirectoryV2) that need per-chunk results for manifest
     // construction without running a separate external probe round.
     const skipProbeResults = new Map<string, true | false | null>();
+    // Every chunk stored on anything but a watch event: probe-confirmed
+    // (viaFallback) or provisional. The post-batch verify loop is the only
+    // way out of this set, and the only way storeChunkedContent can return.
+    const nonceAdvanceIndices = new Set<number>();
+    const markProvisional = (idx: number): void => {
+      stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
+      nonceAdvanceIndices.add(idx);
+    };
+    // Best-block probe that never lets present:null pass (#1657). A null after
+    // a WS halt is a dead socket, not an unknown chunk: reconnect (whose own
+    // exhaustion message is what S8's storm accepts) and ask again. Returns
+    // the absent results; throws ChunkInclusionUnverifiedError when a chunk
+    // stays unanswered after MAX_REPROBE_RETRIES re-probes.
+    const probeAtBestUntilAnswered = async (cids: string[]): Promise<{ cid: string }[]> => {
+      let results = await probeChunks(cids, { client });
+      for (let attempt = 1; results.some(r => r.present === null); attempt++) {
+        const unknown = results.filter(r => r.present === null);
+        const reason = (unknown[0] as { failureReason?: string }).failureReason ?? "unknown";
+        if (attempt > MAX_REPROBE_RETRIES) {
+          const unknownCids = new Set(unknown.map(r => r.cid));
+          const idxs = chunkCidsComputed.flatMap((c, i) => (unknownCids.has(c.toString()) ? [i + 1] : []));
+          throw new ChunkInclusionUnverifiedError(
+            `Could not verify that chunk ${idxs.join(", ")} is stored on-chain: the TransactionByContentHash probe at the best ` +
+            `block gave no answer ${MAX_REPROBE_RETRIES + 1} times (${reason}). Not treating it as stored. Check the Bulletin RPC ` +
+            `(${BULLETIN_ENDPOINTS[0]}) and re-run the deploy; chunks already on-chain are skipped.`,
+          );
+        }
+        if (wsHaltDetected && reconnect) {
+          // Throws the existing "max reconnections exhausted" error once the budget is spent.
+          wsHaltDetected = false;
+          await doReconnect();
+        } else {
+          await new Promise(r => setTimeout(r, RETRY_BASE_DELAY_MS));
+        }
+        console.log(`   ${unknown.length} chunk probe(s) unanswered (${reason}), re-probing (${attempt}/${MAX_REPROBE_RETRIES})`);
+        results = await reprobeUnanswered(results, client);
+      }
+      return results.filter(r => r.present === false);
+    };
 
     // Single pass to compute CIDs and handle both trustedCids (no-reprobe skip)
     // and skipCids (reprobe before skip) in one chunk iteration.
@@ -1390,7 +1549,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
 
     if (skipCidsCandidates.length > 0) {
       const cidStrings = skipCidsCandidates.map(c => c.cid.toString());
-      const probeResults = await probeChunks(cidStrings, { client });
+      // One re-probe for unanswered CIDs (as probeFinalityGap does) before
+      // falling back to uploading them.
+      const probeResults = await reprobeUnanswered(await probeChunks(cidStrings, { client }), client);
       const probeResultMap = new Map(probeResults.map(r => [r.cid, r.present]));
       for (const r of probeResults) skipProbeResults.set(r.cid, r.present);
 
@@ -1398,19 +1559,20 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       for (const { index: i, cid } of skipCidsCandidates) {
         const cidStr = cid.toString();
         const present = probeResultMap.get(cidStr) ?? null;
-        if (present !== false) {
+        if (present === true) {
+          // Only a positive answer skips the upload (#1657). An unanswered
+          // probe is not evidence, so that chunk is uploaded like an absent
+          // one: a duplicate store is harmless, a missing chunk is not.
           stored[i] = { cid, len: chunks[i].length, viaFallback: true };
           confirmedCount++;
-          if (present === true) {
-            tier2Verified++;
-          } else {
-            tier2Inconclusive++;
-          }
+          tier2Verified++;
+        } else if (present === null) {
+          tier2Inconclusive++;
         } else {
           tier2Fallback++;
         }
       }
-      console.log(`   Cache check: ${confirmedCount} confirmed, ${tier2Fallback} missing${tier2Fallback > 0 ? " (will upload)" : ""}`);
+      console.log(`   Cache check: ${confirmedCount} confirmed, ${tier2Fallback} missing${tier2Inconclusive > 0 ? `, ${tier2Inconclusive} unanswered` : ""}${tier2Fallback + tier2Inconclusive > 0 ? " (will upload)" : ""}`);
     }
 
     // Pre-compute dense nonces: skipped chunks consume zero nonce slots, so the
@@ -1433,7 +1595,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     const doReconnectAndRebase = async (): Promise<{ changed: boolean; currentNonce: number }> => {
       const prevSS58 = ss58;
       await doReconnect();
-      const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+      const currentNonce = await readChunkNonce();
       const changed = ss58 !== prevSS58;
       if (changed) {
         assignedNonces = assignDenseNonces(stored, currentNonce);
@@ -1452,7 +1614,6 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     // exceed uploadTotal (e.g. [3/2], [4/2] …) (#932).
     const uploadEmittedIndices = new Set<number>();
     let uploadEmitted = 0;
-    const nonceAdvanceIndices = new Set<number>();
 
     let b = 0;
     while (b < chunks.length) {
@@ -1487,7 +1648,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         const isRetry = uploadEmittedIndices.has(i);
         if (!isRetry) { uploadEmittedIndices.add(i); uploadEmitted++; }
         console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i + 1} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
-        return storeChunk(unsafeApi, signer as PolkadotSigner, chunkData, nonce, ss58 as string, { fetchNonce: fetchNonceOverride });
+        return storeChunk(unsafeApi, signer as PolkadotSigner, chunkData, nonce, chunkOpts);
       });
 
       const results = await Promise.allSettled(batchPromises);
@@ -1515,19 +1676,17 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       const needsReconnect = failures.some(f => isConnectionError(f.error));
       if (needsReconnect && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
         const { changed, currentNonce } = await doReconnectAndRebase();
-        // "nonce consumed → included" heuristic: only valid when the account did
-        // NOT change. On rotation the old assignedNonce baseline belongs to a
-        // different account — currentNonce (new account) is always higher and
-        // would produce a false "included" for chunks never submitted anywhere
-        // (#951). Skip the heuristic; the downstream re-probe backstop in
-        // nonceAdvanceIndices handles genuinely-missing chunks.
+        // "nonce consumed" routing: only valid when the account did NOT change.
+        // On rotation the old assignedNonce baseline belongs to a different
+        // account (#951). A consumed nonce is NOT inclusion (the pool view
+        // counts pending txs, #1656): the chunk goes provisional and the
+        // post-batch verify loop probes it, re-uploading it if absent.
         if (!changed) {
           for (const idx of batchIndices) {
             const chunkNonce = assignedNonces.get(idx);
             if (chunkNonce !== undefined && chunkNonce < currentNonce && stored[idx] === null) {
-              console.log(`   Chunk ${idx + 1}: nonce ${chunkNonce} consumed (current=${currentNonce}), treating as included`);
-              stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
-              nonceAdvanceIndices.add(idx);
+              console.log(`   Chunk ${idx + 1}: nonce ${chunkNonce} consumed (current=${currentNonce}), pending on-chain verification`);
+              markProvisional(idx);
               assignedNonces.delete(idx);
             }
           }
@@ -1546,18 +1705,19 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           continue;
         }
         // isValid:false backstop: if the initial failure was a pool rejection AND
-        // the chunk's CID was probe-failed (present:null), the chunk is already on
-        // chain — the probe was a false-negative. Treat as success immediately,
-        // before burning retries on a tx the chain will keep rejecting.
+        // the chunk's CID was probe-failed (present:null), the chunk is probably
+        // already on chain. Stop burning retries on a tx the chain will keep
+        // rejecting, but "probably" is not evidence: it goes provisional and the
+        // post-batch verify loop must find it at best (or re-upload it).
         const failCid = createCID(fail.chunkData, CID_CONFIG.codec, 0x12);
         if (
           probeFailedCids &&
           probeFailedCids.has(failCid.toString()) &&
           fail.error?.message?.includes("isValid:false")
         ) {
-          console.log(`   Chunk ${fail.index + 1}: isValid:false but CID was probe-failed — treating as already on chain`);
-          captureWarning("isValid:false treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
-          stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
+          console.log(`   Chunk ${fail.index + 1}: isValid:false but CID was probe-failed — pending on-chain verification`);
+          captureWarning("isValid:false deferred to verification (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString() });
+          markProvisional(fail.index);
           continue;
         }
         captureWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
@@ -1585,7 +1745,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             }
           }
           try {
-            const currentNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+            const currentNonce = await readChunkNonce();
             const originalNonce = assignedNonces.get(fail.index);
             // Reconcile before resubmit (#1051): probe the chunk's own CID at
             // best-block in addition to the nonce heuristic below. Probe
@@ -1600,10 +1760,16 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             // On rotation, originalNonce is the new account's rebased value and
             // the comparison is not meaningful until the new account actually
             // advances its nonce (#951).
-            if (reconcileTimedOutChunk({ originalNonce, currentNonce, nonceHeuristicValid: !perRetryChanged, cidPresentAtBest })) {
-              console.log(`   Chunk ${fail.index + 1}: reconcile found it already included (nonce ${originalNonce}→${currentNonce}${cidPresentAtBest ? ", CID present at best-block" : ""}) — skipping resubmit`);
-              stored[fail.index] = { cid: createCID(fail.chunkData, CID_CONFIG.codec, 0x12), len: fail.chunkData.length, viaFallback: true };
-              nonceAdvanceIndices.add(fail.index);
+            const decision = reconcileTimedOutChunk({ originalNonce, currentNonce, nonceHeuristicValid: !perRetryChanged, cidPresentAtBest });
+            if (decision !== "resubmit") {
+              if (decision === "included") {
+                console.log(`   Chunk ${fail.index + 1}: reconcile found its CID at the best block — skipping resubmit`);
+                stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
+                nonceAdvanceIndices.add(fail.index);
+              } else {
+                console.log(`   Chunk ${fail.index + 1}: nonce ${originalNonce} consumed (current=${currentNonce}) but its CID is not at the best block — pending on-chain verification`);
+                markProvisional(fail.index);
+              }
               assignedNonces.delete(fail.index);
               // progress resets the recovery budget — a landed chunk means recovery is
               // healthy, not thrashing (the budget guards no-progress thrashing only). #864
@@ -1622,8 +1788,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               console.log(`   Chunk ${fail.index + 1}: chain still frozen at block ${heightBefore} after ${(CHUNK_LIVENESS_MAX_WAIT_MS / 1000).toFixed(0)}s wait — resubmitting anyway`);
             }
             const retryNonce = originalNonce ?? currentNonce;
-            const result = await storeChunk(unsafeApi, signer as PolkadotSigner, fail.chunkData, retryNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
+            const result = await storeChunk(unsafeApi, signer as PolkadotSigner, fail.chunkData, retryNonce, chunkOpts);
             stored[fail.index] = result;
+            if (result.viaFallback) nonceAdvanceIndices.add(fail.index);
             assignedNonces.delete(fail.index);
             // progress resets the recovery budget — a landed chunk means recovery is
             // healthy, not thrashing (the budget guards no-progress thrashing only). #864
@@ -1637,9 +1804,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               probeFailedCids.has(failCid.toString()) &&
               e?.message?.includes("isValid:false")
             ) {
-              console.log(`   Chunk ${fail.index + 1}: retry isValid:false but CID was probe-failed — treating as already on chain`);
-              captureWarning("isValid:false retry treated as success (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
-              stored[fail.index] = { cid: failCid, len: fail.chunkData.length, viaFallback: true };
+              console.log(`   Chunk ${fail.index + 1}: retry isValid:false but CID was probe-failed — pending on-chain verification`);
+              captureWarning("isValid:false retry deferred to verification (probe-failed backstop)", { chunkIndex: fail.index + 1, cid: failCid.toString(), attempt });
+              markProvisional(fail.index);
               assignedNonces.delete(fail.index);
               retried = true;
               break;
@@ -1665,49 +1832,68 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       b += batchSize;
     }
 
+    // Post-batch verify loop (#1656, #1657): the one gate between a chunk
+    // that was not confirmed by a watch event and a successful return. Probes
+    // at the BEST block (never finalized: a lagging GRANDPA head is not
+    // absence, #1049). present:true is the only accept; present:false is
+    // re-uploaded at a fresh bounded nonce and probed again next round;
+    // present:null is retried, then fails by name. Bounded: at most
+    // MAX_REPROBE_RETRIES re-upload rounds, then one last probe round.
     if (nonceAdvanceIndices.size > 0) {
-      const cidToIndex = new Map([...nonceAdvanceIndices].map(i => [(stored[i] as StoredChunk).cid.toString(), i]));
       setDeployAttribute("deploy.pool.nonce_collision_count", nonceAdvanceIndices.size);
-
-      const probeResults = await probeChunks([...cidToIndex.keys()], { client });
-      const missingResults = probeResults.filter(r => r.present === false);
-      setDeployAttribute("deploy.pool.nonce_collision_missing", missingResults.length);
-
-      if (missingResults.length > 0) {
+      const pending = new Set(nonceAdvanceIndices);
+      let reuploadCount = 0;
+      for (let round = 1; pending.size > 0; round++) {
+        const cidToIndex = new Map([...pending].map(i => [(stored[i] as StoredChunk).cid.toString(), i]));
+        const missingResults = await probeAtBestUntilAnswered([...cidToIndex.keys()]);
+        const missingCids = new Set(missingResults.map(m => m.cid));
+        for (const [cid, idx] of cidToIndex) if (!missingCids.has(cid)) pending.delete(idx);
+        // First round only: how many chunks the batch left absent at best.
+        if (round === 1) setDeployAttribute("deploy.pool.nonce_collision_missing", missingResults.length);
+        if (missingResults.length === 0) break;
+        if (round > MAX_REPROBE_RETRIES) {
+          throw new ChunkInclusionUnverifiedError(
+            `Chunk ${missingResults.map(m => cidToIndex.get(m.cid)! + 1).join(", ")} still absent at the best block after ` +
+            `${MAX_REPROBE_RETRIES} re-upload rounds; not treating it as stored. The Bulletin chain is accepting the account's ` +
+            `txs but not including this chunk: check the account's pending queue and re-run the deploy.`,
+          );
+        }
         captureWarning("nonce-advance collision: re-uploading missing chunks", {
           collision_count: missingResults.length,
         });
-      }
 
-      // A WS halt between the batch loop and here leaves the client destroyed
-      // with no chunk error to trigger doReconnect; rebuild before re-uploading
-      // (mirrors the proactive guard at the top of the batch loop, ~L932). #946
-      if (wsHaltDetected && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
-        wsHaltDetected = false;
-        await doReconnect();
-      }
+        // A WS halt between the batch loop and here leaves the client destroyed
+        // with no chunk error to trigger doReconnect; rebuild before re-uploading
+        // (mirrors the proactive guard at the top of the batch loop, ~L932). #946
+        if (wsHaltDetected && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
+          wsHaltDetected = false;
+          await doReconnect();
+        }
 
-      let reuploadCount = 0;
-      for (const m of missingResults) {
-        const idx = cidToIndex.get(m.cid)!;
-        for (let attempt = 1; attempt <= MAX_REPROBE_RETRIES; attempt++) {
-          console.log(`   Nonce-collision re-upload: chunk ${idx + 1} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
-          try {
-            const freshNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
-            const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, ss58 as string, { fetchNonce: fetchNonceOverride });
-            stored[idx] = result;
-            reuploadCount++;
-            break;
-          } catch (e: any) {
-            // ChainHead disjointed / WS drop: rebuild the client (rebinds
-            // unsafeApi/signer/ss58) and retry the remaining attempts against
-            // it, instead of re-running every attempt on the dead client —
-            // matches the batch-retry and root-store loops. #946
-            if (isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
-              try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
-            }
-            if (attempt === MAX_REPROBE_RETRIES) {
-              throw new Error(`Nonce-collision re-upload of chunk ${idx + 1} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
+        for (const m of missingResults) {
+          const idx = cidToIndex.get(m.cid)!;
+          for (let attempt = 1; attempt <= MAX_REPROBE_RETRIES; attempt++) {
+            console.log(`   Nonce-collision re-upload: chunk ${idx + 1} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
+            try {
+              const freshNonce = await readChunkNonce();
+              const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, chunkOpts);
+              // A watch event in a best block is evidence; a probe-confirmed
+              // result is re-verified next round.
+              stored[idx] = result;
+              if (!result.viaFallback) pending.delete(idx);
+              reuploadCount++;
+              break;
+            } catch (e: any) {
+              // ChainHead disjointed / WS drop: rebuild the client (rebinds
+              // unsafeApi/signer/ss58) and retry the remaining attempts against
+              // it, instead of re-running every attempt on the dead client —
+              // matches the batch-retry and root-store loops. #946
+              if (isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
+                try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
+              }
+              if (attempt === MAX_REPROBE_RETRIES) {
+                throw new Error(`Nonce-collision re-upload of chunk ${idx + 1} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
+              }
             }
           }
         }
@@ -1782,7 +1968,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     } else {
       const MAX_ROOT_RETRIES = 3;
       for (let rootAttempt = 1; rootAttempt <= MAX_ROOT_RETRIES; rootAttempt++) {
-        const rootNonce = await _fetchNonce(BULLETIN_ENDPOINTS, ss58 as string);
+        const rootNonce = await readChunkNonce();
         console.log(`   Storing root node (nonce: ${rootNonce})...`);
         const rootTx = unsafeApi.tx.TransactionStorage.store_with_cid_config({ cid: { codec: BigInt(0x70), hashing: toHashingEnum(hashCode) }, data: dagBytes });
         const rootTxOpts = { mortality: { mortal: true, period: 256 }, nonce: rootNonce };
@@ -1790,7 +1976,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           const watchResult = await watchTransaction(rootTx, signer!, rootTxOpts, () => {
             console.log(`   Root CID: ${rootCid.toString()}\n`);
             return rootCid.toString();
-          }, { label: "root-node", rpc: BULLETIN_ENDPOINTS, senderSS58: ss58, expectedNonce: rootNonce, timeoutMs: CHUNK_TIMEOUT_MS, fetchNonce: fetchNonceOverride });
+          }, { label: "root-node", timeoutMs: CHUNK_TIMEOUT_MS, confirmIncluded: () => cidPresentAtBest(client, rootCid.toString()) });
           result = watchResult.value;
           // Root tx is the canonical upload receipt — it finalises the DAG.
           uploadReceipt = watchResult.receipt;
@@ -2743,7 +2929,11 @@ export async function storeDirectoryV2(
         for (let i = 0; i < phaseB.chunkCids.length; i++) {
           phaseBChunkByCid.set(phaseB.chunkCids[i], phaseB.chunks[i]);
         }
-        const fetchNonceFn = phaseALiveProvider.fetchNonce ?? fetchNonce;
+        // Bounded like every chunk nonce (#1641); getters follow the provider across reconnects.
+        const readReuploadNonce = boundedNonceReader({
+          client: () => phaseALiveProvider.client, unsafeApi: () => phaseALiveProvider.unsafeApi,
+          ss58: () => phaseALiveProvider.ss58 as string, fetchNonceFn: phaseALiveProvider.fetchNonce ?? fetchNonce,
+        });
 
         for (let round = 1; round <= GRANDPA_REUPLOAD_MAX_ROUNDS && missingCids.size > 0; round++) {
           const roundSuffix = round > 1 ? ` (round ${round}/${GRANDPA_REUPLOAD_MAX_ROUNDS}, retry after fork)` : '';
@@ -2756,7 +2946,7 @@ export async function storeDirectoryV2(
           try {
             for (let i = 0; i < reuploadList.length; i++) {
               const cid = reuploadList[i];
-              const freshNonce = await fetchNonceFn(BULLETIN_ENDPOINTS, phaseALiveProvider.ss58 as string);
+              const freshNonce = await readReuploadNonce();
               if (cid === storageCid) {
                 // Root re-upload: store_with_cid_config with DAG-PB codec.
                 const rootTx = phaseALiveProvider.unsafeApi.tx.TransactionStorage.store_with_cid_config({
@@ -2765,11 +2955,8 @@ export async function storeDirectoryV2(
                 });
                 await watchTransaction(rootTx, phaseALiveProvider.signer as PolkadotSigner, { mortality: { mortal: true, period: 256 }, nonce: freshNonce }, () => storageCid, {
                   label: "root-reupload",
-                  rpc: BULLETIN_ENDPOINTS,
-                  senderSS58: phaseALiveProvider.ss58 as string,
-                  expectedNonce: freshNonce,
                   timeoutMs: CHUNK_TIMEOUT_MS,
-                  fetchNonce: phaseALiveProvider.fetchNonce,
+                  confirmIncluded: () => cidPresentAtBest(phaseALiveProvider.client, storageCid),
                 });
               } else {
                 const chunkBytes = phaseBChunkByCid.get(cid);
@@ -2779,7 +2966,7 @@ export async function storeDirectoryV2(
                     `its bytes are not in phaseB.chunks (cannot re-upload). This indicates an internal state issue.`
                   );
                 }
-                await storeChunk(phaseALiveProvider.unsafeApi, phaseALiveProvider.signer as PolkadotSigner, chunkBytes, freshNonce, phaseALiveProvider.ss58 as string, { fetchNonce: phaseALiveProvider.fetchNonce });
+                await storeChunk(phaseALiveProvider.unsafeApi, phaseALiveProvider.signer as PolkadotSigner, chunkBytes, freshNonce, { client: () => phaseALiveProvider.client });
               }
               reuploadCount++;
               console.log(`      [${i + 1}/${reuploadList.length}] re-uploaded ${cid.slice(0, 20)}… (nonce ${freshNonce})`);

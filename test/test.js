@@ -12668,7 +12668,7 @@ describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
   // Fixtures live at the literal /tmp paths the real workflow step hardcodes
   // (it isn't parametrized — that's the thing under test), so this suite
   // owns cleanup before AND after to avoid leaking fixture state.
-  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md"];
+  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md", "/tmp/readiness-section.md"];
   function cleanFixtures() {
     for (const p of FIXTURE_PATHS) fs.rmSync(p, { force: true });
   }
@@ -12734,6 +12734,72 @@ describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
       // (c) one-line failure signature per failing leg, in the body.
       assert.match(body, /Failure signatures/, ">> FAIL: report body must include a Failure signatures section");
       assert.ok(body.includes(failSig), ">> FAIL: report body must include the exact >> FAIL: one-line signature for the failing leg");
+    } finally {
+      cleanFixtures();
+      if (summaryPath) fs.rmSync(summaryPath, { force: true });
+    }
+  });
+
+  test("a not-ready env gets an Environment readiness section with the values read and its canary result (#1624)", () => {
+    cleanFixtures();
+    let summaryPath;
+    try {
+      const report = jobBlock(fs.readFileSync(E2E_YAML_PATH, "utf-8"), "nightly-report");
+      const script = stepRunScript(report, "Render report body");
+      fs.writeFileSync("/tmp/s1-legs.tsv", "");
+      fs.writeFileSync("/tmp/s2-legs.tsv", "");
+      fs.writeFileSync("/tmp/all-nightly-legs.tsv", [
+        "Nightly S1 pool/js on parity-default (paseo-next-v2)\tsuccess\tpaseo-next-v2",
+        "Nightly S1 direct/js on parity-default (preview)\tsuccess\tpreview",
+        "Nightly S1 direct/kubo on parity-default (preview)\tfailure\tpreview",
+      ].join("\n") + "\n");
+      fs.writeFileSync("/tmp/fail-signatures.tsv", "");
+      summaryPath = path.join(os.tmpdir(), `bd-step-summary-${process.pid}.md`);
+      fs.writeFileSync(summaryPath, "");
+      const scriptPath = path.join(os.tmpdir(), `bd-render-report-${process.pid}.sh`);
+      fs.writeFileSync(scriptPath, script);
+      const notReady = { preview: [{ check: "funding", reason: "//e2e-direct has 1.0000 PAS, below the 30.0000 PAS floor" }] };
+      const res = spawnSync("bash", [scriptPath], {
+        encoding: "utf-8",
+        env: {
+          ...process.env, TAG: "e2e-nightly", VERSION: "0.11.0", RUN_URL: "https://example/run/1",
+          SELECTED_ENV: "paseo-next-v2", HEALTHY_ENVS: '["paseo-next-v2"]',
+          NOT_READY: JSON.stringify(notReady), GITHUB_STEP_SUMMARY: summaryPath,
+        },
+      });
+      assert.equal(res.status, 0, `render script exited ${res.status}\nstderr:\n${res.stderr}`);
+      const body = fs.readFileSync("/tmp/report-body.md", "utf-8");
+      assert.match(body, /## Environment readiness/, ">> FAIL: env-readiness: a non-empty not_ready must add the section");
+      assert.match(body, /\| preview \| funding \| \/\/e2e-direct has 1\.0000 PAS, below the 30\.0000 PAS floor \| 1 failure, 1 success \|/,
+        ">> FAIL: env-readiness: the row must name the env, failed check, values read and the S1 direct canary result");
+      // The section is also what the env-not-ready issue is built from.
+      assert.match(fs.readFileSync("/tmp/readiness-section.md", "utf-8"), /Environment readiness/);
+    } finally {
+      cleanFixtures();
+      if (summaryPath) fs.rmSync(summaryPath, { force: true });
+    }
+  });
+
+  test("with nothing not-ready the report has no Environment readiness section (#1624)", () => {
+    cleanFixtures();
+    let summaryPath;
+    try {
+      const report = jobBlock(fs.readFileSync(E2E_YAML_PATH, "utf-8"), "nightly-report");
+      const script = stepRunScript(report, "Render report body");
+      for (const f of ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/fail-signatures.tsv"]) fs.writeFileSync(f, "");
+      fs.writeFileSync("/tmp/all-nightly-legs.tsv", "Nightly S1 pool/js on parity-default (paseo-next-v2)\tsuccess\tpaseo-next-v2\n");
+      summaryPath = path.join(os.tmpdir(), `bd-step-summary-${process.pid}.md`);
+      fs.writeFileSync(summaryPath, "");
+      const scriptPath = path.join(os.tmpdir(), `bd-render-report-${process.pid}.sh`);
+      fs.writeFileSync(scriptPath, script);
+      for (const notReady of ["{}", ""]) {
+        const res = spawnSync("bash", [scriptPath], {
+          encoding: "utf-8",
+          env: { ...process.env, TAG: "e2e-nightly", VERSION: "0.11.0", RUN_URL: "https://example/run/1", SELECTED_ENV: "paseo-next-v2", HEALTHY_ENVS: '["paseo-next-v2"]', NOT_READY: notReady, GITHUB_STEP_SUMMARY: summaryPath },
+        });
+        assert.equal(res.status, 0, `render script exited ${res.status}\nstderr:\n${res.stderr}`);
+        assert.doesNotMatch(fs.readFileSync("/tmp/report-body.md", "utf-8"), /Environment readiness/, `>> FAIL: env-readiness: NOT_READY=${JSON.stringify(notReady)} must not add the section`);
+      }
     } finally {
       cleanFixtures();
       if (summaryPath) fs.rmSync(summaryPath, { force: true });
@@ -17653,7 +17719,8 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     // single-env because mixing a free env dim with include produces additive (not cartesian)
     // expansion in GitHub Actions — include entries without the env key are appended as new
     // combinations rather than merged, silently dropping scenario coverage.
-    for (const jobName of ["nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh",
+    // nightly-s1-direct is the readiness canary (#1624) and fans out over canary_envs; see the test below.
+    for (const jobName of ["nightly-s1-pool", "nightly-s2-fresh",
                            "nightly-s3", "nightly-s5", "nightly-s6", "nightly-s7",
                            "nightly-s8", "nightly-s9", "nightly-s-grandpa-reupload",
                            "nightly-s-mortality", "nightly-s-reprove", "nightly-s-car",
@@ -17674,6 +17741,73 @@ describe("paseo-next-v2 E2E harness wiring", () => {
         `${jobName} must NOT fan out via healthy_envs (include-matrix incompatibility)`,
       );
     }
+  });
+
+  describe("env readiness wiring (#1624)", () => {
+    const wf = () => fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+
+    test("select-env exposes ready_envs, not_ready and canary_envs and writes them", () => {
+      const w = wf();
+      for (const out of ["ready_envs", "not_ready", "canary_envs"]) {
+        assert.match(w, new RegExp(`${out}:\\s*\\$\\{\\{\\s*steps\\.select\\.outputs\\.${out}\\s*\\}\\}`),
+          `>> FAIL: env-readiness: select-env must surface ${out} as a job output`);
+        assert.match(workflowJobBlock(w, "select-env"), new RegExp(`echo "${out}=`),
+          `>> FAIL: env-readiness: select-env must write ${out} to GITHUB_OUTPUT`);
+      }
+    });
+
+    test("select-env builds, runs tools/check-env-readiness.mjs per live env, and only on nightly-class events", () => {
+      const block = workflowJobBlock(wf(), "select-env");
+      assert.match(block, /npm run build/, ">> FAIL: env-readiness: the readiness tool imports dist/, so select-env must build");
+      assert.match(block, /node tools\/check-env-readiness\.mjs --env "\$env"/, ">> FAIL: env-readiness: select-env must call the readiness tool per env");
+      assert.match(block, /RUN_READINESS:.*schedule.*release.*workflow_dispatch/s, ">> FAIL: env-readiness: readiness must be gated to schedule/release/nightly dispatch");
+    });
+
+    test("an unknown/crashed readiness probe never excludes an env (only an explicit ready:false does)", () => {
+      const block = workflowJobBlock(wf(), "select-env");
+      assert.match(block, /jq -e '\.ready == false'/, ">> FAIL: env-readiness: only .ready == false may exclude an env");
+      assert.match(block, /no summary line; treating as unknown/, ">> FAIL: env-readiness: a missing summary line must be treated as unknown");
+    });
+
+    test("a release whose selected env is not ready fails select-env instead of falling back", () => {
+      const block = workflowJobBlock(wf(), "select-env");
+      assert.match(block, /EVENT_NAME" == "release"\s*\]\];\s*then[\s\S]*?exit 1/, ">> FAIL: env-readiness: release + not-ready selected env must exit 1");
+      assert.doesNotMatch(block, /EVENT_NAME" == "release" && .*READY\[0\]/, ">> FAIL: env-readiness: release must not move SELECTED to another env");
+    });
+
+    test("nightly-s1-direct is the canary: it fans out over canary_envs, every other fan-out stays on healthy_envs", () => {
+      const w = wf();
+      assert.match(workflowJobBlock(w, "nightly-s1-direct"), /fromJSON\(\s*needs\.select-env\.outputs\.canary_envs\s*\)/,
+        ">> FAIL: env-readiness: nightly-s1-direct must fan out over canary_envs");
+      assert.doesNotMatch(workflowJobBlock(w, "nightly-s1-pool"), /canary_envs/, ">> FAIL: env-readiness: only nightly-s1-direct may use canary_envs");
+      const users = [...w.matchAll(/canary_envs\) \}\}/g)].length;
+      assert.equal(users, 1, ">> FAIL: env-readiness: exactly one matrix may fan out over canary_envs");
+    });
+
+    test("build-nightly is skipped when no env is ready (empty matrix guard)", () => {
+      assert.match(workflowJobBlock(wf(), "build-nightly"), /needs\.select-env\.outputs\.healthy_envs != '\[\]'/,
+        ">> FAIL: env-readiness: build-nightly must skip when healthy_envs is [], an empty matrix errors every scenario job");
+    });
+
+    test("nightly-report renders an Environment readiness section from not_ready", () => {
+      const block = workflowJobBlock(wf(), "nightly-report");
+      assert.match(block, /NOT_READY:\s*\$\{\{\s*needs\.select-env\.outputs\.not_ready\s*\}\}/, ">> FAIL: env-readiness: report must read not_ready");
+      assert.match(block, /## Environment readiness/, ">> FAIL: env-readiness: report must carry an Environment readiness section");
+      assert.match(block, /cat \/tmp\/readiness-section\.md/, ">> FAIL: env-readiness: the section must be included in the report body");
+    });
+
+    test("nightly-report files ONE env-not-ready issue, deduped on the label", () => {
+      const block = workflowJobBlock(wf(), "nightly-report");
+      assert.match(block, /name: Open or update the env-not-ready issue/, ">> FAIL: env-readiness: missing the env-not-ready issue step");
+      assert.match(block, /LABEL=env-not-ready/, ">> FAIL: env-readiness: the issue must carry the env-not-ready label");
+      assert.match(block, /--data-urlencode "labels=\$LABEL"[\s\S]*?issues\/\$EXISTING\/comments/, ">> FAIL: env-readiness: an open labelled issue must get a comment, not a duplicate");
+    });
+
+    test("canary-only red does not file the normal failure issue", () => {
+      const block = workflowJobBlock(wf(), "nightly-report");
+      assert.match(block, /id: canary/, ">> FAIL: env-readiness: missing the canary-only classifier step");
+      assert.match(block, /steps\.canary\.outputs\.canary_only != 'true'/, ">> FAIL: env-readiness: the failure issue must be skipped when every red leg is a canary");
+    });
   });
 
   test("test-pr reads PAD_ENV from select-env, not hardcoded paseo-next-v2", () => {

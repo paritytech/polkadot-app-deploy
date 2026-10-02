@@ -11,7 +11,7 @@ import { runBulletinDeploy } from "./helpers/e2e-cli.js";
 import { trackTimers, armExitGuard } from "./helpers/e2e-exit-guard.js";
 import { resolveContenthashOnChain, resolveTextRecordOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
-import { tieredFixtureLabel, smokeLabel, digitsToLetters } from "../tools/lib/e2e-fixtures.mjs";
+import { S3_OWNED_LABEL, tieredFixtureLabel, smokeLabel, digitsToLetters } from "../tools/lib/e2e-fixtures.mjs";
 import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 import { resolveE2eEnv, resolveE2eEnvId } from "./helpers/e2e-env.js";
@@ -921,7 +921,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       // 0x237a2b1824AC4a87095c25EC30e1431060725909 (squatter), e2eownedns03.paseo
       // owner 0x41dCCBD49b26c50d34355Ed86ff0FA9E489d1e01 (Bob, BOB_H160 below).
       const ownedLabel = E2E_ENV_ID === "paseo-next-v2"
-        ? `e2eownedns03.${tld}`
+        ? `${S3_OWNED_LABEL}.${tld}`
         : `e2eownedns01.${tld}`;
       const envLabel = E2E_ENV_ID;
       // Bob's H160 (from docs/e2e-bootstrap.md).

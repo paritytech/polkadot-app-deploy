@@ -1,9 +1,8 @@
 // Per-tier fixed E2E labels (port of bulletin #1639 / bulletin #1623).
 //
 // Node builtins only, no polkadot-api, so tools and the S-CAR npm-path script
-// in e2e.yml can import this cheaply. (Upstream's file also holds S3_OWNED_LABEL
-// from bulletin #1332; p-a-d's S3 label lives in the workflow and is not ported
-// here.)
+// in e2e.yml can import this cheaply. S3_OWNED_LABEL (bulletin #1332) and
+// BOB_H160 sit at the bottom.
 
 // --- Per-tier fixed labels (bulletin #1623) ---------------------------------
 //
@@ -120,3 +119,10 @@ export function smokeLabel(deployTag, prNumber) {
   const tier = labelTierFromDeployTag(deployTag);
   return tier === "pr" ? prSmokeLabel(prNumber) : fixtureLabel("s1-smoke", tier);
 }
+
+// S3 "owned by a different account" fixture (bulletin #1332) and Bob's H160
+// (//Bob from the dev phrase, see docs/e2e-bootstrap.md). p-a-d's only
+// e2eEligible env is paseo-next-v2, where test/e2e.test.js's S3 scenario uses
+// e2eownedns03 owned by Bob. Read by tools/check-env-readiness.mjs.
+export const S3_OWNED_LABEL = "e2eownedns03";
+export const BOB_H160 = "0x41dccbd49b26c50d34355ed86ff0fa9e489d1e01";

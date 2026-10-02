@@ -79,6 +79,7 @@ export type DeployContent = string | Uint8Array | Uint8Array[];
 
 export { NonRetryableError, EXIT_CODE_NO_RETRY } from "./errors.js";
 import { NonRetryableError } from "./errors.js";
+import { e2eNonceSeedBarrier } from "./e2e-nonce-barrier.js";
 
 // Bulletin's signed extension returns InvalidTransaction::Payment when a storage tx
 // exceeds the signer's quota — Bulletin has no fees, so "Payment" means quota.
@@ -110,6 +111,13 @@ interface ExistingProvider { client?: any; unsafeApi?: any; signer?: PolkadotSig
    * computes and stores the real root, which becomes the contenthash.
    */
   skipRootStore?: boolean;
+  /**
+   * When true, a client storeChunkedContent created by reconnecting is handed back
+   * via `liveProvider` alive, and closing it becomes the caller's job (#1672).
+   * storeDirectoryV2 sets it: it probes finality with that client afterwards.
+   * Callers that drop liveProvider leave it unset, and the client is closed here.
+   */
+  handOffLiveClient?: boolean;
 }
 interface ChainReceipt { txHash: string; blockHash: string; blockNumber: number; }
 // viaFallback: not confirmed by a watch event (a best-block CID probe, or provisional pending the
@@ -326,6 +334,49 @@ export function retryBudgetExhausted(
     if (now - t <= windowMs) inWindow++;
   }
   return inWindow > maxEvents;
+}
+
+// twin: upstream defines this next to its ChainError type, as part of an earlier
+// change (InvalidTransaction variant carried structurally) this repo has not
+// taken. Only the pure extractor is brought in, because isNonceCollisionError
+// needs it; nothing here sets chainErrorVariant, so the message is the carrier.
+/**
+ * Pulls the InvalidTransaction variant name (e.g. "AncientBirthBlock",
+ * "BadProof", "Payment") out of the raw `{ "type": "Invalid", "value": {
+ * "type": "<Variant>" } }` shape substrate's signed extension returns.
+ */
+export function extractInvalidTransactionVariant(msg: string): string | undefined {
+  return /"type"\s*:\s*"Invalid"[\s\S]*?"value"\s*:\s*\{\s*"type"\s*:\s*"([^"]+)"/.exec(msg)?.[1];
+}
+
+/**
+ * How the root-node store loop answers a failed submit (#1672). A tx the pool
+ * rejects for its nonce is a nonce collision, not a lost connection: a sibling
+ * deploy on the same signer took that nonce (S9), so the fix is a fresh nonce,
+ * and a reconnect only burns budget. papi reports it as InvalidTxError Stale once
+ * the block holding the other tx finalises, or as isValid:false on a reorg. A WS
+ * halt or a connection error means the client is dead. Anything else keeps the
+ * historical reconnect.
+ */
+export function classifyRootSubmitError(error: any, wsHalted: boolean): "reconnect" | "nonce-collision" {
+  if (wsHalted || isConnectionError(error)) return "reconnect";
+  return isNonceCollisionError(error) ? "nonce-collision" : "reconnect";
+}
+
+/** The pool rejected the tx for its nonce: InvalidTxError Stale, or isValid:false (#1672). */
+export function isNonceCollisionError(error: any): boolean {
+  const msg = String(error?.message ?? error);
+  return (error?.chainErrorVariant ?? extractInvalidTransactionVariant(msg)) === "Stale" || msg.includes("isValid:false");
+}
+
+// Wait before re-reading the nonce after a collision (#1672). Two deploys on one
+// signer see their Stale at the same finalised block and re-read the same
+// nextIndex, so without a random offset they collide again on every retry.
+const defaultNonceCollisionBackoff = (): number => RETRY_BASE_DELAY_MS + Math.round(Math.random() * 10_000);
+let nonceCollisionBackoffMs: () => number = defaultNonceCollisionBackoff;
+/** Test-only: replace the collision backoff (null restores the default). */
+export function __setNonceCollisionBackoffForTest(fn: (() => number) | null): void {
+  nonceCollisionBackoffMs = fn ?? defaultNonceCollisionBackoff;
 }
 
 export function isConnectionError(error: any): boolean {
@@ -1289,7 +1340,7 @@ function assignDenseNonces(stored: (StoredChunk | null)[], startNonce: number): 
 
 export const __assignDenseNoncesForTest = assignDenseNonces;
 
-export async function storeChunkedContent(chunks: Uint8Array[], { client: existingClient, unsafeApi: existingApi, signer: existingSigner, ss58: existingSS58, reconnect, fetchNonce: fetchNonceOverride, skipCids, probeFailedCids, gateway: providerGateway, trustedCids, skipRootStore }: ExistingProvider = {}): Promise<{ storageCid: string; tier2Verified: number; tier2Inconclusive: number; tier2Fallback: number; liveProvider: ExistingProvider; skipProbeResults: Map<string, true | false | null>; rootSkipped: boolean }> {
+export async function storeChunkedContent(chunks: Uint8Array[], { client: existingClient, unsafeApi: existingApi, signer: existingSigner, ss58: existingSS58, reconnect, fetchNonce: fetchNonceOverride, skipCids, probeFailedCids, gateway: providerGateway, trustedCids, skipRootStore, handOffLiveClient }: ExistingProvider = {}): Promise<{ storageCid: string; tier2Verified: number; tier2Inconclusive: number; tier2Fallback: number; liveProvider: ExistingProvider; skipProbeResults: Map<string, true | false | null>; rootSkipped: boolean }> {
   const _fetchNonce = fetchNonceOverride ?? fetchNonce;
   console.log(`\n   Data chunks: ${chunks.length}`);
   const totalBytes = chunks.reduce((s: number, c: Uint8Array) => s + c.length, 0);
@@ -1615,6 +1666,10 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     const uploadEmittedIndices = new Set<number>();
     let uploadEmitted = 0;
 
+    // E2E-only (#1672): hold here, seed read and nothing submitted yet, until the
+    // sibling deploy has seeded too. A no-op unless its env var is set.
+    if (uploadTotal > 0) await e2eNonceSeedBarrier(startNonce);
+
     let b = 0;
     while (b < chunks.length) {
       // If the WS halt callback fired since the last batch, the current
@@ -1874,8 +1929,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           const idx = cidToIndex.get(m.cid)!;
           for (let attempt = 1; attempt <= MAX_REPROBE_RETRIES; attempt++) {
             console.log(`   Nonce-collision re-upload: chunk ${idx + 1} (attempt ${attempt}/${MAX_REPROBE_RETRIES})`);
+            let freshNonce: number | undefined;
             try {
-              const freshNonce = await readChunkNonce();
+              freshNonce = await readChunkNonce();
               const result = await storeChunk(unsafeApi, signer as PolkadotSigner, chunks[idx], freshNonce, chunkOpts);
               // A watch event in a best block is evidence; a probe-confirmed
               // result is re-verified next round.
@@ -1890,6 +1946,14 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               // matches the batch-retry and root-store loops. #946
               if (isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
                 try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
+              } else if (isNonceCollisionError(e)) {
+                // The sibling deploy took the nonce again (#1672). Back off by a random
+                // offset; once this round's attempts are spent the chunk stays pending
+                // and the next verify round probes and re-uploads it (bounded by rounds).
+                const last = attempt === MAX_REPROBE_RETRIES;
+                console.log(`   Chunk ${idx + 1}: re-upload nonce ${freshNonce} collided${last ? `; left for the next verify round` : ", retrying"}`);
+                await new Promise(r => setTimeout(r, nonceCollisionBackoffMs()));
+                continue;
               }
               if (attempt === MAX_REPROBE_RETRIES) {
                 // twin: upstream throws chunkFailureError here (structural InvalidTransaction variant), which this repo has not taken.
@@ -1983,16 +2047,22 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           uploadReceipt = watchResult.receipt;
           break;
         } catch (e: any) {
+          // The last attempt rethrows: a retry it would schedule never runs, and the
+          // loop used to exit with no root stored and no error (#1672).
+          if (rootAttempt === MAX_ROOT_RETRIES) throw e;
+          if (classifyRootSubmitError(e, wsHaltDetected) === "nonce-collision") {
+            // Not a connection loss (#1672): re-read the nonce and resubmit on the same client.
+            console.log(`   Root node: nonce ${rootNonce} collided (${e.message?.replace(/\s+/g, " ").slice(0, 80)}), resubmitting at a fresh nonce (attempt ${rootAttempt}/${MAX_ROOT_RETRIES})`);
+            captureWarning("root-node nonce collision: resubmitting", { nonce: rootNonce, attempt: rootAttempt });
+            await new Promise(r => setTimeout(r, nonceCollisionBackoffMs()));
+            continue;
+          }
           if (reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
             await doReconnect();
             continue;
           }
-          if (rootAttempt < MAX_ROOT_RETRIES) {
-            console.log(`   Root node attempt ${rootAttempt} failed: ${e.message?.slice(0, 80)}`);
-            await new Promise(r => setTimeout(r, 6000));
-            continue;
-          }
-          throw e;
+          console.log(`   Root node attempt ${rootAttempt} failed: ${e.message?.slice(0, 80)}`);
+          await new Promise(r => setTimeout(r, 6000));
         }
       }
     }
@@ -2018,7 +2088,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
       ownsClient = false;
     }
 
-    if (ownsClient) client.destroy();
+    if (ownsClient && !handOffLiveClient) client.destroy();
     return { storageCid: result as string, tier2Verified, tier2Inconclusive, tier2Fallback, liveProvider: { client, unsafeApi, signer, ss58 }, skipProbeResults, rootSkipped };
   } catch (e) {
     if (ownsClient) client.destroy();
@@ -2680,7 +2750,7 @@ export async function storeDirectoryV2(
       "deploy.car.mb": carMbA,
     }, async () => {
       sampleMemory("chunk_upload_start");
-      const phaseAUpload = await storeChunkedContent(phaseAUploadChunks, { ...provider, gateway, skipCids: skipCidsA, trustedCids: trustedCidsA, skipRootStore: true }); // phase A: single internal probe, no root store (Phase B's root supersedes), Tier 2 counts discarded (intermediate CAR)
+      const phaseAUpload = await storeChunkedContent(phaseAUploadChunks, { ...provider, gateway, skipCids: skipCidsA, trustedCids: trustedCidsA, skipRootStore: true, handOffLiveClient: true }); // phase A: single internal probe, no root store (Phase B's root supersedes), Tier 2 counts discarded (intermediate CAR)
       phaseALiveProvider = { ...provider, ...phaseAUpload.liveProvider };
       phaseASkipProbeResults = phaseAUpload.skipProbeResults;
       setDeployAttribute("deploy.storage.phase_a.root_already_onchain", String(phaseAUpload.rootSkipped));
@@ -2842,7 +2912,7 @@ export async function storeDirectoryV2(
     "deploy.car.mb": carMbB,
   }, async () => {
     sampleMemory("chunk_upload_b_start");
-    const r = await storeChunkedContent(carChunksB, { ...phaseALiveProvider, gateway, trustedCids: trustedCidsB, probeFailedCids: probeFailedCidsA });
+    const r = await storeChunkedContent(carChunksB, { ...phaseALiveProvider, gateway, trustedCids: trustedCidsB, probeFailedCids: probeFailedCidsA, handOffLiveClient: true });
     sampleMemory("chunk_upload_b_end");
     return r;
   });
@@ -3952,7 +4022,15 @@ export async function deploy(content: DeployContent, domainName: string | null =
     if (options.password) console.log(`   Encrypted: yes`);
 
     let provider: ProviderResult | undefined;
-    const reconnect = selectStorageReconnect(options);
+    // Every Bulletin client this deploy opens, so the finally below can close the
+    // ones a mid-upload reconnect handed to storeDirectoryV2 (#1672).
+    const openedClients: any[] = [];
+    const openStorageProvider = selectStorageReconnect(options);
+    const reconnect = async (): Promise<ProviderResult> => {
+      const p = await openStorageProvider();
+      openedClients.push(p.client);
+      return p;
+    };
     // Hoisted so the DotNS phase below can reuse the pre-upload eligibility
     // result when deciding whether registration can continue.
     let dotnsPreflight: DotnsPreflightResult | null = null;
@@ -4445,6 +4523,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       // the deploy span attribute was already written. Idempotent if already set.
       if (_deployRpcFailedOver) setDeployAttribute("deploy.rpc.failed_over", "true");
       provider?.client.destroy();
+      for (const c of openedClients) if (c !== provider?.client) try { c.destroy(); } catch { /* already closed */ }
     }
   });
   } finally {

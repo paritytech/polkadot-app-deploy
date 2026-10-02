@@ -82,12 +82,14 @@ test("checkPoolAccountNonceHealth: healthy when every sample agrees with the cha
 test("checkPoolAccountNonceHealth: partial sample failure uses the samples that succeeded", async () => {
   const h = await checkPoolAccountNonceHealth("5Addr8", {
     readOnchainNonce: async () => 100,
-    readNextIndex: async (_a, i) => { if (i === 0) throw new Error("ws closed"); return 200; },
-    samples: 2,
+    // #1658: was a single surviving sample (200). One sample cannot show the
+    // backend-local spread a stuck verdict now needs, so two survive here.
+    readNextIndex: async (_a, i) => { if (i === 0) throw new Error("ws closed"); return i === 1 ? 200 : 100; },
+    samples: 3,
     sleep: noSleep,
   });
   assert.equal(h.verdict, "stuck");
-  assert.deepEqual(h.samples, [200]);
+  assert.deepEqual(h.samples, [200, 100], ">> FAIL: health: the verdict must use exactly the samples that succeeded");
 });
 
 test("checkPoolAccountNonceHealth: every sample failing yields 'unknown', never throws", async () => {
@@ -127,7 +129,10 @@ test("checkPoolAccountNonceHealth: a large gap whose on-chain nonce advances is 
   const slept = [];
   const h = await checkPoolAccountNonceHealth("5Addr1", {
     readOnchainNonce: async () => onchain.shift(),
-    readNextIndex: async () => 112,
+    // #1658: one backend lags the gossip (101), so the spread alone cannot
+    // clear the account and the re-read decides. A uniform 112 now returns
+    // "unknown" with no re-read (see the gossiped-queue test below).
+    readNextIndex: async (_a, i) => (i === 0 ? 112 : 101),
     samples: 2,
     confirmDelayMs: 12_000,
     sleep: async (ms) => { slept.push(ms); },
@@ -138,16 +143,48 @@ test("checkPoolAccountNonceHealth: a large gap whose on-chain nonce advances is 
   assert.equal(h.gap, 9);
 });
 
-test("checkPoolAccountNonceHealth: a large gap whose on-chain nonce stays flat is stuck", async () => {
+// #1658: the samples used to be a uniform 13116. A queue every backend sees is
+// gossiped (busy), so the stuck shape is now the real #1637 / #1640 one: one
+// backend at the chain's nonce, the other far ahead. The flat-nonce check is
+// kept, over the longer window.
+test("checkPoolAccountNonceHealth: a large backend-local gap whose on-chain nonce stays flat is stuck", async () => {
   let reads = 0;
+  const slept = [];
   const h = await checkPoolAccountNonceHealth("5Addr8", {
     readOnchainNonce: async () => { reads++; return 13063; },
-    readNextIndex: async () => 13116,
+    readNextIndex: async (_a, i) => (i === 0 ? 13114 : 13063),
     samples: 2,
-    sleep: noSleep,
+    sleep: async (ms) => { slept.push(ms); },
   });
   assert.equal(h.verdict, "stuck");
-  assert.equal(reads, 2, ">> FAIL: health: the stuck verdict must be confirmed by a second on-chain read");
+  assert.equal(h.backendLocal, true);
+  assert.equal(reads, 6, ">> FAIL: health: the stuck verdict must be confirmed by 5 on-chain re-reads (one first read + the window)");
+  assert.equal(slept.length, 5, ">> FAIL: health: each re-read waits confirmDelayMs");
+});
+
+test("checkPoolAccountNonceHealth: a large gap on EVERY sample is unknown (busy, gossiped) at once, never stuck (#1658)", async () => {
+  let slept = false;
+  const h = await checkPoolAccountNonceHealth("5Addr1", {
+    readOnchainNonce: async () => 100,
+    readNextIndex: async () => 112,
+    samples: 4,
+    sleep: async () => { slept = true; },
+  });
+  assert.equal(slept, false, ">> FAIL: health: a gossiped queue can never be stuck, so it must not pay the re-read window");
+  assert.equal(h.verdict, "unknown", ">> FAIL: health: a uniform gap is a gossiped queue; with no inclusion in the window it is ambiguous, not stuck");
+  assert.match(h.reason, /every nextIndex sample/);
+});
+
+test("checkPoolAccountNonceHealth: confirmReads bounds the re-read window", async () => {
+  let reads = 0;
+  await checkPoolAccountNonceHealth("5Addr8", {
+    readOnchainNonce: async () => { reads++; return 13063; },
+    readNextIndex: async (_a, i) => (i === 0 ? 13114 : 13063),
+    samples: 2,
+    confirmReads: 2,
+    sleep: noSleep,
+  });
+  assert.equal(reads, 3);
 });
 
 test("checkPoolAccountNonceHealth: a small gap never pays the confirmation wait", async () => {
@@ -166,7 +203,7 @@ test("checkPoolAccountNonceHealth: a failed confirmation re-read yields 'unknown
   let n = 0;
   const h = await checkPoolAccountNonceHealth("5Addr8", {
     readOnchainNonce: async () => { if (n++ > 0) throw new Error("ws gone"); return 13063; },
-    readNextIndex: async () => 13116,
+    readNextIndex: async (_a, i) => (i === 0 ? 13116 : 13063), // #1658: the backend-local shape, so the re-read runs
     samples: 2,
     sleep: noSleep,
   });

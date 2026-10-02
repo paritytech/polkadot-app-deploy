@@ -5220,9 +5220,13 @@ describe("DotNS.register contract path", () => {
     };
     d.verifyOwnership = async () => {};
 
+    d._sleep = async () => {}; // the retry's settle wait
     const result = await d.register("rc6pool");
     assert.deepStrictEqual(result, { label: "rc6pool", owner: "0xabc" });
-    assert.strictEqual(commitCount, 2, "should generate a fresh commitment on retry");
+    // #1659: was 2 ("a fresh commitment on retry"). Committing fresh while the
+    // first commitment is still valid is a double commit (CommitResume
+    // NoDoubleCommitValid, CR_Rivals); the retry now reuses it.
+    assert.strictEqual(commitCount, 1, ">> FAIL: register-barerevert-retry: the retry must reuse the still-valid commitment, not generate a second one");
     assert.strictEqual(finalizeCount, 2, "should attempt finalize twice");
   });
 
@@ -5257,6 +5261,7 @@ describe("DotNS.register contract path", () => {
     d.generateCommitment = async (label) => ({ commitment: "0xc1", registration: { label } });
     d.submitCommitment = async () => {};
     d.waitForCommitmentAge = async () => {};
+    d._sleep = async () => {}; // the retry's settle wait
     d.getPriceAndValidate = async () => ({ priceWei: 0n });
     d.finalizeRegistration = async () => {
       throw new Error("bare-revert (empty 0x) — commitment timing");

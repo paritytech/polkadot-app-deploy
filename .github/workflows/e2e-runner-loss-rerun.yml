@@ -1,31 +1,43 @@
-name: E2E runner-loss re-run
+name: E2E runner-loss watchdog
 
-# Port of bulletin #1638 (#1622). Upstream: 31 red nightly legs in 30 days were
-# a lost parity-default runner
+# Port of bulletin #1638 (#1622), watchdog design. Upstream: 31 red nightly
+# legs in 30 days were a lost parity-default runner
 # ("The self-hosted runner lost communication with the server", "received a
 # shutdown signal", "The operation was canceled", or no log at all), each
 # filing a failure issue that a human closed as "runner lost, nothing to fix".
-# When EVERY red leg of a first-attempt scheduled nightly is a lost runner,
-# re-run the failed jobs once. The re-run's own nightly-report then files (or
-# does not file) the issue as usual.
 #
-# Why a separate workflow: rerun-failed-jobs is refused for a run that is still
-# in progress, and e2e.yml's nightly-report job is part of that run. This
-# workflow fires once the run has COMPLETED. nightly-report skips its failure
-# issue under the same condition, using the same classifier script
-# (.github/scripts/classify-runner-loss.cjs), so the two cannot disagree.
+# Who re-runs: upstream, cattery-scheduler[bot] (Parity's runner
+# infrastructure) re-runs red attempts 13-30 s after they complete. This repo
+# runs on ubuntu-latest and has no such re-runner, so nothing re-runs a red
+# attempt automatically here: on a runner-loss night the watchdog finds no
+# newer attempt and files the issue. That is the accepted twin behaviour.
+# This workflow re-runs NOTHING (it has no actions: write). It used to POST
+# rerun-failed-jobs, which upstream double-fired with cattery and filed
+# spurious unlabelled issues when that POST was refused (#1645, #1650).
 #
-# Safety net: nightly-report skips its issue only when this workflow is about
-# to re-run. If the re-run POST fails, this workflow files the issue itself, so
-# a skipped issue always means "re-run issued" or "issue filed".
+# What it guarantees: no red night vanishes. On a first-attempt scheduled run
+# whose every red leg is a lost runner, nightly-report DEFERS its failure
+# issue (step "Defer the failure issue to the runner-loss watchdog") instead
+# of filing it. This watchdog fires when that attempt completes. It reads
+# that attempt's report through /attempts/{n}/jobs (#1645) and waits out a
+# grace period (cattery's re-run window upstream; also covers a manual re-run
+# here). Then:
+#   - a newer attempt exists: its own report accounts for the night, because
+#     attempts >= 2 never defer. Done.
+#   - no newer attempt exists: it files the issue with the night's
+#     nightly-dedup label and title, which the defer step printed, so dedup
+#     and "Re-run passed" find it.
+#   - the report's state is unknown, or anything cannot be read: it files
+#     (fail closed, #1651).
+# The logic lives in .github/scripts/runner-loss-watchdog.cjs.
 #
-# Schedule events only. Release gates are judged by a human/controller, who
-# decides on a re-run.
-# Attempt >= 2 never auto-re-runs, so there is at most one automatic re-run.
+# If this job's own runner is lost, the run goes red; upstream cattery re-runs
+# it with the same workflow_run payload, so the same attempt is judged again.
+# Here a manual re-run of this workflow does the same.
 #
-# workflow_run only fires for the copy of this file on the default branch, so
-# the workflow_dispatch trigger exists to classify a past run (dry_run=true,
-# the default, never POSTs).
+# Schedule events only, like the deferral itself. workflow_run only fires for
+# the copy of this file on the default branch, so workflow_dispatch exists to
+# judge a past run (dry_run=true, the default, never files).
 
 on:
   workflow_run:
@@ -34,36 +46,44 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: "E2E run ID to classify"
+        description: "E2E run ID to judge"
         required: true
         type: string
+      run_attempt:
+        description: "Attempt of that run to judge"
+        required: false
+        type: string
+        default: "1"
       dry_run:
-        description: "Print the verdict only; do not re-run"
+        description: "Print the decision only; do not file"
         required: false
         type: boolean
         default: true
+      grace_seconds:
+        description: "Seconds to wait for a re-run before checking for a newer attempt"
+        required: false
+        type: string
+        default: "0"
 
 jobs:
-  rerun:
-    name: Re-run failed jobs on runner loss
+  watchdog:
+    name: Account for a deferred runner-loss night
     if: >
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.event == 'schedule' &&
-       github.event.workflow_run.run_attempt == 1 &&
-       github.event.workflow_run.conclusion == 'failure')
+       github.event.workflow_run.conclusion != 'success')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
-      # actions:write — POST /actions/runs/{id}/rerun-failed-jobs
-      actions: write
-      # checks:read — GET /check-runs/{id}/annotations (classifier input)
-      checks: read
-      # contents:read — sparse checkout of .github/scripts
+      # actions:read: GET the triggering attempt's jobs, the report job's log, the run
+      actions: read
+      # contents:read: sparse checkout of .github/scripts
       contents: read
-      # issues:write — failure issue when the re-run POST fails (safety net)
+      # issues:write: file (or comment on) the deferred failure issue
       issues: write
     env:
       RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+      RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || inputs.run_attempt }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -73,55 +93,81 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-      - name: Classify runner loss
-        id: classify
+      # cattery acts within about 30 s of completion; 180 s of grace on top of
+      # this job's own start-up delay leaves a wide margin.
+      - name: Check whether the night is accounted
+        id: decide
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_API_URL: ${{ github.api_url }}
+          GRACE_SECONDS: ${{ inputs.grace_seconds || '180' }}
         run: |
-          node .github/scripts/classify-runner-loss.cjs | tee /tmp/verdict.txt
-          {
-            echo "### Runner-loss verdict for run ${RUN_ID}"
-            echo '```'
-            cat /tmp/verdict.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Re-run failed jobs
-        id: rerun
+          node .github/scripts/runner-loss-watchdog.cjs
+      - name: Dry run
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.dry_run
+        env:
+          DECISION: ${{ steps.decide.outputs.decision }}
+          REASON: ${{ steps.decide.outputs.reason }}
+          DEDUP_LABEL: ${{ steps.decide.outputs.dedup_label }}
+        run: |
+          echo "dry_run=true: run $RUN_ID attempt $RUN_ATTEMPT -> decision=${DECISION:-file} (${REASON:-step failed}), dedup label '${DEDUP_LABEL}'. Nothing filed." | tee -a "$GITHUB_STEP_SUMMARY"
+      # A separate always() step, so a failed decision step still files.
+      - name: File the deferred failure issue
         if: >
-          steps.classify.outputs.verdict == 'all-runner-loss' &&
-          (github.event_name == 'workflow_run' || !inputs.dry_run)
+          always() &&
+          (github.event_name == 'workflow_run' || !inputs.dry_run) &&
+          (steps.decide.outputs.decision == 'file' || steps.decide.outcome == 'failure')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           API_URL: ${{ github.api_url }}
           REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.event.workflow_run.id || inputs.run_id }}
+          WATCHDOG_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DEDUP_LABEL: ${{ steps.decide.outputs.dedup_label }}
+          TITLE: ${{ steps.decide.outputs.title }}
+          REASON: ${{ steps.decide.outputs.reason }}
         run: |
-          code=$(curl -sS --max-time 30 -o /tmp/rerun.json -w '%{http_code}' -X POST \
+          TITLE="${TITLE:-Nightly E2E failure: runner-loss night not accounted (run $RUN_ID)}"
+          BODY=$(printf 'Attempt %s of the nightly run %s ended red and nightly-report deferred its failure issue to the runner-loss watchdog (every red leg looked like a lost runner, or the report state could not be read). No newer attempt accounts for the night: %s.\n\nRe-run the failed jobs by hand, or investigate.\n\n- Run: %s\n- Watchdog: %s' \
+            "$RUN_ATTEMPT" "$RUN_URL" "${REASON:-the watchdog failed}" "$RUN_URL" "$WATCHDOG_URL")
+          if [ -z "$DEDUP_LABEL" ]; then
+            echo "::warning::no dedup label from the report; filing an unlabelled issue"
+            curl -fsSL --max-time 30 -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/issues" \
+              -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" '{title: $title, body: $body}')"
+            exit 0
+          fi
+          # Same sequence as nightly-report's Open failure issue (#1532): look
+          # the label up, comment if an issue has it, else create label + issue.
+          # A failed lookup reads as "none found" and files.
+          EXISTING=$(curl -fsSL --max-time 30 -G \
             -H "Authorization: bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "$API_URL/repos/$REPO/actions/runs/$RUN_ID/rerun-failed-jobs")
-          if [ "$code" != 201 ]; then
-            echo "::error::rerun-failed-jobs returned HTTP $code: $(head -c 300 /tmp/rerun.json)"
-            exit 1
+            --data-urlencode "labels=$DEDUP_LABEL" \
+            --data-urlencode "state=open" \
+            --data-urlencode "per_page=100" \
+            "$API_URL/repos/$REPO/issues" \
+            | jq -r 'map(select(has("pull_request") | not)) | (.[0].number // empty)' || true)
+          if [ -n "$EXISTING" ]; then
+            echo "Open issue #$EXISTING is labelled \"$DEDUP_LABEL\"; commenting."
+            curl -fsSL --max-time 30 -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/issues/$EXISTING/comments" \
+              -d "$(jq -n --arg body "$BODY" '{body: $body}')"
+            exit 0
           fi
-          echo "Every red leg of run $RUN_ID was a lost runner: re-ran the failed jobs once (attempt 2)." | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: Dry run
-        if: steps.classify.outputs.verdict == 'all-runner-loss' && github.event_name == 'workflow_dispatch' && inputs.dry_run
-        run: |
-          echo "dry_run=true: would re-run the failed jobs of run $RUN_ID." | tee -a "$GITHUB_STEP_SUMMARY"
-      - name: File the failure issue when the re-run could not be issued
-        if: always() && steps.rerun.outcome == 'failure' && github.event_name == 'workflow_run'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          API_URL: ${{ github.api_url }}
-          REPO: ${{ github.repository }}
-          RUN_URL: ${{ github.event.workflow_run.html_url }}
-        run: |
-          BODY=$(printf 'Every red leg of the nightly run %s was a lost runner, but the automatic re-run could not be issued (see this workflow run: %s/%s/actions/runs/%s). nightly-report skipped its own failure issue expecting that re-run, so this issue stands in for it.\n\nRe-run the failed jobs by hand.' \
-            "$RUN_URL" "${{ github.server_url }}" "$REPO" "${{ github.run_id }}")
+          curl -fsSL --max-time 30 -o /dev/null -X POST \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "$API_URL/repos/$REPO/labels" \
+            -d "$(jq -n --arg name "$DEDUP_LABEL" '{name: $name, color: "ededed", description: "Nightly/release failure-issue dedup key (#1532) — do not remove from an open nightly-report issue."}')" \
+            || true
           curl -fsSL --max-time 30 -X POST \
             -H "Authorization: bearer $GITHUB_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "$API_URL/repos/$REPO/issues" \
-            -d "$(jq -n --arg title "Nightly E2E failure: runner lost and automatic re-run failed (run $RUN_ID)" --arg body "$BODY" '{title: $title, body: $body}')"
+            -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" --arg label "$DEDUP_LABEL" '{title: $title, body: $body, labels: [$label]}')"

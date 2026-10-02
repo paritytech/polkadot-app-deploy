@@ -25,7 +25,7 @@ import { createRequire } from "node:module";
 // `node`), so it's loaded here via createRequire rather than converted to
 // ESM just for this test file.
 const require = createRequire(import.meta.url);
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
@@ -42,6 +42,7 @@ import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, en
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
+import { Twox128 } from "@polkadot-api/substrate-bindings";
 import { probeChunks, _decodeStorageValue, _resetProbeSession, _bypassMetadataCheckForTest, classifyFinalityGap, probeFinalityGap, getBestBlockNumber } from "../dist/chunk-probe.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "../dist/manifest-embed.js";
 import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLocalManifest, getCacheDir, SIDECAR_FILENAME, normalizeBitswapBytes, fetchManifestFromChain } from "../dist/manifest-fetch.js";
@@ -3420,6 +3421,8 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.tool_version",
     "deploy.runner",
     "deploy.runner_type",
+    "deploy.ci_run_id",
+    "deploy.ci_run_attempt",
     "deploy.expected_error",
     // deploy.pr, deploy.host_app, deploy.host_app_version are conditional — not checked here
   ];
@@ -5220,9 +5223,13 @@ describe("DotNS.register contract path", () => {
     };
     d.verifyOwnership = async () => {};
 
+    d._sleep = async () => {}; // the retry's settle wait
     const result = await d.register("rc6pool");
     assert.deepStrictEqual(result, { label: "rc6pool", owner: "0xabc" });
-    assert.strictEqual(commitCount, 2, "should generate a fresh commitment on retry");
+    // #1659: was 2 ("a fresh commitment on retry"). Committing fresh while the
+    // first commitment is still valid is a double commit (CommitResume
+    // NoDoubleCommitValid, CR_Rivals); the retry now reuses it.
+    assert.strictEqual(commitCount, 1, ">> FAIL: register-barerevert-retry: the retry must reuse the still-valid commitment, not generate a second one");
     assert.strictEqual(finalizeCount, 2, "should attempt finalize twice");
   });
 
@@ -5257,6 +5264,7 @@ describe("DotNS.register contract path", () => {
     d.generateCommitment = async (label) => ({ commitment: "0xc1", registration: { label } });
     d.submitCommitment = async () => {};
     d.waitForCommitmentAge = async () => {};
+    d._sleep = async () => {}; // the retry's settle wait
     d.getPriceAndValidate = async () => ({ priceWei: 0n });
     d.finalizeRegistration = async () => {
       throw new Error("bare-revert (empty 0x) — commitment timing");
@@ -11029,6 +11037,25 @@ describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/wa
   });
 });
 
+// probeChunks client for the #1656 chain-evidence fallback: every
+// TransactionByContentHash key is present at the best block (block 500), every
+// other key (cross-validation's Transactions[block] read) is absent. Callers
+// must _resetProbeSession() + _bypassMetadataCheckForTest() first.
+const CONTENT_HASH_KEY_PREFIX = "0x" + Buffer.concat([
+  Buffer.from(Twox128(new TextEncoder().encode("TransactionStorage"))),
+  Buffer.from(Twox128(new TextEncoder().encode("TransactionByContentHash"))),
+]).toString("hex");
+function presentProbeClient() {
+  const present = (() => { const b = Buffer.alloc(8); b.writeUInt32LE(500, 0); b.writeUInt32LE(1, 4); return "0x" + b.toString("hex"); })();
+  return {
+    destroy() {},
+    _request: async (method, params) => {
+      if (method !== "state_queryStorageAt") throw new Error(`stub: ${method}`);
+      return [{ changes: params[0].map((k) => [k, k.startsWith(CONTENT_HASH_KEY_PREFIX) ? present : null]) }];
+    },
+  };
+}
+
 describe("watchTransaction found:false handling", () => {
   test("normal success: reconnect NOT called", async () => {
     let reconnectCalled = false;
@@ -11072,37 +11099,44 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT be called when waiting events are followed by success");
   });
 
-  // isValid:false + nonce advanced: tx was actually included even though the
-  // pool said invalid (peer disagreement). tryNonceFallback resolves the
-  // chunk; reconnect is NOT called because the WS subscription itself was
-  // healthy — only the tx was a problem.
-  test("isValid:false + nonce advanced: chunk resolves via fallback, no reconnect", async () => {
+  // isValid:false + CID present at best: tx was actually included even though
+  // the pool said invalid (peer disagreement). The best-block probe resolves
+  // the chunk; reconnect is NOT called because the WS subscription itself was
+  // healthy — only the tx was a problem. Pre-#1656 this was decided by the
+  // nonce advancing, which counts the pool's own pending tx: a false positive.
+  test("isValid:false + CID present at best: chunk resolves via the chain fallback, no reconnect", async () => {
+    _resetProbeSession(); _bypassMetadataCheckForTest();
     let reconnectCalled = false;
     const reconnect = async () => {
       reconnectCalled = true;
-      return { client: { destroy() {} }, unsafeApi: makeStubApi(normalSubscribable), signer: stubSigner, ss58: STUB_SS58 };
+      return { client: presentProbeClient(), unsafeApi: makeStubApi(normalSubscribable), signer: stubSigner, ss58: STUB_SS58 };
     };
 
-    let nonceCalls = 0;
-    const fakeFetchNonce = async () => {
-      nonceCalls++;
-      // call 1 = startNonce query; call 2+ = nonce advanced → chunk "included"
-      return nonceCalls === 1 ? 100 : 101;
-    };
+    let txCalls = 0;
+    const api = makeSequencedStubApi(poolRejectSubscribable, normalSubscribable);
+    const origStore = api.tx.TransactionStorage.store_with_cid_config;
+    api.tx.TransactionStorage.store_with_cid_config = (...a) => { txCalls++; return origStore(...a); };
+    const fakeFetchNonce = async () => 100;
 
     await storeChunkedContent([ONE_BYTE_CHUNK], {
-      client: { destroy() {} },
-      unsafeApi: makeSequencedStubApi(poolRejectSubscribable, normalSubscribable),
+      client: presentProbeClient(),
+      unsafeApi: api,
       signer: stubSigner,
       ss58: STUB_SS58,
       reconnect,
       fetchNonce: fakeFetchNonce,
+      skipRootStore: true,
     });
 
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT fire on a tx-level rejection — the WS sub was healthy");
+    assert.strictEqual(txCalls, 1, ">> FAIL: chain fallback: the chunk was found at best, so it must not be resubmitted");
   });
 
-  test("connection error + nonce advanced marks failed chunk stored without retrying it again", async () => {
+  // Pre-#1656 the consumed nonce alone marked chunk 2 stored. Now it only
+  // routes chunk 2 to the post-batch verify loop, which accepts it because the
+  // best-block probe finds it (so still no resubmit).
+  test("connection error + nonce advanced: failed chunk goes to verification and is accepted on a best-block probe, without a resubmit", async () => {
+    _resetProbeSession(); _bypassMetadataCheckForTest();
     let reconnectCalled = false;
     let txCalls = 0;
     const countingApi = () => makeStubApi(() => {
@@ -11112,7 +11146,7 @@ describe("watchTransaction found:false handling", () => {
     });
     const reconnect = async () => {
       reconnectCalled = true;
-      return { client: { destroy() {} }, unsafeApi: countingApi(), signer: stubSigner, ss58: STUB_SS58 };
+      return { client: presentProbeClient(), unsafeApi: countingApi(), signer: stubSigner, ss58: STUB_SS58 };
     };
 
     let nonceCalls = 0;
@@ -11124,7 +11158,7 @@ describe("watchTransaction found:false handling", () => {
     };
 
     await storeChunkedContent([new Uint8Array([0x41]), new Uint8Array([0x42])], {
-      client: { destroy() {} },
+      client: presentProbeClient(),
       unsafeApi: countingApi(),
       signer: stubSigner,
       ss58: STUB_SS58,
@@ -11133,7 +11167,7 @@ describe("watchTransaction found:false handling", () => {
     });
 
     assert.strictEqual(reconnectCalled, true, "connection failure should reconnect once");
-    assert.strictEqual(txCalls, 3, "must submit chunk 1, chunk 2, and root only; chunk 2 must not be retried after nonce fallback stores it");
+    assert.strictEqual(txCalls, 2, "must submit chunk 1 and chunk 2 only (the root is found at best); chunk 2 must not be retried once the verify probe finds it");
   });
 
   test("authorization read reconnects when stale client passes System.Number but account_authorization is disjointed", async () => {
@@ -11563,13 +11597,18 @@ describe("verifyNonceAdvanced source structure (issue #153, AC#1)", () => {
     },
   );
 
-  test("src/deploy.ts: tryNonceFallback uses verifyNonceAdvanced (not bare fetchNonce for verify sites)",
+  // #1656: the Bulletin watcher used verifyNonceAdvanced as its timeout
+  // fallback. system_accountNextIndex counts the deploy's own pending tx, so a
+  // pending chunk read as included. The fallback is now a best-block CID probe;
+  // verifyNonceAdvanced stays for the DotNS path (dotns.ts), which pairs it
+  // with an effect check.
+  test("src/deploy.ts: the Bulletin watcher falls back to a best-block CID probe, never to the pool-aware nonce",
     () => {
       const src = fs.readFileSync("src/deploy.ts", "utf-8");
-      assert.ok(
-        src.includes("verifyNonceAdvanced"),
-        "tryNonceFallback must use verifyNonceAdvanced for cross-RPC nonce verification",
-      );
+      assert.ok(!src.includes("verifyNonceAdvanced"),
+        ">> FAIL: #1656: deploy.ts must not decide Bulletin inclusion with verifyNonceAdvanced (system_accountNextIndex counts pending txs)");
+      assert.match(src, /tryChainFallback/, ">> FAIL: #1656: watchTransaction must keep a chain-evidence fallback");
+      assert.match(src, /cidPresentAtBest\(/, ">> FAIL: #1656: chunk and root watches must probe their CID at the best block");
     },
   );
 
@@ -11745,41 +11784,97 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
   }
 
   // Port of bulletin #1638 (#1622): a lost runner used to file a "nothing to fix" issue
-  // each time. nightly-report now classifies the run (shared script) and skips
-  // the issue on a first-attempt SCHEDULED all-runner-loss run; the re-run is
-  // issued by e2e-runner-loss-rerun.yml because rerun-failed-jobs is refused
-  // for a run still in progress, and nightly-report is part of that run.
-  test(".github/workflows: runner-loss re-run is gated on schedule + attempt 1 + the classifier verdict, and the issue is skipped when it fires (bulletin #1622)", () => {
+  // each time. nightly-report classifies its own attempt (shared script) and
+  // DEFERS the issue on a first-attempt SCHEDULED all-runner-loss run.
+  // cattery-scheduler[bot] owns re-running (#1645). e2e-runner-loss-rerun.yml
+  // used to POST rerun-failed-jobs, which double-fired with cattery and filed
+  // spurious issues when refused (#1650). It is now a watchdog that re-runs
+  // nothing and files the deferred issue when no newer attempt appears. This
+  // test used to assert the re-run POST, actions: write and the
+  // steps.rerun.outcome fallback. Those were the bugs, so it now asserts
+  // their absence and the watchdog contract instead.
+  test(".github/workflows: runner-loss issue is deferred on schedule + attempt 1 + all-runner-loss, and the watchdog files it without re-running anything (#1622, #1645, #1650, #1651)", () => {
     const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
     const report = jobBlock(e2e, "nightly-report");
     const steps = report.split(/\n(?= {6}- )/);
     const classifyStep = steps.find((step) => /- name: Classify runner loss$/m.test(step));
+    const deferStep = steps.find((step) => /- name: Defer the failure issue to the runner-loss watchdog$/m.test(step));
     const openStep = steps.find((step) => /- name: Open failure issue$/m.test(step));
     assert.ok(classifyStep, ">> FAIL: runner-loss: nightly-report must have a 'Classify runner loss' step");
+    assert.ok(deferStep, ">> FAIL: runner-loss: nightly-report must have the 'Defer the failure issue to the runner-loss watchdog' step the watchdog reads");
     assert.match(classifyStep, /id: runner-loss/, ">> FAIL: runner-loss: the classify step must expose id runner-loss");
     assert.match(classifyStep, /node \.github\/scripts\/classify-runner-loss\.cjs/,
       ">> FAIL: runner-loss: nightly-report must use the shared classifier script, not a re-inlined copy");
     assert.match(classifyStep, /continue-on-error: true/,
       ">> FAIL: runner-loss: a classifier failure must never block the failure issue");
-    assert.match(openStep,
-      /!\(github\.event_name == 'schedule' && github\.run_attempt == 1 && steps\.runner-loss\.outputs\.verdict == 'all-runner-loss'\)/,
-      ">> FAIL: runner-loss: Open failure issue must be skipped only on schedule + run_attempt 1 + all-runner-loss");
+    assert.match(classifyStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/,
+      ">> FAIL: runner-loss: nightly-report must classify its own attempt (#1645)");
+    assert.doesNotMatch(deferStep, /continue-on-error/,
+      ">> FAIL: runner-loss: the defer step must not be continue-on-error, or a failed deferral would read as success to the watchdog");
+    assert.match(deferStep, /id: runner-loss-defer/, ">> FAIL: runner-loss: the defer step must expose id runner-loss-defer");
+
+    // The defer gate must be exactly 'the issue would be filed, but every red leg is a lost runner'.
+    // If it drifted from Open's gate, a night could be neither filed nor deferred.
+    const gate = (step) => (step.match(/^ {8}if: >\n((?: {10}.*\n?)+)/m) ?? [])[1]?.replace(/\s+/g, " ").trim() ?? "";
+    const openGate = gate(openStep);
+    const deferGate = gate(deferStep);
+    assert.match(openGate, /steps\.runner-loss-defer\.outcome != 'success'$/,
+      ">> FAIL: runner-loss: Open failure issue must be skipped only when the defer step succeeded");
+    const shared = openGate
+      .replace(/ && steps\.runner-loss-defer\.outcome != 'success'$/, "")
+      .replace("(github.event_name == 'schedule' || github.event_name == 'release')", "github.event_name == 'schedule' && github.run_attempt == 1");
+    assert.equal(deferGate, `${shared} && steps.runner-loss.outputs.verdict == 'all-runner-loss'`,
+      ">> FAIL: runner-loss: the defer gate must equal Open failure issue's gate restricted to schedule + attempt 1 + all-runner-loss");
     assert.doesNotMatch(report, /actions\/runs\/[^\s"]*rerun-failed-jobs/,
-      ">> FAIL: runner-loss: nightly-report must not POST rerun-failed-jobs itself — GitHub refuses it for a run still in progress");
+      ">> FAIL: runner-loss: nightly-report must not POST rerun-failed-jobs");
 
     const rr = fs.readFileSync(".github/workflows/e2e-runner-loss-rerun.yml", "utf-8");
+    const rrCode = rr.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
     assert.match(rr, /workflow_run:\s*\n\s*workflows: \["E2E \(Paseo Bulletin\)"\]\s*\n\s*types: \[completed\]/,
-      ">> FAIL: runner-loss: the re-run workflow must trigger on completion of the E2E workflow");
-    assert.match(rr, /github\.event\.workflow_run\.event == 'schedule'/, ">> FAIL: runner-loss: re-run must be schedule-only (never release)");
-    assert.match(rr, /github\.event\.workflow_run\.run_attempt == 1/, ">> FAIL: runner-loss: attempt >= 2 must never auto-re-run");
-    assert.match(rr, /github\.event\.workflow_run\.conclusion == 'failure'/, ">> FAIL: runner-loss: re-run only fires for a failed run");
-    assert.match(rr, /steps\.classify\.outputs\.verdict == 'all-runner-loss'/, ">> FAIL: runner-loss: the POST must be gated on the all-runner-loss verdict");
-    assert.match(rr, /node \.github\/scripts\/classify-runner-loss\.cjs/, ">> FAIL: runner-loss: re-run workflow must use the shared classifier script");
-    assert.match(rr, /actions\/runs\/\$RUN_ID\/rerun-failed-jobs/, ">> FAIL: runner-loss: re-run workflow must POST rerun-failed-jobs");
-    assert.match(rr, /actions: write/, ">> FAIL: runner-loss: re-run workflow needs actions: write");
-    assert.match(rr, /steps\.rerun\.outcome == 'failure'/,
-      ">> FAIL: runner-loss: a failed re-run POST must file the issue nightly-report skipped");
+      ">> FAIL: runner-loss: the watchdog must trigger on completion of the E2E workflow");
+    assert.match(rr, /github\.event\.workflow_run\.event == 'schedule'/, ">> FAIL: runner-loss: the watchdog is schedule-only, like the deferral");
+    assert.match(rr, /github\.event\.workflow_run\.conclusion != 'success'/,
+      ">> FAIL: runner-loss: the watchdog must look at every non-green scheduled attempt (a cancelled-only run concludes cancelled)");
+    assert.doesNotMatch(rrCode, /rerun-failed-jobs/, ">> FAIL: runner-loss: the watchdog must not re-run anything (cattery owns re-running, #1645/#1650)");
+    assert.doesNotMatch(rrCode, /actions: write/, ">> FAIL: runner-loss: the watchdog must not hold actions: write");
+    assert.match(rrCode, /actions: read/, ">> FAIL: runner-loss: the watchdog needs actions: read");
+    assert.match(rrCode, /node \.github\/scripts\/runner-loss-watchdog\.cjs/, ">> FAIL: runner-loss: the watchdog must use the shared script");
+    assert.match(rrCode, /RUN_ATTEMPT: \$\{\{ github\.event\.workflow_run\.run_attempt \|\| inputs\.run_attempt \}\}/,
+      ">> FAIL: runner-loss: the watchdog must judge the triggering attempt (#1645)");
+    assert.match(rrCode, /steps\.decide\.outputs\.decision == 'file' \|\| steps\.decide\.outcome == 'failure'/,
+      ">> FAIL: runner-loss: the filing step must also run when the decision step failed (fail closed, #1651)");
+    assert.match(rrCode, /labels: \[\$label\]/, ">> FAIL: runner-loss: the watchdog's issue must carry the night's dedup label (#1650)");
     assert.match(rr, /dry_run:[\s\S]*?default: true/, ">> FAIL: runner-loss: workflow_dispatch dry_run must default to true");
+  });
+
+  // #1652: the in-run runner-loss verdict must count exactly the jobs
+  // nightly-report waits for. The API exposes job display names, not ids, so
+  // EXCLUDE_JOBS lists the names of every job OUTSIDE needs. This guards that
+  // list against the needs line: a new job outside needs that is missing from
+  // it would be counted (possibly still running), and a needs job that matches
+  // it would be ignored.
+  test(".github/workflows: nightly-report's EXCLUDE_JOBS matches every job outside its needs and none inside (#1652)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const needs = new Set(parseNeedsRefs(report));
+    const raw = (report.match(/^ {10}EXCLUDE_JOBS: (.*)$/m) ?? [])[1];
+    assert.ok(raw, ">> FAIL: #1652: the Classify runner loss step must set EXCLUDE_JOBS");
+    const exclude = new RegExp(raw);
+    const jobsSection = e2e.slice(e2e.match(/^jobs:\s*$/m).index);
+    const ids = [...jobsSection.matchAll(/^ {2}([\w-]+):\s*$/gm)].map((m) => m[1]);
+    assert.ok(ids.length > 20, ">> FAIL: #1652: could not enumerate e2e.yml jobs");
+    for (const id of ids) {
+      if (id === "nightly-report") continue;
+      const name = (jobBlock(e2e, id).match(/^ {4}name: (.*)$/m) ?? [])[1];
+      assert.ok(name, `>> FAIL: #1652: job ${id} has no name:`);
+      // The static part of the name, before any \${{ }} (matrix/outputs).
+      const stem = name.split("${{")[0];
+      if (needs.has(id)) {
+        assert.ok(!exclude.test(stem), `>> FAIL: #1652: job ${id} ("${name}") is in nightly-report needs but EXCLUDE_JOBS matches it, so its red legs would be ignored`);
+      } else {
+        assert.ok(exclude.test(stem) || /E2E Report/.test(stem), `>> FAIL: #1652: job ${id} ("${name}") is outside nightly-report needs but EXCLUDE_JOBS does not match it, so it would be counted while possibly still running`);
+      }
+    }
   });
 
   // Port of bulletin #1427/#1392: a registry ECONNRESET during an install
@@ -14393,38 +14488,80 @@ describe("getBestBlockNumber (#1051)", () => {
 // ---------------------------------------------------------------------------
 // reconcileTimedOutChunk (#1051) — pure reconcile-before-resubmit decision.
 // ---------------------------------------------------------------------------
-describe("reconcileTimedOutChunk (#1051)", () => {
+describe("reconcileTimedOutChunk (#1051, #1641)", () => {
+  // #1641 item 2: "nonce advanced" used to mean "included". The nonce is read
+  // from system_accountNextIndex, which counts pool txs, so it now only routes
+  // the chunk to the post-batch verify loop ("verify"); inclusion needs the CID.
   test("CID present at best-block alone is sufficient, even if nonce heuristic is invalid", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: false, cidPresentAtBest: true,
-    }), true, ">> FAIL: reconcileTimedOutChunk: CID-present must short-circuit to included regardless of nonce state");
+    }), "included", ">> FAIL: reconcileTimedOutChunk: CID-present must short-circuit to included regardless of nonce state");
   });
 
-  test("nonce advance alone is sufficient when the heuristic is valid", () => {
+  test("nonce advance alone is NOT inclusion: it routes the chunk to verification (#1641)", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 101, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), true);
+    }), "verify", ">> FAIL: reconcileTimedOutChunk: a consumed nonce must route to verification, never report included (#1641 item 2)");
   });
 
   test("nonce advance is ignored when the heuristic is invalid (#951 account rotation)", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 101, nonceHeuristicValid: false, cidPresentAtBest: null,
-    }), false, ">> FAIL: reconcileTimedOutChunk: nonce heuristic must be ignored after an account rotation, else #951 false-positive returns");
+    }), "resubmit", ">> FAIL: reconcileTimedOutChunk: nonce heuristic must be ignored after an account rotation, else #951 false-positive returns");
   });
 
-  test("neither signal present -> not included, resubmit is warranted", () => {
+  test("neither signal present -> resubmit", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: true, cidPresentAtBest: false,
-    }), false);
+    }), "resubmit");
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: 100, currentNonce: 100, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), false);
+    }), "resubmit");
   });
 
-  test("undefined originalNonce never falsely reports inclusion via the nonce path", () => {
+  test("undefined originalNonce never routes via the nonce path", () => {
     assert.strictEqual(reconcileTimedOutChunk({
       originalNonce: undefined, currentNonce: 5, nonceHeuristicValid: true, cidPresentAtBest: null,
-    }), false);
+    }), "resubmit");
+  });
+});
+
+describe("readBoundedChunkNonce (#1641)", () => {
+  const quiet = { log: () => {} };
+  const seq = (...xs) => { let i = 0; return async () => { const x = xs[Math.min(i++, xs.length - 1)]; if (x instanceof Error) throw x; return x; }; };
+
+  test("an in-bound nextIndex is used as-is (a shared signer stacks above pending txs)", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(105), ...quiet }), 105);
+  });
+
+  test("exactly the bound above the on-chain nonce is accepted", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(108), bound: 8, ...quiet }), 108);
+  });
+
+  test("a lagging backend (nextIndex below the on-chain nonce) yields the on-chain nonce", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 100, readNextIndex: seq(97), ...quiet }), 100);
+  });
+
+  test("a stuck backend's read is rejected and re-read; the in-bound re-read wins", async () => {
+    const logs = [];
+    const n = await readBoundedChunkNonce({ readOnchainNonce: async () => 13063, readNextIndex: seq(13114, 13063), bound: 8, log: (m) => logs.push(m) });
+    assert.strictEqual(n, 13063, ">> FAIL: readBoundedChunkNonce: the out-of-bound (stuck backend) read must not be used");
+    assert.ok(logs.some((l) => l.includes("stuck backend") && l.includes("13114")), ">> FAIL: readBoundedChunkNonce: the rejected read must be logged");
+  });
+
+  test("every read out of bound: falls back to the on-chain nonce after `reads` attempts", async () => {
+    let calls = 0;
+    const n = await readBoundedChunkNonce({ readOnchainNonce: async () => 50, readNextIndex: async () => { calls++; return 200; }, reads: 3, ...quiet });
+    assert.strictEqual(n, 50);
+    assert.strictEqual(calls, 3, ">> FAIL: readBoundedChunkNonce: exactly `reads` nextIndex reads, then the on-chain fallback");
+  });
+
+  test("nextIndex reads all fail: the on-chain nonce is used", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => 7, readNextIndex: seq(new Error("ws down")), ...quiet }), 7);
+  });
+
+  test("on-chain read fails: degrades to the unbounded nextIndex (pre-#1641 behaviour; inclusion is still probe-gated)", async () => {
+    assert.strictEqual(await readBoundedChunkNonce({ readOnchainNonce: async () => { throw new Error("no System.Account"); }, readNextIndex: seq(321), ...quiet }), 321);
   });
 });
 
@@ -15323,7 +15460,7 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: chunk-numbering: the mortal-expiry note must use 1-based `${fail.index + 1}`");
     assert.match(src, /Retrying chunk \$\{fail\.index \+ 1\} \(attempt/,
       ">> FAIL: chunk-numbering: the retry-progress line must use 1-based `${fail.index + 1}`");
-    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: reconcile found it already included/,
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: reconcile found its CID at the best block/,
       ">> FAIL: chunk-numbering: the reconcile-found line must use 1-based `${fail.index + 1}`");
     assert.match(src, /Chunk \$\{fail\.index \+ 1\}: chain still frozen/,
       ">> FAIL: chunk-numbering: the frozen-chain-wait line must use 1-based `${fail.index + 1}`");
@@ -16266,22 +16403,28 @@ describe("storeChunkedContent post-upload chunk verification", () => {
     });
   });
 
-  test("probe-failed chain response (present:null) does not throw", async () => {
+  // #1657: an unanswered probe used to skip the upload, keeping the chunk on
+  // no evidence. Now the chunk is uploaded like an absent one (a duplicate
+  // store is harmless; a missing chunk is not), and the deploy still succeeds.
+  test("probe-failed chain response (present:null) is not treated as stored: the chunk is uploaded, no throw", async () => {
     _resetProbeSession(); _bypassMetadataCheckForTest();
     const chunk = new Uint8Array([0x45]);
     const chunkCid = createCID(chunk).toString();
+    let txCalls = 0;
+    const api = makeStubApi(() => { txCalls++; return normalSubscribable(); });
 
     await storeChunkedContent([chunk], {
       client: {
         destroy() {},
         _request: async () => { throw new Error("RPC timeout"); },
       },
-      unsafeApi: makeStubApi(normalSubscribable),
+      unsafeApi: api,
       signer: stubSigner,
       ss58: STUB_SS58,
       fetchNonce: async () => 100,
       skipCids: new Set([chunkCid]),
     });
+    assert.ok(txCalls >= 1, ">> FAIL: #1657: a chunk whose skip probe never answered must be uploaded, not kept as stored");
   });
 
   test("skipCids chunk absent is uploaded and deploy succeeds", async () => {

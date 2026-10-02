@@ -12,6 +12,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import pkg from "../package.json";
 
 export const VERSION: string = pkg.version;
@@ -281,6 +282,11 @@ export interface DotnsCommitmentRecord {
   pricingVersion?: string;
   // The bytes32 commitment hash already submitted on-chain.
   commitment: string;
+  // #1659: a random id per written record, so a process clears or replaces
+  // only the record it wrote or resumed (compare-and-replace below). Records
+  // written before #1659 have none; commitmentRecordKey gives them a stable
+  // key from their commitment hash.
+  recordId?: string;
 }
 
 const COMMITMENT_FILE_MODE = 0o600;
@@ -300,6 +306,19 @@ function commitmentKey(environmentId: string, tld: string, owner: string, label:
 
 export function commitmentStateFilePath(environmentId: string, tld: string, owner: string, label: string): string {
   return path.join(resolveStateDir(), `commitment-${commitmentKey(environmentId, tld, owner, label)}.json`);
+}
+
+// #1659: one lock per record key, held for a whole commitAndRegister, so two
+// processes committing the same (env, tld, owner, label) never interleave
+// their resolve / persist / clear on the one record file.
+export function commitmentLockFilePath(environmentId: string, tld: string, owner: string, label: string): string {
+  return path.join(resolveStateDir(), `commitment-${commitmentKey(environmentId, tld, owner, label)}.lock`);
+}
+
+// The identity compare-and-replace and compare-and-unlink check against.
+export function commitmentRecordKey(record: DotnsCommitmentRecord | null): string | null {
+  if (!record) return null;
+  return typeof record.recordId === "string" ? record.recordId : `legacy:${record.commitment}`;
 }
 
 // Fallback for the chain's `maxCommitmentAge` when a live read of it fails.
@@ -377,7 +396,11 @@ function pruneStaleCommitmentRecords(nowMs: number = Date.now()): void {
       const record = parseJsonRecord<DotnsCommitmentRecord>(raw);
       const isStale = record === null || typeof record.savedAt !== "number" || nowMs - record.savedAt > COMMITMENT_RECORD_MAX_AGE_MS;
       if (isStale) tryUnlink(file);
-    } else if (entry.endsWith(".tmp")) {
+    } else if (entry.endsWith(".tmp") || entry.endsWith(".lock") || entry.endsWith(".stale")) {
+      // .lock / .stale (#1659): a lock left by a SIGKILLed deploy. A live
+      // holder's lock is never this old (the lock lives for one deploy), and
+      // tryAcquireCommitmentLock takes over a dead holder's lock long before.
+      // Their filenames embed the label, so they must not linger either.
       let mtimeMs: number;
       try {
         mtimeMs = fs.statSync(file).mtimeMs;
@@ -405,13 +428,126 @@ export function writeCommitmentRecord(record: DotnsCommitmentRecord): boolean {
   return writeJsonAtomic(() => commitmentStateFilePath(record.environmentId, record.tld, record.owner, record.label), record, { mode: COMMITMENT_FILE_MODE });
 }
 
-export function clearCommitmentRecord(environmentId: string, tld: string, owner: string, label: string): void {
+// #1659 compare-and-replace: writes only when the record on disk is still the
+// one the caller resolved (`expectedKey`, null = no record). The caller holds
+// the commitment lock, so nothing else writes between this read and the
+// rename; the compare is what stops a process from overwriting a record it
+// never looked at (another process's, or one it could not verify).
+export function replaceCommitmentRecord(record: DotnsCommitmentRecord, expectedKey: string | null): boolean {
+  const current = readJsonSafe<DotnsCommitmentRecord>(() => commitmentStateFilePath(record.environmentId, record.tld, record.owner, record.label));
+  if (commitmentRecordKey(current) !== expectedKey) return false;
+  return writeCommitmentRecord(record);
+}
+
+// Compare-and-unlink (#1659): removes the record only when it is still the one
+// the caller resolved or wrote (`expectedKey`, see commitmentRecordKey), so a
+// process never deletes a record another process wrote meanwhile.
+export function clearCommitmentRecord(environmentId: string, tld: string, owner: string, label: string, expectedKey: string | null): void {
   try {
+    const current = readJsonSafe<DotnsCommitmentRecord>(() => commitmentStateFilePath(environmentId, tld, owner, label));
+    if (commitmentRecordKey(current) !== expectedKey) return;
     tryUnlink(commitmentStateFilePath(environmentId, tld, owner, label));
   } catch {
     // commitmentStateFilePath itself can throw (resolveStateDir() — see the
     // path-thunk note on readJsonSafe above); tryUnlink only guards the
     // unlink call itself, so this outer try is what keeps THIS function's
     // own never-throw contract intact.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// #1659: the commitment lock.
+//
+// O_EXCL create of commitment-<key>.lock (0600, no secret: pid, host, a random
+// token, createdAt). A holder is STALE, and its lock is taken over, when it
+// ran on this host and its pid is gone (a SIGKILLed or crashed deploy), when
+// the lock is older than the record pruning ceiling, or when the file is
+// unreadable garbage older than a minute (a crash mid-write). Taking over
+// renames the stale file to a unique name first, so of two processes breaking
+// the same stale lock only one wins the rename; the loser re-reads.
+
+export interface CommitmentLockHolder {
+  pid: number;
+  host: string;
+  token: string;
+  createdAt: number;
+}
+
+export type CommitmentLockResult =
+  // token null: the lock could not be written (readonly HOME, unresolvable
+  // state dir). Resume is impossible then too, so the deploy runs unlocked,
+  // exactly as before #1659.
+  | { token: string | null; heldBy?: undefined; release: () => void }
+  | { token?: undefined; heldBy: CommitmentLockHolder; release?: undefined };
+
+const LOCK_GARBAGE_GRACE_MS = 60_000;
+
+function isStaleLock(holder: CommitmentLockHolder | null, mtimeMs: number, nowMs: number): boolean {
+  if (!holder || typeof holder.pid !== "number" || typeof holder.createdAt !== "number") {
+    return nowMs - mtimeMs > LOCK_GARBAGE_GRACE_MS;
+  }
+  if (nowMs - holder.createdAt > COMMITMENT_RECORD_MAX_AGE_MS) return true;
+  return holder.host === os.hostname() && !isPidAlive(holder.pid);
+}
+
+const NO_LOCK: CommitmentLockResult = { token: null, release: () => {} };
+
+export function tryAcquireCommitmentLock(environmentId: string, tld: string, owner: string, label: string, nowMs: number = Date.now()): CommitmentLockResult {
+  let file: string;
+  try {
+    file = commitmentLockFilePath(environmentId, tld, owner, label);
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  } catch {
+    return NO_LOCK;
+  }
+  const token = crypto.randomBytes(16).toString("hex");
+  const mine: CommitmentLockHolder = { pid: process.pid, host: os.hostname(), token, createdAt: nowMs };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      fs.writeFileSync(file, JSON.stringify(mine), { encoding: "utf-8", flag: "wx", mode: COMMITMENT_FILE_MODE });
+      return { token, release: () => releaseCommitmentLock(file, token) };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") return NO_LOCK;
+    }
+    let raw: string;
+    let mtimeMs: number;
+    try {
+      raw = fs.readFileSync(file, "utf-8");
+      mtimeMs = fs.statSync(file).mtimeMs;
+    } catch {
+      continue; // Released between our create and our read: try again.
+    }
+    const holder = parseJsonRecord<CommitmentLockHolder>(raw);
+    if (!isStaleLock(holder, mtimeMs, nowMs)) {
+      return { heldBy: holder ?? { pid: 0, host: "unknown", token: "", createdAt: mtimeMs } };
+    }
+    const grabbed = `${file}.${process.pid}.${token}.stale`;
+    try {
+      fs.renameSync(file, grabbed);
+    } catch {
+      continue; // Someone else broke it first.
+    }
+    let grabbedRaw = "";
+    try { grabbedRaw = fs.readFileSync(grabbed, "utf-8"); } catch { /* treat as ours */ }
+    if (grabbedRaw !== raw) {
+      // We moved a FRESH lock someone created after our read. Put it back
+      // (link fails if yet another lock appeared) and report it as held.
+      try { fs.linkSync(grabbed, file); } catch { /* the newer lock stands */ }
+      tryUnlink(grabbed);
+      const fresh = parseJsonRecord<CommitmentLockHolder>(grabbedRaw);
+      if (fresh) return { heldBy: fresh };
+      continue;
+    }
+    tryUnlink(grabbed);
+  }
+  return NO_LOCK;
+}
+
+function releaseCommitmentLock(file: string, token: string): void {
+  try {
+    const holder = parseJsonRecord<CommitmentLockHolder>(fs.readFileSync(file, "utf-8"));
+    if (holder?.token === token) tryUnlink(file);
+  } catch {
+    // Already gone or unreadable: nothing of ours to remove.
   }
 }

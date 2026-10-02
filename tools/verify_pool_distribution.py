@@ -40,6 +40,8 @@ import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
 
+from sentry_run_scope import RUN_SCOPED, TAG_WINDOW, build_deploy_query, selector_line
+
 SENTRY_BASE = "https://de.sentry.io/api/0"
 
 
@@ -65,6 +67,7 @@ def fetch_pool_indices(
     project: str,
     tag: str,
     since_hours: int,
+    run_id: str = "",
 ) -> list[str]:
     now_utc = datetime.now(tz=timezone.utc)
     start_ts = calendar.timegm(now_utc.timetuple()) - since_hours * 3600
@@ -73,7 +76,7 @@ def fetch_pool_indices(
     )
     end_str = now_utc.strftime("%Y-%m-%dT%H:%M:%S")
 
-    query = f"span.op:deploy deploy.signer.mode:pool deploy.tag:{tag}"
+    query = build_deploy_query("span.op:deploy deploy.signer.mode:pool", tag, run_id=run_id)
     fields = ["id", "deploy.pool.index"]
     per_page = 100
 
@@ -131,6 +134,13 @@ def main() -> None:
         help="Minimum sample size before assertions are meaningful (default 10). "
         "Smaller samples exit 2 (skip).",
     )
+    p.add_argument(
+        "--run-id",
+        default="",
+        help="GitHub Actions run id (GITHUB_RUN_ID). Scopes the query to spans with "
+        "deploy.ci_run_id=<id> so runs sharing a tag do not see each other (#1646). "
+        "Explicit flag only; the window (--since) still applies.",
+    )
     args = p.parse_args()
 
     if not args.since.endswith("h"):
@@ -143,7 +153,10 @@ def main() -> None:
         print("ERROR: SENTRY_AUTH_TOKEN env var not set", file=sys.stderr)
         sys.exit(2)
 
-    indices_raw = fetch_pool_indices(token, args.org, args.project, args.tag, since_hours)
+    # No --version here: the pool check always runs against this checkout's build.
+    mode = RUN_SCOPED if args.run_id else TAG_WINDOW
+    print(selector_line(mode, "no --run-id given", args.run_id), flush=True)
+    indices_raw = fetch_pool_indices(token, args.org, args.project, args.tag, since_hours, args.run_id)
     indices = [i for i in indices_raw if i != ""]
     total = len(indices)
     if total < args.min_spans:

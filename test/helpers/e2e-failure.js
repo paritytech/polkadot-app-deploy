@@ -25,7 +25,7 @@ export const FLAKE_PATTERNS = [
   { needle: "ChainHead disjointed", class: "chainhead_disjointed", summary: "Substrate RPC reorg / chain-head subscription dropped; usually clears on retry." },
   { needle: "max reconnections", class: "connection_lost", summary: "WS reconnect budget exhausted — chain RPC or Bulletin endpoint is flaky right now." },
   { needle: "Connection lost", class: "connection_lost", summary: "WS connection dropped mid-deploy; usually clears on retry." },
-  { needle: "Account mapping did not take effect", class: "account_mapping_race", summary: "Revive auto-account-mapping tx didn't land before the next call; transient." },
+  { needle: "Account auto-mapping did not take effect", class: "account_mapping_race", summary: "Revive auto-account-mapping tx didn't land before the next call; transient." },
   { needle: "fetchManifestRoundtrip failed", class: "gateway_timeout", summary: "IPFS gateway couldn't serve the deployed CID within budget. Often a Bulletin→IPFS bridge issue rather than gateway-down; check tools/.find-bulletin-chunk.mjs to confirm bytes are on chain." },
   { needle: "Contract execution would revert", class: "contract_revert", summary: "Revive dry-run rejected the call. Read the revert data — often a domain-state or PoP-status mismatch, not a flake." },
   { needle: "Contract reverted (flags=1)", class: "contract_revert", summary: "Revive call reverted on chain. flags=1 = execution revert; data field carries the selector." },

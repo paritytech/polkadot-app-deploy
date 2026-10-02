@@ -376,10 +376,24 @@ export const NONCE_HEALTH_SAMPLES = 8;
 const NONCE_HEALTH_TIMEOUT_MS = 10_000;
 // A gap above the threshold can also be a busy account: several concurrent
 // deploys from one key (S9, a consumer's CI matrix) that collision recovery
-// handles today. Stuck vs busy: re-read the on-chain nonce after about two
-// Bulletin blocks. Busy accounts advance; a stuck one does not (//deploy/8 sat
-// at 13063 for hours). Only paid when the gap is already large.
+// handles today. Stuck vs busy (#1658):
+//   - Re-read the on-chain nonce every ~2 Bulletin blocks, up to
+//     NONCE_HEALTH_CONFIRM_READS times (about a minute). Any advance = busy.
+//     One 12 s re-read called a busy account stuck whenever no block included
+//     its head in that window, the same slow-inclusion condition that makes
+//     chunks time out.
+//   - "Stuck" also needs the samples to show the
+//     #1637 shape: some backend reports nextIndex within the threshold of the
+//     chain while another is far ahead, i.e. the queue sits in one backend's
+//     local pool and was never gossiped (//deploy/8: samples a mix of 13063
+//     and 13114, on-chain 13063). This is a heuristic on the samples. A queue
+//     every sample sees is gossiped, so block authors have it: that is a busy
+//     account under slow inclusion (or a stuck node that is the only backend,
+//     which the spread cannot tell apart). Its verdict is "unknown" at once,
+//     with no re-reads; "unknown" never skips and never fails fast.
+// Only paid when the gap is already large.
 const NONCE_HEALTH_CONFIRM_DELAY_MS = 2 * BULLETIN_BLOCK_TIME_SECS * 1000;
+const NONCE_HEALTH_CONFIRM_READS = 5;
 
 export type NonceHealthVerdict = "healthy" | "stuck" | "unknown";
 
@@ -390,6 +404,8 @@ export interface NonceHealth {
   nextIndex?: number;
   gap?: number;
   samples: number[];
+  /** #1658: some sample is within the threshold of the chain while the max is beyond it (a queue local to one backend). */
+  backendLocal?: boolean;
   /** Why the verdict is "unknown". */
   reason?: string;
 }
@@ -400,7 +416,7 @@ export function nonceGapVerdict(onchain: number, nextIndex: number, threshold: n
 }
 
 // Calls `fn` inside the race so a synchronous throw becomes a rejection too.
-function withTimeout<T>(fn: () => Promise<T>, ms: number, what: string): Promise<T> {
+export function withTimeout<T>(fn: () => Promise<T>, ms: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   return Promise.race([
     Promise.resolve().then(fn),
@@ -416,8 +432,10 @@ export interface NonceHealthDeps {
   samples?: number;
   timeoutMs?: number;
   threshold?: number;
-  /** Wait before the stuck-vs-busy re-read of the on-chain nonce. */
+  /** Wait before each stuck-vs-busy re-read of the on-chain nonce. */
   confirmDelayMs?: number;
+  /** How many re-reads (each after confirmDelayMs) before a flat nonce counts. */
+  confirmReads?: number;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -442,16 +460,31 @@ export async function checkPoolAccountNonceHealth(address: string, deps: NonceHe
   const nextIndex = Math.max(...got);
   const result: NonceHealth = { verdict: nonceGapVerdict(onchain, nextIndex, deps.threshold), onchain, nextIndex, gap: nextIndex - onchain, samples: got };
   if (result.verdict !== "stuck") return result;
+  result.backendLocal = nonceGapVerdict(onchain, Math.min(...got), deps.threshold) === "healthy";
+  // A queue every sample sees is gossiped: never stuck, whatever the nonce
+  // does next, and callers act only on "stuck", so waiting buys nothing.
+  if (!result.backendLocal) {
+    return {
+      ...result,
+      verdict: "unknown",
+      reason: `gap ${result.gap} on every nextIndex sample (a gossiped queue): a busy account, not a backend-local stuck queue`,
+    };
+  }
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
-  await sleep(deps.confirmDelayMs ?? NONCE_HEALTH_CONFIRM_DELAY_MS);
-  try {
-    const later = Number(await withTimeout(() => deps.readOnchainNonce(address), timeoutMs, "on-chain nonce re-read"));
+  const delayMs = deps.confirmDelayMs ?? NONCE_HEALTH_CONFIRM_DELAY_MS;
+  const reads = deps.confirmReads ?? NONCE_HEALTH_CONFIRM_READS;
+  for (let i = 0; i < reads; i++) {
+    await sleep(delayMs);
+    let later: number;
+    try {
+      later = Number(await withTimeout(() => deps.readOnchainNonce(address), timeoutMs, "on-chain nonce re-read"));
+    } catch (e: any) {
+      return { ...result, verdict: "unknown", reason: `on-chain nonce re-read: ${e?.message ?? e}` };
+    }
     // Advanced: a busy account whose queue is draining, not a stuck one.
     if (later > onchain) return { ...result, verdict: "healthy", onchain: later, gap: nextIndex - later };
-    return result;
-  } catch (e: any) {
-    return { ...result, verdict: "unknown", reason: `on-chain nonce re-read: ${e?.message ?? e}` };
   }
+  return result;
 }
 
 export interface StuckPoolAccount {

@@ -31,7 +31,7 @@ import { NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
-import { loadCommitmentRecord, writeCommitmentRecord, clearCommitmentRecord, FALLBACK_MAX_COMMITMENT_AGE_SECONDS } from "./run-state.js";
+import { loadCommitmentRecord, replaceCommitmentRecord, clearCommitmentRecord, commitmentRecordKey, tryAcquireCommitmentLock, FALLBACK_MAX_COMMITMENT_AGE_SECONDS } from "./run-state.js";
 import type { DotnsCommitmentRecord } from "./run-state.js";
 
 /** One step in the phone-signature plan fired at preflight. */
@@ -563,6 +563,40 @@ type PhoneOnResign = (attempt: number, reason?: "resign" | "silence") => Promise
 // few hundred ms; the jitter spreads concurrent jobs so they don't re-collide on
 // the same retry tick. Bounded so a genuine outage still fails fast within the
 // attempt budget.
+// #1659: a stored commitment that reads commitments(hash) == 0 may be a commit
+// tx still in the pool. Re-probe this many times this far apart (about two
+// Asset Hub blocks in total) before re-submitting the SAME hash.
+const RESUME_PENDING_PROBES = 4;
+const RESUME_PENDING_PROBE_MS = 3_000;
+// #1659: how long a deploy waits for another live process that holds the
+// commitment lock for the same (env, tld, owner, label): 200 x 3 s = 10 min.
+const COMMIT_LOCK_POLL_MS = 3_000;
+const COMMIT_LOCK_WAIT_POLLS = 200;
+// Before re-registering with the SAME commitment after a timing bare-revert,
+// let the lagging node catch up (about two Asset Hub blocks).
+const SAME_COMMITMENT_RETRY_SETTLE_MS = 12_000;
+
+/** A stored commitment resolveResumableCommitment found usable (#1412, #1659). */
+export interface ResumableCommitment {
+  commitment: unknown;
+  registration: Record<string, unknown>;
+  /** commitmentRecordKey of the record on disk, for compare-and-unlink. */
+  recordKey: string | null;
+  /** commitments(hash) still reads 0: re-submit this same hash before waiting. */
+  needsCommit: boolean;
+}
+
+/** waitForCommitmentAge's errors for a commitment that can no longer be revealed. */
+function isCommitmentDeadError(msg: string): boolean {
+  return /Commitment not found on-chain|Commitment has expired/.test(msg);
+}
+
+/** The controller's own expiry rule: commit() accepts the hash again from ts + maxCommitmentAge. */
+function isCommitmentExpired(chainNowSeconds: number, commitTimestamp: number, maximumAge: unknown): boolean {
+  const maximumAgeSeconds = Number(maximumAge ?? FALLBACK_MAX_COMMITMENT_AGE_SECONDS);
+  return chainNowSeconds >= commitTimestamp + maximumAgeSeconds;
+}
+
 const DOTNS_RETRY_BASE_MS = 400;
 const DOTNS_RETRY_MAX_MS = 6_000;
 export function dotnsRetryBackoffMs(attempt: number, rand: () => number = Math.random): number {
@@ -1518,13 +1552,18 @@ function tierDescriptionFor(status: number): string {
 }
 
 // Shared NoStatus-anchoring convention (issue #1189): pad the charset-cleaned
-// base to 9 chars with 'x' then append "00" — 9+ chars with exactly 2
+// base to 9 chars with 'x', then append "00" — 9+ chars with exactly 2
 // trailing digits is always NoStatus, so this is always registrable
 // regardless of how short or reserved-adjacent the original base was.
+// The 9-char cut must END IN A LETTER: a cut that ends in a digit
+// ("release-2") would make "release-200" (3 trailing digits, Reserved), and one
+// that ends in a hyphen would make a hyphen-base label. So trailing digits and
+// hyphens are stripped from the cut before it is padded back to 9 (#1647).
 // exampleNoStatusLabel (below) and buildLabelAlternatives both call this —
 // one convention, not two.
 function noStatusFallbackBase(base: string): string {
-  return `${base.padEnd(9, "x").slice(0, 9)}00`;
+  const cut = base.padEnd(9, "x").slice(0, 9).replace(/[\d-]+$/, "");
+  return `${cut.padEnd(9, "x")}00`;
 }
 
 export interface DomainLabelAlternative {
@@ -1538,8 +1577,10 @@ export interface DomainLabelAlternative {
 // validateDomainLabel or classifyDotnsLabel — derive up to 3 compliant
 // alternatives from the operator's OWN input, each labelled with the
 // Personhood tier it needs. Never returns a candidate that is itself Reserved
-// or otherwise invalid; the NoStatus fallback (c) always survives because it's
-// engineered to be 9+ chars with exactly 2 trailing digits.
+// or otherwise invalid: every candidate must pass the same classifyRegistrability
+// the registration preflight enforces. The NoStatus fallback (c) always survives
+// for a valid label because it is exactly 9 letters/inner-hyphens plus "00"
+// (noStatusFallbackBase); formal/lean/Label.lean proves this (#1647).
 export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile): DomainLabelAlternative[] {
   const trailingRun = label.slice(label.length - countTrailingDigits(label));
   const base = stripTrailingDigits(label);
@@ -1561,7 +1602,7 @@ export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile):
     seen.add(candidate);
     if (!/^[a-z0-9-]{3,63}$/.test(candidate)) continue;
     if (candidate.startsWith("-") || candidate.endsWith("-")) continue;
-    if (/-\d+$/.test(candidate)) continue;
+    if (!classifyRegistrability(candidate, profile).registrable) continue;
     const { status, baseLength } = classifyLabelStatus(candidate, profile);
     if (status === ProofOfPersonhoodStatus.Reserved) continue;
     alternatives.push({ label: candidate, baseLength, status, tierDescription: tierDescriptionFor(status) });
@@ -2708,6 +2749,9 @@ export class DotNS {
   private _popSelfServe: PopSelfServeConfig | null = null;
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
   private _tld: string = DEFAULT_TLD;
+  // Injectable for tests (#1659): the commit-resume re-probe and lock waits.
+  private _sleep: (ms: number) => Promise<void> = (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  private _commitLockWaitPolls = COMMIT_LOCK_WAIT_POLLS;
   // Defaults to poprules-startingPrice so every existing test/library caller
   // that constructs a DotNS instance and stubs its chain-accessing methods
   // WITHOUT ever calling connect() keeps today's exact prior behaviour (call
@@ -5148,22 +5192,22 @@ export class DotNS {
     }
   }
 
-  // Persists a just-submitted commitment so a later invocation can resume it
-  // (issue #1412) instead of abandoning it. Never throws — a write failure
-  // degrades to today's behaviour (no resume, pay a fresh commit next time),
-  // which must never fail the deploy that's actually in progress.
-  private persistCommitmentRecord(label: string, reserved: boolean, registration: Record<string, unknown>, commitment: unknown): void {
-    // writeCommitmentRecord SHOULD never throw — run-state.ts resolves every
-    // path inside its own try, and resolveStateDir() itself now falls back
-    // rather than throwing (see homedirOrFallback in run-state.ts) — but
-    // that contract is enforced by convention across two files, not by the
-    // type system. This call site is guarded too, as the real safety net:
-    // code review on #1412 found a never-throw contract phrased exactly
-    // this confidently had a real gap elsewhere in this same flow.
+  // Persists a commitment BEFORE its commit tx so a later invocation can
+  // resume it (issue #1412) instead of abandoning it. #1659: the record gets a
+  // fresh recordId and is written by compare-and-replace: it replaces only
+  // `expectedKey` (null = no record on disk), so a record this process never
+  // resolved, or could not verify, is never overwritten. Returns the new
+  // record's key, or null when nothing was written. Never throws: a write
+  // failure degrades to no resume, which must never fail the deploy.
+  private persistCommitmentRecord(label: string, reserved: boolean, registration: Record<string, unknown>, commitment: unknown, expectedKey: string | null): string | null {
+    // replaceCommitmentRecord SHOULD never throw (run-state.ts resolves every
+    // path inside its own try), but that contract is enforced by convention
+    // across two files, so this call site is guarded too (#1412 code review).
+    const recordId = crypto.randomBytes(16).toString("hex");
     let ok: boolean;
     let err: unknown;
     try {
-      ok = writeCommitmentRecord({
+      ok = replaceCommitmentRecord({
         savedAt: Date.now(),
         environmentId: this._environmentId ?? "unknown",
         tld: this._tld,
@@ -5175,7 +5219,8 @@ export class DotNS {
         maxPrice: registration.maxPrice !== undefined ? (registration.maxPrice as bigint).toString() : undefined,
         pricingVersion: registration.pricingVersion !== undefined ? (registration.pricingVersion as bigint).toString() : undefined,
         commitment: commitment as string,
-      });
+        recordId,
+      }, expectedKey);
     } catch (caught) {
       ok = false;
       err = caught;
@@ -5183,6 +5228,90 @@ export class DotNS {
     if (!ok) {
       const suffix = err !== undefined ? ` (${(err as Error)?.message ?? err})` : "";
       console.log(`   Warning: could not persist commitment state to disk${suffix}. If this process is interrupted before registration finishes, this commitment cannot be resumed — a later attempt will pay for a fresh one.`);
+      return null;
+    }
+    return recordId;
+  }
+
+  private async readCommitmentTimestamp(commitment: unknown): Promise<number> {
+    try {
+      const ts = await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "commitments", [commitment]), 30000, "commitments");
+      return typeof ts === "bigint" ? Number(ts) : Number(ts ?? 0);
+    } catch {
+      return 0;
+    }
+  }
+
+  // The commitment's on-chain timestamp and whether it is live (on-chain and
+  // not expired). Unreadable = { ts: 0, live: false }.
+  private async readCommitmentState(commitment: unknown): Promise<{ ts: number; live: boolean }> {
+    try {
+      const [ts, maximumAge, nowMs] = await Promise.all([
+        withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "commitments", [commitment]), 30000, "commitments"),
+        withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR_CONTROLLER, this._adapter.controllerAbi, "maxCommitmentAge", []), 30000, "maxCommitmentAge"),
+        this.clientWrapper!.client.query.Timestamp.Now.getValue(),
+      ]);
+      const tsSeconds = Number(ts ?? 0);
+      return { ts: tsSeconds, live: tsSeconds > 0 && !isCommitmentExpired(Math.floor(Number(nowMs) / 1000), tsSeconds, maximumAge) };
+    } catch {
+      return { ts: 0, live: false };
+    }
+  }
+
+  // #1659: re-submit a stored commitment that is not on-chain, or expired. The
+  // original tx may land first (commit() then reverts UnexpiredCommitmentExists),
+  // so a rejected re-submit is fine when the commitment is live afterwards.
+  // `onDead`: the controller deterministically REJECTED the revive (a dry-run
+  // revert) of an expired commitment, so this record can never be revived; the
+  // caller discards it before the error goes up, so the next run commits fresh
+  // instead of retrying a dead record forever. A timeout or a dropped
+  // connection is not a rejection: the revive tx may still be in the pool, so
+  // the record stays (discarding it would abandon that tx, the #1659 bug).
+  private async resubmitCommitment(commitment: unknown, onDead: () => void): Promise<void> {
+    try {
+      await this.submitCommitment(commitment);
+    } catch (err) {
+      const { ts, live } = await this.readCommitmentState(commitment);
+      if (live) {
+        console.log(`   Re-submit was rejected, but the commitment is live on-chain (the original commit tx landed). Continuing.`);
+        return;
+      }
+      const rejected = err instanceof ContractDryRunRevertError || /would revert during/.test((err as Error)?.message ?? "");
+      if (ts > 0 && rejected) onDead();
+      throw err;
+    }
+  }
+
+  // #1659: one process at a time per (env, tld, owner, label). A live holder
+  // (another deploy of the same name from the same owner) is waited on, never
+  // overridden; if the name is ours once we hold the lock, there is nothing to do.
+  // A dead holder's lock (SIGKILL, crash) is taken over by run-state.ts.
+  private async acquireCommitmentLockOrWait(label: string): Promise<{ release: () => void } | "registered-by-sibling"> {
+    const environmentId = this._environmentId ?? "unknown";
+    for (let poll = 0; ; poll++) {
+      let res: ReturnType<typeof tryAcquireCommitmentLock>;
+      try {
+        res = tryAcquireCommitmentLock(environmentId, this._tld, this.evmAddress!, label);
+      } catch {
+        return { release: () => {} }; // Never-throw safety net: run unlocked, as before #1659.
+      }
+      if (res.release) {
+        // Always, not only after waiting: the sibling may have registered the
+        // name and released the lock between register()'s availability check
+        // and this acquire (CommitResume CR_FixedShared).
+        if ((await this.checkOwnership(label)).owned) {
+          res.release();
+          console.log(`   ${label}.${this._tld} was registered to this owner by the other process. Nothing left to commit.`);
+          return "registered-by-sibling";
+        }
+        return res;
+      }
+      const holder = `pid ${res.heldBy.pid} on ${res.heldBy.host}`;
+      if (poll >= this._commitLockWaitPolls) {
+        throw new Error(`Another bulletin-deploy process (${holder}) is registering ${label}.${this._tld} for this owner and did not finish within ${Math.round(this._commitLockWaitPolls * COMMIT_LOCK_POLL_MS / 1000)}s. Wait for it to finish (or stop it), then retry.`);
+      }
+      if (poll === 0) console.log(`\n   Another bulletin-deploy process (${holder}) is committing ${label}.${this._tld} for this owner. Waiting for it to finish instead of committing over it...`);
+      await this._sleep(COMMIT_LOCK_POLL_MS);
     }
   }
 
@@ -5196,7 +5325,7 @@ export class DotNS {
   // the record is bad). Correctness beats reuse: every check here exists to
   // avoid resuming something that would fail at reveal, which is the
   // expensive end of this flow.
-  async resolveResumableCommitment(label: string, reserved: boolean): Promise<{ commitment: unknown; registration: Record<string, unknown> } | null> {
+  async resolveResumableCommitment(label: string, reserved: boolean): Promise<ResumableCommitment | null> {
     const environmentId = this._environmentId ?? "unknown";
     const owner = this.evmAddress!;
 
@@ -5215,6 +5344,9 @@ export class DotNS {
     try {
       const record: DotnsCommitmentRecord | null = loadCommitmentRecord(environmentId, this._tld, owner, label);
       if (!record) return null;
+      // Every discard below is a compare-and-unlink on THIS record (#1659).
+      // Not on-chain and expired are NOT discards: both re-submit the same hash.
+      const recordKey = commitmentRecordKey(record);
 
       if (
         typeof record.owner !== "string" ||
@@ -5230,7 +5362,7 @@ export class DotNS {
         // version of this tool). Can never be resumed regardless of this
         // run's own values — safe to discard rather than leave around to
         // fail the same way on every future run too.
-        clearCommitmentRecord(environmentId, this._tld, owner, label);
+        clearCommitmentRecord(environmentId, this._tld, owner, label, recordKey);
         return null;
       }
 
@@ -5246,7 +5378,7 @@ export class DotNS {
         // it, and no fee is at risk either way (register() never ran), so
         // it's safe to clear rather than leave a permanently-unmatchable file
         // around.
-        clearCommitmentRecord(environmentId, this._tld, owner, label);
+        clearCommitmentRecord(environmentId, this._tld, owner, label, recordKey);
         return null;
       }
 
@@ -5275,7 +5407,7 @@ export class DotNS {
       }
       if (typeof recomputed !== "string" || recomputed.toLowerCase() !== String(record.commitment).toLowerCase()) {
         // Provably corrupt or inconsistent — this record can never be valid.
-        clearCommitmentRecord(environmentId, this._tld, owner, label);
+        clearCommitmentRecord(environmentId, this._tld, owner, label, recordKey);
         return null;
       }
 
@@ -5291,22 +5423,36 @@ export class DotNS {
       } catch {
         return null; // Transient — don't discard, just don't resume this run.
       }
-      const commitTimestamp = typeof onChainTimestamp === "bigint" ? Number(onChainTimestamp) : Number(onChainTimestamp ?? 0);
-      if (commitTimestamp === 0) {
-        // Never landed on-chain, or already consumed/cleared. No fee is at
-        // risk either way — safe to discard.
-        clearCommitmentRecord(environmentId, this._tld, owner, label);
-        return null;
+      let commitTimestamp = typeof onChainTimestamp === "bigint" ? Number(onChainTimestamp) : Number(onChainTimestamp ?? 0);
+      // #1659: 0 does NOT mean "never landed". The record is written before
+      // the commit tx, so 0 is also a commit tx still in the pool (a restart
+      // right after a crash, a CI retry), one that was dropped, or one never
+      // sent (a crash between persist and submit). Discarding here and
+      // committing fresh abandoned the pending one when it landed. Re-probe
+      // for about two blocks; if it is still 0, keep the record and
+      // re-submit the SAME hash: right in every one of those cases, since
+      // only this record's secret can ever reveal it.
+      for (let probe = 0; commitTimestamp === 0 && probe < RESUME_PENDING_PROBES; probe++) {
+        await this._sleep(RESUME_PENDING_PROBE_MS);
+        commitTimestamp = await this.readCommitmentTimestamp(record.commitment);
       }
-      const maximumAgeSeconds = typeof maximumAge === "bigint" ? Number(maximumAge) : Number(maximumAge ?? FALLBACK_MAX_COMMITMENT_AGE_SECONDS);
-      const nowMs = await this.clientWrapper!.client.query.Timestamp.Now.getValue();
-      const chainNowSeconds = Math.floor(Number(nowMs) / 1000);
-      if (chainNowSeconds >= commitTimestamp + maximumAgeSeconds) {
-        // Resuming an expired commitment is worse than starting fresh (#1412)
-        // — it wastes the wait and still fails at reveal. Discard.
-        console.log(`\n   Stored commitment for ${label}.${this._tld} has expired on-chain (chain.now=${chainNowSeconds}, expired at=${commitTimestamp + maximumAgeSeconds}). Discarding, starting fresh.\n`);
-        clearCommitmentRecord(environmentId, this._tld, owner, label);
-        return null;
+      let needsCommit = commitTimestamp === 0;
+      if (needsCommit) {
+        console.log(`\n   Stored commitment for ${label}.${this._tld} is not on-chain yet (its commit tx may still be pending, or never landed). Re-submitting the SAME commitment instead of a fresh one.\n`);
+      } else {
+        const nowMs = await this.clientWrapper!.client.query.Timestamp.Now.getValue();
+        const chainNowSeconds = Math.floor(Number(nowMs) / 1000);
+        if (isCommitmentExpired(chainNowSeconds, commitTimestamp, maximumAge)) {
+          // Waiting out an expired commitment fails at reveal (#1412). #1659:
+          // the controller accepts commit() again for an EXPIRED hash
+          // (DotnsRegistrarController.commit: prior == 0 || prior +
+          // maxCommitmentAge <= block.timestamp) and restarts its clock, so the
+          // same commitment is revived for the same fee a fresh one costs.
+          // Discarding it instead raced a re-submit of this very hash that
+          // may still be in the pool (CommitResume CR_Fixed1).
+          console.log(`\n   Stored commitment for ${label}.${this._tld} has expired on-chain (chain.now=${chainNowSeconds}). Re-committing the SAME commitment, which restarts its window.\n`);
+          needsCommit = true;
+        }
       }
 
       // Priced profiles pin pricingVersion into the committed tuple. If the
@@ -5323,7 +5469,7 @@ export class DotNS {
         const liveStr = (typeof livePricingVersion === "bigint" ? livePricingVersion : BigInt(livePricingVersion as any)).toString();
         if (liveStr !== record.pricingVersion) {
           console.log(`\n   Stored commitment's pricing version (${record.pricingVersion}) is stale (live: ${liveStr}). Discarding, starting fresh.\n`);
-          clearCommitmentRecord(environmentId, this._tld, owner, label);
+          clearCommitmentRecord(environmentId, this._tld, owner, label, recordKey);
           return null;
         }
 
@@ -5348,14 +5494,14 @@ export class DotNS {
           const livePriceWei = typeof livePriceRaw === "bigint" ? livePriceRaw : BigInt(livePriceRaw);
           if (livePriceWei > BigInt(record.maxPrice)) {
             console.log(`\n   Stored commitment's committed price ceiling (${record.maxPrice}) is now below the live price (${livePriceWei}). Discarding, starting fresh.\n`);
-            clearCommitmentRecord(environmentId, this._tld, owner, label);
+            clearCommitmentRecord(environmentId, this._tld, owner, label, recordKey);
             return null;
           }
         }
       }
 
-      console.log(`\n   Resuming previously-submitted commitment for ${label}.${this._tld} (still valid on-chain).\n`);
-      return { commitment: record.commitment, registration };
+      if (!needsCommit) console.log(`\n   Resuming previously-submitted commitment for ${label}.${this._tld} (still valid on-chain).\n`);
+      return { commitment: record.commitment, registration, recordKey, needsCommit };
     } catch (err) {
       // Safety net for anything not already handled above (a maxPrice/
       // pricingVersion string BigInt() can't parse, an RPC drop on
@@ -5375,13 +5521,33 @@ export class DotNS {
   // waitForCommitmentAge/getPriceAndValidate/finalizeRegistration) without a
   // live chain or register()'s unrelated preflight checks.
   async commitAndRegister(label: string, reverse: boolean): Promise<void> {
-    let pricingEarly: PriceValidationResult | null = null;
+    // #1659: held for the whole commit -> wait -> register, released however
+    // it ends. A second process for the same name and owner waits for it.
+    const lock = await this.acquireCommitmentLockOrWait(label);
+    if (lock === "registered-by-sibling") return;
+    try {
+      await this.commitAndRegisterLocked(label, reverse);
+    } finally {
+      lock.release();
+    }
+  }
 
-    const doCommitAndRegister = async (resumeWith: { commitment: unknown; registration: Record<string, unknown> } | null): Promise<void> => {
+  private async commitAndRegisterLocked(label: string, reverse: boolean): Promise<void> {
+    const environmentId = this._environmentId ?? "unknown";
+    let pricingEarly: PriceValidationResult | null = null;
+    // The commitment the last attempt used, for the bare-revert retry below.
+    let active: ResumableCommitment | null = null;
+
+    const doCommitAndRegister = async (resumeWith: ResumableCommitment | null): Promise<void> => {
       let commitment: unknown;
       let registration: Record<string, unknown>;
+      let recordKey: string | null;
       if (resumeWith) {
-        ({ commitment, registration } = resumeWith);
+        ({ commitment, registration, recordKey } = resumeWith);
+        active = { ...resumeWith, needsCommit: false };
+        if (resumeWith.needsCommit) {
+          await withSpan("deploy.dotns.submit-commitment", "2a-i. submit-commitment", {}, () => this.resubmitCommitment(commitment, () => clearCommitmentRecord(environmentId, this._tld, this.evmAddress!, label, recordKey)));
+        }
       } else {
         // v0.5.8-rc1 (needsPricingBeforeCommit): maxPrice + pricingVersion are
         // part of the COMMITTED tuple, so pricing must be resolved before
@@ -5402,17 +5568,19 @@ export class DotNS {
         // Persisted BEFORE submitting (#1412): if this process dies during
         // or after the commit tx — RPC drop, SIGKILL, chain timeout — the
         // secret must already be on disk, since it's never regenerable. A
-        // record whose tx never actually lands is harmless to keep around:
-        // resolveResumableCommitment's on-chain check treats
-        // "commitments[hash] == 0" as not-yet-landed and discards it for
-        // free (no fee was ever paid for it).
-        this.persistCommitmentRecord(label, reverse, registration, commitment);
+        // record whose tx never lands is re-submitted (same hash) by the
+        // next resolveResumableCommitment, never discarded for reading 0
+        // (#1659).
+        // expectedKey null: a fresh commit never replaces a record on disk. If
+        // resolve left one (it could not be verified), it stays, unresumed.
+        recordKey = this.persistCommitmentRecord(label, reverse, registration, commitment, null);
+        active = { commitment, registration, recordKey, needsCommit: false };
         await withSpan("deploy.dotns.submit-commitment", "2a-i. submit-commitment", {}, () => this.submitCommitment(commitment));
       }
       await withSpan("deploy.dotns.wait-commitment-age", "2a-ii. wait-commitment-age", {}, () => this.waitForCommitmentAge(commitment));
       const pricing = pricingEarly ?? await withSpan("deploy.dotns.price-validation", "2a-iii. price-validation", {}, () => this.getPriceAndValidate(label));
       await withSpan("deploy.dotns.finalize-registration", "2a-iv. finalize-registration", {}, () => this.finalizeRegistration(registration, pricing.priceWei));
-      clearCommitmentRecord(this._environmentId ?? "unknown", this._tld, this.evmAddress!, label);
+      clearCommitmentRecord(environmentId, this._tld, this.evmAddress!, label, recordKey);
     };
 
     // Resolved BEFORE the retry block below, so a stale/expired/mismatched
@@ -5426,15 +5594,29 @@ export class DotNS {
       await doCommitAndRegister(resumable);
     } catch (err) {
       const msg = (err as Error).message ?? "";
-      if (!isCommitmentTimingBarerevert(msg)) throw err;
+      // `active` is assigned inside the closure, which TS cannot see from here.
+      const same = active as ResumableCommitment | null;
+      if (!isCommitmentTimingBarerevert(msg) || !same) throw err;
       // Commitment timing race: the register dry-run saw a block where the
-      // commitment was still too new (node lag) or had just expired. Generate
-      // a fresh commitment (new secret, new on-chain entry) and retry once.
-      // Bounded to one attempt so a real double-revert (label collision, PoP
-      // status mismatch) fails after two tries, not N.
+      // commitment was still too new (node lag) or had just expired. #1659:
+      // the commitment is still ours and may well be valid, so retry with
+      // the SAME one: committing fresh over a valid commitment is a double
+      // commit (and, against a rival, a wasted one). If waitForCommitmentAge
+      // finds it gone or expired, the same hash is committed again (commit()
+      // accepts an expired hash). Bounded to one retry, so a real double revert
+      // (label collision, PoP status mismatch) fails after two register tries.
       console.log(`\n   Register bare-reverted (commitment timing race — node saw a block where commitment was too new or expired).`);
-      console.log(`   Retrying with a fresh commitment. This usually resolves in one block.\n`);
-      await doCommitAndRegister(null);
+      console.log(`   Retrying once with the same commitment after ${SAME_COMMITMENT_RETRY_SETTLE_MS / 1000}s (re-committed first if it is no longer valid on-chain).\n`);
+      await this._sleep(SAME_COMMITMENT_RETRY_SETTLE_MS);
+      try {
+        await doCommitAndRegister(same);
+      } catch (retryErr) {
+        if (!isCommitmentDeadError((retryErr as Error).message ?? "")) throw retryErr;
+        // Gone or expired: re-commit the SAME hash (commit() accepts it again
+        // once expired, and it is ours), never a second commitment.
+        console.log(`   The commitment is no longer valid on-chain (${(retryErr as Error).message}). Re-committing the same commitment.\n`);
+        await doCommitAndRegister({ ...same, needsCommit: true });
+      }
     }
   }
 

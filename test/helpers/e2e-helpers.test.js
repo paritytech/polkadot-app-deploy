@@ -110,7 +110,7 @@ describe("e2e-failure: classifyDeployStderr", () => {
   });
 
   test("classifies Account mapping race", () => {
-    const out = classifyDeployStderr("Account mapping did not take effect on-chain for 5Df...");
+    const out = classifyDeployStderr("Account auto-mapping did not take effect on-chain for 5Df. The signer needs enough testnet PAS");
     assert.strictEqual(out.class, "account_mapping_race");
   });
 

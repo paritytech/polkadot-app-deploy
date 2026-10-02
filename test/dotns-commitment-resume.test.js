@@ -20,6 +20,7 @@ import {
   writeCommitmentRecord,
   loadCommitmentRecord,
   clearCommitmentRecord,
+  commitmentRecordKey,
   commitmentStateFilePath,
   resolveStateDir,
 } from "../dist/run-state.js";
@@ -56,6 +57,7 @@ function makeDotNS({ protocol = "poprules-startingPrice", environmentId = ENV_ID
   d._adapter = getAdapter(protocol);
   d.evmAddress = owner;
   d.substrateAddress = "5TestSigner";
+  d._sleep = async () => {}; // #1659 re-probe / retry settle waits
   return d;
 }
 
@@ -149,7 +151,7 @@ describe("commitment record persistence (run-state.ts)", () => {
       assert.equal(ok, true, ">> FAIL: commitment-persistence: write should report success on a writable state dir");
       const loaded = loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL);
       assert.deepEqual(loaded, record, ">> FAIL: commitment-persistence: loaded record should equal what was written");
-      clearCommitmentRecord(ENV_ID, TLD, OWNER, LABEL);
+      clearCommitmentRecord(ENV_ID, TLD, OWNER, LABEL, commitmentRecordKey(record));
       assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), null, ">> FAIL: commitment-persistence: record should be gone after clear");
     });
   });
@@ -312,7 +314,12 @@ describe("DotNS.commitAndRegister — resume orchestration (#1412)", () => {
     });
   });
 
-  test("stored commitment expired on-chain: discarded, fresh commit paid for", async () => {
+  // #1659: was "discarded, fresh commit paid for". The controller accepts
+  // commit() again for an expired hash and restarts its clock, so the same
+  // commitment is re-committed (same fee) instead: a discard raced a
+  // re-submit of this very hash still in the pool (CommitResume CR_Fixed1).
+  // The property kept: an expired commitment is never just waited out.
+  test("stored commitment expired on-chain: re-committed with the SAME hash (restarts its window), never waited out (#1659)", async () => {
     await withIsolatedHome(async () => {
       writeCommitmentRecord(baseRecord());
       const d = makeDotNS();
@@ -329,9 +336,10 @@ describe("DotNS.commitAndRegister — resume orchestration (#1412)", () => {
 
       await d.commitAndRegister(LABEL, false);
 
-      assert.equal(d.generateCommitment.calls.length, 1, ">> FAIL: commit-resume-expired: an expired stored commitment must be discarded in favour of a FRESH commit, not reused");
-      assert.equal(d.submitCommitment.calls.length, 1, ">> FAIL: commit-resume-expired: the fresh commitment must actually be submitted on-chain");
-      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), null, ">> FAIL: commit-resume-expired: the expired record must be removed from disk, not left around to be misread later");
+      assert.equal(d.generateCommitment.calls.length, 0, ">> FAIL: commit-resume-expired: an expired stored commitment is revived by re-committing it, not replaced by a second commitment");
+      assert.deepEqual(d.submitCommitment.calls.map((c) => c[0]), [COMMITMENT_HASH], ">> FAIL: commit-resume-expired: the expired commitment must be re-committed on-chain before any wait, never just waited out");
+      assert.ok(d.submitCommitment.calls.length === 1 && d.waitForCommitmentAge.calls.length === 1, ">> FAIL: commit-resume-expired: re-commit, then wait the fresh window");
+      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), null, ">> FAIL: commit-resume-expired: the record is removed from disk once registered");
     });
   });
 
@@ -356,23 +364,73 @@ describe("DotNS.commitAndRegister — resume orchestration (#1412)", () => {
     });
   });
 
-  test("stored commitment never landed on-chain (commitments() returns 0): discarded, fresh commit paid for", async () => {
+  // #1659: this test used to assert "discarded, fresh commit paid for". That
+  // was the FV-A-F5 bug: 0 is also a commit tx still in the pool, and the
+  // fresh commit abandoned it when it landed. The property kept: a stored
+  // commitment that is not on-chain never blocks registration.
+  test("stored commitment not on-chain (commitments() returns 0): the SAME commitment is re-submitted, no fresh one, record kept until register (#1659)", async () => {
     await withIsolatedHome(async () => {
       writeCommitmentRecord(baseRecord());
       const d = makeDotNS();
       wireHappyPathSpies(d);
       d.contractCall = spy(async (_addr, _abi, fn) => {
-        if (fn === "makeCommitment") return COMMITMENT_HASH; // hash matches — proves "never landed", not corruption
-        if (fn === "commitments") return 0n; // never landed on-chain, or already consumed/cleared
+        if (fn === "makeCommitment") return COMMITMENT_HASH; // hash matches — the tuple is intact
+        if (fn === "commitments") return 0n; // pending, dropped, or never sent
         if (fn === "maxCommitmentAge") return BigInt(86_400);
         throw new Error(`unexpected contractCall: ${fn}`);
       });
+      let recordAtSubmit;
+      d.submitCommitment = spy(async () => { recordAtSubmit = loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL); });
 
       await d.commitAndRegister(LABEL, false);
 
-      assert.equal(d.generateCommitment.calls.length, 1, ">> FAIL: commit-resume-never-landed: a commitment with no on-chain record must be discarded in favour of a fresh commit");
-      assert.equal(d.submitCommitment.calls.length, 1, ">> FAIL: commit-resume-never-landed: the fresh commitment must actually be submitted on-chain");
-      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), null, ">> FAIL: commit-resume-never-landed: the never-landed record must be discarded, not left around");
+      assert.equal(d.generateCommitment.calls.length, 0, ">> FAIL: commit-resume-not-landed: a stored commitment that reads 0 may still be pending; it must never be replaced by a fresh one");
+      assert.deepEqual(d.submitCommitment.calls.map((c) => c[0]), [COMMITMENT_HASH], ">> FAIL: commit-resume-not-landed: the stored hash itself must be re-submitted");
+      assert.equal(recordAtSubmit?.secret, SECRET, ">> FAIL: commit-resume-not-landed: the record must stay on disk while the same hash is re-submitted");
+      assert.equal(d.finalizeRegistration.calls[0][0].secret, SECRET, ">> FAIL: commit-resume-not-landed: register must reveal the stored secret");
+      const commitmentReads = d.contractCall.calls.filter((c) => c[2] === "commitments").length;
+      assert.equal(commitmentReads, 5, ">> FAIL: commit-resume-not-landed: a 0 read must be re-probed (1 read + 4 re-probes) before re-submitting");
+      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), null, ">> FAIL: commit-resume-not-landed: the record is cleared once registered");
+    });
+  });
+
+  test("re-submitting a stored commitment that the original tx landed first: a rejected re-submit is fine when the commitment is on-chain (#1659)", async () => {
+    await withIsolatedHome(async () => {
+      writeCommitmentRecord(baseRecord());
+      const d = makeDotNS();
+      wireHappyPathSpies(d);
+      let landed = false;
+      d.contractCall = spy(async (_addr, _abi, fn) => {
+        if (fn === "makeCommitment") return COMMITMENT_HASH;
+        if (fn === "commitments") return landed ? 1_000n : 0n;
+        if (fn === "maxCommitmentAge") return BigInt(86_400);
+        throw new Error(`unexpected contractCall: ${fn}`);
+      });
+      d.clientWrapper = { client: { query: { Timestamp: { Now: { getValue: async () => 1_100_000n } } } } };
+      d.submitCommitment = spy(async () => { landed = true; throw new Error("Contract execution would revert during commit"); });
+
+      await d.commitAndRegister(LABEL, false);
+
+      assert.equal(d.finalizeRegistration.calls.length, 1, ">> FAIL: commit-resume-resubmit-race: the original commit landed, so the deploy must continue to register");
+      assert.equal(d.generateCommitment.calls.length, 0);
+    });
+  });
+
+  test("re-submitting a stored commitment that fails and is still not on-chain propagates the error, record kept (#1659)", async () => {
+    await withIsolatedHome(async () => {
+      writeCommitmentRecord(baseRecord());
+      const d = makeDotNS();
+      wireHappyPathSpies(d);
+      d.contractCall = spy(async (_addr, _abi, fn) => {
+        if (fn === "makeCommitment") return COMMITMENT_HASH;
+        if (fn === "commitments") return 0n;
+        if (fn === "maxCommitmentAge") return BigInt(86_400);
+        throw new Error(`unexpected contractCall: ${fn}`);
+      });
+      d.submitCommitment = spy(async () => { throw new Error("connection reset"); });
+
+      await assert.rejects(() => d.commitAndRegister(LABEL, false), /connection reset/);
+      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL)?.secret, SECRET, ">> FAIL: commit-resume-resubmit-fail: the record must survive for the next run");
     });
   });
 
@@ -541,10 +599,18 @@ describe("DotNS.commitAndRegister — resume orchestration (#1412)", () => {
         if (attempt === 1) throw new Error("Contract execution would revert during register ... bare-revert (empty 0x).");
       });
 
+
       await d.commitAndRegister(LABEL, false);
 
-      assert.equal(d.generateCommitment.calls.length, 2, ">> FAIL: commit-resume-barerevert-retry: a register()-side timing bare-revert must still get exactly one fresh-commitment retry (pre-existing behaviour, must survive the #1412 refactor)");
+      // #1659: was "exactly one FRESH-commitment retry" (generateCommitment 2).
+      // A fresh commit over a still-valid commitment is a double commit
+      // (CommitResume NoDoubleCommitValid); the retry now reuses the same
+      // commitment. The property kept: exactly one retry, which reaches register.
+      assert.equal(d.generateCommitment.calls.length, 1, ">> FAIL: commit-resume-barerevert-retry: a timing bare-revert must retry with the SAME commitment while it is still valid, not commit fresh");
+      assert.equal(d.submitCommitment.calls.length, 1, ">> FAIL: commit-resume-barerevert-retry: the retry must not send a second commit tx");
+      assert.equal(d.waitForCommitmentAge.calls.length, 2, ">> FAIL: commit-resume-barerevert-retry: the retry must re-check the commitment's age/validity");
       assert.equal(d.finalizeRegistration.calls.length, 2, ">> FAIL: commit-resume-barerevert-retry: the retry must actually reach finalizeRegistration a second time");
+      assert.equal(d.finalizeRegistration.calls[1][0].secret, SECRET, ">> FAIL: commit-resume-barerevert-retry: the retry must reveal the same commitment");
     });
   });
 
@@ -575,13 +641,87 @@ describe("DotNS.commitAndRegister — resume orchestration (#1412)", () => {
         if (registerAttempt === 1) throw new Error("Contract execution would revert during register ... bare-revert (empty 0x).");
       });
 
+
       await d.commitAndRegister(LABEL, false);
 
       // The expired-resume discard must not have been counted as the one
-      // allowed bare-revert retry: the FRESH commit (after discarding the
-      // expired record) still gets its own bare-revert retry when IT races.
-      assert.equal(d.generateCommitment.calls.length, 2, ">> FAIL: commit-resume-budget: discarding an expired resume must not consume the bare-revert retry — the fresh commit that follows still needs its own one-shot retry");
+      // allowed bare-revert retry: the commit that follows (now a re-commit
+      // of the expired hash) still gets its own bare-revert retry when IT races.
+      // #1659: the expired record is now revived (same hash re-committed), not
+      // replaced, and the race retry reuses it too: no commitment is generated.
+      assert.equal(d.generateCommitment.calls.length, 0, ">> FAIL: commit-resume-budget: the expired record is re-committed, and its race retry reuses it");
+      assert.equal(d.submitCommitment.calls.length, 1, ">> FAIL: commit-resume-budget: one re-commit of the expired hash, none for the race retry");
       assert.equal(d.finalizeRegistration.calls.length, 2, ">> FAIL: commit-resume-budget: the retry after the fresh commit must actually run");
+    });
+  });
+
+  test("bare-revert retry whose commitment expired meanwhile re-commits the SAME hash, never a second commitment (#1659)", async () => {
+    await withIsolatedHome(async () => {
+      const d = makeDotNS();
+      wireHappyPathSpies(d);
+      let waits = 0;
+      d.waitForCommitmentAge = spy(async () => { if (++waits === 2) throw new Error("Commitment has expired (chain.now=9, expired at=8). A fresh commit cycle is needed."); });
+      let attempt = 0;
+      d.finalizeRegistration = spy(async () => { if (++attempt === 1) throw new Error("Contract execution would revert during register ... bare-revert (empty 0x)."); });
+
+      await d.commitAndRegister(LABEL, false);
+
+      assert.equal(d.generateCommitment.calls.length, 1, ">> FAIL: commit-resume-retry-dead: a commitment that expired during the retry is re-committed, not replaced by a second one");
+      assert.deepEqual(d.submitCommitment.calls.map((c) => c[0]), [COMMITMENT_HASH, COMMITMENT_HASH], ">> FAIL: commit-resume-retry-dead: the same hash is committed again after it expired");
+      assert.equal(d.finalizeRegistration.calls.length, 2, ">> FAIL: commit-resume-retry-dead: exactly two register tries");
+      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), null);
+    });
+  });
+
+  test("a re-commit rejected while the stored commitment is expired discards the record, so the next run commits fresh (#1659)", async () => {
+    await withIsolatedHome(async () => {
+      writeCommitmentRecord(baseRecord());
+      const d = makeDotNS();
+      wireHappyPathSpies(d);
+      d.contractCall = spy(async (_addr, _abi, fn) => {
+        if (fn === "makeCommitment") return COMMITMENT_HASH;
+        if (fn === "commitments") return 1_000n;
+        if (fn === "maxCommitmentAge") return 100n;
+        throw new Error(`unexpected contractCall: ${fn}`);
+      });
+      d.clientWrapper = { client: { query: { Timestamp: { Now: { getValue: async () => 1_200_000n } } } } }; // expired
+      d.submitCommitment = spy(async () => { throw new Error("Contract execution would revert during commit (flags=1)"); }); // a controller that refuses the revive
+
+      await assert.rejects(() => d.commitAndRegister(LABEL, false), /would revert during commit/);
+      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), null, ">> FAIL: commit-resume-revive-refused: an expired record the chain refuses to revive is dead and must go, or every later run fails the same way");
+    });
+  });
+
+  test("a revive of an expired commitment that times out (tx may still be pending) keeps the record (#1659)", async () => {
+    await withIsolatedHome(async () => {
+      writeCommitmentRecord(baseRecord());
+      const d = makeDotNS();
+      wireHappyPathSpies(d);
+      d.contractCall = spy(async (_addr, _abi, fn) => {
+        if (fn === "makeCommitment") return COMMITMENT_HASH;
+        if (fn === "commitments") return 1_000n;
+        if (fn === "maxCommitmentAge") return 100n;
+        throw new Error(`unexpected contractCall: ${fn}`);
+      });
+      d.clientWrapper = { client: { query: { Timestamp: { Now: { getValue: async () => 1_200_000n } } } } }; // expired
+      d.submitCommitment = spy(async () => { throw new Error("commit timed out after 120000ms"); });
+
+      await assert.rejects(() => d.commitAndRegister(LABEL, false), /timed out/);
+      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL)?.secret, SECRET,
+        ">> FAIL: commit-resume-revive-timeout: a timed-out revive may still land; discarding its record would abandon it (the #1659 bug)");
+    });
+  });
+
+  test("a second bare-revert with the same commitment fails after two register tries, never commits fresh (#1659)", async () => {
+    await withIsolatedHome(async () => {
+      const d = makeDotNS();
+      wireHappyPathSpies(d);
+      d.finalizeRegistration = spy(async () => { throw new Error("Contract execution would revert during register ... bare-revert (empty 0x)."); });
+
+      await assert.rejects(() => d.commitAndRegister(LABEL, false), /bare-revert/);
+      assert.equal(d.finalizeRegistration.calls.length, 2, ">> FAIL: commit-resume-double-revert: a real double revert must fail after two register tries");
+      assert.equal(d.generateCommitment.calls.length, 1, ">> FAIL: commit-resume-double-revert: a rival or collision must never trigger a fresh commit over the still-valid one");
+      assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL)?.secret, SECRET, ">> FAIL: commit-resume-double-revert: the still-valid record stays for the next run");
     });
   });
 

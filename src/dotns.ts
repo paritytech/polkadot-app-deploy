@@ -1518,13 +1518,18 @@ function tierDescriptionFor(status: number): string {
 }
 
 // Shared NoStatus-anchoring convention (issue #1189): pad the charset-cleaned
-// base to 9 chars with 'x' then append "00" — 9+ chars with exactly 2
+// base to 9 chars with 'x', then append "00" — 9+ chars with exactly 2
 // trailing digits is always NoStatus, so this is always registrable
 // regardless of how short or reserved-adjacent the original base was.
+// The 9-char cut must END IN A LETTER: a cut that ends in a digit
+// ("release-2") would make "release-200" (3 trailing digits, Reserved), and one
+// that ends in a hyphen would make a hyphen-base label. So trailing digits and
+// hyphens are stripped from the cut before it is padded back to 9 (#1647).
 // exampleNoStatusLabel (below) and buildLabelAlternatives both call this —
 // one convention, not two.
 function noStatusFallbackBase(base: string): string {
-  return `${base.padEnd(9, "x").slice(0, 9)}00`;
+  const cut = base.padEnd(9, "x").slice(0, 9).replace(/[\d-]+$/, "");
+  return `${cut.padEnd(9, "x")}00`;
 }
 
 export interface DomainLabelAlternative {
@@ -1538,8 +1543,10 @@ export interface DomainLabelAlternative {
 // validateDomainLabel or classifyDotnsLabel — derive up to 3 compliant
 // alternatives from the operator's OWN input, each labelled with the
 // Personhood tier it needs. Never returns a candidate that is itself Reserved
-// or otherwise invalid; the NoStatus fallback (c) always survives because it's
-// engineered to be 9+ chars with exactly 2 trailing digits.
+// or otherwise invalid: every candidate must pass the same classifyRegistrability
+// the registration preflight enforces. The NoStatus fallback (c) always survives
+// for a valid label because it is exactly 9 letters/inner-hyphens plus "00"
+// (noStatusFallbackBase); formal/lean/Label.lean proves this (#1647).
 export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile): DomainLabelAlternative[] {
   const trailingRun = label.slice(label.length - countTrailingDigits(label));
   const base = stripTrailingDigits(label);
@@ -1561,7 +1568,7 @@ export function buildLabelAlternatives(label: string, profile: DotnsAbiProfile):
     seen.add(candidate);
     if (!/^[a-z0-9-]{3,63}$/.test(candidate)) continue;
     if (candidate.startsWith("-") || candidate.endsWith("-")) continue;
-    if (/-\d+$/.test(candidate)) continue;
+    if (!classifyRegistrability(candidate, profile).registrable) continue;
     const { status, baseLength } = classifyLabelStatus(candidate, profile);
     if (status === ProofOfPersonhoodStatus.Reserved) continue;
     alternatives.push({ label: candidate, baseLength, status, tierDescription: tierDescriptionFor(status) });

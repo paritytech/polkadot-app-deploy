@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert";
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import path from "node:path";
 import { classifyForRetry, HARNESS_GUARD_MARKER, NO_RETRY_EXIT_CODE, FLAKE_PATTERNS } from "../tools/release-retry-wrapper.mjs";
 
 const WRAPPER = new URL("../tools/release-retry-wrapper.mjs", import.meta.url).pathname;
@@ -13,7 +14,7 @@ test("classifyForRetry: flake-class patterns return exit 75", () => {
     'Deployment failed: { "type": "Invalid", "value": { "type": "Stale" } }',
     "ChainHead disjointed",
     "Connection lost and max reconnections (3) exhausted",
-    "Account mapping did not take effect on-chain for 5DfhGyQd",
+    "Account auto-mapping did not take effect on-chain for 5DfhGyQd",
   ];
   for (const stderr of flakes) {
     assert.strictEqual(classifyForRetry(stderr), 75,
@@ -210,5 +211,128 @@ test("no flake pattern appears in a harness failure message or hint", () => {
       undefined,
       `>> FAIL: test/e2e.test.js prints the flake pattern "${needle}" on a failure path, so tripping that assertion would be retried as a flake. Reword it. Line: ${offender?.trim()}`,
     );
+  }
+});
+
+// #1649: the retry decision reads the FINAL failure only. src/deploy.ts prints
+// "Connection lost ..., reconnecting..." for reconnects that RECOVER, and a later
+// deterministic failure in the same run used to exit 75 because of it.
+const RECONNECT_LINES = [
+  "\n   Connection lost (heartbeat timeout), reconnecting...\n",
+  "\n   Connection lost, reconnecting to Bulletin in 2s (1/5)...\n",
+];
+const CONTENTHASH = "Post-deploy verification failed for app.dot: on-chain contenthash is 0x00";
+
+test("classifyForRetry: a recovered reconnect does not make a later deterministic failure retry-eligible (#1649)", () => {
+  for (const log of RECONNECT_LINES) {
+    // bare message, CLI shape, and the harness shape whose "seen tail" can quote the reconnect line
+    for (const failure of [
+      CONTENTHASH,
+      `Deployment failed: ${CONTENTHASH}`,
+      `>> FAIL: S1 deploy: unknown (exit 1)\n   seen tail:\n     ${log.trim()}\n     ${CONTENTHASH}`,
+    ]) {
+      assert.strictEqual(classifyForRetry(log + failure, 1), 1,
+        `>> FAIL: retry-wrapper: recovered reconnect + deterministic failure must not retry: ${failure.slice(0, 60)}`);
+    }
+  }
+});
+
+test("classifyForRetry: a flake that IS the final failure still retries after recovered reconnects (#1649 cross-table cases)", () => {
+  const finals = [
+    "Connection lost and max reconnections (5) exhausted",
+    "Connection lost and max reconnections (5) exhausted after phase B — finality probe unavailable. Retry the deploy.",
+    "Invalid: Stale",
+    "roundtrip budget exhausted: HTTP 504",
+    "Error: bulletin-deploy requires Node.js >=22 (running v18.19.1).",
+    "ChainHead disjointed",
+    "Account auto-mapping did not take effect on-chain for 5Df. The signer needs enough testnet PAS",
+  ];
+  for (const log of RECONNECT_LINES) {
+    for (const f of finals) {
+      for (const failure of [f, `Deployment failed: ${f}`, `>> FAIL: S1 deploy: x (exit 1)\n   seen tail:\n     ${f}`]) {
+        assert.strictEqual(classifyForRetry(log + failure, 1), 75,
+          `>> FAIL: retry-wrapper: a final flake must retry after a recovered reconnect: ${f.slice(0, 50)}`);
+      }
+    }
+  }
+});
+
+test("classifyForRetry: only the LAST failure block decides (#1649)", () => {
+  const flake = 'Deployment failed: { "type": "Invalid", "value": { "type": "Stale" } }';
+  const real = `>> FAIL: S1 deploy: contenthash (exit 1)\n   ${CONTENTHASH}`;
+  assert.strictEqual(classifyForRetry(`${flake}\n${real}`, 1), 1,
+    ">> FAIL: retry-wrapper: an earlier recovered flake must not retry a later deterministic failure");
+  assert.strictEqual(classifyForRetry(`${real}\n${flake}`, 1), 75,
+    ">> FAIL: retry-wrapper: a final flake must retry");
+});
+
+test("classifyForRetry: harness guard and no-retry keep precedence over a final-block flake (#1649)", () => {
+  const out = `${HARNESS_GUARD_MARKER} leak\nDeployment failed: ChainHead disjointed`;
+  assert.strictEqual(classifyForRetry(out, 1), 1);
+  assert.strictEqual(classifyForRetry("Deployment failed: ChainHead disjointed", NO_RETRY_EXIT_CODE), NO_RETRY_EXIT_CODE);
+});
+
+test("wrapper: a recovered reconnect then a deterministic failure exits 1, a final flake exits 75 (#1649)", async () => {
+  const run = (script) => new Promise((resolve) => {
+    const child = spawn(process.execPath, [WRAPPER, process.execPath, "-e", script]);
+    child.on("close", resolve);
+  });
+  assert.strictEqual(await run(`console.error("   Connection lost (heartbeat timeout), reconnecting..."); console.error(${JSON.stringify(`Deployment failed: ${CONTENTHASH}`)}); process.exit(1);`), 1,
+    ">> FAIL: retry-wrapper: recorded log, recovered reconnect + contenthash mismatch, must not exit 75");
+  assert.strictEqual(await run(`console.error("   Connection lost, reconnecting to Bulletin in 2s (1/5)..."); console.error("Deployment failed: Connection lost and max reconnections (5) exhausted"); process.exit(1);`), 75,
+    ">> FAIL: retry-wrapper: recorded log, exhausted reconnections, must exit 75");
+});
+
+// #1648: a needle nothing emits is dead weight that reads as coverage. The
+// "Account mapping did not take effect" needle survived a rewording of its only
+// producer for exactly that reason. Every needle in the wrapper and in the
+// e2e-failure table must occur in a string src/ can emit, or be listed here
+// with why no producer exists in src/.
+const NEEDLES_WITHOUT_SRC_PRODUCER = {
+  "Invalid: Stale": "papi 1.x transaction error text, not emitted by src/",
+  '"type": "Stale"': "papi 2.x JSON-serialised transaction error, not emitted by src/",
+  "ChainHead disjointed": "polkadot-api ChainHead follow-subscription error",
+  "is not pinned": "polkadot-api / node error: 'Block 0x... is not pinned'",
+  "received a shutdown signal": "GitHub Actions runner message, not from this code",
+  "All promises were rejected": "AggregateError message of the JS engine's Promise.any (src/dotns.ts fetchNonce uses it)",
+  "fetchManifestRoundtrip failed": "emitted by test/e2e.test.js, not src/",
+  "Contract reverted (flags=1)": "pallet-revive dispatch error text, wrapped by src/ but not authored there",
+};
+
+// Needles whose producer interpolates part of the text: every listed fragment must occur in src/.
+const COMPOSED_PRODUCERS = {
+  "requires Node.js >=22": ["requires Node.js ${enginesNode}", "engines"],
+  "ReviveApi.address timed out": ['"ReviveApi.address"', "${operationName} timed out after"],
+};
+
+function collectSrcProducerText() {
+  const out = [];
+  const walk = (dir) => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      // telemetry.ts holds the classifier regexes, which mention needles without emitting them
+      else if (e.name.endsWith(".ts") && e.name !== "telemetry.ts") out.push(readFileSync(full, "utf8"));
+    }
+  };
+  walk(new URL("../src", import.meta.url).pathname);
+  // drop comment text: a needle that only a comment mentions has no producer
+  return out.join("\n").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+}
+
+test("every wrapper and e2e-failure needle has a producer in src/ or a documented reason it has none (#1648)", () => {
+  const e2eSource = readFileSync(new URL("./helpers/e2e-failure.js", import.meta.url), "utf8");
+  const e2eNeedles = [...e2eSource.matchAll(/\{ needle: ((?:"(?:[^"\\]|\\.)*")|(?:'(?:[^'\\]|\\.)*')), class:/g)].map((m) => (m[1][0] === '"' ? JSON.parse(m[1]) : m[1].slice(1, -1)));
+  assert.ok(e2eNeedles.length >= 10, ">> FAIL: needle-producer guard: could not parse the e2e-failure table, so this guard proves nothing");
+  const needles = new Set([...FLAKE_PATTERNS, ...e2eNeedles]);
+  const src = collectSrcProducerText();
+  for (const needle of needles) {
+    if (needle in NEEDLES_WITHOUT_SRC_PRODUCER) continue;
+    const fragments = COMPOSED_PRODUCERS[needle] ?? [needle];
+    assert.ok(fragments.every((f) => src.includes(f)),
+      `>> FAIL: needle-producer guard: the flake needle ${JSON.stringify(needle)} appears in no string src/ emits, so it can never match. Update it to the producer's current wording, or list it in NEEDLES_WITHOUT_SRC_PRODUCER with the external source.`);
+  }
+  for (const listed of Object.keys(NEEDLES_WITHOUT_SRC_PRODUCER)) {
+    assert.ok(needles.has(listed), `>> FAIL: needle-producer guard: NEEDLES_WITHOUT_SRC_PRODUCER lists ${JSON.stringify(listed)}, which is in neither table. Remove it.`);
   }
 });

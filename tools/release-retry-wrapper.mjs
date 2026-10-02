@@ -27,7 +27,7 @@ export const FLAKE_PATTERNS = [
   "ChainHead disjointed",                    // RPC reorg / WS flake
   "Connection lost",                         // WS hard drop
   "is not pinned",                           // papi ChainHead subscription: node dropped block pin (stop-call)
-  "Account mapping did not take effect",     // Revive mapping race
+  "Account auto-mapping did not take effect", // Revive mapping race (src/dotns.ts producer)
   "requires Node.js >=22",                   // parity-default runner downgrade (Node v18) — infra flake
   "received a shutdown signal",              // runner process killed mid-job — CI infra flake
   // Chain/block-inclusion timeouts — top transient error class on
@@ -62,8 +62,6 @@ export const FLAKE_PATTERNS = [
   "All promises were rejected",
 ];
 
-// output: combined stdout+stderr text from the child. Any flake pattern
-// appearing anywhere in the child's output makes the run retry-eligible.
 // Printed by the E2E harness when it outlives its suite. A leak is deterministic,
 // and the WS-fault scenarios log flake wording while passing, so it must not retry.
 export const HARNESS_GUARD_MARKER = ">> FAIL: e2e harness:";
@@ -73,12 +71,37 @@ export const HARNESS_GUARD_MARKER = ">> FAIL: e2e harness:";
 // the marker is checked too.
 export const NO_RETRY_EXIT_CODE = 78;
 
+// Progress lines src/deploy.ts prints for a reconnect that is being RECOVERED:
+// "Connection lost (<reason>), reconnecting..." and "Connection lost, reconnecting to
+// Bulletin in Ns (i/N)...". They say the opposite of "the run failed", so they are
+// never evidence of the failure. The terminal "Connection lost and max reconnections
+// (N) exhausted" has no ", reconnecting" and is untouched (#1649).
+const RECOVERED_RECONNECT_RE = /Connection lost[^\n]*?, reconnecting[^\n]*/g;
+
+// What a run that FAILED printed last. The failure the run ends on starts at the last of
+// these; text before it is progress of attempts that recovered (retried Stale txs,
+// reconnects, earlier passing tests) and says nothing about why the run is red.
+const FINAL_FAILURE_ANCHORS = [">> FAIL:", "Deployment failed"];
+
+// The text a retry decision may read: the child's output without recovered-reconnect
+// progress lines, cut to the last failure block when the output has one. Output with no
+// anchor (a bare error line) is read whole.
+export function finalFailureRegion(output) {
+  const text = output.replace(RECOVERED_RECONNECT_RE, "");
+  const start = Math.max(...FINAL_FAILURE_ANCHORS.map((a) => text.lastIndexOf(a)));
+  return start < 0 ? text : text.slice(start);
+}
+
+// output: combined stdout+stderr text from the child. A flake pattern in the FINAL
+// failure makes the run retry-eligible. The harness-guard and no-retry checks keep
+// precedence and read the whole output / the exit code, as before.
 export function classifyForRetry(output, childExitCode = 1) {
   if (childExitCode === 0) return 0;
   if (childExitCode === NO_RETRY_EXIT_CODE) return NO_RETRY_EXIT_CODE;
   if (output.includes(HARNESS_GUARD_MARKER)) return childExitCode || 1;
+  const failure = finalFailureRegion(output);
   for (const pat of FLAKE_PATTERNS) {
-    if (output.includes(pat)) return 75;
+    if (failure.includes(pat)) return 75;
   }
   return childExitCode || 1;
 }

@@ -1,0 +1,61 @@
+name: e2e result
+description: >
+  Write this leg's e2e-result.json (scenario, env, signer, merkle, exit, class, signature, run_attempt, job)
+  and upload it as e2e-result-<leg>-a<attempt> (#1625). Merges the file the in-process harness wrote to
+  E2E_RESULT_PATH when there is one; otherwise derives it from job.status plus the captured log. Never fails
+  the job. Call it as the LAST step of a scenario job with `if: always()` and `continue-on-error: true`.
+inputs:
+  scenario:
+    description: Scenario id (s1, s8, s-car, ...)
+    required: false
+    default: ''
+  env:
+    description: Target environment id
+    required: false
+    default: ''
+  signer:
+    description: pool | direct | empty when the scenario has none
+    required: false
+    default: ''
+  merkle:
+    description: js | kubo | empty
+    required: false
+    default: ''
+  job-name:
+    description: The job's display name, verbatim. nightly-report joins results to jobs on it (asserted against the job's name in test/test.js).
+    required: true
+  status:
+    description: Pass the calling job's status (the job.status context value).
+    required: true
+  log-path:
+    description: Captured output of the scenario step (tee'd under RUNNER_TEMP); optional.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Build e2e-result.json
+      id: write
+      shell: bash
+      continue-on-error: true
+      env:
+        E2E_SCENARIO: ${{ inputs.scenario }}
+        E2E_ENV: ${{ inputs.env }}
+        E2E_SIGNER: ${{ inputs.signer }}
+        E2E_MERKLE: ${{ inputs.merkle }}
+        E2E_JOB_NAME: ${{ inputs.job-name }}
+        E2E_JOB_STATUS: ${{ inputs.status }}
+        E2E_LOG_PATH: ${{ inputs.log-path }}
+        # Where the harness hook writes; the workflow sets the same value on the scenario step.
+        E2E_RESULT_PATH: ${{ github.workspace }}/e2e-result/e2e-result.json
+        E2E_RESULT_OUT_DIR: ${{ runner.temp }}/e2e-result-out
+      run: node "${{ github.action_path }}/../../scripts/e2e-result.mjs" write
+    - name: Upload e2e-result
+      if: always() && steps.write.outputs.artifact != ''
+      continue-on-error: true
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ steps.write.outputs.artifact }}
+        path: ${{ steps.write.outputs.file }}
+        retention-days: 7
+        if-no-files-found: ignore

@@ -81,6 +81,14 @@ on:
         description: 'Sticky-comment header used to identify this workflow''s prior PR comment so it can be replaced on re-runs (marocchino/sticky-pull-request-comment). Override when multiple deploy workflows in the same repo each post their own comment.'
         type: string
         default: 'polkadot-app-deploy'
+      result-job-name:
+        description: 'polkadot-app-deploy E2E only (bulletin #1625): the CALLER job''s display name. When set, this workflow records the leg''s e2e-result.json and uploads it as an artifact; it requires the caller repository to carry .github/actions/e2e-result. Leave empty (the default) in consumer repos: every related step is skipped.'
+        type: string
+        default: ''
+      result-scenario:
+        description: 'polkadot-app-deploy E2E only (bulletin #1625): scenario id recorded in e2e-result.json. Used only with result-job-name.'
+        type: string
+        default: ''
     secrets:
       mnemonic:
         description: 'Mnemonic (DotNS domain owner)'
@@ -326,6 +334,11 @@ jobs:
           # classification side-effects for consumers who don't opt in to retry.
           retry_on_exit_code: 75
           command: |
+            # bulletin #1625: only for this repo's own E2E legs. Keep the attempt's
+            # output for the e2e-result step; the exit code is untouched.
+            if [ -n "${{ inputs.result-job-name }}" ]; then
+              exec > >(tee "$RUNNER_TEMP/e2e-leg.log") 2>&1
+            fi
             export MNEMONIC='${{ secrets.mnemonic }}'
             export IPFS_CID='${{ steps.cached-deploy.outputs.cid }}'
             export NODE_OPTIONS='--max-old-space-size=8192'
@@ -456,3 +469,18 @@ jobs:
             **${{ steps.final.outputs.domain }}.dot** · [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
             ${{ steps.browser.outputs.url }}
+
+      # This repo's own E2E legs only (bulletin #1625). Skipped for every consumer:
+      # result-job-name defaults to empty, so the local action is never resolved.
+      - name: Write e2e-result.json
+        if: always() && inputs.result-job-name != ''
+        continue-on-error: true
+        uses: ./.github/actions/e2e-result
+        with:
+          scenario: ${{ inputs.result-scenario }}
+          env: ${{ inputs.env }}
+          signer: ${{ inputs.direct-signer && 'direct' || 'pool' }}
+          merkle: ${{ inputs.js-merkle && 'js' || 'kubo' }}
+          job-name: ${{ inputs.result-job-name }}
+          status: ${{ job.status }}
+          log-path: ${{ runner.temp }}/e2e-leg.log

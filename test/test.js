@@ -27435,3 +27435,126 @@ describe("e2e-funding-check workflow (bulletin #1628)", () => {
     assert.match(code, /labels: \['funding'\]/, ">> FAIL: funding-check: new issues must carry the funding label");
   });
 });
+
+describe("e2e.yml: per-leg e2e-result files (#1625)", () => {
+  const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+  const deployWf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+  const RESULT_PATH = "${{ github.workspace }}/e2e-result/e2e-result.json";
+  const REUSABLE = ["nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh"];
+  // Every nightly scenario job: the S-numbered and S- named scenarios plus the HEAD coverage matrix.
+  // The harness-smoke, telemetry, pool-distribution, drift, chain-identity and code-path jobs are META verdicts.
+  const scenarioJobs = [...e2e.matchAll(/^ {2}(nightly-(?:s\d+[\w-]*|s-[\w-]+|pr-coverage)):\s*$/gm)]
+    .map((m) => m[1])
+    .filter((j) => j !== "nightly-s-v060-unblock");
+  const nameOf = (block) => block.match(/^ {4}name: (.*)$/m)[1];
+  const resultStep = (block) => block.split(/\n(?= {6}- )/).find((st) => st.includes("uses: ./.github/actions/e2e-result"));
+
+  test("the scenario-job list is not empty and includes the known legs", () => {
+    for (const j of ["nightly-s3", "nightly-s8", "nightly-s-car", "nightly-s-inc", "nightly-pr-coverage", ...REUSABLE]) {
+      assert.ok(scenarioJobs.includes(j), `>> FAIL: e2e-result: ${j} is not recognised as a scenario job; update the pattern in this test`);
+    }
+  });
+
+  for (const job of scenarioJobs.filter((j) => !REUSABLE.includes(j))) {
+    test(`${job}: ends with an always() e2e-result step whose job-name equals the job's name`, () => {
+      const block = jobBlock(e2e, job);
+      const step = resultStep(block);
+      assert.ok(step, `>> FAIL: e2e-result: ${job} has no e2e-result step, so its failure signature comes only from log grepping`);
+      assert.match(step, /^\s+if: always\(\)$/m, `>> FAIL: e2e-result: ${job}'s step must run on failure (if: always())`);
+      assert.match(step, /^\s+continue-on-error: true$/m, `>> FAIL: e2e-result: ${job}'s step must never fail the job`);
+      assert.match(step, /^\s+status: \$\{\{ job\.status \}\}$/m, `>> FAIL: e2e-result: ${job} must pass job.status`);
+      const jobName = step.match(/^\s+job-name: (.*)$/m)?.[1];
+      assert.equal(jobName, nameOf(block),
+        `>> FAIL: e2e-result: ${job}'s job-name must equal its name: verbatim, because nightly-report joins results to jobs on it`);
+      assert.ok(block.trimEnd().endsWith(step.trimEnd()), `>> FAIL: e2e-result: ${job}'s e2e-result step must be the LAST step so it sees every earlier outcome`);
+    });
+
+    test(`${job}: every harness step points E2E_RESULT_PATH where the composite reads it`, () => {
+      const block = jobBlock(e2e, job);
+      const harness = block.split(/\n(?= {6}- )/).filter((st) => /^\s+E2E: "1"$/m.test(st));
+      for (const st of harness) {
+        assert.ok(st.includes(`E2E_RESULT_PATH: ${RESULT_PATH}`),
+          `>> FAIL: e2e-result: a harness step in ${job} lacks E2E_RESULT_PATH, so its in-process result is never merged`);
+      }
+    });
+  }
+
+  for (const job of REUSABLE) {
+    test(`${job}: passes result-job-name (equal to its name) and result-scenario to the reusable workflow`, () => {
+      const block = jobBlock(e2e, job);
+      assert.equal(block.match(/^\s+result-job-name: (.*)$/m)?.[1], nameOf(block),
+        `>> FAIL: e2e-result: ${job} must pass its own name as result-job-name`);
+      assert.match(block, /^\s+result-scenario: s\d$/m, `>> FAIL: e2e-result: ${job} must pass result-scenario`);
+    });
+  }
+
+  test("deploy.yml: the result step and the log tee are opt-in, so consumer repos never resolve the local action", () => {
+    assert.match(deployWf, /result-job-name:\n(?:.*\n)*?\s+default: ''/m, ">> FAIL: e2e-result: result-job-name must default to empty");
+    const step = deployWf.split(/\n(?= {6}- )/).find((st) => st.includes("uses: ./.github/actions/e2e-result"));
+    assert.ok(step, ">> FAIL: e2e-result: deploy.yml has no e2e-result step");
+    assert.match(step, /if: always\(\) && inputs\.result-job-name != ''/, ">> FAIL: e2e-result: the step must be gated on result-job-name");
+    assert.match(step, /continue-on-error: true/);
+    assert.match(deployWf, /if \[ -n "\$\{\{ inputs\.result-job-name \}\}" \]; then\n\s+exec > >\(tee/,
+      ">> FAIL: e2e-result: the output tee in the Deploying step must be gated on result-job-name");
+  });
+
+  test("the composite action builds the file, then uploads it under the per-leg, per-attempt name the script printed", () => {
+    const action = fs.readFileSync(".github/actions/e2e-result/action.yml", "utf-8");
+    assert.match(action, /e2e-result\.mjs" write/);
+    assert.match(action, /name: \$\{\{ steps\.write\.outputs\.artifact \}\}/, ">> FAIL: e2e-result: the artifact name must come from the script (unique per leg and attempt)");
+    assert.match(action, /E2E_RESULT_PATH: \$\{\{ github\.workspace \}\}\/e2e-result\/e2e-result\.json/);
+    assert.match(action, /if-no-files-found: ignore/);
+    // A `${{ }}` inside a description is evaluated by the runner, and `job` is not a context there:
+    // the first dispatch failed to load the action on exactly this.
+    const descriptions = action.split("\n").filter((l) => /^\s+description:/.test(l));
+    assert.ok(descriptions.every((l) => !l.includes("${{")), ">> FAIL: e2e-result: action.yml descriptions must not contain ${{ }} expressions (the runner evaluates them)");
+  });
+
+  describe("nightly-report", () => {
+    const report = jobBlock(e2e, "nightly-report");
+    const steps = report.split(/\n(?= {6}- )/);
+
+    test("downloads every e2e-result-* artifact with merge-multiple, tolerating none", () => {
+      const dl = steps.find((st) => st.includes("actions/download-artifact"));
+      assert.ok(dl, ">> FAIL: e2e-result: nightly-report does not download the result files");
+      assert.match(dl, /pattern: e2e-result-\*/);
+      assert.match(dl, /merge-multiple: true/);
+      assert.match(dl, /continue-on-error: true/, ">> FAIL: e2e-result: a run with no result files must still report");
+    });
+
+    test("checks out and sets up Node BEFORE the Fetch step that runs the script", () => {
+      const idx = (needle) => steps.findIndex((st) => st.includes(needle));
+      assert.ok(idx("actions/checkout@") !== -1 && idx("actions/checkout@") < idx("name: Fetch per-leg job results"),
+        ">> FAIL: e2e-result: the sparse checkout must precede the Fetch step");
+      assert.ok(idx("actions/setup-node@") < idx("name: Fetch per-leg job results"));
+      assert.ok(idx("actions/download-artifact") < idx("name: Fetch per-leg job results"));
+      const checkout = steps[idx("actions/checkout@")];
+      for (const p of [".github/scripts", "package.json", "test/helpers/e2e-failure.js", "tools/release-retry-wrapper.mjs"]) {
+        assert.ok(checkout.includes(p), `>> FAIL: e2e-result: sparse checkout must include ${p}`);
+      }
+    });
+
+    test("still falls back to the log grep for legs with no usable result file", () => {
+      const fetch = steps.find((st) => st.includes("name: Fetch per-leg job results"));
+      assert.match(fetch, /grep -aE '>> FAIL:\|Deployment failed'/, ">> FAIL: e2e-result: the log-grep fallback is gone");
+      assert.match(fetch, /signatures: \$\{FROM_FILE\} from result files, \$\{FROM_LOG\} from log fallback/);
+      assert.match(fetch, /\[ -n "\$SIG" \]/, ">> FAIL: e2e-result: the fallback must be conditional on a missing signature");
+    });
+
+    test("the per-leg tables, readiness section and runner-loss steps are intact", () => {
+      for (const needle of ["Failing legs by env", "### Failure signatures", "## Environment readiness", "name: Classify runner loss", "name: Classify canary-only red", "all-runner-loss"]) {
+        assert.ok(report.includes(needle), `>> FAIL: e2e-result: nightly-report lost "${needle}"`);
+      }
+    });
+
+    test("the cause label is added at issue creation only and never joins the dedup lookup", () => {
+      const open = steps.find((st) => /- name: Open failure issue$/m.test(st));
+      assert.ok(open.includes('"Dominant cause') || open.includes("CAUSE_LINE"), ">> FAIL: e2e-result: the issue body must carry the dominant-cause line");
+      const lookup = open.slice(open.indexOf("EXISTING=$("), open.indexOf('if [ -n "$EXISTING" ]'));
+      assert.match(lookup, /labels=\$DEDUP_LABEL/);
+      assert.ok(!/CAUSE_LABEL/.test(lookup), ">> FAIL: e2e-result: the cause label must not be part of the dedup query (#1536)");
+      assert.match(open, /labels: \(\[\$label\] \+ \(if \$cause == "" then \[\] else \[\$cause\] end\)\)/);
+      assert.match(open, /"\$API_URL\/repos\/\$REPO\/labels"[\s\S]*?CAUSE_LABEL|CAUSE_LABEL[\s\S]*?"\$API_URL\/repos\/\$REPO\/labels"/, ">> FAIL: e2e-result: the cause label must be created on demand");
+    });
+  });
+});

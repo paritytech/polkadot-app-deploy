@@ -533,6 +533,9 @@ export function computeDeployOutcome(
 //   tool.out_of_memory             — the Node process ran out of heap
 //   tool.external_signer_unsupported — external signer mode combined with dotns-cli, which does not support it
 //   chain.chunk_failed             — a chunk upload failed after its retry budget and no more specific cause was recognised
+//   chain.chunk_unverified        — the best-block TransactionByContentHash probe gave no answer, so chunk inclusion could not be verified
+//   chain.chunk_not_included      — the chain accepts the account's txs but still has not included the chunk after the re-upload rounds
+//   chain.queue_stuck             — the signer's pending-tx queue is stuck behind a head tx the node is not including (pinned pool account or direct signer)
 //   chain.tx_dropped               — tx dropped from best chain / chain may have dropped or evicted the extrinsic
 //   chain.tx_invalid               — extrinsic rejected with a generic Invalid::* error not covered by a specific kind
 //   chain.not_finalised            — an extrinsic did not finalise within the wait budget
@@ -587,6 +590,12 @@ export type DeployErrorKind =
   | 'tool.out_of_memory'
   | 'tool.external_signer_unsupported'
   | 'chain.chunk_failed'
+  // ChunkInclusionUnverifiedError, probe branch: the TransactionByContentHash probe at the best block gave no answer, so inclusion could not be verified
+  | 'chain.chunk_unverified'
+  // ChunkInclusionUnverifiedError, re-upload branch: the chain accepts the account's txs but still does not include the chunk
+  | 'chain.chunk_not_included'
+  // stuckQueueMessage (src/pool.ts): the signer's pending-tx queue is stuck behind a head tx the node is not including
+  | 'chain.queue_stuck'
   | 'chain.tx_dropped'
   | 'chain.tx_invalid'
   | 'chain.not_finalised'
@@ -630,6 +639,16 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   // (2026-08-06 telemetry sweep: this was the largest live `unknown` bucket —
   // 31 spans, 30 of them env=preview, from the per-env authorizer gap #1209.)
   [/is not authorized for Bulletin storage/i, 'storage.rejected'],
+  // The three chunk-inclusion / stuck-queue messages (src/deploy.ts
+  // ChunkInclusionUnverifiedError, src/pool.ts stuckQueueMessage). Ahead of the
+  // generic infra rules: the unverified message interpolates the probe's failure
+  // reason, which routinely reads "timed out" / "websocket closed" and would be
+  // claimed by chain-timeout or connection; the stuck-queue message says "every
+  // chunk would time out", and both inclusion messages end up before the broader
+  // /chunk.*failed after.*retr/ and /not finalised after/ fallbacks.
+  [/Could not verify that chunk .+ is stored on-chain/i, 'chain.chunk_unverified'],
+  [/still absent at the best block after \d+ re-upload rounds/i, 'chain.chunk_not_included'],
+  [/has a stuck pending-tx queue/i, 'chain.queue_stuck'],
   // Revive surfaces the personhood gate as a bare revert reason rather than the
   // "requires ProofOfPersonhoodX, but this signer is NoStatus" prose matched
   // further down — same user-actionable cause, so it shares that kind. Ordered
@@ -793,6 +812,12 @@ export const ERROR_KIND_CATEGORY: Record<DeployErrorKind, DeployErrorCategory> =
   'chain.quota_exhausted': 'user',
   'chain.bad_proof': 'environment',
   'chain.chunk_failed': 'environment',
+  'chain.chunk_unverified': 'environment',
+  'chain.chunk_not_included': 'environment',
+  // Always the node's pool state, not the operator's: a pinned index is only the
+  // remedy (unset/pick another), the stuck queue is the cause, and the same
+  // message is also thrown for a direct signer that pinned nothing.
+  'chain.queue_stuck': 'environment',
   'chain.tx_dropped': 'environment',
   'chain.tx_invalid': 'environment',
   'chain.not_finalised': 'environment',

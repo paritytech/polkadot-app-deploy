@@ -1070,7 +1070,10 @@ jobs:
           - { scenario: s-inc-portability,        signer: pool,   merkle: js,   poolIndex: 5 }
           - { scenario: s-inc-asset-rotation,     signer: pool,   merkle: js,   poolIndex: 6 }
           - { scenario: s-subdomain,              signer: pool,   merkle: js,   poolIndex: 7 }
-          - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 8 }
+          # Pinned to 13, not 8 (bulletin #1637): //deploy/8's nonce is stuck behind
+          # immortal third-party txs in one RPC backend's pool. Any unused index would
+          # do — the pin only keeps this leg's nonces apart from the concurrent pinned legs.
+          - { scenario: s-content-only,           signer: pool,   merkle: js,   poolIndex: 13 }
           - { scenario: s-manifest-env,           signer: pool,   merkle: js,   poolIndex: 9 }
           # No poolIndex: --product-name derives its own signer and refuses a
           # derivation path, so this leg cannot be pinned to a //deploy/N account.

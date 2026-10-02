@@ -25,7 +25,7 @@
  *   - //e2e-direct        — s1 direct shard
  *   - //e2e-fresh-pool    — s2 pool shard
  *   - //e2e-fresh-direct  — s2 direct shard
- *   - //deploy/0 .. //deploy/9 — the chunk-upload pool, gated by Bulletin
+ *   - //deploy/0 .. //deploy/13 — the chunk-upload pool, gated by Bulletin
  *                                authorization quota. Asset Hub balance is
  *                                shown but doesn't matter operationally.
  *
@@ -55,7 +55,7 @@ const PAS_DECIMALS = 10n;
 const ONE_PAS = 10n ** PAS_DECIMALS;
 
 // role feeds tools/funding-verdict.mjs: root = Alice ROOT, dotns = signs DotNS,
-// pool = Bulletin-only chunk-upload account. //deploy/10..12 are the pool
+// pool = Bulletin-only chunk-upload account. //deploy/10..13 are the pool
 // indexes e2e.yml pins beyond the original 0..9.
 export const SIGNERS = [
   { label: "Alice ROOT",        path: "",                   role: "root"  },
@@ -63,7 +63,7 @@ export const SIGNERS = [
   { label: "//e2e-direct",      path: "//e2e-direct",       role: "dotns" },
   { label: "//e2e-fresh-pool",  path: "//e2e-fresh-pool",   role: "dotns" },
   { label: "//e2e-fresh-direct", path: "//e2e-fresh-direct", role: "dotns" },
-  ...Array.from({ length: 13 }, (_, i) => ({
+  ...Array.from({ length: 14 }, (_, i) => ({
     label: `//deploy/${i}`,
     path: `//deploy/${i}`,
     role: "pool",

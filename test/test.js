@@ -12397,8 +12397,8 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     // not here.
     assert.match(
       job,
-      /scenario:\s*s-content-only,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*8\s*}/,
-      "nightly-pr-coverage must wire scenario s-content-only to signer pool, merkle js, poolIndex 8",
+      /scenario:\s*s-content-only,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*13\s*}/,
+      "nightly-pr-coverage must wire scenario s-content-only to signer pool, merkle js, poolIndex 13 (not 8: bulletin #1637)",
     );
 
     // #1094: manifest publish on a non-default env (PAD_ENV is always set
@@ -26698,8 +26698,9 @@ describe("e2e-ensure-authorized: DRIFT GUARD — signer list derived from e2e.ym
     const expected = [
       "//e2e-direct", "//e2e-fresh-direct", "//e2e-fresh-pool", "//e2e-s9", "//e2e-sgrandpa",
       "//deploy/0", "//deploy/1", "//deploy/2", "//deploy/3", "//deploy/4", "//deploy/5",
-      "//deploy/6", "//deploy/7", "//deploy/8", "//deploy/9", "//deploy/10", "//deploy/11",
-      "//deploy/12",
+      // No pinned //deploy/8: s-content-only moved to 13 (bulletin #1637).
+      "//deploy/6", "//deploy/7", "//deploy/9", "//deploy/10", "//deploy/11",
+      "//deploy/12", "//deploy/13",
     ];
     assert.deepStrictEqual(labels, expected,
       `>> FAIL: e2e-signer-drift-guard: the derived signer set no longer matches the pinned expectation (derived: ${JSON.stringify(labels)}). ` +

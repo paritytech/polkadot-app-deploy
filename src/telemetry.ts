@@ -345,6 +345,15 @@ const DEPLOY_SEED_POOL: Record<string, number> = {
   "deploy.pool.nonce_collision_reupload_count": 0,
 };
 
+// #1637: pool accounts skipped because their pending-tx queue was stuck
+// (system_accountNextIndex far ahead of the on-chain nonce). Comma-joined pool
+// indices, "none" when nothing was skipped. A string seed, unlike
+// DEPLOY_SEED_POOL, so count_if(deploy.pool.stuck_skipped, "none") has a
+// denominator on every span.
+const DEPLOY_SEED_POOL_HEALTH: Record<string, string> = {
+  "deploy.pool.stuck_skipped": "none",
+};
+
 // Manifest fetch outcome. Seeded so every span carries the attributes even when
 // fetchPreviousManifest is never reached (first deploy, early error, non-incremental path).
 // "none" + "0" form the denominator for ratio queries.
@@ -398,6 +407,7 @@ export function getDeployAttributes(domain: string): Record<string, string | num
     ...DEPLOY_SEED_STORAGE,
     ...DEPLOY_SEED_PROBE,
     ...DEPLOY_SEED_POOL,
+    ...DEPLOY_SEED_POOL_HEALTH,
     ...DEPLOY_SEED_MANIFEST,
     ...DEPLOY_SEED_BULLETIN_UPLOAD,
     ...DEPLOY_SEED_RECEIPTS,

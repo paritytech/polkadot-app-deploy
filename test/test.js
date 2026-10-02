@@ -3386,6 +3386,8 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.pool.nonce_collision_count": 0,
     "deploy.pool.nonce_collision_missing": 0,
     "deploy.pool.nonce_collision_reupload_count": 0,
+    // pool health (#1637)
+    "deploy.pool.stuck_skipped": "none",
     // manifest (string "0" per @sentry/node EAP numeric-attribute caveat)
     "deploy.manifest.fetch_source": "none",
     "deploy.manifest.fetch_attempts": "0",

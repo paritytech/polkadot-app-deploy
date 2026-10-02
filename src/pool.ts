@@ -6,6 +6,7 @@ import { getPolkadotSigner } from "polkadot-api/signer";
 import { getWsProvider } from "polkadot-api/ws";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
+import { NonRetryableError } from "./errors.js";
 
 // Both Paseo Asset Hub and Paseo Bulletin report `tokenDecimals: 10` via
 // system_properties — same on Polkadot Asset Hub. Display formatter for tools
@@ -40,6 +41,13 @@ export const DEPLOY_PATH_PREFIX = "//deploy";
 // derivePoolAccounts() / the pinned BULLETIN_POOL_ACCOUNT_INDEX.
 export function poolAccountDerivationPath(index: number): string {
   return `${DEPLOY_PATH_PREFIX}/${index}`;
+}
+
+/** Inverse of poolAccountDerivationPath: N for "//deploy/N", else undefined. */
+export function parsePoolDerivationIndex(path: string): number | undefined {
+  const prefix = `${DEPLOY_PATH_PREFIX}/`;
+  const rest = path.startsWith(prefix) ? path.slice(prefix.length) : "";
+  return /^\d+$/.test(rest) ? Number(rest) : undefined;
 }
 
 // Pure decision for the #1054 Asset Hub pre-fund: a pool leg pays its own DotNS
@@ -343,6 +351,194 @@ export function selectAccount(authorizations: PoolAuthorization[], random: () =>
     return { account: pinned, eligibleCount: authorizations.length };
   }
   return { account: authorizations[Math.floor(random() * authorizations.length)], eligibleCount: authorizations.length };
+}
+
+// ---------------------------------------------------------------------------
+// #1637: stuck pending-tx queue detection.
+//
+// A pool account can have a valid head tx that never leaves one RPC backend's
+// local pool (seen on paseo-next-v2: one of two load-balanced backends held 52
+// txs from //deploy/8, head valid per TaggedTransactionQueue_validate_transaction
+// but never gossiped). That backend reports system_accountNextIndex far ahead of
+// the on-chain nonce, and any chunk nonce read through it is a future nonce that
+// never becomes ready: every chunk times out after 180 s, three times over.
+//
+// Threshold: one deploy keeps at most BATCH_SIZE_INITIAL = 2 chunk txs in flight
+// (plus a root/retry tx), so 8 tolerates about three concurrent deploys on the
+// same account before calling it stuck. The #1637 gap was 53.
+export const STUCK_NONCE_GAP_THRESHOLD = 8;
+// nextIndex samples per health check, fired in parallel. Every sample opens a
+// fresh connection, so behind a load balancer each one is a new backend pick.
+// The #1637 probes hit the bad backend about 1 time in 3, so 8 samples miss it
+// about 4% of the time. This is per endpoint: callers take NONCE_HEALTH_SAMPLES
+// for each endpoint, round-robin, since each endpoint has its own balancer.
+export const NONCE_HEALTH_SAMPLES = 8;
+const NONCE_HEALTH_TIMEOUT_MS = 10_000;
+// A gap above the threshold can also be a busy account: several concurrent
+// deploys from one key (S9, a consumer's CI matrix) that collision recovery
+// handles today. Stuck vs busy: re-read the on-chain nonce after about two
+// Bulletin blocks. Busy accounts advance; a stuck one does not (//deploy/8 sat
+// at 13063 for hours). Only paid when the gap is already large.
+const NONCE_HEALTH_CONFIRM_DELAY_MS = 2 * BULLETIN_BLOCK_TIME_SECS * 1000;
+
+export type NonceHealthVerdict = "healthy" | "stuck" | "unknown";
+
+export interface NonceHealth {
+  verdict: NonceHealthVerdict;
+  onchain?: number;
+  /** Max system_accountNextIndex over the successful samples. */
+  nextIndex?: number;
+  gap?: number;
+  samples: number[];
+  /** Why the verdict is "unknown". */
+  reason?: string;
+}
+
+export function nonceGapVerdict(onchain: number, nextIndex: number, threshold: number = STUCK_NONCE_GAP_THRESHOLD): "healthy" | "stuck" {
+  // A negative gap is a backend lagging behind the chain, not a stuck queue.
+  return nextIndex - onchain > threshold ? "stuck" : "healthy";
+}
+
+// Calls `fn` inside the race so a synchronous throw becomes a rejection too.
+function withTimeout<T>(fn: () => Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  return Promise.race([
+    Promise.resolve().then(fn),
+    new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms}ms`)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+export interface NonceHealthDeps {
+  /** The account's nonce in System.Account at the BEST block (not finalized: nextIndex is best + pool). */
+  readOnchainNonce: (address: string) => Promise<number>;
+  /** One system_accountNextIndex read over a fresh connection. `sample` is 0..samples-1. */
+  readNextIndex: (address: string, sample: number) => Promise<number>;
+  samples?: number;
+  timeoutMs?: number;
+  threshold?: number;
+  /** Wait before the stuck-vs-busy re-read of the on-chain nonce. */
+  confirmDelayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/** Never throws: any RPC failure yields verdict "unknown" so the caller can proceed as before. */
+export async function checkPoolAccountNonceHealth(address: string, deps: NonceHealthDeps): Promise<NonceHealth> {
+  const samples = deps.samples ?? NONCE_HEALTH_SAMPLES;
+  const timeoutMs = deps.timeoutMs ?? NONCE_HEALTH_TIMEOUT_MS;
+  const [onchainRes, ...sampleRes] = await Promise.allSettled([
+    withTimeout(() => deps.readOnchainNonce(address), timeoutMs, "on-chain nonce read"),
+    ...Array.from({ length: samples }, (_, i) =>
+      withTimeout(() => deps.readNextIndex(address, i), timeoutMs, "system_accountNextIndex")),
+  ]);
+  const got = sampleRes.flatMap((r) => (r.status === "fulfilled" ? [Number(r.value)] : []));
+  if (onchainRes.status === "rejected") {
+    return { verdict: "unknown", samples: got, reason: `on-chain nonce: ${onchainRes.reason?.message ?? onchainRes.reason}` };
+  }
+  if (got.length === 0) {
+    const first = sampleRes.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    return { verdict: "unknown", samples: got, reason: `nextIndex: every sample failed (${first?.reason?.message ?? first?.reason})` };
+  }
+  const onchain = Number(onchainRes.value);
+  const nextIndex = Math.max(...got);
+  const result: NonceHealth = { verdict: nonceGapVerdict(onchain, nextIndex, deps.threshold), onchain, nextIndex, gap: nextIndex - onchain, samples: got };
+  if (result.verdict !== "stuck") return result;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  await sleep(deps.confirmDelayMs ?? NONCE_HEALTH_CONFIRM_DELAY_MS);
+  try {
+    const later = Number(await withTimeout(() => deps.readOnchainNonce(address), timeoutMs, "on-chain nonce re-read"));
+    // Advanced: a busy account whose queue is draining, not a stuck one.
+    if (later > onchain) return { ...result, verdict: "healthy", onchain: later, gap: nextIndex - later };
+    return result;
+  } catch (e: any) {
+    return { ...result, verdict: "unknown", reason: `on-chain nonce re-read: ${e?.message ?? e}` };
+  }
+}
+
+export interface StuckPoolAccount {
+  index: number;
+  address: string;
+  health: NonceHealth;
+}
+
+export interface HealthySelectionResult extends SelectionResult {
+  skippedStuck: StuckPoolAccount[];
+}
+
+/** Thrown when BULLETIN_POOL_ACCOUNT_INDEX pins an account whose queue is stuck. */
+export class StuckPoolAccountError extends NonRetryableError {
+  constructor(message: string, readonly skippedStuck: StuckPoolAccount[]) {
+    super(message);
+    this.name = "StuckPoolAccountError";
+  }
+}
+
+export interface HealthySelectionOptions {
+  pinnedIndex?: number;
+  random?: () => number;
+  checkHealth: (account: PoolAuthorization) => Promise<NonceHealth>;
+  log?: { warn: (msg: string) => void };
+}
+
+function describeGap(h: NonceHealth): string {
+  return `on-chain nonce ${h.onchain}, system_accountNextIndex ${h.nextIndex} (gap ${h.gap} > ${STUCK_NONCE_GAP_THRESHOLD}, on-chain nonce did not advance)`;
+}
+
+/** The fail-fast message for a signer whose queue is stuck; `remedy` is the caller-specific way out. */
+export function stuckQueueMessage(who: string, address: string, h: NonceHealth, remedy: string): string {
+  return (
+    `${who} (${address}) has a stuck pending-tx queue: ${describeGap(h)}. ` +
+    `Its txs would wait behind a head tx that is not being included, so every chunk would time out. ` +
+    `${remedy} ` +
+    `The queue clears once the RPC node drops or includes the stuck txs (node-side pool flush).`
+  );
+}
+
+/**
+ * selectAccount() plus a stuck-queue check on the chosen account (#1637).
+ * Unpinned: a stuck draw is skipped and the next one is drawn uniformly from
+ * the rest. Never sort by gap: that is the bias tools/verify_pool_distribution.py
+ * guards against. Pinned: a stuck account fails fast.
+ */
+export async function selectHealthyPoolAccount(
+  authorizations: PoolAuthorization[],
+  { pinnedIndex, random = Math.random, checkHealth, log = console }: HealthySelectionOptions,
+): Promise<HealthySelectionResult> {
+  const eligibleCount = authorizations.length;
+  const check = async (a: PoolAuthorization): Promise<NonceHealth> => {
+    try {
+      return await checkHealth(a);
+    } catch (e: any) {
+      return { verdict: "unknown", samples: [], reason: e?.message ?? String(e) };
+    }
+  };
+
+  if (pinnedIndex != null) {
+    const { account } = selectAccount(authorizations, random, pinnedIndex);
+    const h = await check(account);
+    if (h.verdict === "stuck") {
+      throw new StuckPoolAccountError(
+        stuckQueueMessage(`Pool account ${account.index}`, account.address, h,
+          `BULLETIN_POOL_ACCOUNT_INDEX=${account.index} pins it: unset BULLETIN_POOL_ACCOUNT_INDEX or pick another index.`),
+        [{ index: account.index, address: account.address, health: h }],
+      );
+    }
+    return { account, eligibleCount, skippedStuck: [] };
+  }
+
+  const skippedStuck: StuckPoolAccount[] = [];
+  let remaining = authorizations;
+  let firstDraw: PoolAuthorization | undefined;
+  while (remaining.length > 0) {
+    const { account } = selectAccount(remaining, random);
+    firstDraw ??= account;
+    const h = await check(account);
+    if (h.verdict !== "stuck") return { account, eligibleCount, skippedStuck };
+    log.warn(`   ⚠ Skipping pool account ${account.index} (${account.address}): stuck pending-tx queue, ${describeGap(h)}`);
+    skippedStuck.push({ index: account.index, address: account.address, health: h });
+    remaining = remaining.filter((a) => a !== account);
+  }
+  log.warn(`   ⚠ Every pool account looks stuck; using pool account ${firstDraw!.index} anyway`);
+  return { account: firstDraw!, eligibleCount, skippedStuck };
 }
 
 export async function fetchPoolAuthorizations(api: any, accounts: PoolAccount[]): Promise<PoolAuthorization[]> {

@@ -15,6 +15,8 @@ import {
   smokeLabel,
   digitsToLetters,
   PAD_LABEL_PREFIX,
+  S3_OWNED_LABEL,
+  BOB_H160,
 } from "../tools/lib/e2e-fixtures.mjs";
 import { classifyDotnsLabel, sanitizeDomainLabel, ProofOfPersonhoodStatus } from "../dist/dotns.js";
 
@@ -193,5 +195,19 @@ describe("e2e harness label call sites", () => {
     assert.match(block("S1-SMOKE"), /smokeLabel\(process\.env\.DEPLOY_TAG, process\.env\.E2E_PR_NUMBER\)/);
     assert.match(workflow, /E2E_SCENARIO: s1-smoke\n(?:\s+#.*\n)*\s+E2E_PR_NUMBER: \$\{\{ github\.event\.pull_request\.number \}\}/,
       ">> FAIL: e2e-fixtures: test-pr must pass E2E_PR_NUMBER, or every PR shares one smoke label");
+  });
+});
+
+describe("S3 fixture constants (bulletin #1332 / #1642)", () => {
+  test("the S3 scenario's paseo-next-v2 label and the readiness probe read the same constant", () => {
+    const e2e = fs.readFileSync(new URL("../test/e2e.test.js", import.meta.url), "utf8");
+    assert.match(e2e, /\? `\$\{S3_OWNED_LABEL\}\.\$\{tld\}`/,
+      ">> FAIL: e2e-fixtures: S3 must build its paseo-next-v2 label from S3_OWNED_LABEL, or the readiness probe checks a different name than the scenario owns");
+    assert.equal(S3_OWNED_LABEL, "e2eownedns03");
+  });
+
+  test("BOB_H160 is the lower-case //Bob H160 the S3 scenario pins", () => {
+    const e2e = fs.readFileSync(new URL("../test/e2e.test.js", import.meta.url), "utf8");
+    assert.ok(e2e.includes(`const BOB_H160 = "${BOB_H160}"`), ">> FAIL: e2e-fixtures: BOB_H160 drifted from the value S3 pins");
   });
 });

@@ -331,17 +331,30 @@ jobs:
       (needs.detect-deps-change.result == 'skipped' || needs.detect-deps-change.outputs.is_version_only != 'true') &&
       (github.event_name == 'pull_request' || github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'release' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    # 6 min was sized for the probe alone; the readiness check (#1624) adds
+    # npm ci + build + one bounded check per live env on nightly-class events.
+    timeout-minutes: 20
     permissions:
       contents: read
     outputs:
       selected_env: ${{ steps.select.outputs.selected_env }}
-      # healthy_envs: JSON array of all e2eEligible envs that passed the probe.
-      # For schedule (cron) triggers this is the full set of healthy envs so
-      # the nightly matrix can fan out across all of them. For release and
-      # workflow_dispatch triggers it is a single-element array containing
+      # healthy_envs: JSON array of the envs the scenario matrices fan out over.
+      # Schedule (cron): every live env that is also READY (#1624). A live env
+      # whose readiness check says not-ready (DotNS ABI drift, signer below its
+      # floor, S3 fixture gone) is left out; it is in not_ready instead.
+      # Release and workflow_dispatch: a single-element array containing
       # selected_env so those runs stay fast (release gating must not fan out).
       healthy_envs: ${{ steps.select.outputs.healthy_envs }}
+      # ready_envs: JSON array of live envs that passed readiness (all live envs
+      # on events that do not run the readiness check).
+      ready_envs: ${{ steps.select.outputs.ready_envs }}
+      # not_ready: JSON object env -> [{check, reason}] for live envs that failed
+      # readiness. "{}" when none. Read by nightly-report (#1624).
+      not_ready: ${{ steps.select.outputs.not_ready }}
+      # canary_envs: every LIVE env on schedule (ready or not); [selected_env]
+      # otherwise. Used ONLY by nightly-s1-direct, so one S1 direct leg still
+      # runs on a not-ready env and a wrongly-red probe is visible.
+      canary_envs: ${{ steps.select.outputs.canary_envs }}
       primary_healthy: ${{ steps.select.outputs.primary_healthy }}
       fallback_used: ${{ steps.select.outputs.fallback_used }}
     steps:
@@ -355,10 +368,23 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: npm install -g npm@11.17.0
+      # The readiness check (#1624) imports dist/ (DotNS profile detection, fee
+      # floors, balance readers), unlike probe-env-health.mjs which stays
+      # build-free. Only nightly-class events run it, so PR/push select-env
+      # keeps its probe-only cost.
+      - name: npm ci (readiness check)
+        if: github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')
+        uses: ./.github/actions/npm-retry
+        with:
+          run: npm ci
+      - name: npm run build (readiness check)
+        if: github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')
+        run: npm run build
       - id: select
         env:
           PRIMARY_ENV: ${{ inputs.primary-env || 'paseo-next-v2' }}
           EVENT_NAME: ${{ github.event_name }}
+          RUN_READINESS: ${{ (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly')) && 'true' || 'false' }}
         shell: bash
         run: |
           set -uo pipefail
@@ -387,17 +413,71 @@ jobs:
             echo "❌ All E2E-eligible envs are unhealthy" >&2
             exit 1
           fi
-          # Build JSON array from the healthy list.
-          HEALTHY_JSON=$(printf '%s\n' "${HEALTHY[@]}" | jq -R . | jq -sc .)
-          # For schedule (cron) nightly: fan out across all healthy envs.
+          # Build JSON array from the healthy (live) list.
+          HEALTHY_JSON=$(jq -nc '$ARGS.positional' --args "${HEALTHY[@]}")
+          # Readiness (#1624): a live env can still be untestable (DotNS ABI
+          # drift, a signer below its floor, the S3 fixture gone), which turns
+          # every leg on it red at once. Check each live env; "unknown" (probe
+          # glitch, tool crash, no summary line) never marks an env not-ready.
+          READY=()
+          NOT_READY_JSON='{}'
+          # One node process per live env (startup + dist imports + DotNS connect
+          # each), so run them concurrently and read the results in probe order.
+          RDIR=$(mktemp -d)
+          if [[ "$RUN_READINESS" == "true" ]]; then
+            for env in "${HEALTHY[@]}"; do
+              node tools/check-env-readiness.mjs --env "$env" > "$RDIR/$env.out" 2>&1 &
+            done
+            wait
+          fi
+          for env in "${HEALTHY[@]}"; do
+            if [[ "$RUN_READINESS" == "true" ]]; then
+              OUT=$(cat "$RDIR/$env.out" 2>/dev/null || true)
+              echo "::group::Readiness: $env"
+              printf '%s\n' "$OUT"
+              echo "::endgroup::"
+              LINE=$(printf '%s\n' "$OUT" | grep '^ENV_READINESS ' | tail -n 1 | sed 's/^ENV_READINESS //')
+              if [[ -z "$LINE" ]]; then
+                echo "::warning::readiness for $env produced no summary line; treating as unknown (env stays ready)"
+              else
+                if echo "$LINE" | jq -e '(.unknown | length) > 0' >/dev/null 2>&1; then
+                  echo "::warning::readiness for $env has unknown checks (not gating): $(echo "$LINE" | jq -c '.unknown')"
+                fi
+                if echo "$LINE" | jq -e '.ready == false' >/dev/null 2>&1; then
+                  NOT_READY_JSON=$(jq -c --arg e "$env" --argjson l "$LINE" '. + {($e): $l.reasons}' <<<"$NOT_READY_JSON")
+                  echo "::warning::env $env is NOT READY: $(echo "$LINE" | jq -c '.reasons')"
+                  continue
+                fi
+              fi
+            fi
+            READY+=("$env")
+          done
+          # jq --args with an empty list prints nothing on some builds; spell out [].
+          if [[ ${#READY[@]} -eq 0 ]]; then READY_JSON='[]'; else READY_JSON=$(jq -nc '$ARGS.positional' --args "${READY[@]}"); fi
+          # Schedule: the selected (single-env) jobs move to the first READY env
+          # (falling back to the first live one when none is ready; the matrix
+          # is then skipped, see build-nightly). Release/dispatch keep SELECTED
+          # as is: the gate must not quietly move to a different env.
+          if [[ "$EVENT_NAME" == "schedule" && ${#READY[@]} -gt 0 ]]; then
+            SELECTED="${READY[0]}"
+          fi
+          # For schedule (cron) nightly: fan out across the READY envs, plus
+          # canary_envs = every live env for the one S1 direct canary job.
           # For release + workflow_dispatch: single-env to keep the gate fast.
           if [[ "$EVENT_NAME" == "schedule" ]]; then
-            FAN_OUT_ENVS="$HEALTHY_JSON"
+            FAN_OUT_ENVS="$READY_JSON"
+            CANARY_ENVS="$HEALTHY_JSON"
           else
             FAN_OUT_ENVS="[\"$SELECTED\"]"
+            CANARY_ENVS="$FAN_OUT_ENVS"
           fi
-          echo "selected_env=$SELECTED" >> "$GITHUB_OUTPUT"
-          echo "healthy_envs=$FAN_OUT_ENVS" >> "$GITHUB_OUTPUT"
+          {
+            echo "selected_env=$SELECTED"
+            echo "healthy_envs=$FAN_OUT_ENVS"
+            echo "ready_envs=$READY_JSON"
+            echo "not_ready=$NOT_READY_JSON"
+            echo "canary_envs=$CANARY_ENVS"
+          } >> "$GITHUB_OUTPUT"
           if [[ "$SELECTED" == "$PRIMARY_ENV" ]]; then
             echo "primary_healthy=true" >> "$GITHUB_OUTPUT"
             echo "fallback_used=false" >> "$GITHUB_OUTPUT"
@@ -408,6 +488,21 @@ jobs:
           echo "Healthy envs: ${HEALTHY[*]:-none}"
           echo "Fan-out envs (healthy_envs): $FAN_OUT_ENVS"
           echo "Selected (single-env fallback / release gate): $SELECTED"
+          echo "Ready envs: $READY_JSON  Not ready: $NOT_READY_JSON  Canary envs: $CANARY_ENVS"
+          # A release gate on the wrong env is worse than a red gate: when the
+          # env the gate would run on is not ready, fail with the reasons rather
+          # than fall back to a different env. (workflow_dispatch only warns:
+          # the caller asked for that env and is watching.)
+          if jq -e --arg e "$SELECTED" 'has($e)' <<<"$NOT_READY_JSON" >/dev/null; then
+            REASONS=$(jq -r --arg e "$SELECTED" '.[$e][] | "  - \(.check): \(.reason)"' <<<"$NOT_READY_JSON")
+            if [[ "$EVENT_NAME" == "release" ]]; then
+              echo "::error::Release gate env $SELECTED is not ready; refusing to run the gate there or on another env:"$'\n'"$REASONS"
+              echo "Release gate env $SELECTED is not ready:" >&2
+              printf '%s\n' "$REASONS" >&2
+              exit 1
+            fi
+            echo "::warning::selected env $SELECTED is not ready (running anyway on this $EVENT_NAME event):"$'\n'"$REASONS"
+          fi
 
   # ---- Per-PR smoke ---------------------------------------------------
   #
@@ -700,7 +795,10 @@ jobs:
   build-nightly:
     name: Prepare fixture artifact (nightly)
     needs: select-env
-    if: always() && needs.select-env.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
+    # healthy_envs == '[]' means no live env passed readiness (#1624): there is
+    # nothing to test, and an empty matrix would error every scenario job. The
+    # env-not-ready issue filed by nightly-report is the signal that night.
+    if: always() && needs.select-env.result == 'success' && needs.select-env.outputs.healthy_envs != '[]' && (github.event_name == 'schedule' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.test-suite == 'nightly'))
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     # Raised from 20 to 58 to accommodate the publish.yml human-approval wait
     # (up to ~45 min) on release triggers. The 60-min ceiling (safety-net test)
@@ -1268,7 +1366,11 @@ jobs:
       fail-fast: false
       matrix:
         # env fans out on schedule, single-env on release/dispatch (see select-env).
-        env: ${{ fromJSON(needs.select-env.outputs.healthy_envs) }}
+        # canary_envs, not healthy_envs (#1624): every LIVE env runs this one S1
+        # direct shard, ready or not, so a wrongly-red readiness probe shows up
+        # as a green leg on an env the matrix skipped. nightly-report separates
+        # these legs from the real scenario failures.
+        env: ${{ fromJSON(needs.select-env.outputs.canary_envs) }}
         merkle: [js, kubo]
         runner: ["${{ inputs.runner || 'ubuntu-latest' }}"]
     uses: ./.github/workflows/deploy.yml
@@ -2853,6 +2955,7 @@ jobs:
           RUN_URL:                ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           SELECTED_ENV:           ${{ needs.select-env.outputs.selected_env }}
           HEALTHY_ENVS:           ${{ needs.select-env.outputs.healthy_envs }}
+          NOT_READY:              ${{ needs.select-env.outputs.not_ready }}
         run: |
           emoji() { case "$1" in
             success)   echo "✅ PASS";;
@@ -2868,6 +2971,27 @@ jobs:
             e2e-ci-dispatch) TITLE="Dispatched E2E Test Pass · \`$VERSION_LABEL\`";;
             *)               TITLE="Nightly E2E Test Pass · \`$VERSION_LABEL\`";;
           esac
+
+          # Environment readiness (#1624). Built once into a file: it goes into the
+          # report body below AND into the env-not-ready issue. Empty when every
+          # live env was ready (or the check did not run).
+          : > /tmp/readiness-section.md
+          if [ -n "${NOT_READY:-}" ] && [ "$NOT_READY" != "{}" ] && echo "$NOT_READY" | jq -e 'length > 0' >/dev/null 2>&1; then
+            {
+              echo "## Environment readiness"
+              echo ""
+              echo "These envs are live but failed the readiness check, so the scenario matrix was NOT run on them (the S1 direct canary still was; its result is the last column, and a green canary on a not-ready env means the probe may be wrong)."
+              echo ""
+              echo "| Env | Failed check | Values read | Canary (S1 direct legs) |"
+              echo "|-----|--------------|-------------|--------------------------|"
+              for nr_env in $(echo "$NOT_READY" | jq -r 'keys[]'); do
+                CANARY=$(awk -F'\t' -v e="$nr_env" '$1 ~ /^Nightly S1 direct/ && $3==e { c[$2]++ } END { for (k in c) print c[k] " " k }' /tmp/all-nightly-legs.tsv | sort -k2 | paste -sd ',' - | sed 's/,/, /g')
+                CANARY="${CANARY:-not run}"
+                echo "$NOT_READY" | jq -r --arg e "$nr_env" --arg canary "$CANARY" '.[$e][] | "| \($e) | \(.check) | \(.reason | gsub("\\|"; "/")) | \($canary) |"'
+              done
+              echo ""
+            } > /tmp/readiness-section.md
+          fi
 
           # Rendered once and reused for the step summary AND the failure-issue
           # body, so both surfaces show the same per-leg table.
@@ -2894,6 +3018,7 @@ jobs:
             # column). META failures get their own line so a global failure
             # there can never render as "all green".
             join_semi() { paste -sd '|' - | sed 's/|/; /g'; }
+            cat /tmp/readiness-section.md
             echo "Environment status:"
             while IFS= read -r env; do
               [ -z "$env" ] && continue
@@ -3122,6 +3247,34 @@ jobs:
             echo "Every red leg is a lost runner: failure issue skipped on this attempt; e2e-runner-loss-rerun.yml re-runs the failed jobs once (bulletin #1622)." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
+      # Canary-only red (#1624). nightly-s1-direct also runs on envs the readiness
+      # check marked not-ready, on purpose: those legs are EXPECTED to be red and
+      # must not file the normal failure issue on top of the env-not-ready one.
+      # canary_only=true only when select-env and build-nightly succeeded, at
+      # least one leg is red, and every red leg is an S1 direct leg on a
+      # not-ready env. Anything else (including this step failing) files as before.
+      - name: Classify canary-only red
+        id: canary
+        if: always()
+        continue-on-error: true
+        env:
+          NOT_READY: ${{ needs.select-env.outputs.not_ready }}
+          SELECT_RESULT: ${{ needs.select-env.result }}
+          BUILD_RESULT: ${{ needs.build-nightly.result }}
+        run: |
+          NR_ENVS=$(printf '%s' "${NOT_READY:-}" | jq -r 'keys[]' 2>/dev/null || true)
+          RED=$(awk -F'\t' '$2=="failure"||$2=="cancelled"' /tmp/all-nightly-legs.tsv 2>/dev/null || true)
+          if [ -z "$NR_ENVS" ] || [ -z "$RED" ] || [ "$SELECT_RESULT" != success ] || [ "$BUILD_RESULT" != success ]; then
+            echo "canary_only=false" | tee -a "$GITHUB_OUTPUT"; exit 0
+          fi
+          OTHER=$(printf '%s\n' "$RED" | awk -F'\t' -v nr="$NR_ENVS" 'BEGIN { n = split(nr, a, "\n"); for (i = 1; i <= n; i++) bad[a[i]] = 1 } !($1 ~ /^Nightly S1 direct/ && ($3 in bad))' | grep -c . || true)
+          if [ "$OTHER" -eq 0 ]; then
+            echo "canary_only=true" | tee -a "$GITHUB_OUTPUT"
+            echo "Every red leg is an S1 direct canary on a not-ready env; the failure issue is skipped, the env-not-ready issue carries it."
+          else
+            echo "canary_only=false" | tee -a "$GITHUB_OUTPUT"
+          fi
+
       # workflow_dispatch runs are manual — skip auto-issue for those (maintainer
       # is already watching). schedule + release get an issue because failures
       # there indicate drift nobody was watching for. `contains(needs.*.result, …)`
@@ -3137,6 +3290,7 @@ jobs:
           always() &&
           (github.event_name == 'schedule' || github.event_name == 'release') &&
           (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) &&
+          steps.canary.outputs.canary_only != 'true' &&
           !(github.event_name == 'schedule' && github.run_attempt == 1 && steps.runner-loss.outputs.verdict == 'all-runner-loss')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -3217,6 +3371,70 @@ jobs:
               -H "Accept: application/vnd.github+json" \
               "$API_URL/repos/$REPO/issues" \
               -d "$(jq -n --arg title "$TITLE" --arg body "$BODY" --arg label "$DEDUP_LABEL" '{title: $title, body: $body, labels: [$label]}')"
+          fi
+
+      # ONE issue labelled env-not-ready (#1624), found by the label, not the
+      # title. First night: create it. Later nights: comment on it, so a
+      # multi-day outage is one thread. A re-run of the same night does not
+      # comment again. Schedule + release only, like the failure issue.
+      - name: Open or update the env-not-ready issue
+        if: >
+          always() &&
+          (github.event_name == 'schedule' || github.event_name == 'release') &&
+          needs.select-env.outputs.not_ready != '' &&
+          needs.select-env.outputs.not_ready != '{}'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          NOT_READY: ${{ needs.select-env.outputs.not_ready }}
+          EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          LABEL=env-not-ready
+          TODAY=$(date -u +%Y-%m-%d)
+          ENVS=$(echo "$NOT_READY" | jq -r 'keys | join(", ")')
+          {
+            echo "The E2E readiness check (tools/check-env-readiness.mjs, #1624) found ${ENVS} live but not testable on ${TODAY} (${EVENT}). The scenario matrix skipped it; the failures below are the environment, not the code."
+            echo ""
+            cat /tmp/readiness-section.md
+            echo "Fix the environment (DotNS profile drift: update the client or the deployment; funding: refill from //Alice; S3 fixture: re-register e2eownedns03 to Bob, see docs/e2e-bootstrap.md). Genuine scenario failures on ready envs still file the normal nightly failure issue."
+            echo ""
+            echo "- Run: $RUN_URL"
+          } > /tmp/env-not-ready-body.md
+          EXISTING=$(curl -fsSL --max-time 30 -G \
+            -H "Authorization: bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            --data-urlencode "labels=$LABEL" \
+            --data-urlencode "state=open" \
+            --data-urlencode "per_page=100" \
+            "$API_URL/repos/$REPO/issues" \
+            | jq -r 'map(select(has("pull_request") | not)) | (.[0].number // empty)')
+          if [ -n "$EXISTING" ]; then
+            if [ "${GITHUB_RUN_ATTEMPT:-1}" -gt 1 ]; then
+              echo "Re-run of the same night: #$EXISTING already has this run's comment."
+              exit 0
+            fi
+            echo "Open issue #$EXISTING is labelled $LABEL; commenting."
+            curl -fsSL --max-time 30 -o /dev/null -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/issues/$EXISTING/comments" \
+              -d "$(jq -n --arg body "$(cat /tmp/env-not-ready-body.md)" '{body: $body}')"
+          else
+            curl -fsSL --max-time 30 -o /dev/null -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/labels" \
+              -d "$(jq -n --arg name "$LABEL" '{name: $name, color: "d93f0b", description: "An e2eEligible env is live but failed the readiness check (#1624). One open issue at a time."}')" \
+              || true
+            curl -fsSL --max-time 30 -X POST \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "$API_URL/repos/$REPO/issues" \
+              -d "$(jq -n --arg title "E2E env not ready: ${ENVS} (${TODAY})" --arg body "$(cat /tmp/env-not-ready-body.md)" --arg label "$LABEL" '{title: $title, body: $body, labels: [$label]}')"
           fi
 
       - name: Note a green re-run on the day's failure issue

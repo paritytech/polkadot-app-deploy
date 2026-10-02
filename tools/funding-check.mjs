@@ -47,7 +47,7 @@ function parseArgs(argv) {
   return out;
 }
 
-async function withTimeout(promise, ms, what) {
+export async function withTimeout(promise, ms, what) {
   let timer;
   try {
     return await Promise.race([promise, new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`${what} timed out after ${ms / 1000}s`)), ms); })]);
@@ -56,7 +56,7 @@ async function withTimeout(promise, ms, what) {
   }
 }
 
-async function gatherEnv(doc, envId, signers) {
+export async function gatherEnv(doc, envId, signers) {
   const env = doc.environments.find((e) => e.id === envId);
   const base = { envId, registerStorageDeposit: env?.registerStorageDeposit === undefined ? undefined : BigInt(env.registerStorageDeposit) };
   try {

@@ -1819,8 +1819,19 @@ describe("e2e", { skip: !ENABLED }, () => {
       const S9_GRANDPA_WAIT_MS = 30_000;
       const { fixtureDir: fixA } = await makeMultiChunkFixture(`s9a-${RUN_TAG}`);
       const { fixtureDir: fixB } = await makeMultiChunkFixture(`s9b-${RUN_TAG}`);
+      // #1672: the collision is staged, not left to timing. Each deploy seeds from
+      // system_accountNextIndex, which counts the other's pending txs, so whichever
+      // finished its pre-upload checks later used to seed ABOVE the first one's chunks
+      // and nothing collided. The E2E-only nonce-seed barrier (src/e2e-nonce-barrier.ts)
+      // holds each deploy between its seed read and its first chunk submit until both
+      // have seeded, so both sign chunks from the same nonce.
+      const barrierDir = fs.mkdtempSync(path.join(os.tmpdir(), "s9-nonce-barrier-"));
       try {
-        const s9Env = { BULLETIN_GRANDPA_NATURAL_WAIT_MS: String(S9_GRANDPA_WAIT_MS) };
+        const s9Env = {
+          BULLETIN_GRANDPA_NATURAL_WAIT_MS: String(S9_GRANDPA_WAIT_MS),
+          PAD_E2E_NONCE_SEED_BARRIER: barrierDir,
+          PAD_E2E_NONCE_SEED_BARRIER_PARTIES: "2",
+        };
         // Per-deploy timeout extends DEPLOY_TIMEOUT_MS by 5 min to absorb
         // nonce-collision retries on slower testnets (paseo-next-v2 12s blocks).
         const S9_DEPLOY_TIMEOUT_MS = DEPLOY_TIMEOUT_MS + 5 * 60 * 1000;
@@ -1832,7 +1843,18 @@ describe("e2e", { skip: !ENABLED }, () => {
         assertDeploySucceeded(rA, { scenario: "S9", step: "deploy A" });
         assertDeploySucceeded(rB, { scenario: "S9", step: "deploy B" });
 
-        const combined = rA.stdout + rA.stderr + rB.stdout + rB.stderr;
+        // Race precondition: both deploys met at the barrier with the same seed. A
+        // missed barrier or different seeds means the collision was not staged; that
+        // must fail here by name, not pass or fail on whether a collision happened anyway.
+        const outs = [rA, rB].map((r) => r.stdout + r.stderr);
+        const barrierSeeds = outs.map((o) => o.match(/E2E nonce-seed barrier met: seeds \[(\d+), (\d+)\]/));
+        assert.ok(barrierSeeds.every(Boolean),
+          ">> FAIL: S9: a deploy did not meet the other at the nonce-seed barrier (timed out or never reached it), so the chunk-nonce collision was not staged. " +
+            "Barrier lines: " + outs.map((o) => (o.match(/E2E nonce-seed barrier[^\n]*/g) ?? ["<none>"]).join(" | ")).join(" ;; "));
+        assert.ok(barrierSeeds.every((m) => m[1] === m[2]),
+          `>> FAIL: S9: the two deploys seeded different chunk nonces (${barrierSeeds.map((m) => m[0]).join(" / ")}); a third party moved the signer's nonce, so the collision was not staged`);
+
+        const combined = outs.join("");
         // Accept ANY of the deploy's nonce-collision-recovery signals — not just
         // the "consumed → included" heuristic (deploy.ts nonce-advance fallback /
         // consumed-heuristic logs), but crucially the "Nonce-collision re-upload"
@@ -1848,13 +1870,13 @@ describe("e2e", { skip: !ENABLED }, () => {
           /(nonce (advanced past \d+|consumed \(current=|\d+ consumed)|Nonce-collision re-upload|nonce-advance collision)/i,
           ">> FAIL: S9: neither parallel deploy logged any nonce-collision-recovery signal " +
             "(expected one of: 'Nonce-collision re-upload', 'nonce advanced past N', or 'nonce N consumed (current=...)'). " +
-            "Both use the same signer, so their Bulletin chunk txs share a nonce counter and MUST contend. " +
-            "If this fails, the deploys ran sequentially / fixture overlap was insufficient (the race did not stage) — " +
-            "widen makeMultiChunkFixture rather than weakening this check; not necessarily a product defect (check timestamps).",
+            "Both deploys met at the nonce-seed barrier with the same seed, so their chunk txs were signed with the same nonces " +
+            "and MUST have collided: the collision-recovery path did not log its signal. Check the chunk/retry lines of both deploys.",
         );
       } finally {
         fs.rmSync(fixA, { recursive: true, force: true });
         fs.rmSync(fixB, { recursive: true, force: true });
+        fs.rmSync(barrierDir, { recursive: true, force: true });
       }
     });
   });

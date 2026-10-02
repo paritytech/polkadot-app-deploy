@@ -39,6 +39,16 @@ import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyErrorKind, ERROR_KIND_CATEGORY, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
 import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests, resolvePoolMnemonic, describeIgnoredPoolMnemonicEnv } from "../dist/pool.js";
+import { stuckQueueMessage } from "../dist/pool.js";
+// Mirrors of the anchor + slot parts of the two ChunkInclusionUnverifiedError messages in
+// src/deploy.ts; the source-pin test in the chunk-inclusion describe pins the anchors.
+const chunkUnverifiedMessage = (idxs, reason) =>
+  `Could not verify that chunk ${idxs} is stored on-chain: the TransactionByContentHash probe gave no answer (${reason}).`;
+const chunkNotIncludedMessage = (idxs) =>
+  `Chunk ${idxs} still absent at the best block after 3 re-upload rounds; not treating it as stored.`;
+const STUCK_ADDR = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
+const STUCK_HEALTH = { verdict: "stuck", samples: [], onchain: 5, nextIndex: 42, gap: 37 };
+const STUCK_POOL_MESSAGE = stuckQueueMessage("Pool account 7", STUCK_ADDR, STUCK_HEALTH, "BULLETIN_POOL_ACCOUNT_INDEX=7 pins it: unset BULLETIN_POOL_ACCOUNT_INDEX or pick another index.");
 import { merkleizeJS, merkleizeWithStableOrder, merkleizeBackend, merkleizeJSBackend, merkleizeKuboBackend, buildOrderedCar, rebuildOrderedCarFromBytes } from "../dist/merkle.js";
 import { hasIPFS } from "../dist/deploy.js";
 import { classifyFile, classifyFileHeuristic, parseManifest, isVolatilePath, MANIFEST_VERSION, MANIFEST_PATH } from "../dist/manifest.js";
@@ -2300,6 +2310,51 @@ describe("classifyErrorKind", () => {
     assert.deepStrictEqual(scrubbed, [],
       `>> FAIL: kind-scrub guard: ${scrubbed.join(", ")} contain(s) a substring Sentry's relayPiiConfig masks — the value would render as asterisks in every dashboard grouped by deploy.error_kind. Rename the kind (e.g. storage.rejected, not storage.not_authorized).`);
   });
+
+  // Chunk-inclusion and stuck-queue errors (follow-up to the S9 / #1637 fixes): each
+  // had no rule and landed in 'unknown'. The two ChunkInclusionUnverifiedError
+  // throw sites in src/deploy.ts are different mechanisms (the probe RPC gave no
+  // answer vs the chain accepted the txs but never included the chunk), so they get
+  // two kinds. The message builders below mirror the producers; the source-pin test
+  // reads src/deploy.ts so a wording change there fails here instead of silently
+  // demoting the span back to 'unknown'.
+  describe("classifyErrorKind — chunk-inclusion and stuck-queue errors", () => {
+    const deploySrc = fs.readFileSync(new URL("../src/deploy.ts", import.meta.url), "utf8");
+
+    test("source pin: the producers still contain the fragments these tests mirror", () => {
+      for (const fragment of ["Could not verify that chunk", "is stored on-chain", "still absent at the best block after", "re-upload rounds"]) {
+        assert.ok(deploySrc.includes(fragment),
+          `>> FAIL: chunk-inclusion kinds: src/deploy.ts no longer contains "${fragment}"; update chunkUnverifiedMessage/chunkNotIncludedMessage in test/test.js and the ERROR_KIND_RULES regexes together`);
+      }
+    });
+
+    test("chain.chunk_unverified: probe gave no answer; not stolen by connection/timeout rules via the interpolated reason", () => {
+      for (const reason of ["timed out", "websocket closed"]) {
+        const msg = chunkUnverifiedMessage("4", reason);
+        assert.strictEqual(classifyErrorKind(msg), "chain.chunk_unverified",
+          `>> FAIL: chunk-inclusion kinds: reason "${reason}" made the message classify as ${classifyErrorKind(msg)}`);
+        assert.strictEqual(classifyDeployError(msg), "environment");
+      }
+    });
+
+    test("chain.chunk_not_included: chain accepts txs but does not include the chunk", () => {
+      for (const list of ["1", "1, 2, 3"]) {
+        const msg = chunkNotIncludedMessage(list);
+        assert.strictEqual(classifyErrorKind(msg), "chain.chunk_not_included",
+          `>> FAIL: chunk-inclusion kinds: got ${classifyErrorKind(msg)} for "${msg}"`);
+        assert.strictEqual(classifyDeployError(msg), "environment");
+      }
+    });
+
+    test("chain.queue_stuck: pinned pool account and direct signer share the kind", () => {
+      const direct = stuckQueueMessage("Direct signer //dotns/3", STUCK_ADDR, STUCK_HEALTH, "Deploy with another signer or derivation path, or wait for the queue to clear.");
+      for (const msg of [STUCK_POOL_MESSAGE, direct]) {
+        assert.strictEqual(classifyErrorKind(msg), "chain.queue_stuck", `>> FAIL: stuck-queue kind: got ${classifyErrorKind(msg)} for "${msg}"`);
+        assert.strictEqual(classifyDeployError(msg), "environment");
+      }
+    });
+  });
+
 });
 
 // ---------------------------------------------------------------------------

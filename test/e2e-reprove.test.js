@@ -22,6 +22,7 @@ import assert from "node:assert/strict";
 import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS } from "../dist/dotns.js";
 import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig } from "../dist/environments.js";
 import { trackTimers, armExitGuard } from "./helpers/e2e-exit-guard.js";
+import { installE2eResultHook } from "./helpers/e2e-result.js";
 
 const ENABLED = process.env.E2E === "1";
 if (ENABLED) trackTimers();
@@ -45,6 +46,7 @@ async function resolveDotnsEnvConnectOptions() {
 }
 
 describe("S-REPROVE — auto-reprove on bound-likely-stale", { skip: !ENABLED }, () => {
+  installE2eResultHook({ scenario: "s-reprove", env: PAD_ENV ?? "" });
   after(() => armExitGuard());
   // Positive path: inject "bound-likely-stale" via the test seam, verify that
   // preflight runs the reprove branch and emits the expected log lines.

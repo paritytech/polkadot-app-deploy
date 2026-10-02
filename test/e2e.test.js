@@ -9,6 +9,7 @@ import { buildFixture as buildIncrementalFixture } from "./helpers/e2e-increment
 import { buildManifestSidecar, buildPvmAppManifest } from "./helpers/e2e-manifest-fixture.js";
 import { runBulletinDeploy } from "./helpers/e2e-cli.js";
 import { trackTimers, armExitGuard } from "./helpers/e2e-exit-guard.js";
+import { installE2eResultHook } from "./helpers/e2e-result.js";
 import { resolveContenthashOnChain, resolveTextRecordOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
 import { S3_OWNED_LABEL, tieredFixtureLabel, smokeLabel, digitsToLetters } from "../tools/lib/e2e-fixtures.mjs";
@@ -598,6 +599,8 @@ async function detectDotnsProfile() {
 }
 
 describe("e2e", { skip: !ENABLED }, () => {
+  // Registered before armExitGuard's `after` so the file is on disk first (#1625).
+  installE2eResultHook({ scenario: SCENARIO, signer: SIGNER, merkle: MERKLE, env: E2E_ENV_ID });
   after(() => armExitGuard());
   before(async () => {
     signerPopStatus = await probeSignerPopStatus({

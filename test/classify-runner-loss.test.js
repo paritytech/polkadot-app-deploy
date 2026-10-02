@@ -128,3 +128,45 @@ describe("collectJobs (stubbed GitHub API)", () => {
     assert.deepEqual(r.runnerLoss, ["A"]);
   });
 });
+
+describe("collectJobs: counted job set and unknown state (#1652, #1651)", () => {
+  const json = (body) => () => ({ ok: true, status: 200, json: async () => body });
+  const stubFetch = (routes) => async (url) => {
+    for (const [frag, make] of routes) if (url.includes(frag)) return make();
+    throw new Error(`unrouted ${url}`);
+  };
+  const LOST = [{ annotation_level: "failure", message: "The self-hosted runner lost communication with the server." }];
+
+  test("excludeRe drops jobs outside nightly-report's needs before anything is read", async () => {
+    const seen = [];
+    const base = stubFetch([
+      ["/attempts/1/jobs?", json({ jobs: [{ id: 1, name: "Nightly S1 pool (preview)", conclusion: "failure" }, { id: 2, name: "Nightly · DotNS address drift", conclusion: null, status: "queued" }] })],
+      ["/check-runs/1/annotations", json(LOST)],
+    ]);
+    const fetchImpl = (url, o) => { seen.push(url); return base(url, o); };
+    const jobs = await collectJobs({ apiUrl: "https://x", repo: "o/r", runId: 9, attempt: 1, token: "t", excludeRe: /^Nightly · DotNS address drift/, fetchImpl });
+    assert.equal(classifyRunnerLoss(jobs).verdict, "all-runner-loss", ">> FAIL: classifier: the excluded queued job must not block or change the verdict");
+    assert.ok(!seen.some((u) => u.includes("/check-runs/2/")), ">> FAIL: classifier: an excluded job must not be read");
+  });
+
+  test("a counted job with no conclusion yet throws (the CLI turns it into verdict=error)", async () => {
+    const fetchImpl = stubFetch([
+      ["/attempts/1/jobs?", json({ jobs: [{ id: 1, name: "Nightly S1", conclusion: "failure" }, { id: 2, name: "Nightly S8", conclusion: null, status: "in_progress" }] })],
+      ["/check-runs/1/annotations", json(LOST)],
+    ]);
+    await assert.rejects(
+      collectJobs({ apiUrl: "https://x", repo: "o/r", runId: 9, attempt: 1, token: "t", fetchImpl }),
+      /unknown state: 1 counted job\(s\) not finished \(Nightly S8\)/,
+      ">> FAIL: classifier: an unfinished counted job must fail closed",
+    );
+  });
+
+  test("the report job is never counted even while it is in progress", async () => {
+    const fetchImpl = stubFetch([
+      ["/attempts/1/jobs?", json({ jobs: [{ id: 1, name: "Nightly S1", conclusion: "failure" }, { id: 2, name: "Nightly E2E Report", conclusion: null, status: "in_progress" }] })],
+      ["/check-runs/1/annotations", json(LOST)],
+    ]);
+    const jobs = await collectJobs({ apiUrl: "https://x", repo: "o/r", runId: 9, attempt: 1, token: "t", fetchImpl });
+    assert.equal(classifyRunnerLoss(jobs).verdict, "all-runner-loss");
+  });
+});

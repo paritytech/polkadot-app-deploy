@@ -420,6 +420,10 @@ export function getDeployAttributes(domain: string): Record<string, string | num
     "deploy.tool_version": VERSION,
     "deploy.runner": resolveRunner(),
     "deploy.runner_type": resolveRunnerType(),
+    // #1646: the telemetry verifier scopes its Sentry query to the current CI run
+    // with these (strings, present on every span: both-values rule).
+    "deploy.ci_run_id": process.env.GITHUB_RUN_ID || "none",
+    "deploy.ci_run_attempt": process.env.GITHUB_RUN_ATTEMPT || "none",
     // bulletin #1626: the E2E harness sets PAD_E2E_EXPECT_FAIL=1 on a deploy it
     // asserts will fail (S3 owned-elsewhere, governance-reserved, subdomain
     // orphan…), so the E2E dashboard can exclude those deliberate error spans.

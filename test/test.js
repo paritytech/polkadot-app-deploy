@@ -3421,6 +3421,8 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.tool_version",
     "deploy.runner",
     "deploy.runner_type",
+    "deploy.ci_run_id",
+    "deploy.ci_run_attempt",
     "deploy.expected_error",
     // deploy.pr, deploy.host_app, deploy.host_app_version are conditional — not checked here
   ];
@@ -11782,41 +11784,97 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
   }
 
   // Port of bulletin #1638 (#1622): a lost runner used to file a "nothing to fix" issue
-  // each time. nightly-report now classifies the run (shared script) and skips
-  // the issue on a first-attempt SCHEDULED all-runner-loss run; the re-run is
-  // issued by e2e-runner-loss-rerun.yml because rerun-failed-jobs is refused
-  // for a run still in progress, and nightly-report is part of that run.
-  test(".github/workflows: runner-loss re-run is gated on schedule + attempt 1 + the classifier verdict, and the issue is skipped when it fires (bulletin #1622)", () => {
+  // each time. nightly-report classifies its own attempt (shared script) and
+  // DEFERS the issue on a first-attempt SCHEDULED all-runner-loss run.
+  // cattery-scheduler[bot] owns re-running (#1645). e2e-runner-loss-rerun.yml
+  // used to POST rerun-failed-jobs, which double-fired with cattery and filed
+  // spurious issues when refused (#1650). It is now a watchdog that re-runs
+  // nothing and files the deferred issue when no newer attempt appears. This
+  // test used to assert the re-run POST, actions: write and the
+  // steps.rerun.outcome fallback. Those were the bugs, so it now asserts
+  // their absence and the watchdog contract instead.
+  test(".github/workflows: runner-loss issue is deferred on schedule + attempt 1 + all-runner-loss, and the watchdog files it without re-running anything (#1622, #1645, #1650, #1651)", () => {
     const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
     const report = jobBlock(e2e, "nightly-report");
     const steps = report.split(/\n(?= {6}- )/);
     const classifyStep = steps.find((step) => /- name: Classify runner loss$/m.test(step));
+    const deferStep = steps.find((step) => /- name: Defer the failure issue to the runner-loss watchdog$/m.test(step));
     const openStep = steps.find((step) => /- name: Open failure issue$/m.test(step));
     assert.ok(classifyStep, ">> FAIL: runner-loss: nightly-report must have a 'Classify runner loss' step");
+    assert.ok(deferStep, ">> FAIL: runner-loss: nightly-report must have the 'Defer the failure issue to the runner-loss watchdog' step the watchdog reads");
     assert.match(classifyStep, /id: runner-loss/, ">> FAIL: runner-loss: the classify step must expose id runner-loss");
     assert.match(classifyStep, /node \.github\/scripts\/classify-runner-loss\.cjs/,
       ">> FAIL: runner-loss: nightly-report must use the shared classifier script, not a re-inlined copy");
     assert.match(classifyStep, /continue-on-error: true/,
       ">> FAIL: runner-loss: a classifier failure must never block the failure issue");
-    assert.match(openStep,
-      /!\(github\.event_name == 'schedule' && github\.run_attempt == 1 && steps\.runner-loss\.outputs\.verdict == 'all-runner-loss'\)/,
-      ">> FAIL: runner-loss: Open failure issue must be skipped only on schedule + run_attempt 1 + all-runner-loss");
+    assert.match(classifyStep, /RUN_ATTEMPT: \$\{\{ github\.run_attempt \}\}/,
+      ">> FAIL: runner-loss: nightly-report must classify its own attempt (#1645)");
+    assert.doesNotMatch(deferStep, /continue-on-error/,
+      ">> FAIL: runner-loss: the defer step must not be continue-on-error, or a failed deferral would read as success to the watchdog");
+    assert.match(deferStep, /id: runner-loss-defer/, ">> FAIL: runner-loss: the defer step must expose id runner-loss-defer");
+
+    // The defer gate must be exactly 'the issue would be filed, but every red leg is a lost runner'.
+    // If it drifted from Open's gate, a night could be neither filed nor deferred.
+    const gate = (step) => (step.match(/^ {8}if: >\n((?: {10}.*\n?)+)/m) ?? [])[1]?.replace(/\s+/g, " ").trim() ?? "";
+    const openGate = gate(openStep);
+    const deferGate = gate(deferStep);
+    assert.match(openGate, /steps\.runner-loss-defer\.outcome != 'success'$/,
+      ">> FAIL: runner-loss: Open failure issue must be skipped only when the defer step succeeded");
+    const shared = openGate
+      .replace(/ && steps\.runner-loss-defer\.outcome != 'success'$/, "")
+      .replace("(github.event_name == 'schedule' || github.event_name == 'release')", "github.event_name == 'schedule' && github.run_attempt == 1");
+    assert.equal(deferGate, `${shared} && steps.runner-loss.outputs.verdict == 'all-runner-loss'`,
+      ">> FAIL: runner-loss: the defer gate must equal Open failure issue's gate restricted to schedule + attempt 1 + all-runner-loss");
     assert.doesNotMatch(report, /actions\/runs\/[^\s"]*rerun-failed-jobs/,
-      ">> FAIL: runner-loss: nightly-report must not POST rerun-failed-jobs itself — GitHub refuses it for a run still in progress");
+      ">> FAIL: runner-loss: nightly-report must not POST rerun-failed-jobs");
 
     const rr = fs.readFileSync(".github/workflows/e2e-runner-loss-rerun.yml", "utf-8");
+    const rrCode = rr.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
     assert.match(rr, /workflow_run:\s*\n\s*workflows: \["E2E \(Paseo Bulletin\)"\]\s*\n\s*types: \[completed\]/,
-      ">> FAIL: runner-loss: the re-run workflow must trigger on completion of the E2E workflow");
-    assert.match(rr, /github\.event\.workflow_run\.event == 'schedule'/, ">> FAIL: runner-loss: re-run must be schedule-only (never release)");
-    assert.match(rr, /github\.event\.workflow_run\.run_attempt == 1/, ">> FAIL: runner-loss: attempt >= 2 must never auto-re-run");
-    assert.match(rr, /github\.event\.workflow_run\.conclusion == 'failure'/, ">> FAIL: runner-loss: re-run only fires for a failed run");
-    assert.match(rr, /steps\.classify\.outputs\.verdict == 'all-runner-loss'/, ">> FAIL: runner-loss: the POST must be gated on the all-runner-loss verdict");
-    assert.match(rr, /node \.github\/scripts\/classify-runner-loss\.cjs/, ">> FAIL: runner-loss: re-run workflow must use the shared classifier script");
-    assert.match(rr, /actions\/runs\/\$RUN_ID\/rerun-failed-jobs/, ">> FAIL: runner-loss: re-run workflow must POST rerun-failed-jobs");
-    assert.match(rr, /actions: write/, ">> FAIL: runner-loss: re-run workflow needs actions: write");
-    assert.match(rr, /steps\.rerun\.outcome == 'failure'/,
-      ">> FAIL: runner-loss: a failed re-run POST must file the issue nightly-report skipped");
+      ">> FAIL: runner-loss: the watchdog must trigger on completion of the E2E workflow");
+    assert.match(rr, /github\.event\.workflow_run\.event == 'schedule'/, ">> FAIL: runner-loss: the watchdog is schedule-only, like the deferral");
+    assert.match(rr, /github\.event\.workflow_run\.conclusion != 'success'/,
+      ">> FAIL: runner-loss: the watchdog must look at every non-green scheduled attempt (a cancelled-only run concludes cancelled)");
+    assert.doesNotMatch(rrCode, /rerun-failed-jobs/, ">> FAIL: runner-loss: the watchdog must not re-run anything (cattery owns re-running, #1645/#1650)");
+    assert.doesNotMatch(rrCode, /actions: write/, ">> FAIL: runner-loss: the watchdog must not hold actions: write");
+    assert.match(rrCode, /actions: read/, ">> FAIL: runner-loss: the watchdog needs actions: read");
+    assert.match(rrCode, /node \.github\/scripts\/runner-loss-watchdog\.cjs/, ">> FAIL: runner-loss: the watchdog must use the shared script");
+    assert.match(rrCode, /RUN_ATTEMPT: \$\{\{ github\.event\.workflow_run\.run_attempt \|\| inputs\.run_attempt \}\}/,
+      ">> FAIL: runner-loss: the watchdog must judge the triggering attempt (#1645)");
+    assert.match(rrCode, /steps\.decide\.outputs\.decision == 'file' \|\| steps\.decide\.outcome == 'failure'/,
+      ">> FAIL: runner-loss: the filing step must also run when the decision step failed (fail closed, #1651)");
+    assert.match(rrCode, /labels: \[\$label\]/, ">> FAIL: runner-loss: the watchdog's issue must carry the night's dedup label (#1650)");
     assert.match(rr, /dry_run:[\s\S]*?default: true/, ">> FAIL: runner-loss: workflow_dispatch dry_run must default to true");
+  });
+
+  // #1652: the in-run runner-loss verdict must count exactly the jobs
+  // nightly-report waits for. The API exposes job display names, not ids, so
+  // EXCLUDE_JOBS lists the names of every job OUTSIDE needs. This guards that
+  // list against the needs line: a new job outside needs that is missing from
+  // it would be counted (possibly still running), and a needs job that matches
+  // it would be ignored.
+  test(".github/workflows: nightly-report's EXCLUDE_JOBS matches every job outside its needs and none inside (#1652)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const needs = new Set(parseNeedsRefs(report));
+    const raw = (report.match(/^ {10}EXCLUDE_JOBS: (.*)$/m) ?? [])[1];
+    assert.ok(raw, ">> FAIL: #1652: the Classify runner loss step must set EXCLUDE_JOBS");
+    const exclude = new RegExp(raw);
+    const jobsSection = e2e.slice(e2e.match(/^jobs:\s*$/m).index);
+    const ids = [...jobsSection.matchAll(/^ {2}([\w-]+):\s*$/gm)].map((m) => m[1]);
+    assert.ok(ids.length > 20, ">> FAIL: #1652: could not enumerate e2e.yml jobs");
+    for (const id of ids) {
+      if (id === "nightly-report") continue;
+      const name = (jobBlock(e2e, id).match(/^ {4}name: (.*)$/m) ?? [])[1];
+      assert.ok(name, `>> FAIL: #1652: job ${id} has no name:`);
+      // The static part of the name, before any \${{ }} (matrix/outputs).
+      const stem = name.split("${{")[0];
+      if (needs.has(id)) {
+        assert.ok(!exclude.test(stem), `>> FAIL: #1652: job ${id} ("${name}") is in nightly-report needs but EXCLUDE_JOBS matches it, so its red legs would be ignored`);
+      } else {
+        assert.ok(exclude.test(stem) || /E2E Report/.test(stem), `>> FAIL: #1652: job ${id} ("${name}") is outside nightly-report needs but EXCLUDE_JOBS does not match it, so it would be counted while possibly still running`);
+      }
+    }
   });
 
   // Port of bulletin #1427/#1392: a registry ECONNRESET during an install

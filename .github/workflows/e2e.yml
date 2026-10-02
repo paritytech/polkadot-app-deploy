@@ -3450,17 +3450,14 @@ jobs:
             echo "DEDUP_LABEL=$DEDUP_LABEL"
           } >> "$GITHUB_ENV"
 
-      # Runner-loss verdict (port of bulletin #1638 / #1622). Logs on every event;
-      # on a first-attempt SCHEDULED run whose every red leg is a lost runner, the
-      # failure issue below is skipped because e2e-runner-loss-rerun.yml will
-      # re-run the failed jobs. This job cannot issue that re-run itself:
-      # rerun-failed-jobs is refused while the run (which contains this job) is
-      # still in progress. Both workflows use the same classifier script, so
-      # they agree about the run; if the re-run POST fails, that workflow files
-      # the issue itself. Release runs are never skipped or auto-re-run: the
-      # release gate is judged by a human.
-      # continue-on-error on all three steps: a classifier hiccup must never
-      # suppress an issue, because anything but "all-runner-loss" files as before.
+      # Runner-loss verdict (port of bulletin #1638 / #1622). Logs on every event.
+      # Classifies THIS attempt (RUN_ATTEMPT, #1645) and only the jobs in this
+      # job's `needs` (#1652): EXCLUDE_JOBS names every job outside them, so the
+      # verdict cannot change after this job has run. tests guard that list
+      # against the needs line above. Any classifier error or unfinished counted
+      # job prints verdict=error and fails this step: anything but
+      # all-runner-loss files the failure issue as before (#1651).
+      # continue-on-error: a classifier hiccup must never suppress an issue.
       - name: Classify runner loss
         id: runner-loss
         if: always()
@@ -3470,13 +3467,10 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_API_URL: ${{ github.api_url }}
           RUN_ID: ${{ github.run_id }}
-          EVENT: ${{ github.event_name }}
-          ATTEMPT: ${{ github.run_attempt }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          EXCLUDE_JOBS: ^(Detect signature-only push|Classify package\.json/lock diff|PR · |PR E2E Report|Dispatch · |Chain-call arg encoding|Nightly · DotNS address drift|Nightly · Chain identity)
         run: |
-          node .github/scripts/classify-runner-loss.cjs | tee /tmp/runner-loss.txt
-          if [ "$EVENT" = schedule ] && [ "$ATTEMPT" = 1 ] && grep -q 'verdict=all-runner-loss' /tmp/runner-loss.txt; then
-            echo "Every red leg is a lost runner: failure issue skipped on this attempt; e2e-runner-loss-rerun.yml re-runs the failed jobs once (bulletin #1622)." | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
+          node .github/scripts/classify-runner-loss.cjs
 
       # Canary-only red (#1624). nightly-s1-direct also runs on envs the readiness
       # check marked not-ready, on purpose: those legs are EXPECTED to be red and
@@ -3506,6 +3500,34 @@ jobs:
             echo "canary_only=false" | tee -a "$GITHUB_OUTPUT"
           fi
 
+      # Runner-loss deferral (#1622; watchdog design, #1645/#1650/#1651).
+      # Runs exactly when the failure issue below would be filed but for
+      # runner loss: a first-attempt SCHEDULED run whose every red leg in
+      # `needs` is a lost runner. The issue is deferred, not dropped.
+      # e2e-runner-loss-rerun.yml (the watchdog) reads this step's conclusion
+      # for this attempt. A newer attempt's own report files the issue if it
+      # is still red (attempts >= 2 never defer). If no newer attempt appears
+      # after its grace period, the watchdog files the issue with the label and
+      # title printed here, so dedup and "Re-run passed" find it. In this repo
+      # nothing re-runs a red attempt automatically (no cattery-scheduler on
+      # ubuntu-latest), so a runner-loss night is filed by the watchdog.
+      # Release runs never defer. Keep this gate the complement of the Open
+      # failure issue gate (test/test.js guards it).
+      - name: Defer the failure issue to the runner-loss watchdog
+        id: runner-loss-defer
+        if: >
+          always() &&
+          github.event_name == 'schedule' && github.run_attempt == 1 &&
+          (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) &&
+          steps.canary.outputs.canary_only != 'true' &&
+          steps.runner-loss.outputs.verdict == 'all-runner-loss'
+        run: |
+          # The watchdog parses these two lines out of this job's log. printf
+          # keeps the marker text out of the echoed script itself.
+          printf '%s %s\n' "runner-loss-watchdog:" "dedup_label=${DEDUP_LABEL:?Resolve step did not set DEDUP_LABEL}"
+          printf '%s %s\n' "runner-loss-watchdog:" "title=${ISSUE_TITLE:?Resolve step did not set ISSUE_TITLE}"
+          echo "Every red leg is a lost runner: the failure issue is deferred to the runner-loss watchdog (it files it if no newer attempt accounts for the night)." | tee -a "$GITHUB_STEP_SUMMARY"
+
       # workflow_dispatch runs are manual — skip auto-issue for those (maintainer
       # is already watching). schedule + release get an issue because failures
       # there indicate drift nobody was watching for. `contains(needs.*.result, …)`
@@ -3522,7 +3544,7 @@ jobs:
           (github.event_name == 'schedule' || github.event_name == 'release') &&
           (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) &&
           steps.canary.outputs.canary_only != 'true' &&
-          !(github.event_name == 'schedule' && github.run_attempt == 1 && steps.runner-loss.outputs.verdict == 'all-runner-loss')
+          steps.runner-loss-defer.outcome != 'success'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -3762,6 +3784,7 @@ jobs:
             --org paritytech \
             --project 4511093597405264 \
             --tag "$DEPLOY_TAG" \
+            --run-id "$GITHUB_RUN_ID" \
             --version "$BULLETIN_DEPLOY_VERSION" \
             --since 6h \
             --min-spans 4 \
@@ -3801,6 +3824,7 @@ jobs:
             --org paritytech \
             --project 4511093597405264 \
             --tag "$DEPLOY_TAG" \
+            --run-id "$GITHUB_RUN_ID" \
             --since 24h \
             --min-distinct 5 \
             --max-share 0.40 \

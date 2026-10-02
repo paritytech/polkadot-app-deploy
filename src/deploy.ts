@@ -1892,6 +1892,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
                 try { await doReconnect(); } catch { /* fall through to retry / final-attempt throw */ }
               }
               if (attempt === MAX_REPROBE_RETRIES) {
+                // twin: upstream throws chunkFailureError here (structural InvalidTransaction variant), which this repo has not taken.
                 throw new Error(`Nonce-collision re-upload of chunk ${idx + 1} failed after ${MAX_REPROBE_RETRIES} attempts: ${e.message?.slice(0, 100)}`);
               }
             }

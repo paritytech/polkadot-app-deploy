@@ -4,10 +4,9 @@
 // `run:` blocks of the workflows under bash with a stub curl. Nothing touches
 // the network.
 //
-// Twin port: upstream keeps this file as test/formal-ci-runner-loss.test.js and
-// its helpers under formal/tla-ci/replay/. The formal/ tree is not mirrored
-// here, so the three helpers live in test/helpers/workflow-replay/ unchanged and
-// this file carries the same behavioural assertions as plain unit tests.
+// Twin port: same file name as upstream; its helpers live upstream under
+// formal/tla-ci/replay/, which is not mirrored, so they are copied unchanged
+// into test/helpers/workflow-replay/. Only the import paths differ.
 //
 // The fix (option D: upstream's cattery-scheduler[bot] owns re-running, and
 // e2e-runner-loss-rerun.yml became a watchdog that never re-runs) is asserted

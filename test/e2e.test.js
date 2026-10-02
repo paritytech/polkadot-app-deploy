@@ -11,6 +11,7 @@ import { runBulletinDeploy } from "./helpers/e2e-cli.js";
 import { trackTimers, armExitGuard } from "./helpers/e2e-exit-guard.js";
 import { resolveContenthashOnChain, resolveTextRecordOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
+import { tieredFixtureLabel, smokeLabel, digitsToLetters } from "../tools/lib/e2e-fixtures.mjs";
 import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 import { resolveE2eEnv, resolveE2eEnvId } from "./helpers/e2e-env.js";
@@ -224,6 +225,11 @@ function pickStableLabel() {
 
 function pickDirectLabel() {
   return signerPopStatus >= 2 ? "e2edirect" : "e2edirect01";
+}
+// bulletin #1623: the per-tier fixed label Alice ROOT owns for a scenario whose property
+// is not registration (see tools/lib/e2e-fixtures.mjs).
+function tieredLabel(fixture) {
+  return tieredFixtureLabel(fixture, process.env.DEPLOY_TAG);
 }
 // Per-leg domain isolation for nightly-pr-coverage (#863 follow-up). Multiple
 // pool legs (s-inc js/kubo, s-inc-roundtrip, s-inc-portability) share pickIncLabel
@@ -503,10 +509,7 @@ function normalizeGatewayBase(url) {
 // for the other), so the entropy segment must never end in (or consist of)
 // a raw digit.
 function tagToLetters(tag) {
-  return String(tag)
-    .toLowerCase()
-    .replace(/[^a-z0-9]/g, "")
-    .replace(/[0-9]/g, (d) => String.fromCharCode(97 + Number(d)));
+  return digitsToLetters(String(tag).toLowerCase().replace(/[^a-z0-9]/g, ""));
 }
 
 // Both label shapes below need a FIXED-WIDTH entropy segment (8 chars total
@@ -629,9 +632,14 @@ describe("e2e", { skip: !ENABLED }, () => {
     });
   });
 
-  describe("S1-SMOKE — happy path, per-run fresh label", { skip: SCENARIO !== "s1-smoke" }, () => {
-    test(`smoke ${SIGNER}/${MERKLE} on fresh label`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
-      const label = pickFreshRunLabel("e2esmoke");
+  describe("S1-SMOKE — happy path, per-PR label", { skip: SCENARIO !== "s1-smoke" }, () => {
+    test(`smoke ${SIGNER}/${MERKLE} on the PR's own label`, { timeout: DEPLOY_TIMEOUT_MS + 30_000 }, async () => {
+      // bulletin #1623: one label per PR (E2E_PR_NUMBER), registered on that PR's first
+      // E2E run and redeployed by its later pushes. A shared fixed label would
+      // let two PRs (separate concurrency groups) read back each other's CID.
+      // No PR number (push to main, test-suite=pr dispatch, local) = the tier's
+      // provisioned label.
+      const label = smokeLabel(process.env.DEPLOY_TAG, process.env.E2E_PR_NUMBER);
       const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       try {
@@ -1329,17 +1337,21 @@ describe("e2e", { skip: !ENABLED }, () => {
   // Spec: port of bulletin #1571/#1387.
   describe("S-INC-CROSSLABEL — cross-label dedup with no previous manifest", { skip: SCENARIO !== "s-inc-crosslabel" }, () => {
     test(`second label's first-ever deploy still skips section-1 chunks uploaded under the first label`, { timeout: (DEPLOY_TIMEOUT_MS + 30_000) * 2 }, async () => {
-      // #274 (mirror of bulletin #1589): labelA/labelB used to be
-      // pickFreshRunLabel("e2exlbla")/("e2exlblb") with no merkle
-      // discriminator. Both derive from RUN_TAG (`${GITHUB_RUN_ID}-${sha7}`),
-      // which is identical for the js and kubo matrix legs of one workflow
-      // run, so the two legs picked the SAME labels and whichever leg
-      // deployed second found label B already deployed. Folding MERKLE
-      // ("js"/"kubo", always letter-terminated) into the prefix makes the two
-      // legs' labels distinct while keeping the shared RUN_TAG entropy that
-      // makes each leg's own labels distinct run-to-run.
-      const labelA = pickFreshRunLabel(`e2exlbla${MERKLE}`);
-      const labelB = pickFreshRunLabel(`e2exlblb${MERKLE}`);
+      // #274 (mirror of bulletin #1589): the js and kubo matrix legs of one run
+      // must not share labels, or the second leg finds label B already deployed
+      // and fails the "first-ever deploy" assertion below. MERKLE is part of
+      // both names.
+      //
+      // bulletin #1623: label A only seeds the shared chunks, so it is a fixed
+      // per-tier label Alice ROOT already owns. Label B must have an EMPTY
+      // contenthash ("Manifest: first deploy" prints only when the previous
+      // contenthash reads 0x, and setContenthash cannot clear one), so it is a
+      // fresh SUBNAME of A: never deployed by construction, and
+      // registerSubdomain pays no PopRules deposit. Per-process entropy (not
+      // just RUN_TOKEN) keeps a retry inside the same run from redeploying the
+      // same B.
+      const labelA = tieredLabel(`s-inc-crosslabel-a-${MERKLE}`);
+      const labelB = `b${RUN_TOKEN}${Date.now().toString(36)}.${labelA}`;
       const tld = await resolveE2eTld();
       const fixA = fs.mkdtempSync(path.join(os.tmpdir(), "e2exlbl-A-"));
       const fixB = fs.mkdtempSync(path.join(os.tmpdir(), "e2exlbl-B-"));
@@ -1377,7 +1389,7 @@ describe("e2e", { skip: !ENABLED }, () => {
         assertStdoutMatches(rB.stdout, /Manifest:\s+first deploy \(no previous manifest\)/, {
           scenario: "S-INC-CROSSLABEL",
           what: "manifest_source: none / first_deploy for label B",
-          hint: "label B must be genuinely fresh (never deployed before). If this fails with an 'embedded'/'heuristic_fallback' line instead, label B collided with a previously-used domain — check pickFreshRunLabel's per-run uniqueness.",
+          hint: "label B must be genuinely fresh (never deployed before). If this fails with an 'embedded'/'heuristic_fallback' line instead, label B collided with a previously-used name — check the per-process entropy in label B's sublabel.",
         });
 
         // Despite no previous manifest, the probe-only path must still find
@@ -1656,9 +1668,10 @@ describe("e2e", { skip: !ENABLED }, () => {
   //                  AND for #278's suppression NOT trapping us in an
   //                  infinite loop.
   //
-  // Uses a fresh per-run label (pickFreshRunLabel("s8smoke")) so concurrent
-  // nightly runs don't race on the same domain. Both subtests use the same
-  // label binding — pick once at describe scope, use twice. Keep the two
+  // Uses the tier's fixed label (tieredLabel("s8"), bulletin #1623): the property is the
+  // reconnect, not registration, and per-tier labels keep concurrent nightly
+  // tiers off the same domain. Both subtests use the same label binding — pick
+  // once at describe scope, use twice. Keep the two
   // subtests serial: both use the same signer/account on paseo-next-v2, so
   // overlapping deploys can race nonces and make fallback inclusion checks
   // ambiguous.
@@ -1679,7 +1692,7 @@ describe("e2e", { skip: !ENABLED }, () => {
   //     batches still trigger doReconnect rather than running the next
   //     batch against a destroyed client).
   describe("S8 — chunk-upload survives WS halt + budget bails clean on storm", { skip: SCENARIO !== "s8", concurrency: false }, () => {
-    const label = pickFreshRunLabel("s8smoke");
+    const label = tieredLabel("s8");
     test("drop-once mid-upload: deploy succeeds via reconnect, budget never trips", { timeout: DEPLOY_TIMEOUT_MS + 60_000 }, async () => {
       // Multi-chunk fixture so the upload spans long enough that mid-upload
       // is a real point in time (not after-the-fact). 7 MB → 4 chunks of 2 MB.
@@ -1867,7 +1880,9 @@ describe("e2e", { skip: !ENABLED }, () => {
       });
       const { fixtureDir } = await makeMultiChunkFixture(`s-grandpa-reupload-${RUN_TAG}`);
       try {
-        const label = pickFreshRunLabel("sgreupload");
+        // bulletin #1623: fixed per-tier label; the property is the stale-head probe,
+        // which runs at the end of Phase B on every deploy, owned or fresh.
+        const label = tieredLabel("s-grandpa-reupload");
         const tld = await resolveE2eTld();
         const args = [
           fixtureDir,
@@ -1969,12 +1984,12 @@ describe("e2e", { skip: !ENABLED }, () => {
     // either because no chunk expired or because the code path is broken).
     // Deploy exit code: explicitly NOT asserted. Either outcome is fine.
     //
-    // Label uses noStatusRunLabel (PoP-independent) so the test works in
-    // both PopFull and NoStatus signer environments. Period=4 (~24s on 6s
+    // Label is the tier's fixed Alice-ROOT-owned label (bulletin #1623); the property is
+    // the chunk retry path in the storage phase, which runs before DotNS. Period=4 (~24s on 6s
     // blocks) is generous enough to let SOME chunks land while still
     // triggering expiry on slower batches.
     test("forced chunk expiry engages the retry path", { timeout: DEPLOY_TIMEOUT_MS + 3 * 60 * 1000 }, async () => {
-      const label = noStatusRunLabel("smortality");
+      const label = tieredLabel("s-mortality");
       const tld = await resolveE2eTld();
       const { fixtureDir } = await makeMultiChunkFixture(`s-mortality-${RUN_TAG}`);
       try {
@@ -2161,11 +2176,12 @@ describe("e2e", { skip: !ENABLED }, () => {
 
   describe("S-CAR — deploy from pre-built CAR file (--input-car)", { skip: SCENARIO !== "s-car" }, () => {
     test(`deploy pool/${MERKLE} via --input-car matches normal deploy CID`, { timeout: DEPLOY_TIMEOUT_MS * 2 + 60_000 }, async () => {
-      // Use a fresh per-run label so first deploy hits register() rather than
-      // racing with S1 on the stable pool label. Env var LABEL lets the nightly workflow
-      // pass a unique per-run label; default falls back to a local stable label.
+      // bulletin #1623: the tier's fixed label, owned by Alice ROOT and
+      // provisioned from tools/lib/e2e-fixtures.mjs; separate from S1's pool
+      // label, so no race with it. The property is the --input-car CID and
+      // contenthash, not registration. LABEL still overrides it for a manual run.
       const tld = await resolveE2eTld();
-      const label = process.env.LABEL ?? (signerPopStatus >= 2 ? `e2escarpool.${tld}` : `e2escarpool01.${tld}`);
+      const label = process.env.LABEL ?? `${tieredLabel("s-car")}.${tld}`;
       const { fixtureDir } = await mutateFixture(RUN_TAG);
       const dumpPath = path.join(os.tmpdir(), `e2e-s-car-${Date.now()}.car`);
       try {

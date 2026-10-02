@@ -17405,11 +17405,11 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       /startFaultProxy\(\{[\s\S]{0,260}mode: "rapid"[\s\S]{0,260}upstream: await resolveE2eBulletinRpc\(\)/.test(e2e),
       "S8 rapid proxy must target the selected environment's Bulletin RPC",
     );
-    // S8 uses a fresh per-run label picked once at describe scope, so both
-    // deploys reference the same `label` binding rather than re-calling
-    // pickDirectLabel(). Verify: one fresh-label pick + two buildArgs calls.
-    assert.match(e2e, /describe\("S8[\s\S]{0,300}const label = pickFreshRunLabel\("s8smoke"\)/,
-      "S8 must pick a fresh per-run label once at describe scope");
+    // S8 picks its label once at describe scope (the tier's fixed label since
+    // bulletin #1623), so both deploys reference the same `label` binding rather than
+    // re-calling pickDirectLabel(). Verify: one label pick + two buildArgs calls.
+    assert.match(e2e, /describe\("S8[\s\S]{0,300}const label = tieredLabel\("s8"\)/,
+      "S8 must pick its tier label once at describe scope");
     // #paseo-tld: the suffix is now the env's resolved tld (bare "dot" was
     // hardcoded pre-#1240; the CLI's wrong-TLD guard would reject that on a
     // .paseo env), so this regex accepts any `.${tld}`-shaped interpolation
@@ -17425,7 +17425,9 @@ describe("paseo-next-v2 E2E harness wiring", () => {
   test("PR/source E2E harness uses NoStatus labels when the signer has no PoP status", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
 
-    for (const label of ["e2epoolns01", "e2edirect01", "e2eincpool01", "e2erotpool01", "e2escarpool01"]) {
+    // S-CAR's old e2escarpool01 fallback is gone (bulletin #1623): it deploys to a
+    // per-tier label, each pinned NoStatus on every profile in test/e2e-fixtures.test.js.
+    for (const label of ["e2epoolns01", "e2edirect01", "e2eincpool01", "e2erotpool01"]) {
       assertNoStatusLabel(label);
       assert.match(e2e, new RegExp(label), `source E2E harness must include NoStatus fallback label ${label}.dot`);
     }
@@ -17444,8 +17446,10 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
     assert.match(
       e2e,
-      /describe\("S-INC-CROSSLABEL[\s\S]{0,1200}const labelA = pickFreshRunLabel\(`e2exlbla\$\{MERKLE\}`\);[\s\S]{0,200}const labelB = pickFreshRunLabel\(`e2exlblb\$\{MERKLE\}`\);/,
-      ">> FAIL: crosslabel-leg-collision: S-INC-CROSSLABEL must fold MERKLE into both labelA's and labelB's prefix so the js and kubo matrix legs (which share RUN_TAG) can't pick the same fresh label.",
+      // bulletin #1623: label A is the per-merkle tier label; label B is a subname of A,
+      // so it inherits the merkle discriminator.
+      /describe\("S-INC-CROSSLABEL[\s\S]{0,2000}const labelA = tieredLabel\(`s-inc-crosslabel-a-\$\{MERKLE\}`\);[\s\S]{0,200}const labelB = `[^`]*\.\$\{labelA\}`;/,
+      ">> FAIL: crosslabel-leg-collision: S-INC-CROSSLABEL must fold MERKLE into label A (and derive label B from A) so the js and kubo matrix legs (which share RUN_TAG) can't pick the same labels.",
     );
   });
 
@@ -17521,7 +17525,6 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     for (const label of [
       "e2es525829471478a1x00",
       "e2epoolns01",
-      "e2escar25829471478a1x00",
     ]) {
       assertNoStatusLabel(label);
     }
@@ -17529,7 +17532,12 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.match(workflowJobBlock(workflow, "nightly-s5"), /LABEL:\s*"e2es5\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00"/, "nightly S5 must use a dynamic NoStatus label");
     assert.match(workflowJobBlock(workflow, "nightly-s6"), /build e2epoolns01\b(?!\.)/, "nightly S6 must deploy the NoStatus pool label as a BARE label — a \".dot\" suffix is rejected on a .paseo environment");
     assert.match(workflowJobBlock(workflow, "nightly-s7"), /LABEL:\s*e2epoolns01/, "nightly S7 must use the v2 NoStatus pool label");
-    assert.match(workflowJobBlock(workflow, "nightly-s-car"), /LABEL:\s*e2escar\$\{\{ github\.run_id \}\}a\$\{\{ github\.run_attempt \}\}x00$/m, "nightly S-CAR must use a dynamic NoStatus label");
+    // bulletin #1623: S-CAR deploys to the tier's fixed label from tools/lib/e2e-fixtures.mjs
+    // on both paths; a per-run LABEL here would register a fresh name every run.
+    const sCar = workflowJobBlock(workflow, "nightly-s-car");
+    assert.doesNotMatch(sCar, /^\s*LABEL:/m, ">> FAIL: S-CAR: the job must not set LABEL; it would override the provisioned per-tier label");
+    assert.match(sCar, /tieredFixtureLabel\("s-car", process\.env\.DEPLOY_TAG\)/, ">> FAIL: S-CAR: the npm-path script must take its label from tools/lib/e2e-fixtures.mjs");
+    assert.match(sCar, /DEPLOY_TAG: \$\{\{ needs\.build-nightly\.outputs\.deploy-tag \}\}/, ">> FAIL: S-CAR: the label tier comes from DEPLOY_TAG, so the job must set it");
 
     const sExt = workflowJobBlock(workflow, "nightly-s-ext-signer");
     assert.match(sExt, /setContenthash\("e2epoolns01", expected\)/, "nightly S-ext-signer must write the v2 NoStatus pool label");

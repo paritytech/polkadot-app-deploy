@@ -138,13 +138,8 @@ jobs:
       # test/test.js actually run (hasIPFS() was false here, so they skipped).
       # Same fallback script as the E2E jobs (primary host, then the GitHub
       # release, sha512-verified).
-      - name: Restore Kubo from cache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/kubo
-          key: kubo-v0.33.0-linux-amd64
       - name: Setup IPFS Kubo
-        run: bash .github/scripts/install-kubo.sh v0.33.0
+        uses: ./.github/actions/setup-kubo
       - name: Initialize IPFS
         run: ipfs init
       - run: npm run typecheck
@@ -173,33 +168,25 @@ jobs:
       #     deliberate and must stay off, not be "fixed" by removing the guard.
       # All three are scoped by exact phrase so they cannot mask a real
       # expression error like the matrix-context bug above.
-      - name: Restore actionlint from cache
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/actionlint
-          key: actionlint-1.7.12-linux-amd64
-      # Pinned release downloaded from GitHub Releases and verified against the
-      # release's own checksums file. Previously this piped the unpinned
-      # `main` branch installer script from raw.githubusercontent.com into bash.
+      # Pinned release downloaded from GitHub Releases and verified against a
+      # sha256 pinned HERE (not a checksums file fetched from the same host).
+      # GitHub is the only host: pin plus checksum, no alternate. Previously
+      # this piped the unpinned `main` branch installer into bash. No cache:
+      # the ~5 MB download costs about what a cache restore does.
       - name: Lint workflows (actionlint)
         env:
           ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         run: |
           set -euo pipefail
-          BIN="$HOME/.cache/actionlint/actionlint"
-          if [ ! -x "$BIN" ]; then
-            BASE="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
-            TARBALL="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-            WORK="$(mktemp -d)"
-            for f in "$TARBALL" "actionlint_${ACTIONLINT_VERSION}_checksums.txt"; do
-              curl --fail --silent --show-error --location --retry 3 --retry-all-errors --retry-delay 2 \
-                --connect-timeout 10 --max-time 120 -o "$WORK/$f" "$BASE/$f"
-            done
-            (cd "$WORK" && grep -F " $TARBALL" "actionlint_${ACTIONLINT_VERSION}_checksums.txt" | sha256sum --check --strict -)
-            mkdir -p "$HOME/.cache/actionlint"
-            tar -xzf "$WORK/$TARBALL" -C "$HOME/.cache/actionlint" actionlint
-            rm -rf "$WORK"
-          fi
+          TARBALL="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          WORK="$(mktemp -d)"
+          curl --fail --silent --show-error --location --retry 3 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 10 --max-time 120 -o "$WORK/$TARBALL" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${TARBALL}"
+          echo "${ACTIONLINT_SHA256}  $WORK/$TARBALL" | sha256sum --check --strict -
+          tar -xzf "$WORK/$TARBALL" -C "$WORK" actionlint
+          BIN="$WORK/actionlint"
           "$BIN" -version
           "$BIN" -color \
             -ignore 'shellcheck reported issue in this script' \

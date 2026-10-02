@@ -554,15 +554,9 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: npm ci
-      - name: Restore Kubo from cache
-        if: matrix.merkle == 'kubo'
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/kubo
-          key: kubo-v0.33.0-linux-amd64
       - name: Setup IPFS Kubo
         if: matrix.merkle == 'kubo'
-        run: bash .github/scripts/install-kubo.sh v0.33.0
+        uses: ./.github/actions/setup-kubo
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo'
         run: ipfs init
@@ -1203,15 +1197,9 @@ jobs:
         uses: ./.github/actions/npm-retry
         with:
           run: npm install -g npm@11.17.0
-      - name: Restore Kubo from cache
-        if: matrix.merkle == 'kubo'
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/kubo
-          key: kubo-v0.33.0-linux-amd64
       - name: Setup IPFS Kubo
         if: matrix.merkle == 'kubo'
-        run: bash .github/scripts/install-kubo.sh v0.33.0
+        uses: ./.github/actions/setup-kubo
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo'
         run: ipfs init
@@ -2646,15 +2634,9 @@ jobs:
       # assertion fails the leg. Gated on the source-build ref: it is empty on
       # release / stable-cron / test-version runs, which skip the scenario, so a
       # failed download must not red those runs. Port of bulletin-deploy #1606.
-      - name: Restore Kubo from cache
-        if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/kubo
-          key: kubo-v0.33.0-linux-amd64
       - name: Setup IPFS Kubo
         if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
-        run: bash .github/scripts/install-kubo.sh v0.33.0
+        uses: ./.github/actions/setup-kubo
       - name: Initialize IPFS
         if: matrix.merkle == 'kubo' && env.BULLETIN_DEPLOY_REF != ''
         run: ipfs init

@@ -1,0 +1,19 @@
+name: Setup IPFS Kubo
+description: Restore Kubo from cache, else download it (dist.ipfs.tech, then the GitHub release) verified against a sha512 pinned in install-kubo.sh. Used by e2e.yml and tests.yml; the reusable deploy.yml carries the same logic inline because a local action path there would resolve against the caller's checkout.
+inputs:
+  version:
+    description: Kubo release tag. The ONE place this version lives for e2e.yml and tests.yml; deploy.yml's inline step must equal it (test/install-kubo.test.js).
+    default: v0.33.0
+runs:
+  using: composite
+  steps:
+    - name: Restore Kubo from cache
+      uses: actions/cache@v5
+      with:
+        path: ~/.cache/kubo
+        key: kubo-${{ inputs.version }}-linux-amd64
+    - name: Install Kubo
+      shell: bash
+      env:
+        KUBO_VERSION: ${{ inputs.version }}
+      run: bash "${{ github.action_path }}/../../scripts/install-kubo.sh" "$KUBO_VERSION"

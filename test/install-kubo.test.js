@@ -21,7 +21,7 @@ const VERSION = "v9.9.9";
 const TARBALL = `kubo_${VERSION}_linux-amd64.tar.gz`;
 const DEAD = "http://127.0.0.1:1"; // connection refused immediately
 
-let tmp, goodTar, goodSha, server, goodBase, badSumBase;
+let tmp, goodTar, goodSha, server, goodBase, wrongBase;
 
 function startServer(handler) {
   return new Promise((resolve) => {
@@ -37,20 +37,17 @@ before(async () => {
   goodTar = path.join(tmp, TARBALL);
   execFileSync("tar", ["-czf", goodTar, "-C", path.join(tmp, "stage"), "kubo"]);
   goodSha = crypto.createHash("sha512").update(fs.readFileSync(goodTar)).digest("hex");
-  // /good/<tarball>[.sha512] serves valid bytes; /badsum/ serves a wrong digest.
+  // /good/<tarball> serves the valid bytes, /wrong/<tarball> serves different bytes.
+  // No .sha512 file is served: the expected hash is pinned in the script, never fetched.
   server = await startServer((req, res) => {
     const [, which, file] = req.url.split("/");
-    if (file === TARBALL) return res.end(fs.readFileSync(goodTar));
-    if (file === `${TARBALL}.sha512`) {
-      const digest = which === "badsum" ? "0".repeat(128) : goodSha;
-      return res.end(`${digest}  ${TARBALL}\n`);
-    }
+    if (file === TARBALL) return res.end(which === "wrong" ? Buffer.from("not the kubo tarball") : fs.readFileSync(goodTar));
     res.statusCode = 404;
     res.end();
   });
   const port = server.address().port;
   goodBase = `http://127.0.0.1:${port}/good`;
-  badSumBase = `http://127.0.0.1:${port}/badsum`;
+  wrongBase = `http://127.0.0.1:${port}/wrong`;
 });
 
 after(() => {
@@ -58,18 +55,19 @@ after(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-function run(sources, { cache } = {}) {
+function run(sources, { cache, version = VERSION, sha512 = goodSha } = {}) {
   const installDir = fs.mkdtempSync(path.join(tmp, "bin-"));
   const cacheDir = cache ?? fs.mkdtempSync(path.join(tmp, "cache-"));
   return new Promise((resolve) => {
-    const child = spawn("bash", [SCRIPT, VERSION], {
+    const child = spawn("bash", [SCRIPT, version], {
       env: {
         PATH: process.env.PATH,
         HOME: tmp,
         KUBO_INSTALL_DIR: installDir,
         KUBO_CACHE_DIR: cacheDir,
         KUBO_ARCH: "linux-amd64",
-        INSTALL_KUBO_TEST_SOURCES: sources.join(" "),
+        ...(sources ? { INSTALL_KUBO_TEST_SOURCES: sources.join(" ") } : {}),
+        ...(sha512 ? { INSTALL_KUBO_TEST_SHA512: sha512 } : {}),
       },
     });
     let out = "";
@@ -89,17 +87,29 @@ describe("install-kubo.sh", () => {
     assert.ok(fs.existsSync(path.join(r.cacheDir, "ipfs")), "binary cached");
   });
 
-  test("bad checksum on primary -> fallback used, bad bytes never installed from primary", async () => {
-    const r = await run([badSumBase, goodBase]);
+  test("primary serves a wrong tarball -> sha512 mismatch warning, fallback used, wrong bytes never installed", async () => {
+    const r = await run([wrongBase, goodBase]);
     assert.equal(r.code, 0, r.out);
-    assert.match(r.out, /::warning::.*checksum mismatch/i);
-    assert.match(r.out, /::notice::.*\/good/);
+    assert.match(r.out, /::warning::.*\/wrong.*sha512 mismatch/i);
+    assert.match(r.out, /::notice::.*\/good.*matches the pinned hash/);
   });
 
-  test("bad checksum everywhere -> hard failure, nothing installed", async () => {
-    const r = await run([badSumBase]);
+  test("every source wrong -> hard failure, nothing installed", async () => {
+    const r = await run([wrongBase, wrongBase + "/"]);
     assert.notEqual(r.code, 0);
+    assert.match(r.out, /::error::.*all sources failed/);
     assert.equal(fs.existsSync(path.join(r.installDir, "ipfs")), false);
+  });
+
+  test("unknown version/arch (no pinned hash) -> clear error telling the maintainer to add one, no download", async () => {
+    const r = await run(null, { version: "v0.0.1", sha512: null });
+    assert.notEqual(r.code, 0);
+    assert.match(r.out, /::error::No pinned sha512 for Kubo v0\.0\.1 linux-amd64/);
+  });
+
+  test("the pinned hash for the shipped version is a 128-char hex string", () => {
+    const m = fs.readFileSync(SCRIPT, "utf8").match(/v0\.33\.0\/linux-amd64\) KUBO_SHA512="([0-9a-f]+)"/);
+    assert.ok(m && m[1].length === 128, "v0.33.0/linux-amd64 must be pinned");
   });
 
   test("all sources dead -> non-zero exit with a clear error, quickly", async () => {
@@ -135,7 +145,7 @@ describe("deploy.yml inline Kubo step vs install-kubo.sh (drift guard)", () => {
   test("shared core blocks (sources, checksum, timeouts) are identical", () => {
     const a = coreBlocks(script);
     const b = coreBlocks(deploy);
-    assert.ok(a.length >= 2, "script must expose marked core blocks");
+    assert.ok(a.length >= 3, "script must expose marked core blocks");
     assert.deepEqual(b, a, ">> FAIL: deploy.yml inline Kubo step has drifted from .github/scripts/install-kubo.sh");
   });
 
@@ -144,14 +154,19 @@ describe("deploy.yml inline Kubo step vs install-kubo.sh (drift guard)", () => {
     const iDist = core.indexOf("dist.ipfs.tech");
     const iGh = core.indexOf("github.com/ipfs/kubo/releases/download");
     assert.ok(iDist >= 0 && iGh > iDist, "primary dist.ipfs.tech, then GitHub");
-    assert.match(core, /\.sha512/);
+    assert.match(core, /KUBO_SHA512/);
+    assert.equal(core.includes(".sha512"), false, "hash is pinned in-repo, never fetched");
     assert.match(core, /--connect-timeout 10\b/);
+    assert.match(core, /--max-time 120\b/);
+    assert.match(core, /--speed-limit 50000 --speed-time 15/);
   });
 
   test("test-only source override is outside the core and absent from deploy.yml", () => {
-    assert.match(script, /INSTALL_KUBO_TEST_SOURCES/);
-    assert.equal(deploy.includes("INSTALL_KUBO_TEST_SOURCES"), false);
-    for (const [, b] of coreBlocks(script)) assert.equal(b.includes("INSTALL_KUBO_TEST_SOURCES"), false);
+    for (const v of ["INSTALL_KUBO_TEST_SOURCES", "INSTALL_KUBO_TEST_SHA512"]) {
+      assert.match(script, new RegExp(v));
+      assert.equal(deploy.includes(v), false);
+      for (const [, b] of coreBlocks(script)) assert.equal(b.includes(v), false);
+    }
   });
 
   test("deploy.yml keeps its skip conditions and does not call a local script", () => {
@@ -160,15 +175,19 @@ describe("deploy.yml inline Kubo step vs install-kubo.sh (drift guard)", () => {
     assert.equal(step.includes("./.github/scripts"), false, "reusable workflow must stay inline");
   });
 
-  test("every workflow Kubo cache key / script call uses one version", () => {
-    const versions = new Set();
-    for (const f of ["deploy.yml", "e2e.yml", "tests.yml"]) {
+  test("one Kubo version: deploy.yml KUBO_VERSION equals the setup-kubo action default, nothing else hard-codes one", () => {
+    const action = fs.readFileSync(path.join(ROOT, ".github/actions/setup-kubo/action.yml"), "utf8");
+    const def = action.match(/default:\s*(v\d+\.\d+\.\d+)/)?.[1];
+    assert.ok(def, "setup-kubo must declare a default version");
+    const dv = deploy.match(/KUBO_VERSION:\s*(v\d+\.\d+\.\d+)/)?.[1];
+    assert.equal(dv, def, "deploy.yml inline KUBO_VERSION must equal the setup-kubo default");
+    assert.ok(deploy.includes(`key: kubo-${def}-linux-amd64`), "deploy.yml cache key uses the same version");
+    assert.ok(script.includes(`${def}/linux-amd64)`), "script pins a hash for that version");
+    for (const f of ["e2e.yml", "tests.yml"]) {
       const t = fs.readFileSync(path.join(ROOT, ".github/workflows", f), "utf8");
-      for (const m of t.matchAll(/kubo-(v\d+\.\d+\.\d+)-linux-amd64/g)) versions.add(m[1]);
-      for (const m of t.matchAll(/install-kubo\.sh\s+(v\d+\.\d+\.\d+)/g)) versions.add(m[1]);
-      for (const m of t.matchAll(/KUBO_VERSION:\s*(v\d+\.\d+\.\d+)/g)) versions.add(m[1]);
+      assert.equal(/kubo-v\d|install-kubo\.sh|KUBO_VERSION/.test(t), false, `${f} must take the version from the setup-kubo action only`);
+      assert.match(t, /uses: \.\/\.github\/actions\/setup-kubo/);
     }
-    assert.equal(versions.size, 1, `Kubo version must be one value, got ${[...versions]}`);
   });
 
   test("no workflow downloads Kubo straight from dist.ipfs.tech outside the shared core", () => {

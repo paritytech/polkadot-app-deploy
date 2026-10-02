@@ -103,6 +103,21 @@ describe("tieredFixtureLabel", () => {
     assert.ok(prSmokeLabel("1623").startsWith(PAD_LABEL_PREFIX), ">> FAIL: e2e-fixtures: the per-PR smoke label must be in p-a-d's namespace");
   });
 
+  // p-a-d: a scenario on an isolated direct signer deploys as that account, so
+  // a label owned by Alice ROOT is a hard "already owned" refusal on chain.
+  test("a fixture whose scenario signs as an isolated direct signer is owned by that signer", () => {
+    const e2e = fs.readFileSync(new URL("./e2e.test.js", import.meta.url), "utf-8");
+    const block = e2e.match(/const ISOLATED_DIRECT_SIGNERS = \{([\s\S]*?)\};/);
+    assert.ok(block, ">> FAIL: e2e-fixtures: ISOLATED_DIRECT_SIGNERS not found in test/e2e.test.js");
+    const isolated = Object.fromEntries([...block[1].matchAll(/"([^"]+)":\s*"([^"]+)"/g)].map((m) => [m[1], m[2]]));
+    assert.ok(Object.keys(isolated).length > 0, ">> FAIL: e2e-fixtures: could not parse ISOLATED_DIRECT_SIGNERS");
+    for (const { fixture, label, owner } of tieredFixtureLabels()) {
+      const scenario = Object.keys(isolated).find((sc) => fixture === sc || fixture.startsWith(`${sc}-`));
+      assert.equal(owner, scenario ? isolated[scenario] : "",
+        `>> FAIL: e2e-fixtures: ${label} must be owned by ${scenario ? isolated[scenario] : "Alice ROOT"}, the account ${fixture} signs DotNS as`);
+    }
+  });
+
   test("a tier the fixture was not provisioned for throws", () => {
     // crosslabel only runs on the source-build path, so no release label exists.
     assert.throws(() => tieredFixtureLabel("s-inc-crosslabel-a-js", "e2e-ci-release"), /not provisioned/);

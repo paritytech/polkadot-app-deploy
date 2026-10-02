@@ -58,7 +58,10 @@ const ALL_TIERS = Object.freeze([...Object.values(E2E_LABEL_TIERS).filter((t) =>
 // `tiers` lists the tiers the scenario actually runs on, which is what gets provisioned.
 export const TIERED_FIXTURES = Object.freeze({
   "s-car": { base: "pade2escar", tiers: ALL_TIERS },
-  "s-grandpa-reupload": { base: "pade2egrandpa", tiers: ALL_TIERS },
+  // p-a-d only: S-GRANDPA-REUPLOAD signs DotNS as its isolated direct signer
+  // //e2e-sgrandpa (ISOLATED_DIRECT_SIGNERS in test/e2e.test.js, p-a-d #25),
+  // not Alice ROOT as upstream does, so its labels must be owned by that account.
+  "s-grandpa-reupload": { base: "pade2egrandpa", tiers: ALL_TIERS, owner: "//e2e-sgrandpa" },
   "s-mortality": { base: "pade2emortal", tiers: ALL_TIERS },
   s8: { base: "pade2es8halt", tiers: ALL_TIERS },
   // nightly-s-inc runs only on the source-build path (HEAD cron or a dispatch
@@ -84,10 +87,14 @@ export function tieredFixtureLabel(fixture, deployTag) {
   return fixtureLabel(fixture, labelTierFromDeployTag(deployTag));
 }
 
-/** Every label to provision, as { fixture, tier, label }. */
+/**
+ * Every label to provision, as { fixture, tier, label, owner }. `owner` is the
+ * DotNS owner as a derivation path from the dev mnemonic: "" (Alice ROOT) unless
+ * the fixture names its own.
+ */
 export function tieredFixtureLabels() {
-  return Object.entries(TIERED_FIXTURES).flatMap(([fixture, { tiers }]) =>
-    tiers.map((tier) => ({ fixture, tier, label: fixtureLabel(fixture, tier) })));
+  return Object.entries(TIERED_FIXTURES).flatMap(([fixture, { tiers, owner = "" }]) =>
+    tiers.map((tier) => ({ fixture, tier, label: fixtureLabel(fixture, tier), owner })));
 }
 
 /** 0-9 -> a-j, so a number can supply label entropy without adding digits. */

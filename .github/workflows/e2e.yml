@@ -2735,6 +2735,10 @@ jobs:
       actions: read
       # issues:write — needed to open failure issues on schedule/release triggers
       issues: write
+      # checks:read — GET /check-runs/{id}/annotations for the runner-loss classifier (bulletin #1622)
+      checks: read
+      # contents:read — sparse checkout of .github/scripts for the runner-loss classifier (bulletin #1622)
+      contents: read
     steps:
       - name: Fetch per-leg job results
         env:
@@ -3073,6 +3077,48 @@ jobs:
             echo "DEDUP_LABEL=$DEDUP_LABEL"
           } >> "$GITHUB_ENV"
 
+      # Runner-loss verdict (port of bulletin #1638 / #1622). Logs on every event;
+      # on a first-attempt SCHEDULED run whose every red leg is a lost runner, the
+      # failure issue below is skipped because e2e-runner-loss-rerun.yml will
+      # re-run the failed jobs. This job cannot issue that re-run itself:
+      # rerun-failed-jobs is refused while the run (which contains this job) is
+      # still in progress. Both workflows use the same classifier script, so
+      # they agree about the run; if the re-run POST fails, that workflow files
+      # the issue itself. Release runs are never skipped or auto-re-run: the
+      # release gate is judged by a human.
+      # continue-on-error on all three steps: a classifier hiccup must never
+      # suppress an issue, because anything but "all-runner-loss" files as before.
+      - name: Check out the runner-loss classifier
+        if: always()
+        continue-on-error: true
+        uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
+      - name: Set up Node for the runner-loss classifier
+        if: always()
+        continue-on-error: true
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+      - name: Classify runner loss
+        id: runner-loss
+        if: always()
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT: ${{ github.event_name }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          node .github/scripts/classify-runner-loss.cjs | tee /tmp/runner-loss.txt
+          if [ "$EVENT" = schedule ] && [ "$ATTEMPT" = 1 ] && grep -q 'verdict=all-runner-loss' /tmp/runner-loss.txt; then
+            echo "Every red leg is a lost runner: failure issue skipped on this attempt; e2e-runner-loss-rerun.yml re-runs the failed jobs once (bulletin #1622)." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
       # workflow_dispatch runs are manual — skip auto-issue for those (maintainer
       # is already watching). schedule + release get an issue because failures
       # there indicate drift nobody was watching for. `contains(needs.*.result, …)`
@@ -3087,7 +3133,8 @@ jobs:
         if: >
           always() &&
           (github.event_name == 'schedule' || github.event_name == 'release') &&
-          (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+          (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) &&
+          !(github.event_name == 'schedule' && github.run_attempt == 1 && steps.runner-loss.outputs.verdict == 'all-runner-loss')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

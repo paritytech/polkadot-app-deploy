@@ -11744,6 +11744,44 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
     return [...pathsMatch[1].matchAll(/^ {6}- (.+)$/gm)].map(match => match[1].trim().replace(/^['"](.*)['"]$/, "$1"));
   }
 
+  // Port of bulletin #1638 (#1622): a lost runner used to file a "nothing to fix" issue
+  // each time. nightly-report now classifies the run (shared script) and skips
+  // the issue on a first-attempt SCHEDULED all-runner-loss run; the re-run is
+  // issued by e2e-runner-loss-rerun.yml because rerun-failed-jobs is refused
+  // for a run still in progress, and nightly-report is part of that run.
+  test(".github/workflows: runner-loss re-run is gated on schedule + attempt 1 + the classifier verdict, and the issue is skipped when it fires (bulletin #1622)", () => {
+    const e2e = fs.readFileSync(".github/workflows/e2e.yml", "utf-8");
+    const report = jobBlock(e2e, "nightly-report");
+    const steps = report.split(/\n(?= {6}- )/);
+    const classifyStep = steps.find((step) => /- name: Classify runner loss$/m.test(step));
+    const openStep = steps.find((step) => /- name: Open failure issue$/m.test(step));
+    assert.ok(classifyStep, ">> FAIL: runner-loss: nightly-report must have a 'Classify runner loss' step");
+    assert.match(classifyStep, /id: runner-loss/, ">> FAIL: runner-loss: the classify step must expose id runner-loss");
+    assert.match(classifyStep, /node \.github\/scripts\/classify-runner-loss\.cjs/,
+      ">> FAIL: runner-loss: nightly-report must use the shared classifier script, not a re-inlined copy");
+    assert.match(classifyStep, /continue-on-error: true/,
+      ">> FAIL: runner-loss: a classifier failure must never block the failure issue");
+    assert.match(openStep,
+      /!\(github\.event_name == 'schedule' && github\.run_attempt == 1 && steps\.runner-loss\.outputs\.verdict == 'all-runner-loss'\)/,
+      ">> FAIL: runner-loss: Open failure issue must be skipped only on schedule + run_attempt 1 + all-runner-loss");
+    assert.doesNotMatch(report, /actions\/runs\/[^\s"]*rerun-failed-jobs/,
+      ">> FAIL: runner-loss: nightly-report must not POST rerun-failed-jobs itself — GitHub refuses it for a run still in progress");
+
+    const rr = fs.readFileSync(".github/workflows/e2e-runner-loss-rerun.yml", "utf-8");
+    assert.match(rr, /workflow_run:\s*\n\s*workflows: \["E2E \(Paseo Bulletin\)"\]\s*\n\s*types: \[completed\]/,
+      ">> FAIL: runner-loss: the re-run workflow must trigger on completion of the E2E workflow");
+    assert.match(rr, /github\.event\.workflow_run\.event == 'schedule'/, ">> FAIL: runner-loss: re-run must be schedule-only (never release)");
+    assert.match(rr, /github\.event\.workflow_run\.run_attempt == 1/, ">> FAIL: runner-loss: attempt >= 2 must never auto-re-run");
+    assert.match(rr, /github\.event\.workflow_run\.conclusion == 'failure'/, ">> FAIL: runner-loss: re-run only fires for a failed run");
+    assert.match(rr, /steps\.classify\.outputs\.verdict == 'all-runner-loss'/, ">> FAIL: runner-loss: the POST must be gated on the all-runner-loss verdict");
+    assert.match(rr, /node \.github\/scripts\/classify-runner-loss\.cjs/, ">> FAIL: runner-loss: re-run workflow must use the shared classifier script");
+    assert.match(rr, /actions\/runs\/\$RUN_ID\/rerun-failed-jobs/, ">> FAIL: runner-loss: re-run workflow must POST rerun-failed-jobs");
+    assert.match(rr, /actions: write/, ">> FAIL: runner-loss: re-run workflow needs actions: write");
+    assert.match(rr, /steps\.rerun\.outcome == 'failure'/,
+      ">> FAIL: runner-loss: a failed re-run POST must file the issue nightly-report skipped");
+    assert.match(rr, /dry_run:[\s\S]*?default: true/, ">> FAIL: runner-loss: workflow_dispatch dry_run must default to true");
+  });
+
   // Port of bulletin #1427/#1392: a registry ECONNRESET during an install
   // reds a leg before any product code runs. Every npm install/ci step in
   // this repo's workflows must go through the pinned retry mechanism.

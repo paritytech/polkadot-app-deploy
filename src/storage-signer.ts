@@ -6,7 +6,7 @@ import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { sr25519, ss58Address } from "@polkadot-labs/hdkd-helpers";
 import { createClient as createPolkadotClient } from "polkadot-api";
 import { getPolkadotSigner } from "polkadot-api/signer";
-import { getWsProvider } from "polkadot-api/ws";
+import { getWsProvider } from "./ws.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { BULLETIN_ENDPOINTS, WS_HEARTBEAT_TIMEOUT_MS, makeBulletinStatusHandler } from "./deploy.js";
 import { readAccountAuthorization, type BulletinAuthorization } from "./pool.js";

@@ -1,6 +1,7 @@
 import { execSync, execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { Readable } from "node:stream";
+import { discardBody } from "./http.js";
 import { VERSION } from "./telemetry.js";
 
 const REGISTRY_URL = "https://registry.npmjs.org/@parity/polkadot-app-deploy/latest";
@@ -67,7 +68,7 @@ async function fetchJson(url: string): Promise<any | null> {
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timer);
-    if (!res.ok) return null;
+    if (!res.ok) { discardBody(res); return null; }
     return await res.json();
   } catch {
     return null;

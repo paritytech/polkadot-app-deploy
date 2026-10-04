@@ -10,7 +10,8 @@ import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { blake2b } from "@noble/hashes/blake2b";
 import { createClient as createPolkadotClient } from "polkadot-api";
-import { getWsProvider, WsEvent } from "polkadot-api/ws";
+import { WsEvent } from "polkadot-api/ws";
+import { getWsProvider } from "./ws.js";
 import { CID } from "multiformats/cid";
 import { create as createMultihash } from "multiformats/hashes/digest";
 import { base32 } from "multiformats/bases/base32";
@@ -2489,6 +2490,7 @@ export function resolveReproducibleTimestamp(source: string): string {
 }
 
 // ── Gateway pre-warm ───────────────────────────────────────────────────────
+const PREWARM_TIMEOUT_MS = 15_000;
 // Fire-and-forget HEAD requests for newly uploaded chunks so gateway caches
 // are warm before the first user hits the site. Errors are intentionally
 // swallowed — this is a best-effort optimisation only.
@@ -2496,7 +2498,8 @@ function preWarmGateway(chunkCids: string[], gateways: string[]): void {
   for (const cid of chunkCids) {
     for (const gw of gateways) {
       const url = `${gw.replace(/\/$/, "")}/ipfs/${cid}`;
-      fetch(url, { method: "HEAD" }).catch(() => {});
+      // #1675: bounded, so a hung gateway can't keep an in-process caller alive after deploy() returns.
+      fetch(url, { method: "HEAD", signal: AbortSignal.timeout(PREWARM_TIMEOUT_MS) }).catch(() => {});
     }
   }
 }

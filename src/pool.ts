@@ -3,7 +3,7 @@ import { DEV_PHRASE, entropyToMiniSecret, mnemonicToEntropy } from "@polkadot-la
 import { createClient, Enum } from "polkadot-api";
 import type { PolkadotSigner } from "polkadot-api";
 import { getPolkadotSigner } from "polkadot-api/signer";
-import { getWsProvider } from "polkadot-api/ws";
+import { getWsProvider } from "./ws.js";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { NonRetryableError } from "./errors.js";

@@ -20,6 +20,7 @@ import { CarReader } from "@ipld/car/reader";
 import * as dagPB from "@ipld/dag-pb";
 import { CID } from "multiformats/cid";
 import { parseManifest, type EmbeddedManifest, MANIFEST_DIR, MANIFEST_FILENAME } from "./manifest.js";
+import { discardBody } from "./http.js";
 
 // No DEFAULT_GATEWAY constant — caller must provide a gateway URL (typically
 // from environments.ts's resolveEndpoints().ipfs, threaded through
@@ -238,6 +239,7 @@ async function fetchOneTier(url: string, tierIndex: number, budgetRemaining: num
       span.setAttribute("manifest.tier.wait_ms", String(waitMs));
       span.setAttribute("manifest.tier.http_status", String(res.status));
 
+      if (res.status !== 200 && res.status !== 206) discardBody(res);
       if (res.status === 404) {
         span.setAttribute("manifest.tier.outcome", "http_404");
         return { outcome: "http_404" as TierOutcome, reason: "gateway 404", bytes: 0 };

@@ -7,6 +7,7 @@
 // Spec: docs-internal/superpowers/specs/2026-05-08-incremental-upload-v2-revision-design.md (§ 10)
 
 import { extractManifestFromCar } from "./manifest-fetch.js";
+import { discardBody } from "./http.js";
 
 export interface RoundtripOptions {
   gateway: string;
@@ -38,6 +39,7 @@ export async function fetchManifestRoundtrip(
       await sleep(poll); continue;
     } finally { clearTimeout(timer); }
 
+    if (res.status !== 200) discardBody(res);
     if (res.status === 404 || res.status === 504) {
       lastReason = `gateway HTTP ${res.status}`;
       await sleep(poll); continue;

@@ -2,7 +2,7 @@
 // for a given environment. Mirrors the AH-client setup pattern in dotns.ts.
 
 import { createClient } from "polkadot-api";
-import { getWsProvider } from "polkadot-api/ws";
+import { getWsProvider } from "../ws.js";
 import type { PolkadotClient } from "polkadot-api";
 import { loadEnvironments } from "../environments.js";
 import { WS_HEARTBEAT_TIMEOUT_MS } from "../dotns.js";

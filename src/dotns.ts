@@ -2,7 +2,7 @@ import crypto from "crypto";
 import { createReadStream } from "fs";
 import { createClient, Enum } from "polkadot-api";
 import { getPolkadotSigner } from "polkadot-api/signer";
-import { getWsProvider } from "polkadot-api/ws";
+import { getWsProvider } from "./ws.js";
 import { PGAS_ASSET_LOCATION } from "./personhood/constants.js";
 import { resolveEffectiveMnemonic, mnemonicConflictNotice } from "./mnemonic.js";
 import { Keyring } from "@polkadot/keyring";

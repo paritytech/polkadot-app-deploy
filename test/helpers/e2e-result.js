@@ -24,6 +24,11 @@ function messageOf(err) {
   return String(inner?.message ?? inner ?? "");
 }
 
+/** Cause class a failWith(cls) failure declared for itself, or "". */
+export function classOf(err) {
+  return String((err?.cause ?? err)?.e2eClass ?? "");
+}
+
 /**
  * @param {{ scenario: string, signer?: string, merkle?: string, env?: string }} meta
  */
@@ -31,6 +36,8 @@ export function installE2eResultHook(meta) {
   const outPath = process.env.E2E_RESULT_PATH;
   if (!outPath || !builder) return;
   const failures = [];
+  // Class of the FIRST failure, to match where the signature comes from.
+  let selfClass = "";
   let outcomesKnown = true;
   let seen = 0;
 
@@ -38,7 +45,10 @@ export function installE2eResultHook(meta) {
     try {
       seen++;
       if (typeof t?.passed !== "boolean") outcomesKnown = false;
-      else if (!t.passed) failures.push(messageOf(t.error));
+      else if (!t.passed) {
+        if (failures.length === 0) selfClass = classOf(t.error);
+        failures.push(messageOf(t.error));
+      }
     } catch {
       outcomesKnown = false;
     }
@@ -55,7 +65,7 @@ export function installE2eResultHook(meta) {
         ...meta,
         status: failed ? "failure" : "success",
         log: text,
-        harness: { signature: builder.extractSignature(text) || firstLine },
+        harness: { signature: builder.extractSignature(text) || firstLine, class: selfClass || undefined },
         runAttempt: process.env.GITHUB_RUN_ATTEMPT,
       });
       fs.mkdirSync(path.dirname(outPath), { recursive: true });

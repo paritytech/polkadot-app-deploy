@@ -5,7 +5,7 @@ import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 import { setupIsolatedHome } from "./helpers/isolated-home.js";
 // Personhood bootstrap imports (loaded after build)
 import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason } from "../dist/dotns.js";
-import { getAdapter } from "../dist/dotns-protocol.js";
+import { getAdapter, HIGHEST_VERIFIED_DOTNS_RELEASE } from "../dist/dotns-protocol.js";
 import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
 import { probeBootstrapState, nextBootstrapAction, runBootstrap } from "../dist/personhood/bootstrap.js";
@@ -59,7 +59,9 @@ import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLoca
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
 import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache, computePhaseACounts, formatUploadInclusionLine } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
-import { pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
+import { directSignerArgsFor, pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
+import { SIGNERS as BALANCE_SIGNERS } from "../tools/check-balances.mjs";
+import { NON_GATING_LABELS } from "../tools/check-env-readiness.mjs";
 import * as nodeCrypto from "node:crypto";
 import { CarReader } from "@ipld/car/reader";
 import * as dagPb from "@ipld/dag-pb";
@@ -5577,10 +5579,10 @@ describe("detectProtocolVersion reads the declared DotNS release", () => {
   }
 
   test("a declared release is reported alongside the profile, without warning at the verified ceiling", async () => {
-    const d = makeDotNS({ declared: "0.8.0" });
+    const d = makeDotNS({ declared: HIGHEST_VERIFIED_DOTNS_RELEASE });
     const logs = await captureLogs(() => d["detectProtocolVersion"]());
     assert.equal(d["_protocolVersion"], "v0.6.0");
-    assert.match(logs, /declares DotNS 0\.8\.0/, ">> FAIL: the declared release is the only signal that a generation rollout happened — the profile alone cannot show it");
+    assert.match(logs, new RegExp(`declares DotNS ${HIGHEST_VERIFIED_DOTNS_RELEASE.replaceAll(".", "\\.")}`), ">> FAIL: the declared release is the only signal that a generation rollout happened — the profile alone cannot show it");
     assert.doesNotMatch(logs, /WARNING/, ">> FAIL: warning on the newest verified release would train everyone to ignore it");
   });
 
@@ -5592,7 +5594,8 @@ describe("detectProtocolVersion reads the declared DotNS release", () => {
   });
 
   test("a release newer than anything diffed against this client warns", async () => {
-    const d = makeDotNS({ declared: "0.9.0" });
+    const [major, minor, patch] = HIGHEST_VERIFIED_DOTNS_RELEASE.split(".").map(Number);
+    const d = makeDotNS({ declared: `${major}.${minor}.${patch + 1}` });
     const logs = await captureLogs(() => d["detectProtocolVersion"]());
     assert.equal(d["_protocolVersion"], "v0.6.0", ">> FAIL: still deploy — refusing an unknown generation would strand every user the day dotns tags one");
     assert.match(logs, /WARNING/, ">> FAIL: an undiffed generation must be loud; this warning is what v0.7.0 and v0.8.0 were missing");
@@ -11261,17 +11264,15 @@ const BIN_PATH = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkado
 // Helper: run polkadot-app-deploy with HOME/XDG_STATE_HOME pointed at a tmpdir
 // so the on-disk state file is isolated per-test. Also returns the tmpdir
 // so the caller can inspect/preseed the state file.
+// Must match resolveStateDir() exactly: tests pre-seed and inspect this path.
+function isolatedStateDir(tmpdir) {
+  if (process.platform === "darwin") return path.join(tmpdir, "Library", "Application Support", "polkadot-app-deploy");
+  if (process.platform === "win32") return path.join(tmpdir, "AppData", "Local", "polkadot-app-deploy");
+  return path.join(tmpdir, ".local", "state", "polkadot-app-deploy");
+}
+
 function runBinIsolated(tmpdir, argv, { preseedState, extraEnv } = {}) {
-  // Platform-appropriate base + polkadot-app-deploy subdir — must match
-  // resolveStateDir() exactly, because tests pre-seed the file path.
-  let stateDir;
-  if (process.platform === "darwin") {
-    stateDir = path.join(tmpdir, "Library", "Application Support", "polkadot-app-deploy");
-  } else if (process.platform === "win32") {
-    stateDir = path.join(tmpdir, "AppData", "Local", "polkadot-app-deploy");
-  } else {
-    stateDir = path.join(tmpdir, ".local", "state", "polkadot-app-deploy");
-  }
+  const stateDir = isolatedStateDir(tmpdir);
   fs.mkdirSync(stateDir, { recursive: true });
   if (preseedState) {
     fs.writeFileSync(path.join(stateDir, "last-run.json"), typeof preseedState === "string" ? preseedState : JSON.stringify(preseedState));
@@ -11391,6 +11392,168 @@ describe("withDeploySpan no-telemetry run-state RSS", () => {
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  });
+});
+
+describe("commitment state hardening (#1570)", () => {
+  const RECORD = {
+    savedAt: Date.now(), environmentId: "e", tld: "dot", protocol: "v0.6.0", label: "verysecretlabel",
+    owner: "0xabc", reserved: false, secret: "0xdeadbeefsecret", commitment: "0xbeef",
+  };
+  const DIST = pathToFileUrl(path.resolve("dist/run-state.js"));
+  const run = (env, body, cwd) => spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { writeCommitmentRecord, loadCommitmentRecord, commitmentStateFilePath, resolveStateDir, usesTmpdirFallback } from "${DIST}";
+    import * as fs from "node:fs";
+    import * as path from "node:path";
+    const RECORD = ${JSON.stringify(RECORD)};
+    ${body}
+  `], { encoding: "utf-8", env, ...(cwd ? { cwd } : {}) });
+  const isolated = (tmp) => ({ ...process.env, HOME: tmp, USERPROFILE: tmp, XDG_STATE_HOME: path.join(tmp, ".local", "state"), LOCALAPPDATA: path.join(tmp, "AppData", "Local") });
+  const withTmp = (tag, fn) => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `bd-1570-${tag}-`));
+    try { fn(tmp); } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+  };
+  const ok = (res) => assert.equal(res.status, 0, `>> FAIL: #1570: the probe process exited ${res.status}, so the assertion below never ran: ${String(res.stderr).split("\n")[0]}`);
+
+  test("the filename carries no label", () => {
+    withTmp("name", (tmp) => {
+      const res = run(isolated(tmp), `process.stdout.write(commitmentStateFilePath("e", "dot", "0xabc", "verysecretlabel"));`);
+      ok(res);
+      assert.ok(!res.stdout.includes("verysecretlabel"),
+        ">> FAIL: #1570: the label of an in-flight commit-reveal is in the filename, so anyone who can list the directory reads it");
+      assert.match(path.basename(res.stdout), /^commitment-[0-9a-f]{32}\.json$/,
+        ">> FAIL: #1570: the commitment filename must be a digest");
+    });
+  });
+
+  test("HOME set to empty writes nothing, least of all into the working directory", () => {
+    withTmp("relpath", (tmp) => {
+      const res = run({ ...process.env, HOME: "", USERPROFILE: "", XDG_STATE_HOME: "", LOCALAPPDATA: "" },
+        `process.stdout.write(JSON.stringify({ fellBack: usesTmpdirFallback(), ok: writeCommitmentRecord(RECORD), loaded: loadCommitmentRecord("e", "dot", "0xabc", "verysecretlabel") }));`, tmp);
+      ok(res);
+      assert.deepEqual(JSON.parse(res.stdout), { fellBack: true, ok: false, loaded: null },
+        ">> FAIL: #1570: os.homedir() returns \"\" for HOME=\"\", which makes resolveStateDir relative and drops the commit-reveal secret into the caller's working directory");
+      assert.deepEqual(fs.readdirSync(tmp), [],
+        ">> FAIL: #1570: a commitment record was written into the working directory");
+    });
+  });
+
+  test("does not follow a symlink planted at the tmp path", { skip: process.platform === "win32" }, () => {
+    withTmp("symlink", (tmp) => {
+      const canary = path.join(tmp, "canary");
+      fs.writeFileSync(canary, "untouched");
+      const res = run(isolated(tmp), `
+        const file = commitmentStateFilePath("e", "dot", "0xabc", "verysecretlabel");
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.symlinkSync(${JSON.stringify(canary)}, file + "." + process.pid + ".tmp");
+        process.stdout.write(JSON.stringify({ ok: writeCommitmentRecord(RECORD) }));
+      `);
+      ok(res);
+      assert.equal(fs.readFileSync(canary, "utf-8"), "untouched",
+        ">> FAIL: #1570: the tmp write followed a planted symlink, so the commit-reveal secret landed in a file someone else chose");
+    });
+  });
+
+  test("tightens an existing 0755 state dir to 0700", { skip: process.platform === "win32" }, () => {
+    withTmp("mode", (tmp) => {
+      const dir = isolatedStateDir(tmp);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.chmodSync(dir, 0o755);
+      const res = run(isolated(tmp), `process.stdout.write(JSON.stringify({ ok: writeCommitmentRecord(RECORD) }));`);
+      ok(res);
+      assert.equal(JSON.parse(res.stdout).ok, true, ">> FAIL: #1570: the record must still be written");
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700,
+        ">> FAIL: #1570: a state dir created by an older version stays 0755, so its listing leaks every pending commitment");
+    });
+  });
+
+  test("removes a tmp file left by a failed rename", () => {
+    withTmp("tmpclean", (tmp) => {
+      const res = run(isolated(tmp), `
+        const dest = commitmentStateFilePath("e", "dot", "0xabc", "verysecretlabel");
+        fs.mkdirSync(dest, { recursive: true });
+        fs.writeFileSync(path.join(dest, "blocker"), "x");
+        const ok = writeCommitmentRecord(RECORD);
+        process.stdout.write(JSON.stringify({ ok, leftovers: fs.readdirSync(resolveStateDir()).filter(f => f.endsWith(".tmp")) }));
+      `);
+      ok(res);
+      const out = JSON.parse(res.stdout);
+      assert.equal(out.ok, false, ">> FAIL: #1570: a failed write must report false, never throw");
+      assert.deepEqual(out.leftovers, [],
+        ">> FAIL: #1570: a tmp file holding the commit-reveal secret was left behind under a predictable name");
+    });
+  });
+
+  test("prunes a malformed record and a legacy label-named one, keeps a fresh one", () => {
+    withTmp("prune", (tmp) => {
+      const dir = isolatedStateDir(tmp);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "commitment-00000000000000000000000000000000.json"), "{not json");
+      fs.writeFileSync(path.join(dir, "commitment-e_dot_0xabc_oldlabel.json"), JSON.stringify({ ...RECORD, savedAt: Date.now() }));
+      const res = run(isolated(tmp), `
+        writeCommitmentRecord(RECORD);
+        loadCommitmentRecord("e", "dot", "0xabc", "verysecretlabel");
+        process.stdout.write(JSON.stringify({ left: fs.readdirSync(resolveStateDir()).sort() }));
+      `);
+      ok(res);
+      const { left } = JSON.parse(res.stdout);
+      assert.ok(!left.includes("commitment-00000000000000000000000000000000.json"),
+        ">> FAIL: #1570: a record that can never parse must be pruned");
+      assert.ok(!left.some((f) => f.includes("oldlabel")),
+        ">> FAIL: #1570: a record named before the digest still leaks its label, so it must be removed on sight");
+      assert.equal(left.filter((f) => /^commitment-[0-9a-f]{32}\.json$/.test(f)).length, 1,
+        ">> FAIL: #1570: the prune sweep deleted the fresh record it should have kept");
+    });
+  });
+
+  test("keeps a fresh tmp file and stale lock, which carry the pid after the extension", () => {
+    withTmp("suffix", (tmp) => {
+      const dir = isolatedStateDir(tmp);
+      fs.mkdirSync(dir, { recursive: true });
+      const hex = "0".repeat(32);
+      const fresh = [`commitment-${hex}.json.4242.tmp`, `commitment-${hex}.lock.4242.abcd.stale`];
+      for (const f of fresh) fs.writeFileSync(path.join(dir, f), "x");
+      const res = run(isolated(tmp), `
+        writeCommitmentRecord(RECORD);
+        loadCommitmentRecord("e", "dot", "0xabc", "verysecretlabel");
+        process.stdout.write(JSON.stringify({ left: fs.readdirSync(resolveStateDir()) }));
+      `);
+      ok(res);
+      const { left } = JSON.parse(res.stdout);
+      for (const f of fresh) {
+        assert.ok(left.includes(f),
+          `>> FAIL: #1570: the sweep deleted ${f}, a live tmp or stale lock, because the digest pattern did not allow the .<pid> suffix the writer appends`);
+      }
+    });
+  });
+
+  test("a FIFO at the state file does not hang the deploy", { skip: process.platform === "win32" }, () => {
+    withTmp("fifo", (tmp) => {
+      const dir = isolatedStateDir(tmp);
+      fs.mkdirSync(dir, { recursive: true });
+      const mk = spawnSync("mkfifo", [path.join(dir, "last-run.json")], { encoding: "utf-8" });
+      if (mk.status !== 0) return; // no mkfifo on this box; nothing to assert
+      const res = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        import { loadRunState } from "${DIST}";
+        process.stdout.write(JSON.stringify({ v: loadRunState() }));
+      `], { encoding: "utf-8", env: isolated(tmp), timeout: 10_000 });
+      assert.equal(res.signal, null,
+        ">> FAIL: #1570: reading the state file blocked on a planted FIFO, so a deploy hangs instead of degrading to no resume");
+      assert.deepEqual(JSON.parse(res.stdout), { v: null },
+        ">> FAIL: #1570: a path that is not a regular file must read as no state");
+    });
+  });
+
+  test("reports false instead of throwing when the state dir cannot be made", () => {
+    withTmp("enotdir", (tmp) => {
+      const blocker = path.join(tmp, "blocker");
+      fs.writeFileSync(blocker, "x");
+      const res = run({ ...process.env, HOME: blocker, USERPROFILE: blocker, XDG_STATE_HOME: path.join(blocker, "state"), LOCALAPPDATA: path.join(blocker, "state") },
+        `process.stdout.write(JSON.stringify({ ok: writeCommitmentRecord(RECORD), loaded: loadCommitmentRecord("e", "dot", "0xabc", "verysecretlabel") }));`);
+      ok(res);
+      assert.deepEqual(JSON.parse(res.stdout), { ok: false, loaded: null },
+        ">> FAIL: #1570: losing commitment persistence must degrade to a fresh commit, never throw");
+    });
   });
 });
 
@@ -12818,7 +12981,8 @@ describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
   // Fixtures live at the literal /tmp paths the real workflow step hardcodes
   // (it isn't parametrized — that's the thing under test), so this suite
   // owns cleanup before AND after to avoid leaking fixture state.
-  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md", "/tmp/readiness-section.md"];
+  const FIXTURE_PATHS = ["/tmp/s1-legs.tsv", "/tmp/s2-legs.tsv", "/tmp/all-nightly-legs.tsv", "/tmp/fail-signatures.tsv", "/tmp/report-body.md", "/tmp/readiness-section.md",
+    "/tmp/issue-body.md", "/tmp/fail-signatures.md", "/tmp/dominant-cause.md", "/tmp/dominant-cause.label", "/tmp/signature-sources.txt"];
   function cleanFixtures() {
     for (const p of FIXTURE_PATHS) fs.rmSync(p, { force: true });
   }
@@ -12999,6 +13163,95 @@ describe("e2e.yml: nightly-report per-environment status (issue #1055)", () => {
     } finally {
       cleanFixtures();
       if (summaryPath) fs.rmSync(summaryPath, { force: true });
+    }
+  });
+
+  // #1701: a leg first red on a re-run reaches the issue only through this comment.
+  test("the re-run comment names each failing leg with its env and signature", () => {
+    cleanFixtures();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-rerun-"));
+    try {
+      assert.equal(spawnSync("jq", ["--version"]).status, 0,
+        ">> FAIL: #1701: jq is not installed, so the workflow steps under test cannot run");
+
+      const e2e = fs.readFileSync(E2E_YAML_PATH, "utf-8");
+      const report = jobBlock(e2e, "nightly-report");
+      const tail = (s) => (s || "").trim().split("\n").slice(-3).join(" / ");
+
+      fs.writeFileSync("/tmp/s1-legs.tsv", "");
+      fs.writeFileSync("/tmp/s2-legs.tsv", "");
+      fs.writeFileSync("/tmp/all-nightly-legs.tsv", [
+        "Nightly S9 parallel nonce-collision resilience (paseo-next-v2)\tfailure\tpaseo-next-v2",
+        "Nightly S-INC s-inc-roundtrip / js\tfailure\tpreview",
+      ].join("\n") + "\n");
+      const s9Sig = ">> FAIL: S9: both deploys must seed the same chunk nonce, got 41 and 42";
+      fs.writeFileSync("/tmp/fail-signatures.tsv", [
+        `Nightly S9 parallel nonce-collision resilience (paseo-next-v2)\t${s9Sig}`,
+        "Nightly S-INC s-inc-roundtrip / js\t" + "x".repeat(400),
+      ].join("\n") + "\n");
+
+      const summaryPath = path.join(dir, "summary.md");
+      fs.writeFileSync(summaryPath, "");
+      const baseEnv = {
+        ...process.env,
+        TAG: "e2e-ci-nightly-stable", VERSION: "0.22.0",
+        RUN_URL: "https://github.com/paritytech/bulletin-deploy/actions/runs/1",
+        SELECTED_ENV: "paseo-next-v2", HEALTHY_ENVS: '["paseo-next-v2"]',
+        GITHUB_STEP_SUMMARY: summaryPath,
+      };
+      // The flags Actions runs a step with: `shell: bash` adds pipefail.
+      const runStep = (name, extraEnv, flags = ["-e"]) => {
+        const f = path.join(dir, `${name.replace(/\W+/g, "-")}.sh`);
+        fs.writeFileSync(f, stepRunScript(report, name));
+        return spawnSync("bash", [...flags, f], { encoding: "utf-8", env: { ...baseEnv, ...extraEnv } });
+      };
+
+      const r1 = runStep("Render report body", {});
+      assert.equal(r1.status, 0,
+        `>> FAIL: #1701: Render report body exited ${r1.status} under bash -e: ${tail(r1.stderr)}`);
+      // One renderer: whatever the comment shows, the body shows too.
+      const section = fs.readFileSync("/tmp/fail-signatures.md", "utf-8");
+      assert.ok(fs.readFileSync("/tmp/report-body.md", "utf-8").includes(section.trim()),
+        ">> FAIL: #1701: the issue body and the re-run comment must render the same signature lines");
+
+      // curl stub: the lookup finds an issue, the POST is recorded.
+      const posted = path.join(dir, "posted.json");
+      const bin = path.join(dir, "bin");
+      fs.mkdirSync(bin);
+      fs.writeFileSync(path.join(bin, "curl"), [
+        "#!/bin/bash",
+        `for a in "$@"; do [ "$a" = "-G" ] && { echo '[{"number":1691}]'; exit 0; }; done`,
+        `while [ $# -gt 0 ]; do [ "$1" = "-d" ] && printf "%s" "$2" > ${JSON.stringify(posted)}; shift; done`,
+        "exit 0",
+      ].join("\n"));
+      fs.chmodSync(path.join(bin, "curl"), 0o755);
+
+      const r2 = runStep("Open failure issue", {
+        PATH: `${bin}:${process.env.PATH}`,
+        GITHUB_TOKEN: "x", API_URL: "https://api.github.com",
+        REPO: "paritytech/bulletin-deploy",
+        ISSUE_TITLE: "Nightly E2E failure (@latest): 2026-10-12",
+        DEDUP_LABEL: "nightly-dedup:stable:2026-10-12",
+        TIER: "stable", VERSION_LABEL: "0.22.0", TODAY: "2026-10-12",
+      }, ["-e", "-o", "pipefail"]);
+      assert.equal(r2.status, 0,
+        `>> FAIL: #1701: Open failure issue exited ${r2.status} under bash -e: ${tail(r2.stderr)}`);
+      assert.ok(fs.existsSync(posted), ">> FAIL: #1701: the dedup branch posted no comment");
+
+      const comment = JSON.parse(fs.readFileSync(posted, "utf-8")).body;
+      assert.match(comment, /Re-run also failed/,
+        ">> FAIL: #1701: the re-run comment lost its run link");
+      assert.match(comment, /### Failure signatures/,
+        ">> FAIL: #1701: the re-run comment must head its legs the same way the issue body does");
+      assert.ok(comment.includes(`- **Nightly S9 parallel nonce-collision resilience (paseo-next-v2)**: ${s9Sig}`),
+        ">> FAIL: #1701: the re-run comment does not name the leg that failed on this attempt");
+      assert.ok(comment.includes("Nightly S-INC s-inc-roundtrip / js (on preview)"),
+        ">> FAIL: #1701: an S-INC leg must carry its env, which its job name does not");
+      assert.ok(!comment.includes("x".repeat(301)),
+        ">> FAIL: #1701: a signature is posted uncapped, so enough red legs push the comment past GitHub's 65536 limit");
+    } finally {
+      cleanFixtures();
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
@@ -17664,6 +17917,38 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     assert.ok(
       helperCalls.length >= 2,
       "test/e2e.test.js must use the shared env-connect helper in both the preflight status probe and the S7 DotNS.connect path",
+    );
+  });
+
+  test("S9 signs as its own derivation path, and the funding check watches it", () => {
+    const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
+    assert.deepEqual(
+      directSignerArgsFor("s9", "SEED"),
+      ["--mnemonic", "SEED", "--derivation-path", "//e2e-s9"],
+      ">> FAIL: S9: s9 must sign as //e2e-s9; as bare Alice ROOT another leg advances the Bulletin chunk nonce between the two seed reads and the equal-seed precondition breaks",
+    );
+    assert.deepEqual(
+      directSignerArgsFor("s1", "SEED"),
+      ["--mnemonic", "SEED"],
+      ">> FAIL: S9: a scenario with no isolated signer must get no --derivation-path, not a null one",
+    );
+    assert.match(
+      e2e,
+      /function s9Args\([\s\S]{0,400}?\.\.\.directSignerArgs\(\),/,
+      ">> FAIL: S9: s9Args must spread directSignerArgs() so the signer comes from ISOLATED_DIRECT_SIGNERS",
+    );
+    assert.match(
+      e2e,
+      /probeSignerPopStatus\(\{[\s\S]{0,600}?derivationPath: isolated/,
+      ">> FAIL: S9: the PoP probe must use the scenario's own derivation path, or S9 picks its label from //e2e-direct's tier (probe-pop-status.js COUPLING NOTE)",
+    );
+    assert.ok(
+      BALANCE_SIGNERS.some((s) => s.path === "//e2e-s9"),
+      ">> FAIL: S9: tools/check-balances.mjs SIGNERS must include //e2e-s9, or the daily funding check cannot see its Asset Hub balance run dry",
+    );
+    assert.ok(
+      NON_GATING_LABELS.has("//e2e-s9"),
+      ">> FAIL: S9: //e2e-s9 must be non-gating, or a low balance on one scenario's signer drops the whole env from healthy_envs",
     );
   });
 
@@ -27749,7 +28034,7 @@ describe("e2e.yml: per-leg e2e-result files (#1625)", () => {
       const open = steps.find((st) => /- name: Open failure issue$/m.test(st));
       assert.ok(open.includes('"Dominant cause') || open.includes("CAUSE_LINE"), ">> FAIL: e2e-result: the issue body must carry the dominant-cause line");
       const lookup = open.slice(open.indexOf("EXISTING=$("), open.indexOf('if [ -n "$EXISTING" ]'));
-      assert.match(lookup, /labels=\$DEDUP_LABEL/);
+      assert.match(lookup, /labels=\$DEDUP_LABEL/, ">> FAIL: e2e-result: the dedup lookup must query the dedup label");
       assert.ok(!/CAUSE_LABEL/.test(lookup), ">> FAIL: e2e-result: the cause label must not be part of the dedup query (#1536)");
       assert.match(open, /labels: \(\[\$label\] \+ \(if \$cause == "" then \[\] else \[\$cause\] end\)\)/);
       assert.match(open, /"\$API_URL\/repos\/\$REPO\/labels"[\s\S]*?CAUSE_LABEL|CAUSE_LABEL[\s\S]*?"\$API_URL\/repos\/\$REPO\/labels"/, ">> FAIL: e2e-result: the cause label must be created on demand");

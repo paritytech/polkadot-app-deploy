@@ -33,19 +33,39 @@ export interface RunState {
   reason?: string;
 }
 
-// os.homedir() throws ERR_SYSTEM_ERROR when HOME is unset and the current
-// UID has no /etc/passwd entry (containers run with --user) — #1412 code
-// review found this reachable. Falls back to os.tmpdir(), which never
-// consults the passwd database (it reads TMPDIR/TMP/TEMP, falling back to a
-// fixed path). A state file landing under /tmp instead of the real home is
-// a degraded-but-working outcome — this whole module is a diagnostic/resume
-// aid, never a deploy requirement.
-function homedirOrFallback(): string {
+// os.homedir() throws with no HOME and no passwd entry, and returns "" for
+// HOME="", which would make resolveStateDir() relative and put the record
+// holding the commit-reveal secret in the caller's working directory.
+function homedirOrNull(): string | null {
   try {
-    return os.homedir();
+    const home = os.homedir();
+    return home.length > 0 ? home : null;
   } catch {
-    return os.tmpdir();
+    return null;
   }
+}
+
+function homedirOrFallback(): string {
+  return homedirOrNull() ?? os.tmpdir();
+}
+
+// True when resolveStateDir() fell back to os.tmpdir(). Mirrors that
+// function's branches, so edit both together.
+export function usesTmpdirFallback(): boolean {
+  if (process.platform === "win32") return !process.env.LOCALAPPDATA && homedirOrNull() === null;
+  if (process.platform !== "darwin" && process.env.XDG_STATE_HOME && process.env.XDG_STATE_HOME.length > 0) return false;
+  return homedirOrNull() === null;
+}
+
+// mkdirSync applies `mode` only to directories it CREATES, so a state dir left
+// at 0755 by an older version stays there. A directory another user owns may
+// still be writable by us; refuse it rather than chmod what is not ours.
+function ensureStateDir(dir: string): void {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (process.getuid === undefined) return;
+  const st = fs.statSync(dir);
+  if (st.uid !== process.getuid()) throw new Error(`state directory ${dir} is owned by uid ${st.uid}, not us`);
+  if ((st.mode & 0o077) !== 0) fs.chmodSync(dir, 0o700);
 }
 
 // Platform-appropriate per-user state directory. Not configurable via CLI
@@ -94,10 +114,20 @@ export function stateFilePath(): string {
 // the fix, since `readJsonSafe(stateFilePath())` evaluates stateFilePath()
 // eagerly, outside any try.
 function readJsonSafe<T>(pathThunk: () => string): T | null {
+  let fd: number | undefined;
   try {
-    return parseJsonRecord<T>(fs.readFileSync(pathThunk(), "utf-8"));
+    // O_NONBLOCK so opening a planted FIFO cannot block the deploy. The open
+    // is what blocks, so the non-regular-file check needs an already-open fd.
+    const nonBlock = (fs.constants as { O_NONBLOCK?: number }).O_NONBLOCK ?? 0;
+    fd = fs.openSync(pathThunk(), fs.constants.O_RDONLY | nonBlock);
+    if (!fs.fstatSync(fd).isFile()) return null;
+    return parseJsonRecord<T>(fs.readFileSync(fd, "utf-8"));
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* already gone */ }
+    }
   }
 }
 
@@ -142,15 +172,18 @@ function writeJsonAtomic(pathThunk: () => string, data: unknown, options?: { mod
   let tmp: string | undefined;
   try {
     const file = pathThunk();
-    // 0700, not the default 0755: filenames under this directory embed the
-    // PENDING label for an in-flight commit-reveal (commitment-<key>.json,
-    // where key includes the label) — exactly what commit-reveal exists to
-    // keep confidential until reveal. A world/group-readable directory
-    // listing would leak that label to anyone who can `ls` it, even without
-    // read access to the files themselves.
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    ensureStateDir(path.dirname(file));
     tmp = `${file}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data), { encoding: "utf-8", ...(options?.mode !== undefined ? { mode: options.mode } : {}) });
+    // "wx" (O_EXCL) never follows a symlink planted at this predictable name.
+    // EEXIST means a tmp our own pid left in a crash, so clear it and retry.
+    const writeOpts = { encoding: "utf-8" as const, flag: "wx" as const, ...(options?.mode !== undefined ? { mode: options.mode } : {}) };
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(data), writeOpts);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      tryUnlink(tmp);
+      fs.writeFileSync(tmp, JSON.stringify(data), writeOpts);
+    }
     fs.renameSync(tmp, file);
     tmp = undefined; // Renamed successfully — nothing left to clean up.
     return true;
@@ -291,9 +324,17 @@ export interface DotnsCommitmentRecord {
 
 const COMMITMENT_FILE_MODE = 0o600;
 
-function sanitizeKeyComponent(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_.-]/g, "_");
+// Hashed so a directory listing hides the pending label, which is what
+// commit-reveal keeps private until reveal. Unkeyed: anyone who knows
+// (environmentId, tld, owner) can hash a guessed label and compare.
+function commitmentDigest(key: string): string {
+  return crypto.createHash("sha256").update(key).digest("hex").slice(0, 32);
 }
+
+// Legacy records are named after the label itself. They are the leak this
+// replaced, so the prune sweep removes them on sight rather than ageing them
+// out. Losing one costs a fresh commit.
+const HASHED_COMMITMENT_NAME = /^commitment-[0-9a-f]{32}\.(json|lock)(\.|$)/;
 
 // Keyed by (environmentId, tld, owner, label) — not a single shared file
 // like last-run.json, and NOT owner-only — so a deploy for one
@@ -301,18 +342,28 @@ function sanitizeKeyComponent(value: string): string {
 // in-flight commitment on the same machine. Label matters as much as owner
 // here: see the module doc comment above.
 function commitmentKey(environmentId: string, tld: string, owner: string, label: string): string {
-  return `${sanitizeKeyComponent(environmentId)}_${sanitizeKeyComponent(tld)}_${sanitizeKeyComponent(owner.toLowerCase())}_${sanitizeKeyComponent(label)}`;
+  return commitmentDigest(`${environmentId}\u0000${tld}\u0000${owner.toLowerCase()}\u0000${label}`);
+}
+
+// Commitments refuse the shared /tmp fallback, where a co-tenant can plant
+// files at the predictable path. Throwing disables persistence; resume is
+// optional, see the path-thunk note on readJsonSafe.
+function requireOwnedStateDir(): string {
+  if (usesTmpdirFallback()) throw new Error("commitment persistence disabled: no home directory, and the fallback is a shared temp dir");
+  const dir = resolveStateDir();
+  if (!path.isAbsolute(dir)) throw new Error(`commitment persistence disabled: ${dir} is not an absolute path`);
+  return dir;
 }
 
 export function commitmentStateFilePath(environmentId: string, tld: string, owner: string, label: string): string {
-  return path.join(resolveStateDir(), `commitment-${commitmentKey(environmentId, tld, owner, label)}.json`);
+  return path.join(requireOwnedStateDir(), `commitment-${commitmentKey(environmentId, tld, owner, label)}.json`);
 }
 
 // #1659: one lock per record key, held for a whole commitAndRegister, so two
 // processes committing the same (env, tld, owner, label) never interleave
 // their resolve / persist / clear on the one record file.
 export function commitmentLockFilePath(environmentId: string, tld: string, owner: string, label: string): string {
-  return path.join(resolveStateDir(), `commitment-${commitmentKey(environmentId, tld, owner, label)}.lock`);
+  return path.join(requireOwnedStateDir(), `commitment-${commitmentKey(environmentId, tld, owner, label)}.lock`);
 }
 
 // The identity compare-and-replace and compare-and-unlink check against.
@@ -350,8 +401,8 @@ export const FALLBACK_MAX_COMMITMENT_AGE_SECONDS = 86_400;
 // resume; it is not a correctness gate.
 const COMMITMENT_RECORD_MAX_AGE_MS = 2 * FALLBACK_MAX_COMMITMENT_AGE_SECONDS * 1000; // 48h
 
-// Scans resolveStateDir() for every commitment-*.json file and deletes any
-// that fails to PARSE as JSON (a real, permanent failure — the file can
+// Scans requireOwnedStateDir() for every commitment-* file and deletes any
+// whose name predates the digest scheme, plus any that fails to PARSE as JSON (a real, permanent failure — the file can
 // never become readable later) or whose savedAt is older than
 // COMMITMENT_RECORD_MAX_AGE_MS. Deliberately does NOT delete a file this
 // sweep merely failed to READ (EACCES, EMFILE, a rename/unlink race with a
@@ -375,7 +426,7 @@ function pruneStaleCommitmentRecords(nowMs: number = Date.now()): void {
   let dir: string;
   let entries: string[];
   try {
-    dir = resolveStateDir();
+    dir = requireOwnedStateDir();
     entries = fs.readdirSync(dir);
   } catch {
     return;
@@ -383,6 +434,10 @@ function pruneStaleCommitmentRecords(nowMs: number = Date.now()): void {
   for (const entry of entries) {
     if (!entry.startsWith("commitment-")) continue;
     const file = path.join(dir, entry);
+    if (!HASHED_COMMITMENT_NAME.test(entry)) {
+      tryUnlink(file);
+      continue;
+    }
     if (entry.endsWith(".json")) {
       let raw: string;
       try {
@@ -398,9 +453,7 @@ function pruneStaleCommitmentRecords(nowMs: number = Date.now()): void {
       if (isStale) tryUnlink(file);
     } else if (entry.endsWith(".tmp") || entry.endsWith(".lock") || entry.endsWith(".stale")) {
       // .lock / .stale (#1659): a lock left by a SIGKILLed deploy. A live
-      // holder's lock is never this old (the lock lives for one deploy), and
-      // tryAcquireCommitmentLock takes over a dead holder's lock long before.
-      // Their filenames embed the label, so they must not linger either.
+      // holder's lock is never this old, since the lock lives for one deploy.
       let mtimeMs: number;
       try {
         mtimeMs = fs.statSync(file).mtimeMs;
@@ -496,7 +549,7 @@ export function tryAcquireCommitmentLock(environmentId: string, tld: string, own
   let file: string;
   try {
     file = commitmentLockFilePath(environmentId, tld, owner, label);
-    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    ensureStateDir(path.dirname(file));
   } catch {
     return NO_LOCK;
   }

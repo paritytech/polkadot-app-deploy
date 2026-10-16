@@ -118,16 +118,17 @@ export const DOTNS_ABI_PROFILES: Record<DotnsAbiProfile, DotnsAbiProfileInfo> = 
 /**
  * Newest DotNS release whose ABI has been diffed against what this client
  * calls. Every release from v0.6.0 through this one is the `v0.6.0` profile:
- * PopRules is byte-identical across them and the registration tuple is
- * unchanged, and the two differences that do exist (the `persist` field on
- * setSubnodeOwner, then its controller-only gate) have their own probes.
+ * every function this client calls has the same ABI across them and the
+ * label rules are unchanged, and the two differences that do exist (the
+ * `persist` field on setSubnodeOwner, then its controller-only gate) have
+ * their own probes.
  *
  * Raise it only after re-running that diff. A new generation needing its own
  * profile also needs a release range here — this mapping is keyed by release,
  * so adding to DotnsAbiProfile alone will not fail the build the way
  * DOTNS_ABI_PROFILES and classifyLabelStatus do.
  */
-export const HIGHEST_VERIFIED_DOTNS_RELEASE = "0.8.0";
+export const HIGHEST_VERIFIED_DOTNS_RELEASE = "1.0.0";
 
 /** A usable `protocolVersion()` answer. */
 export interface DeclaredProtocolVersion {

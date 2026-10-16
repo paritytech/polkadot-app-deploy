@@ -37,7 +37,7 @@ import {
   type PopSelfServeConfig,
 } from "../environments.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
-import { composeExecutable, composeRoot } from "./compose.js";
+import { composeExecutable, composeRoot, selfListedKeys } from "./compose.js";
 import type { LoadedProductConfig } from "./config-load.js";
 import { verifyEmbeddedAppManifests } from "./product-preflight.js";
 
@@ -210,6 +210,12 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
 
     const rootManifest = composeRoot(config, iconCid);
     const rootJson = JSON.stringify(rootManifest);
+    for (const key of selfListedKeys(config)) {
+      console.log(`  ⚠ trustedProducts: dropped '${key}', the product's own label. The host ignores a product listing itself.`);
+    }
+    if (rootManifest.trustedProducts) {
+      console.log(`  trustedProducts: ${JSON.stringify(rootManifest.trustedProducts)}`);
+    }
     console.log(
       `  Ensuring resolver + writing root manifest text record on ${config.domain} (${Buffer.byteLength(rootJson, "utf8")} B)…`,
     );

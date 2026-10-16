@@ -733,6 +733,19 @@ export const DEFAULT_DOTNS_PROFILE: DotnsAbiProfile = "poprules-startingPrice";
 // leaf (e.g. "myapp.dot" ending up as sublabel "myapp" under parent "dot").
 export const KNOWN_TLDS: readonly string[] = ["dot", "paseo"];
 
+// StringUtils.isNamePath (verified against upstream v0.7.0 source) validates
+// a parent path label-by-label — each label's own <=63-octet charset/hyphen
+// check via _isDnsLabel, applied here via validateDomainLabel on every label
+// of the path — and imposes no bound on how many labels a path may chain.
+// From v1.0.0 it also caps the parent path at 255 octets
+// (StringUtils.MAX_NAME_PATH_OCTETS); bulletin-deploy does not check that
+// cap, so a longer parent path reverts on-chain. A caller
+// that wants a heads-up on unusually deep nesting (more likely a typo, a
+// doubled suffix, or a path mis-joined by tooling than a genuine intention)
+// gets one from src/deploy.ts, which prints an informational console notice
+// and records a telemetry attribute after parsing — parseDomainName itself
+// stays pure and never refuses on depth grounds.
+
 // ---------------------------------------------------------------------------
 // On-chain TLD resolution (dotns PR #218 — DotnsProtocolRegistry.tld()/tldNode()).
 //
@@ -1967,9 +1980,7 @@ export function parseDomainName(input: string, tld: string = DEFAULT_TLD): Parse
   // param, per #1185 — see the comment on the depth-2 branch this replaces),
   // matching the registry's own per-label _isDnsLabel check inside
   // isNamePath (<=63 octets, lowercase/digit/hyphen charset, no leading or
-  // trailing hyphen) — the one bound upstream itself enforces on a nested
-  // path, and the only length-shaped check bulletin-deploy needs to add on
-  // top, since upstream imposes no whole-name or label-count bound of its own.
+  // trailing hyphen). For the 255-octet path cap see the #1449 comment after KNOWN_TLDS.
   const sanitizedSub = validateDomainLabel(parts[0]);
   const sanitizedParent = restParts.map((p) => validateDomainLabel(p)).join(".");
   const fullLabel = `${sanitizedSub}.${sanitizedParent}`;

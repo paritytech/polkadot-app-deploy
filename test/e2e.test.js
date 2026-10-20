@@ -1821,7 +1821,6 @@ describe("e2e", { skip: !ENABLED }, () => {
           "--tag", process.env.DEPLOY_TAG,
           ...directSignerArgs(),
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
-          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
           "--env", E2E_ENV_ID,
         ];
       }
@@ -1929,7 +1928,6 @@ describe("e2e", { skip: !ENABLED }, () => {
           `${label}.${tld}`,
           "--tag", process.env.DEPLOY_TAG,
           ...directSignerArgs(),
-          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
           "--env", E2E_ENV_ID,
         ];
         const result = await runBulletinDeploy({
@@ -2039,7 +2037,6 @@ describe("e2e", { skip: !ENABLED }, () => {
           "--tag", process.env.DEPLOY_TAG,
           ...directSignerArgs(),
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
-          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
           "--env", E2E_ENV_ID,
         ];
         const result = await runBulletinDeploy({

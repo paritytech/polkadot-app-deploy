@@ -733,12 +733,14 @@ export const DEFAULT_DOTNS_PROFILE: DotnsAbiProfile = "poprules-startingPrice";
 // leaf (e.g. "myapp.dot" ending up as sublabel "myapp" under parent "dot").
 export const KNOWN_TLDS: readonly string[] = ["dot", "paseo"];
 
+// #1449: subname depth is observed, not gated. There is no client-side cap
+// on how many labels deep a nested subname may go — the registry's own
 // StringUtils.isNamePath (verified against upstream v0.7.0 source) validates
 // a parent path label-by-label — each label's own <=63-octet charset/hyphen
 // check via _isDnsLabel, applied here via validateDomainLabel on every label
 // of the path — and imposes no bound on how many labels a path may chain.
 // From v1.0.0 it also caps the parent path at 255 octets
-// (StringUtils.MAX_NAME_PATH_OCTETS); bulletin-deploy does not check that
+// (StringUtils.MAX_NAME_PATH_OCTETS); polkadot-app-deploy does not check that
 // cap, so a longer parent path reverts on-chain. A caller
 // that wants a heads-up on unusually deep nesting (more likely a typo, a
 // doubled suffix, or a path mis-joined by tooling than a genuine intention)

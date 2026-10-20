@@ -3587,7 +3587,7 @@ jobs:
             fi
             echo "$CONTEXT"
             echo ""
-            cat /tmp/report-body.md
+            cat /tmp/report-body.md 2>/dev/null || echo "The report body could not be rendered. Open the run."
             echo ""
             echo "- Run: $RUN_URL"
             echo "- Summary: $RUN_URL#summary"

@@ -24,17 +24,9 @@ export function composeRoot(
   config: ProductConfig,
   iconCid: string,
 ): RootManifest {
-  // The product's own bare label is the segment directly under the TLD, not
-  // the first one. Subname depth is deliberately unchecked (#1449), so a
-  // config domain can be `worker.demoapp.dot` — that product is `demoapp`,
-  // with `worker` a modality subname. Reading the first segment there would
-  // drop a grant issued to an unrelated product genuinely named `worker`,
-  // which is the silent-grant-loss this field exists to avoid.
-  const labels = config.domain.split(".");
-  const selfLabel = (labels[labels.length - 2] ?? labels[0]).toLowerCase();
   const trustedProducts = normalizeTrustedProducts(
     config.trustedProducts,
-    selfLabel,
+    selfListedKeys(config),
   );
   return {
     $v: 1,
@@ -43,6 +35,19 @@ export function composeRoot(
     icon: { cid: iconCid, format: config.icon.format },
     ...(trustedProducts !== undefined ? { trustedProducts } : {}),
   };
+}
+
+/** The `trustedProducts` keys composeRoot drops because they name the product itself. */
+export function selfListedKeys(config: ProductConfig): string[] {
+  const self = productLabel(config.domain);
+  return Object.keys(config.trustedProducts ?? {}).filter((id) => id.toLowerCase() === self);
+}
+
+// The segment directly under the TLD: `worker.demoapp.dot` is `demoapp` (#1449).
+// Reading the first segment would drop a grant to an unrelated product named `worker`.
+function productLabel(domain: string): string {
+  const labels = domain.split(".");
+  return (labels[labels.length - 2] ?? labels[0]).toLowerCase();
 }
 
 /**
@@ -59,10 +64,9 @@ export function composeRoot(
  *
  * Two RFC rules drop entries outright, ahead of the empty-grants filter:
  *
- * - Line 143: "A product listing itself is ignored." A key equal
- *   (case-insensitively) to `selfLabel` — the product's own bare label,
- *   `config.domain` up to the first `.` — is dropped regardless of what
- *   grants it lists.
+ * - Line 143: "A product listing itself is ignored." The keys in
+ *   `selfListed` (see selfListedKeys) are dropped regardless of what grants
+ *   they list.
  * - Line 142: "`["all"]` implies `storage` and `context`, so
  *   `["all", "storage"]` is `["all"]`." A grant array containing `"all"`
  *   collapses to exactly `["all"]`, dropping the redundant values — both to
@@ -72,14 +76,14 @@ export function composeRoot(
  */
 function normalizeTrustedProducts(
   input: Record<string, Granted[]> | undefined,
-  selfLabel: string,
+  selfListed: string[],
 ): Record<string, Granted[]> | undefined {
   if (input === undefined) return undefined;
   // Plain `.sort()` on both levels: UTF-16 code-unit order is the same on
   // every machine, which localeCompare's collation would not be.
   const ids = Object.keys(input)
     .filter(
-      (id) => id.toLowerCase() !== selfLabel && input[id].length > 0,
+      (id) => !selfListed.includes(id) && input[id].length > 0,
     )
     .sort();
   if (ids.length === 0) return undefined;

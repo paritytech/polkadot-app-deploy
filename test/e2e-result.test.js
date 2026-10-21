@@ -97,6 +97,11 @@ describe("buildResult", () => {
     assert.equal(r.scenario, "s1");
     assert.equal(r.merkle, "kubo");
   });
+  test("a harness-declared class reaches the result (#1679)", () => {
+    const r = buildResult({ status: "failure", harness: { exit: 1, class: "manifest_unanchored", signature: ">> FAIL: S: precondition not met" }, job: "J" });
+    assert.equal(r.class, "manifest_unanchored",
+      ">> FAIL: buildResult: a class the harness judged for itself was overwritten by text classification");
+  });
   test("job.status is authoritative: harness says pass but the job failed", () => {
     const r = buildResult({ status: "failure", harness: { exit: 0, class: "pass", signature: "" }, job: "J" });
     assert.equal(r.exit, 1);

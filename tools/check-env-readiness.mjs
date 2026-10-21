@@ -41,7 +41,7 @@ const REGISTRAR_OWNER_OF_ABI = [
 ];
 
 // Bob is read (so the daily alarm table is the same) but never gates readiness.
-export const NON_GATING_LABELS = new Set(["Bob"]);
+export const NON_GATING_LABELS = new Set(["Bob", "//e2e-s9"]);
 const SEVERITY = { PASS: 0, WARN: 1, ERROR: 2, FAIL: 3 };
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const fmtPas = (planck, f) => (planck === null || planck === undefined ? "n/a" : f(planck));

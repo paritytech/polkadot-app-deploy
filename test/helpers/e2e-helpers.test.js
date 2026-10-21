@@ -78,7 +78,53 @@ describe("runBulletinDeploy", () => {
   });
 });
 
-import { classifyDeployStderr } from "./e2e-failure.js";
+import { classifyDeployStderr, assertManifestClassified, MANIFEST_UNANCHORED } from "./e2e-failure.js";
+import { classOf } from "./e2e-result.js";
+
+describe("e2e-failure: assertManifestClassified", () => {
+  // src/deploy.ts prints the raw fetch source; renderSummary's prose line follows.
+  const out = (source, prose) => `   Manifest fetch: ${source}\nCache:\n  Manifest:      ${prose}\n`;
+  const embedded = out("embedded (1 attempt)", "embedded (1 attempt, 41.2 KB Range hit)");
+
+  test("passes when every deploy anchored to the previous manifest", () => {
+    assert.doesNotThrow(
+      () => assertManifestClassified({ first: embedded, second: embedded }, { scenario: "S-INC-ASSET-ROTATION" }),
+      ">> FAIL: assertManifestClassified: two embedded deploys were rejected as unanchored",
+    );
+  });
+
+  // Every non-embedded source leaves prevManifest null, so all of them break the anchor.
+  for (const [name, source] of [
+    ["a gateway timeout", "heuristic_fallback (2 attempts)"],
+    ["a first deploy", "none"],
+    ["an unreadable previous CAR", "heuristic_fallback (1 attempt)"],
+  ]) {
+    test(`fails on ${name}`, () => {
+      assert.throws(
+        () => assertManifestClassified({ first: out(source, "x"), second: embedded }, { scenario: "S-INC-ASSET-ROTATION" }),
+        (err) => /the first deploy did not classify from the previous manifest/.test(err.message) && err.e2eClass === MANIFEST_UNANCHORED,
+        `>> FAIL: assertManifestClassified: ${name} was not reported as an unmet precondition`,
+      );
+    });
+  }
+
+  test("checks the second deploy too, not only the first", () => {
+    assert.throws(
+      () => assertManifestClassified({ first: embedded, second: out("heuristic_fallback (3 attempts)", "x") }, { scenario: "S-INC-ASSET-ROTATION" }),
+      (err) => /the second deploy did not classify/.test(err.message),
+      ">> FAIL: assertManifestClassified: a second deploy that lost the anchor went unreported",
+    );
+  });
+
+  test("the thrown error carries the class e2e-result.js reads", () => {
+    let thrown;
+    try { assertManifestClassified({ first: out("none", "x") }, { scenario: "S" }); } catch (e) { thrown = e; }
+    assert.equal(classOf(thrown), MANIFEST_UNANCHORED,
+      ">> FAIL: assertManifestClassified: the declared class did not reach classOf");
+    assert.equal(classOf(new Error("plain")), "",
+      ">> FAIL: classOf: a failure that declared no class was given one");
+  });
+});
 
 describe("e2e-failure: classifyDeployStderr", () => {
   test("classifies tx Invalid (Stale) as nonce_stale", () => {

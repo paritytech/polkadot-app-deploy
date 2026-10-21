@@ -229,8 +229,8 @@ test("classifyDeclaredProtocolVersion: the ceiling is the boundary, and it is st
   assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor}.${patch + 1}`).aboveVerifiedCeiling, true, ">> FAIL: a generation nobody has diffed must be flagged, that warning is the point of reading the version at all");
   assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor + 1}.0`).aboveVerifiedCeiling, true);
   assert.equal(classifyDeclaredProtocolVersion(`${major + 1}.0.0`).aboveVerifiedCeiling, true);
-  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor + 2}.0`).aboveVerifiedCeiling, true, ">> FAIL: a two-digit minor must not sort below a one-digit one");
-  assert.equal(classifyDeclaredProtocolVersion("0.10.0").aboveVerifiedCeiling, true, ">> FAIL: 0.10.0 is newer than 0.8.0 — plain string compare puts it below");
+  assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor + 10}.0`).aboveVerifiedCeiling, true, ">> FAIL: a two-digit minor must not sort below a one-digit one");
+  assert.equal(classifyDeclaredProtocolVersion(`${major + 10}.0.0`).aboveVerifiedCeiling, true, ">> FAIL: a two-digit major must not sort below a one-digit one");
   assert.equal(classifyDeclaredProtocolVersion(`${major}.${minor}.${patch + 1}`).profile, "v0.6.0", ">> FAIL: still classify — the probes would reach the same answer, so refusing one buys nothing");
 });
 

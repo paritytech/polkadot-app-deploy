@@ -171,9 +171,11 @@ export function assertDeploySucceeded(result, { scenario, step = "deploy" }) {
  *
  * @param {string} stdout
  * @param {RegExp} pattern
- * @param {{ scenario: string, what: string, hint?: string }} ctx
+ * `cls` names a cause class; e2e-result.js forwards it to the nightly report.
+ *
+ * @param {{ scenario: string, what: string, hint?: string, cls?: string }} ctx
  */
-export function assertStdoutMatches(stdout, pattern, { scenario, what, hint }) {
+export function assertStdoutMatches(stdout, pattern, { scenario, what, hint, cls }) {
   if (pattern.test(String(stdout ?? ""))) return;
   const headline = `${scenario}: ${what}`;
   const keywords = extractKeywords(pattern);
@@ -182,7 +184,9 @@ export function assertStdoutMatches(stdout, pattern, { scenario, what, hint }) {
     formatSeenTail(stdout, keywords),
     hint ? `   hint: ${hint}` : "",
   ];
-  throw new Error(formatBlock(headline, sections));
+  const err = new Error(formatBlock(headline, sections));
+  if (cls) err.e2eClass = cls;
+  throw err;
 }
 
 /**
@@ -238,6 +242,31 @@ export function failWith({ scenario, message, context = "", keywords = [], hint 
     hint ? `   hint: ${hint}` : "",
   ];
   throw new Error(formatBlock(headline, sections));
+}
+
+// Harness-judged cause class. Not a FLAKE_PATTERNS needle: those match only
+// strings src/ emits, never harness-authored assertion text.
+export const MANIFEST_UNANCHORED = "manifest_unanchored";
+
+/**
+ * Fail unless every named deploy classified files from the previous manifest.
+ * Any other mode leaves the CAR unanchored, so a byte or skip-rate budget
+ * measures the layout shift instead of the content change.
+ *
+ * @param {Record<string, string>} steps  step name (e.g. "first") to that deploy's stdout
+ * @param {{ scenario: string }} ctx
+ */
+export function assertManifestClassified(steps, { scenario }) {
+  for (const [step, out] of Object.entries(steps)) {
+    // The raw fetch source, not renderSummary's prose line: this is the value
+    // deploy.ts keys its prevManifest ternary off.
+    assertStdoutMatches(out, /^\s*Manifest fetch:\s+embedded\b/m, {
+      scenario,
+      what: `precondition not met: the ${step} deploy did not classify from the previous manifest`,
+      hint: "the Manifest line in the tail says which mode it used; this is a precondition failure, not a chunk-alignment regression.",
+      cls: MANIFEST_UNANCHORED,
+    });
+  }
 }
 
 /**

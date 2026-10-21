@@ -26,7 +26,7 @@ import {
   assertStdoutMatches,
   parseLineOrExplain,
   assertOnChainMatches,
-  failWith, assertFixtureOwnership, assertFixtureNotDrifted } from "./helpers/e2e-failure.js";
+  failWith, assertManifestClassified, assertFixtureOwnership, assertFixtureNotDrifted } from "./helpers/e2e-failure.js";
 
 // The CLI prints "CID: bafy..." at the end of a successful deploy. We parse
 // that — not a client-side recomputation — so we verify "what the CLI said
@@ -210,6 +210,18 @@ const RUN_TOKEN = `${process.env.GITHUB_RUN_ID ?? "local"}${(process.env.GITHUB_
 const DEPLOY_TIMEOUT_MS = 15 * 60 * 1000;
 
 const ALICE_MNEMONIC = DEFAULT_MNEMONIC;
+
+// The direct-mode mirror of poolOwnerArgs(): every direct leg signs through
+// this, so a scenario gets its own signer from the map alone. Exported pure
+// form so unit tests can assert the mapping without running a deploy.
+export function directSignerArgsFor(scenario, mnemonic = ALICE_MNEMONIC) {
+  const p = ISOLATED_DIRECT_SIGNERS[scenario] ?? null;
+  return ["--mnemonic", mnemonic, ...(p ? ["--derivation-path", p] : [])];
+}
+
+function directSignerArgs() {
+  return directSignerArgsFor(SCENARIO);
+}
 
 function pickStableLabel() {
   if (SIGNER === "direct") {
@@ -403,9 +415,7 @@ function buildArgs(fixtureDir, label) {
   // fixtures on every env the harness deploys to (isolated per-scenario
   // signers, e.g. S9/S-GRANDPA-REUPLOAD, override via directSignerDerivationPath()).
   if (SIGNER === "direct") {
-    args.push("--mnemonic", ALICE_MNEMONIC);
-    const deriv = directSignerDerivationPath();
-    if (deriv) args.push("--derivation-path", deriv);
+    args.push(...directSignerArgs());
   } else {
     // #1054: a pinned pool leg signs DotNS as its own pool account (//deploy/<index>),
     // which owns its per-leg domain — no more shared bare-Alice Asset Hub nonce.
@@ -456,9 +466,7 @@ function buildInputCarArgs(dumpPath, label) {
   const args = ["--input-car", dumpPath, label, "--tag", process.env.DEPLOY_TAG];
   args.push("--env", E2E_ENV_ID);
   if (SIGNER === "direct") {
-    args.push("--mnemonic", ALICE_MNEMONIC);
-    const deriv = directSignerDerivationPath();
-    if (deriv) args.push("--derivation-path", deriv);
+    args.push(...directSignerArgs());
   } else {
     // #1054: a pinned pool leg signs DotNS as its own pool account (//deploy/<index>).
     args.push(...poolOwnerArgs());
@@ -603,13 +611,16 @@ describe("e2e", { skip: !ENABLED }, () => {
   installE2eResultHook({ scenario: SCENARIO, signer: SIGNER, merkle: MERKLE, env: E2E_ENV_ID });
   after(() => armExitGuard());
   before(async () => {
+    const isolated = directSignerDerivationPath();
     signerPopStatus = await probeSignerPopStatus({
       dotnsFactory: () => new DotNS(),
       signer: SIGNER,
       bulletinDeployEnv: E2E_ENV_ID,
       resolveEnvConnectOptions: resolveDotnsEnvConnectOptions,
       defaultMnemonic: DEFAULT_MNEMONIC,
-      derivationPath: directSignerDerivationPath(),
+      // Probe the path the scenario deploys with (probe-pop-status.js COUPLING
+      // NOTE). Spread: an explicit null would mean "probe the bare account".
+      ...(isolated ? { derivationPath: isolated } : {}),
     });
   });
 
@@ -1502,6 +1513,10 @@ describe("e2e", { skip: !ENABLED }, () => {
         });
         assertDeploySucceeded(r2, { scenario: "S-INC-ASSET-ROTATION", step: "second deploy" });
 
+        // The ceiling below only means anything if both deploys anchored to the
+        // previous manifest. Anything else re-lays the CAR out (#1679).
+        assertManifestClassified({ first: r1.stdout, second: r2.stdout }, { scenario: "S-INC-ASSET-ROTATION" });
+
         // Bytes-uploaded gate: rotating one ~466 KB content-hashed bundle in a
         // 9.6 MB site should re-upload only the bundle bytes + section 2 overhead.
         // Live observation: ~700 KB uploaded. 1.5 MB ceiling = ~2× headroom for
@@ -1804,9 +1819,8 @@ describe("e2e", { skip: !ENABLED }, () => {
           fixtureDir,
           `${label}.${tld}`,
           "--tag", process.env.DEPLOY_TAG,
-          "--mnemonic", ALICE_MNEMONIC,
+          ...directSignerArgs(),
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
-          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
           "--env", E2E_ENV_ID,
         ];
       }
@@ -1913,8 +1927,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           fixtureDir,
           `${label}.${tld}`,
           "--tag", process.env.DEPLOY_TAG,
-          "--mnemonic", ALICE_MNEMONIC,
-          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
+          ...directSignerArgs(),
           "--env", E2E_ENV_ID,
         ];
         const result = await runBulletinDeploy({
@@ -2022,9 +2035,8 @@ describe("e2e", { skip: !ENABLED }, () => {
           fixtureDir,
           `${label}.${tld}`,
           "--tag", process.env.DEPLOY_TAG,
-          "--mnemonic", ALICE_MNEMONIC,
+          ...directSignerArgs(),
           ...(MERKLE === "js" ? ["--js-merkle"] : []),
-          ...(directSignerDerivationPath() ? ["--derivation-path", directSignerDerivationPath()] : []),
           "--env", E2E_ENV_ID,
         ];
         const result = await runBulletinDeploy({

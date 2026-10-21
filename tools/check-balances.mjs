@@ -63,6 +63,7 @@ export const SIGNERS = [
   { label: "//e2e-direct",      path: "//e2e-direct",       role: "dotns" },
   { label: "//e2e-fresh-pool",  path: "//e2e-fresh-pool",   role: "dotns" },
   { label: "//e2e-fresh-direct", path: "//e2e-fresh-direct", role: "dotns" },
+  { label: "//e2e-s9",          path: "//e2e-s9",           role: "dotns" },
   ...Array.from({ length: 14 }, (_, i) => ({
     label: `//deploy/${i}`,
     path: `//deploy/${i}`,

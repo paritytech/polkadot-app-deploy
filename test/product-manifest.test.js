@@ -21,7 +21,7 @@ import {
   formatConfigLoadError,
 } from "../dist/index.js";
 import { registerOrEnsureResolver, domainMatchesEnvTld, manifestSignerOptions } from "../dist/manifest/publish.js";
-import { composeRoot } from "../dist/manifest/compose.js";
+import { composeRoot, selfListedKeys } from "../dist/manifest/compose.js";
 import { NonRetryableError } from "../dist/errors.js";
 import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints, __selectStorageProviderModeForTest, resolveProductSigner } from "../dist/deploy.js";
 import { deriveProductSigner } from "../dist/product-account.js";
@@ -1036,6 +1036,14 @@ describe("composeRoot — trustedProducts (#1484)", () => {
       false,
       ">> FAIL: composeRoot trustedProducts-self-listing-only-key: dropping the only key (the self-listing) must omit the field entirely, exactly like {}",
     );
+  });
+
+  // #1608: one config, two names. `dim2next` is a grant on dim2.paseo and a self-listing on dim2next.paseo.
+  test("selfListedKeys names the key composeRoot drops for this domain", () => {
+    const trustedProducts = { stash: ["storage"], dim2next: ["context"] };
+    assert.deepEqual(selfListedKeys({ ...VALID_CONFIG, domain: "dim2next.paseo", trustedProducts }), ["dim2next"], ">> FAIL: the dropped self-listing must be reported, or the deploy log hides it (#1608)");
+    assert.deepEqual(selfListedKeys({ ...VALID_CONFIG, domain: "dim2.paseo", trustedProducts }), [], ">> FAIL: a grant to another product is not a self-listing");
+    assert.deepEqual(selfListedKeys(VALID_CONFIG), [], ">> FAIL: no trustedProducts means nothing to report");
   });
 
   test("drops a self-listing key case-insensitively", () => {

@@ -21062,7 +21062,7 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
       estimateGasForCall: async () => ({
         success: true,
         gasRequired: { referenceTime: 2_000_000_000n, proofSize: 200_000n },
-        storageDeposit: 1_000_000_000n, // a small measured head estimate must not lower the dependent batch below the env floor
+        storageDeposit: 1_000_000_000n,
       }),
       client: {
         tx: {
@@ -21097,7 +21097,7 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
       operation: "test batch",
       storageDepositLimit: 50_000_000_000n + ((1_000_000_000n * 120n) / 100n),
       value: 0n,
-    }, ">> FAIL: a dependent two-call batch must gate one registration-floor limit plus the measured head's 20%-buffered estimate, not double the floor");
+    }, ">> FAIL: a dependent two-call batch must gate one 5 PAS registration-floor limit plus the measured head's 20%-buffered estimate, not double the floor");
     assert.strictEqual(capturedCalls.length, 2, ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
     for (const call of capturedCalls) {
       assert.deepStrictEqual(call.weight_limit, { ref_time: 2_400_000_000n, proof_size: 240_000n },

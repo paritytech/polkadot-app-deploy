@@ -269,8 +269,8 @@ export const AUTO_MAP_RENT_HEADROOM = ONE_PAS * 20n; // 20 PAS
 // Minimum storage deposit required for a fresh TLD register() on paseo-next-v2.
 // pallet-revive dry-run returns flags=1 data=0x when free balance < this amount.
 export const MINIMUM_REGISTER_STORAGE_DEPOSIT = 2_000_000_000_000n; // 200 PAS
-// bulletin #1712: read-only dry runs on 2026-10-17 measured the exact write
-// calls on paseo-next-v2 and preview: setText 0.02064 PAS, setContenthash 0 PAS,
+// Read-only dry runs on 2026-10-17 measured the exact write calls identically
+// on paseo-next-v2 and preview: setText 0.02064 PAS, setContenthash 0 PAS,
 // setResolver 0 PAS, and a fresh setSubnodeOwner 0.14448 PAS. Keep just over
 // 10x the largest measurement as a runtime/storage-cost variance floor without
 // making an owned-name write reserve the registration-only floor above.
@@ -2187,16 +2187,15 @@ export class ReviveClientWrapper {
 
   client: any;
   mappedAccounts: Set<string>;
-  // bulletin-deploy #1518: the storage-deposit floors available to every
-  // Revive.call dry-run/submission. dryRunReviveCall selects the registration
-  // floor for calls with no explicit depositPolicy or "registration"; "record"
-  // calls use the record floor. Defaults to the module constants so a wrapper
-  // nobody configured (e.g. a bare `new ReviveClientWrapper(client)` in a
-  // test) still declares a safe, known floor rather than 0.
-  // DotNS.recreateReviveClient — the only place a wrapper is ever
-  // constructed — calls setStorageDepositFloors right after construction, so
-  // every dry-run path picks up the owning DotNS instance's values; no
-  // per-call parameter to thread (and forget) at each new call site.
+  // #1518: the storage-deposit floors available to every Revive.call dry-run/
+  // submission. dryRunReviveCall selects the registration floor for calls with
+  // no explicit depositPolicy or "registration"; "record" calls use the record
+  // floor. Defaults to the module constants so a wrapper nobody configured (e.g.
+  // a bare `new ReviveClientWrapper(api)` in a test) still declares a SAFE,
+  // measured floor rather than 0. DotNS.recreateReviveClient — the only place a
+  // wrapper is ever constructed — calls setStorageDepositFloors right after
+  // construction, so every dry-run path picks up the owning DotNS instance's
+  // values; no per-call parameter to thread (and forget) at each call site.
   private _storageDepositFloor: bigint = REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT;
   private _recordStorageDepositFloor: bigint = MINIMUM_RECORD_STORAGE_DEPOSIT;
   private _submissionFundingGate: ((operation: string, storageDepositLimit: bigint, value: bigint) => Promise<void>) | null = null;

@@ -103,6 +103,14 @@ describe("resolveEndpoints — happy path", () => {
     assert.equal(r.envName, "Paseo Next");
   });
 
+  test("recordStorageDeposit resolves to a bigint only when the env declares it", () => {
+    const doc = structuredClone(FIXTURE_DOC);
+    assert.equal(resolveEndpoints(doc, "paseo-next").recordStorageDeposit, undefined,
+      ">> FAIL: an env without recordStorageDeposit must resolve it as undefined so the default applies");
+    doc.environments.find((e) => e.id === "paseo-next").recordStorageDeposit = 12_000_000_000;
+    assert.equal(resolveEndpoints(doc, "paseo-next").recordStorageDeposit, 12_000_000_000n);
+  });
+
   test("normalizes wss array form", () => {
     const r = resolveEndpoints(FIXTURE_DOC, "paseo-review");
     assert.equal(r.bulletin.length, 2);

@@ -32,7 +32,7 @@ export type { PhoneSignatureStep };
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectHealthyPoolAccount, checkPoolAccountNonceHealth, StuckPoolAccountError, STUCK_NONCE_GAP_THRESHOLD, withTimeout, stuckQueueMessage, parsePoolDerivationIndex, NONCE_HEALTH_SAMPLES, type NonceHealth, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
-import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
+import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, noteWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
 import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { setDeployContext as setBugReportContext } from "./bug-report.js";
@@ -78,7 +78,7 @@ export interface DeployResult {
 
 export type DeployContent = string | Uint8Array | Uint8Array[];
 
-export { NonRetryableError, EXIT_CODE_NO_RETRY } from "./errors.js";
+export { InsufficientFundsError, NonRetryableError, EXIT_CODE_NO_RETRY } from "./errors.js";
 import { NonRetryableError } from "./errors.js";
 import { e2eNonceSeedBarrier } from "./e2e-nonce-barrier.js";
 
@@ -222,7 +222,7 @@ export function makeBulletinStatusHandler(primary: string) {
     if (s.type === WsEvent.CONNECTED && s.uri !== primary) {
       _deployRpcFailedOver = true;
       setDeployAttribute("deploy.rpc.failed_over", "true");
-      captureWarning("Bulletin RPC failover", { from: primary, to: s.uri });
+      noteWarning("Bulletin RPC failover", { from: primary, to: s.uri });
     }
     if (s.type === WsEvent.CLOSE || s.type === WsEvent.ERROR) {
       try { _onWsHalt?.(); } catch { /* halt-callback failures are non-fatal */ }
@@ -1436,6 +1436,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   }
 
   let reconnectionsUsed = 0;
+  let chunkRetryCount = 0;
   // Sliding window of recovery-attempt timestamps (#216). Each chunk retry
   // and each reconnect appends; if more than RETRY_BUDGET_MAX_EVENTS land
   // within RETRY_BUDGET_WINDOW_MS, we bail to bound peak in-flight bytes
@@ -1465,9 +1466,10 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     recordRecoveryAndCheckBudget("reconnect");
     reconnectionsUsed++;
     setDeployAttribute("deploy.reconnects", reconnectionsUsed);
+    setDeployAttribute("deploy.reconnected", "true");
     const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, reconnectionsUsed - 1), RETRY_MAX_DELAY_MS);
     console.log(`\n   Connection lost, reconnecting to Bulletin in ${(delay / 1000).toFixed(0)}s (${reconnectionsUsed}/${MAX_RECONNECTIONS})...`);
-    captureWarning("WebSocket connection lost, reconnecting", { reconnection: reconnectionsUsed, maxReconnections: MAX_RECONNECTIONS });
+    noteWarning("WebSocket connection lost, reconnecting", { reconnection: reconnectionsUsed, maxReconnections: MAX_RECONNECTIONS });
     // Peak-during-reconnect answers whether destroyed clients release or pile.
     sampleMemory(`reconnect_${reconnectionsUsed}_before`);
     try { client.destroy(); } catch {}
@@ -1776,12 +1778,16 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           markProvisional(fail.index);
           continue;
         }
-        captureWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
+        chunkRetryCount++;
+        setDeployAttribute("deploy.chunk.retried", "true");
+        setDeployAttribute("deploy.chunk.retry_count", chunkRetryCount);
+        noteWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
         const isExpiryFailure = fail.error?.message?.includes("isValid:false");
         if (isExpiryFailure) {
           console.log(`   Chunk ${fail.index + 1}: tx rejected (isValid:false), likely mortal era expiry — reissuing with fresh nonce`);
         }
         let retried = false;
+        let lastRetryError: Error | undefined;
         for (let attempt = 1; attempt <= MAX_CHUNK_RETRIES; attempt++) {
           recordRecoveryAndCheckBudget("chunk_retry");
           const retryDelay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1), RETRY_MAX_DELAY_MS);
@@ -1867,7 +1873,8 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               retried = true;
               break;
             }
-            captureWarning("Chunk retry failed", { chunkIndex: fail.index + 1, attempt, maxRetries: MAX_CHUNK_RETRIES, error: e.message?.slice(0, 200) });
+            lastRetryError = e instanceof Error ? e : new Error(String(e));
+            noteWarning("Chunk retry failed", { chunkIndex: fail.index + 1, attempt, maxRetries: MAX_CHUNK_RETRIES, error: e.message?.slice(0, 200) });
             console.log(`   Retry ${attempt} failed: ${e.message?.slice(0, 80)}`);
             // If retry also failed with connection error, try reconnecting on next attempt
             if (isConnectionError(e) && reconnect && reconnectionsUsed < MAX_RECONNECTIONS) {
@@ -1876,6 +1883,8 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           }
         }
         if (!retried) {
+          // Exhausted: the one event per chunk; per-attempt failures are breadcrumbs.
+          captureWarning("Chunk retry failed", { chunkIndex: fail.index + 1, attempts: MAX_CHUNK_RETRIES, error: (lastRetryError ?? fail.error)?.message?.slice(0, 200) });
           // When all reconnect slots are exhausted and the chunk failure is a
           // connection error, surface the root cause rather than wrapping it as
           // a chunk error (the reconnection budget, not the chunk, is the limit).
@@ -1914,7 +1923,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             `txs but not including this chunk: check the account's pending queue and re-run the deploy.`,
           );
         }
-        captureWarning("nonce-advance collision: re-uploading missing chunks", {
+        noteWarning("nonce-advance collision: re-uploading missing chunks", {
           collision_count: missingResults.length,
         });
 
@@ -2054,7 +2063,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           if (classifyRootSubmitError(e, wsHaltDetected) === "nonce-collision") {
             // Not a connection loss (#1672): re-read the nonce and resubmit on the same client.
             console.log(`   Root node: nonce ${rootNonce} collided (${e.message?.replace(/\s+/g, " ").slice(0, 80)}), resubmitting at a fresh nonce (attempt ${rootAttempt}/${MAX_ROOT_RETRIES})`);
-            captureWarning("root-node nonce collision: resubmitting", { nonce: rootNonce, attempt: rootAttempt });
+            noteWarning("root-node nonce collision: resubmitting", { nonce: rootNonce, attempt: rootAttempt });
             await new Promise(r => setTimeout(r, nonceCollisionBackoffMs()));
             continue;
           }
@@ -3735,6 +3744,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   let envContracts: Record<string, string> = {};
   let envNativeToEthRatio: bigint | undefined;
   let envRegisterStorageDeposit: bigint | undefined;
+  let envRecordStorageDeposit: bigint | undefined;
   let envPopSelfServe: PopSelfServeConfig | null = null;
   let envTld: string = DEFAULT_TLD;
   // Undefined-preserving twin of envTld: unlike envTld (defaulted to "dot"
@@ -3775,6 +3785,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envContracts = resolved.contracts;
       envNativeToEthRatio = resolved.nativeToEthRatio;
       envRegisterStorageDeposit = resolved.registerStorageDeposit;
+      envRecordStorageDeposit = resolved.recordStorageDeposit;
       envTld = resolved.tld ?? DEFAULT_TLD;
       envConfiguredTld = resolved.tld;
       envPopSelfServe = getPopSelfServeConfig(doc, envId);
@@ -4052,6 +4063,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       const preflight = new DotNS();
       await preflight.connect({
         ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+        recordStorageDeposit: envRecordStorageDeposit,
         // bulletin #1221: plannedAction isn't known until preflight() runs below, so
         // assume "register" (see AUTO_MAP_RENT_HEADROOM's doc comment in dotns.ts for the cost).
         autoMapTopUpTarget: topUpTargetFor("register", envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
@@ -4369,6 +4381,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           };
           await ownerDotns.connect({
             ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+            recordStorageDeposit: envRecordStorageDeposit,
             // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
             // real plannedAction rather than a hardcoded "register".
             autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
@@ -4387,6 +4400,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const dotns = new DotNS();
         await dotns.connect({
           ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+          recordStorageDeposit: envRecordStorageDeposit,
           // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
           // real plannedAction rather than a hardcoded "register".
           autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),

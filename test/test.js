@@ -25,11 +25,11 @@ import { createRequire } from "node:module";
 // `node`), so it's loaded here via createRequire rather than converted to
 // ESM just for this test file.
 const require = createRequire(import.meta.url);
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, InsufficientFundsError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
-import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
+import { captureWarning, noteWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
   isTelemetryDisabled, scrubPaths, truncateAddress, sanitizeBranch,
@@ -59,7 +59,7 @@ import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLoca
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
 import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache, computePhaseACounts, formatUploadInclusionLine } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
-import { directSignerArgsFor, pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
+import { directSignerArgsFor, probeDerivationPathFor, pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
 import { SIGNERS as BALANCE_SIGNERS } from "../tools/check-balances.mjs";
 import { NON_GATING_LABELS } from "../tools/check-env-readiness.mjs";
 import * as nodeCrypto from "node:crypto";
@@ -2558,6 +2558,29 @@ describe("sanitizeErrorMessage", () => {
 // 8d. deploy.error_kind / deploy.error_message propagation via withSpan
 // ---------------------------------------------------------------------------
 describe("withSpan error attribute propagation", () => {
+  test("typed InsufficientFundsError sets funding.insufficient_balance without prose matching", async () => {
+    const span = {
+      attrs: new Map(),
+      setAttribute(key, value) { this.attrs.set(key, value); },
+      setStatus() {},
+    };
+    const stub = {
+      startSpan: async (_options, fn) => fn(span),
+    };
+    const previous = __setSentryForTest(stub);
+    try {
+      await assert.rejects(
+        () => withSpan("test", "typed funding", {}, async () => {
+          throw new InsufficientFundsError("opaque gate refusal");
+        }),
+        InsufficientFundsError,
+      );
+      assert.strictEqual(span.attrs.get("deploy.error_kind"), "funding.insufficient_balance");
+    } finally {
+      __setSentryForTest(previous);
+    }
+  });
+
   test("source: withSpan catch sets deploy.error_kind on the span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
     assert.ok(
@@ -3420,9 +3443,12 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.expected": "false",
     // rpc
     "deploy.rpc.failed_over": "false",
+    "deploy.chunk.retried": "false",
+    "deploy.reconnected": "false",
     // dotns
     "deploy.dotns.signer_below_floor": "false",
     "deploy.dotns.toppedup": "false",
+    "deploy.dotns.commitment_resumed": "false",
     "deploy.dotns.tx_resolution_kind": "hash",
     "deploy.dotns_backend": "contract",
     "deploy.dotns_pop_source": "personhood-precompile",
@@ -4095,6 +4121,181 @@ describe("DotNS initial state", () => {
     );
 
     assert.strictEqual(submitOptions.contracts, d["_contracts"]);
+  });
+
+  // #1518: ReviveClientWrapper (not DotNS) is the object that actually declares
+  // storage_deposit_limit on every Revive.call it dry-runs (dryRunReviveCall, called
+  // from submitTransaction/submitBatchedTransactions — the path finalizeRegistration/
+  // commit/setContenthash submit through). Before this fix it had NO way to learn the
+  // per-env/measured floor at all: it always used the module's hardcoded default, so a
+  // per-env registerStorageDeposit override moved the PREFLIGHT gate but left the REAL
+  // submitted extrinsic's declared limit unchanged — the exact failure mode #1518 warns
+  // against (preflight clears a lower balance, the real call still demands the old,
+  // higher amount mid-deploy). setStorageDepositFloors is DotNS.recreateReviveClient's
+  // one wiring point (the only place a wrapper is ever constructed) — these tests go
+  // straight at the wrapper, the actual owner of the value, rather than at a threaded
+  // parameter that a future call site could add without remembering to pass it.
+  describe("ReviveClientWrapper storage-deposit floor (#1518)", () => {
+    test("setStorageDepositFloors changes the limit dryRunReviveCall declares", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      w.setStorageDepositFloors({ register: 12_345_000_000n, record: 1n }); // a distinctive, obviously-not-the-default value
+      const prep = await w["dryRunReviveCall"]("0xContract", 0n, "0x", "5Signer", {});
+      assert.strictEqual(prep.storage_deposit_limit, 12_345_000_000n,
+        ">> FAIL: ReviveClientWrapper.setStorageDepositFloors: dryRunReviveCall must declare the floor set via setStorageDepositFloors, not a hardcoded default");
+    });
+
+    test("a wrapper nobody configured still declares the measured module default (fail closed)", async () => {
+      const { ReviveClientWrapper, MINIMUM_REGISTER_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({}); // setStorageDepositFloors never called
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      const prep = await w["dryRunReviveCall"]("0xContract", 0n, "0x", "5Signer", {});
+      assert.strictEqual(prep.storage_deposit_limit, MINIMUM_REGISTER_STORAGE_DEPOSIT,
+        ">> FAIL: ReviveClientWrapper unconfigured floor: must fall back to the measured module constant, never undefined/0");
+    });
+
+    test("submitBatchedTransactions gives known record writes the measured record floor", async () => {
+      const { ReviveClientWrapper, MINIMUM_RECORD_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      w.ensureAccountMapped = async () => {};
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      const captured = [];
+      w.client = {
+        tx: {
+          Revive: { call: (args) => { captured.push(args); return { decodedCall: {} }; } },
+          Utility: { batch_all: () => ({}) },
+        },
+      };
+      let fundingGate;
+      w.signAndSubmitWithRetry = async (buildExtrinsic, _signer, _cb, _label, opts) => {
+        buildExtrinsic();
+        fundingGate = opts?.fundingGate;
+        return { kind: "hash", hash: "0xbatch" };
+      };
+
+      await w.submitBatchedTransactions([
+        { contractAddress: "0xText", value: 0n, encodedData: "0x", functionName: "setText", depositPolicy: "record", args: [] },
+        { contractAddress: "0xContent", value: 0n, encodedData: "0x", functionName: "setContenthash", depositPolicy: "record", args: [] },
+      ], "5Signer", {}, () => {});
+
+      assert.deepStrictEqual(fundingGate, {
+        operation: "Utility.batch_all",
+        storageDepositLimit: MINIMUM_RECORD_STORAGE_DEPOSIT,
+        value: 0n,
+      }, ">> FAIL: submitBatchedTransactions must gate one shared floor plus other calls' buffered estimates, not multiply the floor by batch length");
+      assert.strictEqual(captured.length, 2);
+      for (const call of captured) {
+        assert.strictEqual(call.storage_deposit_limit, MINIMUM_RECORD_STORAGE_DEPOSIT,
+          ">> FAIL: every Revive.call inside submitBatchedTransactions must receive the per-call record floor");
+      }
+    });
+
+    const GATE_ARGS = { operation: "Revive.call", storageDepositLimit: 1n, value: 0n };
+
+    test("signAndSubmitWithRetry runs the funding gate on every attempt", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      const order = [];
+      let attempts = 0;
+      w.signAndSubmitExtrinsic = async () => {
+        order.push(`sign${++attempts}`);
+        if (attempts === 1) throw new Error("socket closed");
+        return { kind: "hash", hash: "0xok" };
+      };
+      w.setSubmissionFundingGate(async () => { order.push("gate"); });
+      const res = await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(res.hash, "0xok");
+      assert.deepStrictEqual(order, ["gate", "sign1", "gate", "sign2"],
+        ">> FAIL: #1706: a re-sign submitted without re-reading the balance, so a signer drained by a concurrent deploy stays underfunded for every remaining attempt");
+    });
+
+    test("signAndSubmitWithRetry gates once when the first attempt lands", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let gateCalls = 0;
+      w.signAndSubmitExtrinsic = async () => ({ kind: "hash", hash: "0xok" });
+      w.setSubmissionFundingGate(async () => { gateCalls++; });
+      await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(gateCalls, 1,
+        ">> FAIL: #1706: the gate must run once per attempt, and a landed first attempt is exactly one");
+    });
+
+    test("a signer drained mid-flight is topped up and retried, not aborted", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let attempts = 0;
+      let toppedUp = false;
+      w.signAndSubmitExtrinsic = async () => {
+        if (++attempts === 1) throw new Error('dispatch error {"type":"TransferFailed"}');
+        return { kind: "hash", hash: "0xok" };
+      };
+      w.setSubmissionFundingGate(async () => { toppedUp = true; });
+      const res = await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(res.hash, "0xok",
+        ">> FAIL: #1706: TransferFailed aborted instead of retrying, so a deploy that lost a funding race fails where a top-up and one more attempt would have landed it");
+      assert.ok(toppedUp, ">> FAIL: #1706: the drained signer was retried without topping it back up, so the second attempt is short by the same amount");
+    });
+
+    test("a drain that outlives every attempt names concurrency in the error", async () => {
+      const { ReviveClientWrapper, DOTNS_TX_MAX_ATTEMPTS } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let attempts = 0;
+      w.setSubmissionFundingGate(async () => {});
+      w.signAndSubmitExtrinsic = async () => {
+        attempts++;
+        throw new Error('dispatch error {"type":"TransferFailed"}');
+      };
+      await assert.rejects(
+        () => w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS }),
+        (e) => {
+          assert.match(e.message, /sharing this signer/,
+            ">> FAIL: #1706: a bare TransferFailed gives the reader nothing to act on, and a shared signer is its most common cause");
+          return true;
+        },
+      );
+      assert.strictEqual(attempts, DOTNS_TX_MAX_ATTEMPTS,
+        `>> FAIL: #1706: a drained signer must use every attempt before giving up, got ${attempts}`);
+    });
+
+    test("every submission path hands its funding-gate args to the retry loop", () => {
+      const src = fs.readFileSync("src/dotns.ts", "utf-8");
+      const submits = src.split("\n").filter((line) => /signAndSubmitWithRetry\(/.test(line) && !/async signAndSubmitWithRetry/.test(line));
+      // map_account and the auto-map trigger carry no storage deposit, so they
+      // have no gate to re-run.
+      const funded = submits.filter((line) => !/map_account|^\s*await this\.clientWrapper\.signAndSubmitWithRetry\($/.test(line));
+      for (const line of funded) {
+        assert.match(line, /fundingGate/,
+          `>> FAIL: #1706: a submission retries without re-reading the balance, so a signer drained by a concurrent deploy stays underfunded: ${line.trim()}`);
+      }
+      assert.ok(funded.length >= 2, `>> FAIL: #1706: expected the Revive.call and batch submission sites, found ${funded.length}`);
+    });
+
+    // recreateReviveClient constructs the only ReviveClientWrapper a DotNS instance
+    // ever holds — asserting it applies this._registerStorageDeposit right after
+    // construction is what closes the "future call site forgets to thread it" gap:
+    // every dry-run path through this.clientWrapper picks the floor up automatically.
+    for (const { label, field, wrapperField, value, expected } of [
+      { label: "register", field: "_registerStorageDeposit", wrapperField: "_storageDepositFloor", value: 98_765_000_000n, expected: 98_765_000_000n },
+      { label: "record", field: "_recordStorageDeposit", wrapperField: "_recordStorageDepositFloor", value: 12_345_000_000n, expected: 12_345_000_000n },
+      // The record floor is resolved against the registration floor once, in DotNS.
+      { label: "record (capped at a lower registration floor)", field: "_recordStorageDeposit", wrapperField: "_recordStorageDepositFloor", value: 2n ** 62n, expected: "register" },
+    ]) {
+      test(`DotNS.recreateReviveClient applies the ${label} floor to the new wrapper`, () => {
+        const d = new DotNS();
+        d[field] = value;
+        d["recreateReviveClient"]("wss://invalid.invalid.test"); // never awaited/connected — only the synchronous wiring is under test
+        assert.strictEqual(d.clientWrapper[wrapperField], expected === "register" ? d["_registerStorageDeposit"] : expected,
+          `>> FAIL: recreateReviveClient wiring (${label}): the freshly constructed wrapper must receive the configured floor immediately, not stay on the class default`);
+        d.client?.destroy?.();
+      });
+    }
+
+    test("a DotNS nobody configured defaults the record floor to MINIMUM_RECORD_STORAGE_DEPOSIT", async () => {
+      const { MINIMUM_RECORD_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      assert.strictEqual(new DotNS()["_recordStorageDeposit"], MINIMUM_RECORD_STORAGE_DEPOSIT,
+        ">> FAIL: an unconfigured DotNS must default to the measured record floor");
+    });
   });
 
   test("getUserPopStatus surfaces Personhood precompile read failures", async () => {
@@ -6366,19 +6567,58 @@ describe("DotNS.preflight", () => {
     assert.match(r.reason ?? "", /Top up the signer/);
   });
 
-  test("already-owned-by-us uses the lower setContenthash floor (0.01 PAS)", async () => {
-    // 0.05 PAS — above the OWNED floor (0.01) but below the REGISTER floor (0.10).
-    // For an owned label, this should clear without top-up.
+  test("already-owned-by-us keeps the lightweight preflight floor; actual submissions apply their dry-run storage limit", async () => {
     const d = stubDotns({
       checkOwnership: ownedByUs,
       isTestnet: true,
       signerFreeBalance: 500_000_000n,
-      attemptTestnetTopUp: async () => { throw new Error("must not be called"); },
+      attemptTestnetTopUp: async () => { throw new Error("must not be called before an actual submission"); },
     });
     const r = await d.preflight("e2epool00");
     assert.strictEqual(r.canProceed, true);
     assert.strictEqual(r.plannedAction, "already-owned-by-us");
-    assert.strictEqual(r.feeFloor, 100_000_000n); // 0.01 PAS
+    assert.strictEqual(r.feeFloor, 100_000_000n);
+  });
+
+  test("per-submission funding gate uses the dry-run storage limit, tops up on testnet, and fails closed on mainnet", async () => {
+    const testnet = new DotNS();
+    testnet.connected = true;
+    testnet.substrateAddress = "5Signer";
+    testnet.readFreeBalance = async () => 130_000_000n;
+    testnet.isTestnet = async () => true;
+    let toppedUpTo = 0n;
+    testnet.attemptTestnetTopUp = async (_recipient, targetAmount) => {
+      toppedUpTo = targetAmount;
+      return { source: "Bob", transferred: targetAmount };
+    };
+    await testnet["ensureSubmissionFunding"]("setText", 50_000_000_000n);
+    assert.strictEqual(toppedUpTo, 55_000_000_000n,
+      ">> FAIL: submission gate target must include that transaction's declared storage limit plus refill headroom");
+
+    const mainnet = new DotNS();
+    mainnet.connected = true;
+    mainnet.substrateAddress = "5MainnetSigner";
+    mainnet.readFreeBalance = async () => 130_000_000n;
+    mainnet.isTestnet = async () => false;
+    mainnet.attemptTestnetTopUp = async () => assert.fail("mainnet must never auto-top-up");
+    const error = await mainnet["ensureSubmissionFunding"]("setContenthash", 50_000_000_000n)
+      .then(() => null, (cause) => cause);
+    assert.ok(error instanceof InsufficientFundsError,
+      ">> FAIL: an actual underfunded submission must throw the typed funding error");
+    assert.match(error.message, /needs ≥5\.0100 PAS for setContenthash.*Top up the signer's balance/i);
+  });
+
+  test("unrelated Payment and bare-0x errors retain their original mechanism", () => {
+    assert.strictEqual(
+      classifyErrorKind('{"type":"Invalid","value":{"type":"Payment"}}'),
+      "chain.tx_invalid",
+      ">> FAIL: DotNS must not globally relabel Payment as signer funding",
+    );
+    assert.strictEqual(
+      classifyErrorKind("Contract execution would revert during setText\nrevert: flags=1 data=0x"),
+      "contract-revert",
+      ">> FAIL: a resolver/permission bare revert must retain contract-revert classification",
+    );
   });
 
   // -----------------------------------------------------------------
@@ -6871,7 +7111,17 @@ describe("DotNS.setContenthashAndTextRecord", () => {
     );
     assert.deepStrictEqual(submitted.calls[0].args.slice(1), ["executable", "new manifest"]);
     assert.strictEqual(submitted.calls[1].args[1], "0x1234");
-    assert.strictEqual(submitted.label, "Utility.batch_all(setContenthash+setText)");
+    assert.deepStrictEqual(
+      submitted.calls.map(({ depositPolicy }) => depositPolicy),
+      ["record", "record"],
+      ">> FAIL: setContenthash+setText batch: both inner writes must declare the record deposit policy",
+    );
+    assert.strictEqual(
+      submitted.label,
+      "Utility.batch_all(setContenthash+setText)",
+    );
+    assert.strictEqual(submitted.options.independentCalls, true,
+      ">> FAIL: contenthash+text are independent writes and both must be dry-run instead of leaving an unmeasured tail");
     assert.strictEqual(await submitted.options.verifyEffect(), true);
     assert.deepStrictEqual(result, {
       node: result.node,
@@ -6881,11 +7131,15 @@ describe("DotNS.setContenthashAndTextRecord", () => {
     });
   });
 
-  test("skips the batch only when both resolver records already match", async () => {
+  test("skips the batch without a funding gate when both resolver records already match, even for a low-balance signer", async () => {
     const d = new DotNS();
     d.connected = true;
+    d.substrateAddress = "5LowBalanceSigner";
     d.getContenthash = async () => "0x1234";
     d.getTextRecord = async () => "manifest";
+    d.ensureSubmissionFunding = async () => {
+      assert.fail("unchanged resolver state must not run the per-submission funding gate");
+    };
     d.submitBatchedContractCalls = async () => {
       assert.fail("unchanged resolver state must not submit a batch");
     };
@@ -6999,6 +7253,8 @@ describe("DotNS.ensureResolverAndSetTextRecord", () => {
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's value arg must be the new value");
     assert.strictEqual(submitted.label, "Utility.batch_all(setResolver+setText[manifest])",
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: unexpected batch label");
+    assert.deepStrictEqual(submitted.calls.map(({ depositPolicy }) => depositPolicy), ["record", "record"],
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: resolver+text writes must declare the record deposit policy");
     assert.strictEqual(submitted.options.independentCalls, true,
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: must pass independentCalls: true — setResolver and setText have no on-chain data dependency on each other");
     assert.strictEqual(await submitted.options.verifyEffect(), true,
@@ -7029,6 +7285,7 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    d.ensureSubmissionFunding = async () => {};
     let estimateCalls = 0;
     d.clientWrapper = {
       ensureAccountMapped: async () => {},
@@ -7080,6 +7337,7 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    let fundingGate;
     const capturedCalls = [];
     // storageDeposit values deliberately both exceed computeStorageDepositLimit's
     // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT floor (2e12) so the floor can't mask
@@ -7102,8 +7360,9 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
           },
         },
       },
-      signAndSubmitWithRetry: async (buildBatch) => {
+      signAndSubmitWithRetry: async (buildBatch, _signer, _cb, _label, opts) => {
         buildBatch();
+        fundingGate = opts?.fundingGate;
         return { kind: "hash", hash: "0xbatch" };
       },
     };
@@ -7126,6 +7385,11 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
       ">> FAIL: submitBatchedContractCalls estimate count: every inner call must be dry-run individually, not just the head call");
     assert.strictEqual(capturedCalls.length, 2,
       ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
+    assert.deepStrictEqual(fundingGate, {
+      operation: "test batch",
+      storageDepositLimit: ((20_000_000_000_000n * 120n) / 100n) + ((2_000_000_000_000n * 120n) / 100n),
+      value: 0n,
+    }, ">> FAIL: independent batches must gate the largest shared limit once plus the other call's buffered estimate");
     for (const call of capturedCalls) {
       assert.deepStrictEqual(call.weight_limit, { ref_time: (9_000_000_000n * 120n) / 100n, proof_size: (900_000n * 120n) / 100n },
         ">> FAIL: submitBatchedContractCalls max-estimate weight_limit: must declare the LARGER (tail-call) buffered estimate, not the head call's smaller one — a head-only estimate would under-provision the tail call");
@@ -7316,6 +7580,8 @@ describe("DotNS.setTextRecord", () => {
     assert.strictEqual(capturedOpts.length, 1, "contractTransaction should be called once");
     assert.strictEqual(typeof capturedOpts[0].verifyEffect, "function",
       "setTextRecord must pass verifyEffect to contractTransaction");
+    assert.strictEqual(capturedOpts[0].depositPolicy, "record",
+      ">> FAIL: setTextRecord must declare the record deposit policy at its call site");
   });
 
   test("verifyEffect reads text(node, key) and returns true when value matches", async () => {
@@ -17627,8 +17893,11 @@ describe("setDeployAttribute → root span (regression guard)", () => {
 
   test("source: captureWarning uses deployRootSpan for deploy.sad, not getRootSpan/getActiveSpan", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    const match = src.match(/export function captureWarning[\s\S]*?\n\}/);
-    assert.ok(match, "captureWarning must be present in src/telemetry.ts");
+    // The sad-tracking logic lives once, in noteWarning (captureWarning delegates to it).
+    const match = src.match(/export function noteWarning[\s\S]*?\n\}/);
+    assert.ok(match, "noteWarning must be present in src/telemetry.ts");
+    assert.match(src.match(/export function captureWarning[\s\S]*?\n\}/)[0], /noteWarning\(/,
+      "captureWarning must delegate its sad tracking to noteWarning");
     const body = match[0];
     assert.ok(
       !body.includes("getRootSpan"),
@@ -17920,6 +18189,23 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
   });
 
+  test("#1695: the PoP probe path comes from the same map as the direct signer args", () => {
+    assert.strictEqual(probeDerivationPathFor("s1", "direct"), null,
+      ">> FAIL: #1695: a non-isolated direct scenario deploys as bare Alice ROOT, so it must probe ROOT (null), not //e2e-direct");
+    assert.strictEqual(probeDerivationPathFor("s9", "direct"), "//e2e-s9",
+      ">> FAIL: #1695: s9 must probe its isolated signer");
+    assert.strictEqual(probeDerivationPathFor("s1", "pool"), null,
+      ">> FAIL: #1695: pool probes stay on the bare mnemonic");
+    assert.strictEqual(probeDerivationPathFor("s9", "pool"), null,
+      ">> FAIL: #1695: the isolated direct signer must not leak into a pool probe");
+    for (const sc of ["s1", "s2", "s9", "s-grandpa-reupload"]) {
+      const args = directSignerArgsFor(sc, "SEED");
+      const i = args.indexOf("--derivation-path");
+      assert.strictEqual(i === -1 ? null : args[i + 1], probeDerivationPathFor(sc, "direct"),
+        `>> FAIL: #1695: ${sc}: probe path and deploy signer path diverged`);
+    }
+  });
+
   test("S9 signs as its own derivation path, and the funding check watches it", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
     assert.deepEqual(
@@ -17939,7 +18225,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
     assert.match(
       e2e,
-      /probeSignerPopStatus\(\{[\s\S]{0,600}?derivationPath: isolated/,
+      /probeSignerPopStatus\(\{[\s\S]{0,600}?derivationPath: probeDerivationPathFor\(SCENARIO, SIGNER\)/,
       ">> FAIL: S9: the PoP probe must use the scenario's own derivation path, or S9 picks its label from //e2e-direct's tier (probe-pop-status.js COUPLING NOTE)",
     );
     assert.ok(
@@ -20544,7 +20830,7 @@ describe("readPreviousContenthashSafe (subdomain contenthash read — double-TLD
 // so an operator's configured floor never reached the DECLARED
 // storage_deposit_limit on a submitted Revive.call. Fixed by giving
 // ReviveClientWrapper a settable `_storageDepositFloor` (defaulted to the
-// module constant, overridden via setStorageDepositFloor from
+// module constant, overridden via setStorageDepositFloors from
 // DotNS.recreateReviveClient with this._registerStorageDeposit) and by
 // threading this._registerStorageDeposit directly at the
 // submitBatchedContractCalls call site, which builds its own Revive.call
@@ -20610,12 +20896,14 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
   // (bulletin #1522, same 20% factor applied to ref_time and proof_size
   // separately) legitimately contributes 2 more — both inside the one
   // canonical function, so this is still a single source of truth per helper.
+  // bulletin #1712 adds bufferedStorageDepositEstimate (the shared buffered
+  // estimate the batch-funding arithmetic reuses) as the 4th.
   test("dotns.ts: the 20% buffer formula appears only inside storageDepositLimitFor and weightLimitFor", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
     const matches = dotnsSrc.match(/\*\s*120n\)\s*\/\s*100n/g) || [];
-    assert.equal(matches.length, 3,
+    assert.equal(matches.length, 4,
       `>> FAIL: 20%-buffer drift-guard: found the "* 120n) / 100n" formula ${matches.length} time(s) in dotns.ts, ` +
-      `expected exactly 3 (1 inside storageDepositLimitFor + 2 inside weightLimitFor for ref_time/proof_size) — ` +
+      `expected exactly 4 (1 inside storageDepositLimitFor + 1 inside bufferedStorageDepositEstimate + 2 inside weightLimitFor for ref_time/proof_size) — ` +
       `any other count means a call site grew its own inline copy again`);
   });
 
@@ -20635,7 +20923,10 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
     // call's own estimate (headEstimate.storageDeposit, the pre-#1164 shape) — see
     // the independentCalls/multi-dry-run block above this call site. The floor
     // argument itself is unaffected by that change.
-    assert.match(dotnsSrc, /storageDepositLimitFor\(maxStorageDeposit,\s*this\._registerStorageDeposit\)/,
+    // bulletin #1712/#1716: the limit is chosen per inner call from its declared
+    // depositPolicy (record writes get the record floor, everything else the per-env
+    // registration floor).
+    assert.match(dotnsSrc, /storageDepositLimitForCall\(\s*calls\[index\]\.functionName,\s*estimate\.storageDeposit,\s*calls\[index\]\.depositPolicy,\s*this\._registerStorageDeposit,/,
       ">> FAIL: submitBatchedContractCalls must pass this._registerStorageDeposit as the floor — the per-env config, " +
       "otherwise it silently falls back to the generic 200 PAS default regardless of environments.json");
   });
@@ -20677,7 +20968,7 @@ describe("weightLimitFor (weight_limit buffer helper, #1522)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// ReviveClientWrapper.setStorageDepositFloor — verifies the per-env floor
+// ReviveClientWrapper.setStorageDepositFloors — verifies the per-env floor
 // actually reaches the SUBMITTED extrinsic's storage_deposit_limit (and that
 // the buffered weight_limit rides along), not just dryRunReviveCall's return
 // value. Drives submitTransaction end to end with a fake client capturing the
@@ -20705,7 +20996,7 @@ describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitt
 
     // Env floor: 5 PAS (bulletin's measured paseo-next-v2 value), well below
     // the 200 PAS generic default this wrapper would otherwise fall back to.
-    w.setStorageDepositFloor(50_000_000_000n);
+    w.setStorageDepositFloors({ register: 50_000_000_000n, record: 1n });
     await w.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, { rpcs: [] });
 
     assert.ok(captured, ">> FAIL: submitTransaction setup: fake signAndSubmitWithRetry must trigger buildExtrinsic — check the fake client wiring above");
@@ -20741,12 +21032,12 @@ describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitt
 });
 
 describe("DotNS: recreateReviveClient wires the connected instance's registerStorageDeposit into the wrapper (#1518)", () => {
-  test("dotns.ts: recreateReviveClient calls setStorageDepositFloor(this._registerStorageDeposit) right after construction", () => {
+  test("dotns.ts: recreateReviveClient calls setStorageDepositFloors with this._registerStorageDeposit right after construction", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
     const recreateFnMatch = dotnsSrc.match(/private recreateReviveClient\(endpoint: string\): void \{[\s\S]*?\n  \}/);
     assert.ok(recreateFnMatch, ">> FAIL: recreateReviveClient not found — did the method get renamed/restructured?");
-    assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloor\(this\._registerStorageDeposit\)/,
-      ">> FAIL: recreateReviveClient must call setStorageDepositFloor(this._registerStorageDeposit) — this is the ONLY place a " +
+    assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloors\(\{\s*register: this\._registerStorageDeposit,/,
+      ">> FAIL: recreateReviveClient must call setStorageDepositFloors({ register: this._registerStorageDeposit, ... }) — this is the ONLY place a " +
       "ReviveClientWrapper is constructed, so missing this call here means the per-env floor never reaches a fresh wrapper");
   });
 });
@@ -20763,6 +21054,7 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    let fundingGate;
     d["_registerStorageDeposit"] = 50_000_000_000n; // 5 PAS — the measured paseo-next-v2 floor
     const capturedCalls = [];
     d.clientWrapper = {
@@ -20770,7 +21062,7 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
       estimateGasForCall: async () => ({
         success: true,
         gasRequired: { referenceTime: 2_000_000_000n, proofSize: 200_000n },
-        storageDeposit: 0n, // overwrite-shaped call — zero estimate must still floor at the env value, not 200 PAS
+        storageDeposit: 1_000_000_000n,
       }),
       client: {
         tx: {
@@ -20782,8 +21074,9 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
           },
         },
       },
-      signAndSubmitWithRetry: async (buildBatch) => {
+      signAndSubmitWithRetry: async (buildBatch, _signer, _cb, _label, opts) => {
         buildBatch();
+        fundingGate = opts?.fundingGate;
         return { kind: "hash", hash: "0xbatch" };
       },
     };
@@ -20800,6 +21093,11 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
     );
 
     assert.strictEqual(result.kind, "hash", ">> FAIL: submitBatchedContractCalls setup: fake signAndSubmitWithRetry must resolve — check the fake clientWrapper wiring above");
+    assert.deepStrictEqual(fundingGate, {
+      operation: "test batch",
+      storageDepositLimit: 50_000_000_000n + ((1_000_000_000n * 120n) / 100n),
+      value: 0n,
+    }, ">> FAIL: a dependent two-call batch must gate one 5 PAS registration-floor limit plus the measured head's 20%-buffered estimate, not double the floor");
     assert.strictEqual(capturedCalls.length, 2, ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
     for (const call of capturedCalls) {
       assert.deepStrictEqual(call.weight_limit, { ref_time: 2_400_000_000n, proof_size: 240_000n },
@@ -21961,6 +22259,19 @@ describe("environments.ts: ipfs propagation through resolveEndpoints", () => {
   });
 });
 
+describe("recordStorageDeposit propagation (bulletin #1716)", () => {
+  test("deploy.ts, publish.ts and transfer.ts pass the env's recordStorageDeposit into DotNS.connect()", () => {
+    const deploySrc = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.strictEqual((deploySrc.match(/recordStorageDeposit: envRecordStorageDeposit,/g) ?? []).length, 3,
+      ">> FAIL: deploy.ts: all three DotNS.connect() sites (preflight, owner, deploy) must pass recordStorageDeposit: envRecordStorageDeposit");
+    assert.match(fs.readFileSync("src/manifest/publish.ts", "utf8"),
+      /dotns\.connect\(\{\s*\.\.\.connectOpts,\s*recordStorageDeposit: resolved\.recordStorageDeposit\s*\}\)/,
+      ">> FAIL: manifest/publish.ts connectDotNS(): must pass resolved.recordStorageDeposit into connect, or an env's record floor is ignored on manifest publishes");
+    assert.match(fs.readFileSync("src/commands/transfer.ts", "utf8"), /recordStorageDeposit: resolved\.recordStorageDeposit,/,
+      ">> FAIL: commands/transfer.ts: must pass resolved.recordStorageDeposit into DotNS.connect()");
+  });
+});
+
 describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literals", () => {
   // For every URL-shaped string value declared in assets/environments.json,
   // assert that it does NOT also appear as a hardcoded string literal anywhere
@@ -22502,12 +22813,11 @@ describe("signAndSubmitExtrinsic silent-watcher branch wiring (#990)", () => {
     const src = fs.readFileSync("src/dotns.ts", "utf-8");
     const idx = src.indexOf("async signAndSubmitWithRetry(");
     assert.ok(idx >= 0, ">> FAIL: #990 wiring: could not locate signAndSubmitWithRetry in src/dotns.ts");
-    // Window sized to cover the method's catch region (both calls live well
-    // before the next method decl). Widened from 2000→4000 for #1158: the
-    // nonce-contention branch now sits between the two calls — still BEFORE
-    // the general retry classification, which is the invariant this test
-    // guards; the old fixed window just no longer reached it.
-    const body = src.slice(idx, idx + 4000);
+    // Bounded by the next method, not a fixed offset: a fixed window had to be
+    // widened twice as branches landed between the two calls.
+    const after = src.slice(idx + 1);
+    const end = after.search(/\n  (?:async |private )/);
+    const body = after.slice(0, end === -1 ? undefined : end);
     const fastFailIdx = body.indexOf("classifyWatcherSilentFastFail(");
     const retryDecisionIdx = body.indexOf("classifyTxRetryDecision(");
     assert.ok(fastFailIdx >= 0, ">> FAIL: #990 wiring: signAndSubmitWithRetry must call classifyWatcherSilentFastFail");
@@ -23041,7 +23351,6 @@ describe("probeSignerPopStatus", () => {
   }
 
   const defaultArgs = {
-    signer: "pool",
     bulletinDeployEnv: null,
     resolveEnvConnectOptions: async () => ({}),
     defaultMnemonic: "//Alice",
@@ -23095,38 +23404,35 @@ describe("probeSignerPopStatus", () => {
     assert.strictEqual(result, 0, ">> FAIL: case 5: expected 0 when popStatus is null");
   });
 
-  test("case 6: signer=direct + no bulletinDeployEnv -> connect called with derivationPath //e2e-direct", async () => {
+  test("case 6: derivationPath omitted -> probes the bare mnemonic (ROOT), not //e2e-direct (#1695)", async () => {
     const mock = makeMock({ popStatus: 2n });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       dotnsFactory: () => mock,
     });
     assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 6: connect must be called exactly once");
-    assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-direct",
-      ">> FAIL: case 6: connect must be called with derivationPath '//e2e-direct' when signer=direct; if buildArgs changes this path, probe-pop-status must change too");
+    assert.ok(!("derivationPath" in mock.connectCalls[0]),
+      ">> FAIL: case 6: omitting derivationPath must probe bare ROOT (what directSignerArgsFor deploys as), not silently //e2e-direct (#1695)");
   });
 
-  test("case 7: explicit derivationPath overrides the signer=direct default -> connect called with caller's path", async () => {
+  test("case 7: an explicit derivationPath is probed as given", async () => {
     const mock = makeMock({ popStatus: 0 });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       derivationPath: "//e2e-s9",
       dotnsFactory: () => mock,
     });
     assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 7: connect must be called exactly once");
     assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-s9",
-      ">> FAIL: case 7: an explicitly-passed derivationPath must win over the signer=direct default, so isolated per-scenario signers (e.g. //e2e-s9) get probed instead of //e2e-direct");
+      ">> FAIL: case 7: an explicitly-passed derivationPath must be probed as given, so isolated per-scenario signers (e.g. //e2e-s9) get probed instead of //e2e-direct");
   });
 
   test("case 8: explicit derivationPath=null -> connect called with NO derivationPath key (bare mnemonic)", async () => {
     const mock = makeMock({ popStatus: 2n });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       derivationPath: null,
       dotnsFactory: () => mock,
@@ -23140,7 +23446,6 @@ describe("probeSignerPopStatus", () => {
     const mock = makeMock({ popStatus: 0 });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: "paseo-next-v2",
       resolveEnvConnectOptions: async () => ({ rpc: "wss://example" }),
       derivationPath: "//e2e-sgrandpa",
@@ -28039,5 +28344,88 @@ describe("e2e.yml: per-leg e2e-result files (#1625)", () => {
       assert.match(open, /labels: \(\[\$label\] \+ \(if \$cause == "" then \[\] else \[\$cause\] end\)\)/);
       assert.match(open, /"\$API_URL\/repos\/\$REPO\/labels"[\s\S]*?CAUSE_LABEL|CAUSE_LABEL[\s\S]*?"\$API_URL\/repos\/\$REPO\/labels"/, ">> FAIL: e2e-result: the cause label must be created on demand");
     });
+  });
+});
+
+describe("Sentry error diet: events only for failures", () => {
+  const fakeRoot = () => ({ attrs: new Map(), atEnd: null, setAttribute(k, v) { this.attrs.set(k, v); }, setStatus() {}, end() { this.atEnd ??= new Map(this.attrs); } });
+  const stub = (root, counts) => ({
+    startSpan: async (_o, fn) => fn(root), setTags() {}, setTag() {}, getActiveSpan: () => null,
+    captureMessage() { counts.messages++; }, addBreadcrumb() { counts.crumbs++; }, captureException() {}, withScope() {}, flush: async () => true, close: async () => true,
+  });
+  const run = async (fn) => {
+    const root = fakeRoot();
+    const counts = { messages: 0, crumbs: 0 };
+    const prev = __setSentryForTest(stub(root, counts));
+    try {
+      await withDeploySpan("diet.dot", async () => { fn(); });
+    } finally {
+      __setSentryForTest(prev);
+    }
+    return { root, counts };
+  };
+
+  test("noteWarning tracks sad + reason like captureWarning but sends no event", async () => {
+    const note = await run(() => noteWarning("deploy process terminated: SIGINT"));
+    const cap = await run(() => captureWarning("deploy process terminated: SIGINT"));
+    assert.equal(note.counts.messages, 0, ">> FAIL: noteWarning: must not call captureMessage");
+    assert.equal(note.counts.crumbs, 1, ">> FAIL: noteWarning: must still leave a breadcrumb");
+    assert.equal(cap.counts.messages, 1, ">> FAIL: captureWarning: must still send one event");
+    assert.equal(note.root.attrs.get("deploy.sad"), "true", ">> FAIL: noteWarning: must set deploy.sad");
+    assert.equal(note.root.attrs.get("deploy.outcome"), cap.root.attrs.get("deploy.outcome"),
+      ">> FAIL: noteWarning: sad reason/outcome must match captureWarning");
+    assert.equal(classifySadReason("deploy process terminated: SIGINT"), "killed");
+  });
+
+  const deploySrc = fs.readFileSync("src/deploy.ts", "utf-8");
+  const count = (src, needle) => src.split(needle).length - 1;
+  for (const title of [
+    "Bulletin RPC failover",
+    "WebSocket connection lost, reconnecting",
+    "Chunk upload failed, retrying",
+    "nonce-advance collision: re-uploading missing chunks",
+    "root-node nonce collision: resubmitting",
+  ]) {
+    test(`source: "${title}" is a note, not an event`, () => {
+      assert.ok(count(deploySrc, `noteWarning("${title}"`) >= 1, `>> FAIL: deploy.ts: "${title}" must use noteWarning`);
+      assert.equal(count(deploySrc, `captureWarning("${title}"`), 0, `>> FAIL: deploy.ts: "${title}" must not use captureWarning`);
+    });
+  }
+
+  test('source: "Chunk retry failed" is a note per attempt and ONE event when retries are exhausted', () => {
+    assert.equal(count(deploySrc, 'noteWarning("Chunk retry failed"'), 1, ">> FAIL: per-attempt retry failure must be noteWarning");
+    assert.equal(count(deploySrc, 'captureWarning("Chunk retry failed"'), 1, ">> FAIL: exactly one captureWarning(\"Chunk retry failed\")");
+    const event = deploySrc.indexOf('captureWarning("Chunk retry failed"');
+    const exhausted = deploySrc.lastIndexOf("if (!retried)", event);
+    const nextThrow = deploySrc.indexOf("throw ", exhausted);
+    assert.ok(exhausted >= 0 && event < nextThrow,
+      ">> FAIL: the event must sit inside the `if (!retried)` exhausted block, before its throw");
+  });
+
+  test("source: memory threshold event has a fixed title and the peak in a tag", () => {
+    const src = fs.readFileSync("src/telemetry.ts", "utf-8");
+    assert.ok(src.includes('captureMessage("deploy memory threshold crossed"'), ">> FAIL: memory event title must be a fixed string");
+    assert.ok(!/captureMessage\(`deploy memory threshold/.test(src), ">> FAIL: memory event title must not interpolate");
+    assert.match(src, /"deploy\.mem\.peak_rss_mb":\s*String\(r\.threshold\.peakRssMb\)/);
+    assert.equal(src.split("onSentryAttach:").length - 1, 1, ">> FAIL: memory report is attached from exactly one site (inside withDeploySpan finally)");
+  });
+
+  test("recovered-path flags default to \"false\" on a clean deploy span", () => {
+    const attrs = getDeployAttributes("diet.dot");
+    assert.equal(attrs["deploy.chunk.retried"], "false");
+    assert.equal(attrs["deploy.reconnected"], "false");
+  });
+
+  test("source: retry/reconnect flags are set at exactly one site each", () => {
+    for (const site of ['setDeployAttribute("deploy.chunk.retried", "true")', 'setDeployAttribute("deploy.reconnected", "true")', 'setDeployAttribute("deploy.chunk.retry_count",']) {
+      assert.equal(count(deploySrc, site), 1, `>> FAIL: deploy.ts: ${site} must appear exactly once`);
+    }
+  });
+
+  test("source: bin finalize notes signals and captures crashes", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+    assert.match(bin, /isSignal \? noteWarning : captureWarning/);
+    assert.match(bin, /finalize\(sig, exitCode, true\)/);
+    assert.match(bin, /finalize\(kind, 2\)/);
   });
 });

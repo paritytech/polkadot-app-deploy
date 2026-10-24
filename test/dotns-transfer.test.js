@@ -2,7 +2,22 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient, computeSubnodeIds, DEFAULT_TLD } from "../dist/dotns.js";
+import {
+  weiToNative,
+  DotNS,
+  feeFloorFor,
+  parseDomainName,
+  classifyRegistrability,
+  storageDepositLimitFor,
+  storageDepositFloorForCall,
+  storageDepositLimitForCall,
+  MINIMUM_RECORD_STORAGE_DEPOSIT,
+  MINIMUM_REGISTER_STORAGE_DEPOSIT,
+  ReviveClientWrapper,
+  DEFAULT_TLD,
+  assertNotZeroRecipient,
+  computeSubnodeIds,
+} from "../dist/dotns.js";
 import { namehash, zeroAddress, decodeFunctionData, toFunctionSelector } from "viem";
 
 // bulletin-deploy #1443: transferSubname now ALSO probes isAuthorised
@@ -488,6 +503,183 @@ test("transferSubname: refuses a signer who is neither the parent owner nor appr
     () => d.transferSubname("app", "foo", "0xRECIP"),
     (err) => new RegExp(ADDR_OWNER, "i").test(err.message) && err.message.includes(ADDR_STRANGER),
     ">> FAIL: transferSubname operator-for-all refusal: expected an error naming both the parent's owner and the refused signer",
+  );
+});
+
+// storageDepositLimitFor decides the limit we DECLARE, and pallet-revive makes
+// the origin able to cover whatever is declared — so this function, not the
+// chain's actual charge, is what sets the balance a deploy demands.
+const PAS = 10_000_000_000n;
+
+test("storageDepositLimitFor: a zero estimate falls back to the floor", () => {
+  // A call that overwrites storage rather than adding it estimates zero.
+  assert.equal(storageDepositLimitFor(0n, 200n * PAS), 200n * PAS);
+});
+
+test("storageDepositLimitFor: an estimate under the floor still declares the floor", () => {
+  assert.equal(storageDepositLimitFor(3n * PAS, 200n * PAS), 200n * PAS,
+    ">> FAIL: a small estimate must not lower the declared limit below the environment floor");
+});
+
+test("storageDepositLimitFor: an estimate above the floor wins, with a 20% buffer", () => {
+  assert.equal(storageDepositLimitFor(500n * PAS, 200n * PAS), 600n * PAS);
+});
+
+test("storageDepositLimitFor: the floor is per environment, not the built-in default", () => {
+  // registerStorageDeposit in environments.json is what makes this reachable;
+  // both call sites previously hardcoded 200 PAS and ignored it.
+  assert.equal(storageDepositLimitFor(0n, 5n * PAS), 5n * PAS,
+    ">> FAIL: storageDepositLimitFor ignored the per-environment floor");
+});
+
+// Explicit deposit policy table. Every row is expressed in exported constants,
+// never planck literals. REGISTRATION is deliberately larger than RECORD so a
+// row that selects the wrong floor cannot pass by coincidence.
+const REGISTRATION = MINIMUM_REGISTER_STORAGE_DEPOSIT;
+const RECORD = MINIMUM_RECORD_STORAGE_DEPOSIT;
+const POLICY_TABLE = [
+  { name: "record", policy: "record", registerFloor: REGISTRATION, recordFloor: RECORD, expected: RECORD },
+  { name: "registration", policy: "registration", registerFloor: REGISTRATION, recordFloor: RECORD, expected: REGISTRATION },
+  { name: "absent (fail closed)", policy: undefined, registerFloor: REGISTRATION, recordFloor: RECORD, expected: REGISTRATION },
+  { name: "record is capped at a lower registration floor", policy: "record", registerFloor: RECORD / 3n, recordFloor: RECORD, expected: RECORD / 3n },
+  { name: "record honours a smaller env override", policy: "record", registerFloor: REGISTRATION, recordFloor: RECORD / 2n, expected: RECORD / 2n },
+  { name: "record cannot exceed registration via a larger env override", policy: "record", registerFloor: REGISTRATION, recordFloor: REGISTRATION * 4n, expected: REGISTRATION },
+  { name: "registration ignores the record override", policy: "registration", registerFloor: REGISTRATION, recordFloor: RECORD / 2n, expected: REGISTRATION },
+  { name: "unknown policy string fails closed", policy: "futureKind", registerFloor: REGISTRATION, recordFloor: RECORD, expected: REGISTRATION },
+];
+
+for (const row of POLICY_TABLE) {
+  test(`deposit policy: ${row.name}`, () => {
+    assert.equal(storageDepositFloorForCall(row.policy, row.registerFloor, row.recordFloor), row.expected,
+      `>> FAIL: policy ${String(row.policy)} selected the wrong storage-deposit floor (${row.name})`);
+    // A zero estimate (an overwrite) declares exactly the policy floor.
+    assert.equal(storageDepositLimitForCall("anyName", 0n, row.policy, row.registerFloor, row.recordFloor), row.expected,
+      `>> FAIL: declared limit must equal the policy floor for a zero estimate (${row.name})`);
+  });
+}
+
+test("deposit policy: the floor is a function of the declared policy, not the function name, and defaults to the exported constants", () => {
+  assert.equal(storageDepositFloorForCall("record", REGISTRATION), RECORD,
+    ">> FAIL: the record floor must default to MINIMUM_RECORD_STORAGE_DEPOSIT");
+  assert.equal(storageDepositFloorForCall(undefined, REGISTRATION), REGISTRATION);
+  assert.equal(storageDepositLimitForCall("setText", 0n, undefined, REGISTRATION), REGISTRATION,
+    ">> FAIL: setText with no declared policy must fail closed at the registration floor");
+});
+
+test("storageDepositLimitForCall: an estimate above the record floor wins with the 20% buffer", () => {
+  const estimate = RECORD * 10n;
+  assert.equal(storageDepositLimitForCall("setText", estimate, "record", REGISTRATION, RECORD), (estimate * 120n) / 100n);
+});
+
+test("storageDepositLimitForCall: a non-bigint estimate fails closed", () => {
+  assert.throws(() => storageDepositLimitForCall("setText", undefined, "record", REGISTRATION, RECORD),
+    /storage-deposit estimate unavailable.*setText/);
+});
+
+// Parity with main: before the explicit policy the floor was chosen by function
+// name. Each name below declares the policy its call site now passes and must
+// produce the floor main produced, so a mis-marked call site changes a limit.
+for (const [functionName, policy, expected] of [
+  ["setText", "record", RECORD],
+  ["setContenthash", "record", RECORD],
+  ["setResolver", "record", RECORD],
+  ["setSubnodeOwner", "record", RECORD],
+  ["commit", "registration", REGISTRATION],
+  ["register", "registration", REGISTRATION],
+  ["transferFrom", "registration", REGISTRATION],
+]) {
+  test(`parity with main: ${functionName} declares the same floor as before`, () => {
+    assert.equal(storageDepositLimitForCall(functionName, 0n, policy, REGISTRATION, RECORD), expected);
+  });
+}
+
+function stubbedWrapper({ storageDeposit = 0n } = {}) {
+  const wrapper = new ReviveClientWrapper({});
+  wrapper.ensureAccountMapped = async () => {};
+  wrapper.estimateGasForCall = async () => ({
+    success: true,
+    gasRequired: { referenceTime: 1n, proofSize: 1n },
+    storageDeposit,
+  });
+  const gated = [];
+  const captured = [];
+  wrapper.client = { tx: {
+    Revive: { call: (args) => { captured.push(args); return { decodedCall: {} }; } },
+    Utility: { batch_all: () => ({}) },
+  } };
+  wrapper.signAndSubmitWithRetry = async (buildExtrinsic, _signer, _cb, _label, opts) => {
+    buildExtrinsic();
+    if (opts?.fundingGate) gated.push(opts.fundingGate);
+    return { kind: "hash", hash: "0xtx" };
+  };
+  return { wrapper, gated, captured };
+}
+
+test("submitTransaction: a record-policy gate receives the record floor", async () => {
+  const { wrapper, gated, captured } = stubbedWrapper();
+  await wrapper.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, {
+    rpcs: [], functionName: "setText", depositPolicy: "record",
+  });
+  assert.deepEqual(gated, [{ operation: "setText", storageDepositLimit: RECORD, value: 0n }],
+    ">> FAIL: the funding gate must use the record floor for a record-policy call");
+  assert.equal(captured[0].storage_deposit_limit, RECORD);
+});
+
+for (const [label, opts] of [["no policy", {}], ["registration policy", { depositPolicy: "registration" }]]) {
+  test(`submitTransaction: ${label} on a record-write name fails closed at the registration floor`, async () => {
+    const { wrapper, gated, captured } = stubbedWrapper();
+    await wrapper.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, {
+      rpcs: [], functionName: "setText", ...opts,
+    });
+    assert.equal(gated[0].storageDepositLimit, REGISTRATION,
+      ">> FAIL: the name alone must not select the record floor");
+    assert.equal(captured[0].storage_deposit_limit, REGISTRATION);
+  });
+}
+
+test("submitTransaction: the wrapper's record floor is configurable and capped at the registration floor", async () => {
+  const smaller = stubbedWrapper();
+  smaller.wrapper.setStorageDepositFloors({ register: REGISTRATION, record: RECORD / 2n });
+  await smaller.wrapper.submitTransaction("0xC", 0n, "0x", "5S", {}, () => {}, { rpcs: [], functionName: "setText", depositPolicy: "record" });
+  assert.equal(smaller.gated[0].storageDepositLimit, RECORD / 2n);
+
+  const larger = stubbedWrapper();
+  larger.wrapper.setStorageDepositFloors({ register: REGISTRATION, record: REGISTRATION * 4n });
+  await larger.wrapper.submitTransaction("0xC", 0n, "0x", "5S", {}, () => {}, { rpcs: [], functionName: "setText", depositPolicy: "record" });
+  assert.equal(larger.gated[0].storageDepositLimit, REGISTRATION,
+    ">> FAIL: a record override above the registration floor must be capped");
+});
+
+test("submitBatchedTransactions: per-call policies pick per-call floors", async () => {
+  const { wrapper, gated, captured } = stubbedWrapper();
+  await wrapper.submitBatchedTransactions([
+    { contractAddress: "0xA", value: 0n, encodedData: "0x", functionName: "setText", depositPolicy: "record" },
+    { contractAddress: "0xB", value: 0n, encodedData: "0x", functionName: "setText" },
+  ], "5Signer", {}, () => {});
+  assert.deepEqual(captured.map(c => c.storage_deposit_limit), [RECORD, REGISTRATION]);
+  assert.equal(gated[0].storageDepositLimit, REGISTRATION,
+    ">> FAIL: the shared requirement covers the largest declared limit once");
+});
+
+test("submitTransaction: missing storage estimate fails closed before funding or signing", async () => {
+  const wrapper = new ReviveClientWrapper({});
+  wrapper.ensureAccountMapped = async () => {};
+  wrapper.estimateGasForCall = async () => ({
+    success: true,
+    gasRequired: { referenceTime: 1n, proofSize: 1n },
+    storageDeposit: undefined,
+  });
+  wrapper.setSubmissionFundingGate(async () => assert.fail("funding gate must not run without an estimate"));
+  wrapper.signAndSubmitWithRetry = async () => assert.fail("submission must not run without an estimate");
+
+  await assert.rejects(
+    () => wrapper.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, {
+      rpcs: [],
+      functionName: "setText",
+      depositPolicy: "record",
+    }),
+    /storage-deposit estimate unavailable.*setText/,
+    ">> FAIL: unavailable record-write estimates must fail closed before submission",
   );
 });
 

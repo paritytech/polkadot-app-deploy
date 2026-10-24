@@ -238,18 +238,28 @@ function rejectUnknownEntries<T extends string>(
     );
 }
 
+/** A path inside an executable's archive: relative, '/'-separated, no empty, '.', or '..' segments. */
+function isArchiveRelativePath(value: string): boolean {
+  return (
+    !value.startsWith("/") &&
+    !value.includes("\\") &&
+    !value
+      .split("/")
+      .some((segment) => segment === "" || segment === "." || segment === "..")
+  );
+}
+
 function validateRelativeEntrypoint(
   value: unknown,
   suffix: string,
   prefix: string,
 ): string[] {
-  if (!isNonEmptyString(value)) return [`${prefix}entrypoint must be a non-empty string`];
-  if (
-    value.startsWith("/") ||
-    value.includes("\\") ||
-    value.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
-  ) {
-    return [`${prefix}entrypoint must be a relative path with no empty, '.', or '..' segments`];
+  if (!isNonEmptyString(value))
+    return [`${prefix}entrypoint must be a non-empty string`];
+  if (!isArchiveRelativePath(value)) {
+    return [
+      `${prefix}entrypoint must be a relative path with no empty, '.', or '..' segments`,
+    ];
   }
   if (!value.toLowerCase().endsWith(suffix)) {
     return [`${prefix}entrypoint must end with ${suffix}`];
@@ -293,6 +303,8 @@ const GPU_LIMIT_CEILINGS: Readonly<Record<string, number>> = {
   maxVertexBuffers: 8,
   maxVertexAttributes: 16,
   maxColorAttachments: 4,
+  maxStorageBufferBindingSize: 16 * 1024 * 1024,
+  maxStorageBuffersPerShaderStage: 8,
 };
 
 function validateGraphicsRequirement(value: unknown, prefix: string): string[] {
@@ -424,11 +436,134 @@ function validateFundingFields(input: Record<string, unknown>, p: string): strin
   return rejectUnknownEntries(input.modes, FUNDING_MODES, `${p}modes`);
 }
 
-function validateWorkerFields(input: Record<string, unknown>, p: string): string[] {
+/** Largest card id or title a host accepts, in UTF-8 bytes after trimming and NFC (truapi `CHAT_FIELD_MAX_BYTES`). */
+const POCKET_CARD_TEXT_MAX_BYTES = 256;
+
+/**
+ * Characters a host refuses in a card title, copied from the truapi core's
+ * `validate_chat_name` → `normalize_chat_text` → `is_display_unsafe`
+ * (rust/crates/truapi/src/platform.rs in paritytech/trinity-user-agents at
+ * a12214e1, lines 509-526 and 851-864): controls, zero-width space, bidi
+ * marks and overrides, line and paragraph separators, BOM and tag characters.
+ * A name keeps joiners (ZWJ builds emoji, ZWNJ is needed by Persian).
+ */
+const DISPLAY_UNSAFE_CLASS =
+  String.raw`\p{Cc}\u200B\u061C\u2028\u2029\u202A-\u202E\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}`;
+const POCKET_CARD_TITLE_UNSAFE = new RegExp(`[${DISPLAY_UNSAFE_CLASS}]`, "u");
+
+/**
+ * Characters a host refuses in a card id: the display-unsafe set plus the
+ * invisible characters a name legitimately needs, from `normalize_chat_identifier`
+ * → `is_identifier_unsafe` (same file, lines 497-506 and 821-830): soft
+ * hyphen, joiners, invisible operators, variation selectors, and whitespace
+ * other than a plain space. Hosts drop every card of a product when one id
+ * fails this.
+ */
+const POCKET_CARD_ID_UNSAFE = new RegExp(
+  `[${DISPLAY_UNSAFE_CLASS}\\u00AD\\u200C\\u200D\\u2060-\\u2064\\uFE00-\\uFE0F]|[^\\S ]`,
+  "u",
+);
+
+const POCKET_CARD_FIELDS = ["id", "title", "preview", "faceShown"] as const;
+
+const UTF8 = new TextEncoder();
+
+/** Rust's `str::trim` strips Unicode White_Space; JS `trim` also strips U+FEFF, which a host screens out instead. */
+const WHITE_SPACE_EDGES = /^\p{White_Space}+|\p{White_Space}+$/gu;
+
+/** Why a host would refuse this card id, or undefined when it accepts it. */
+function pocketCardIdError(id: unknown): string | undefined {
+  if (!isNonEmptyString(id)) return "must be a non-empty string";
+  // A host trims and NFC-normalizes the id; publishing it already so keeps the
+  // add link and the record naming the same card.
+  if (id !== id.trim().normalize("NFC")) return `must be trimmed and NFC-normalized (got ${JSON.stringify(id)})`;
+  if (UTF8.encode(id).length > POCKET_CARD_TEXT_MAX_BYTES) return `must be at most ${POCKET_CARD_TEXT_MAX_BYTES} bytes`;
+  if (POCKET_CARD_ID_UNSAFE.test(id)) {
+    return "contains a character hosts refuse (invisible, control, or whitespace other than a space)";
+  }
+  return undefined;
+}
+
+/**
+ * Why a host would refuse this card title, or undefined when it accepts it.
+ * Unlike an id, a title is trimmed and normalized by the host rather than
+ * refused for being untrimmed, so only what survives that is screened.
+ */
+function pocketCardTitleError(title: unknown): string | undefined {
+  if (typeof title !== "string" || title === "") return "must be a non-empty string";
+  const normalized = title.replace(WHITE_SPACE_EDGES, "").normalize("NFC");
+  if (normalized === "") return "must not be blank after trimming";
+  if (UTF8.encode(normalized).length > POCKET_CARD_TEXT_MAX_BYTES) {
+    return `must be at most ${POCKET_CARD_TEXT_MAX_BYTES} bytes after trimming and NFC`;
+  }
+  if (POCKET_CARD_TITLE_UNSAFE.test(normalized)) {
+    return "contains a character hosts refuse (control, bidi override, or other display-unsafe character)";
+  }
+  return undefined;
+}
+
+/** A pocket value hosts read as "no cards": null, or a card list that is empty. */
+function isNoPocketCards(value: unknown): boolean {
+  return value === null || (isPlainObject(value) && Array.isArray(value.cards) && value.cards.length === 0);
+}
+
+/**
+ * Validate a worker's Pocket card list (Pocket modality RFC). Hosts drop all
+ * of a product's cards when one definition is invalid, with only a log line,
+ * so the shape is checked on both sides. Unknown fields are refused only when
+ * `strict` (the author's config), as for icon formats and grants: a reader of
+ * a published record tolerates fields a newer publisher added.
+ */
+function validatePocket(value: unknown, p: string, strict: boolean): string[] {
+  if (!isPlainObject(value)) return [`${p}pocket must be an object with a cards array`];
+  const errors = strict ? rejectUnknownFields(value, ["cards"], `${p}pocket `) : [];
+  if (!Array.isArray(value.cards) || value.cards.length === 0) {
+    return [...errors, `${p}pocket.cards must be a non-empty array`];
+  }
+  const seen = new Set<string>();
+  value.cards.forEach((card, i) => {
+    const at = `${p}pocket.cards[${i}]`;
+    if (!isPlainObject(card)) {
+      errors.push(`${at} must be an object`);
+      return;
+    }
+    if (strict) errors.push(...rejectUnknownFields(card, POCKET_CARD_FIELDS, `${at} `));
+    const idError = pocketCardIdError(card.id);
+    if (idError) errors.push(`${at}.id ${idError}`);
+    else if (seen.has(card.id as string)) errors.push(`${at}.id ${JSON.stringify(card.id)} repeats an earlier card`);
+    else seen.add(card.id as string);
+    const titleError = pocketCardTitleError(card.title);
+    if (titleError) errors.push(`${at}.title ${titleError}`);
+    // A path inside the worker archive, never a URL: hosts refuse a card that names one.
+    if (!isNonEmptyString(card.preview)) {
+      errors.push(`${at}.preview must be a non-empty string`);
+    } else if (!isArchiveRelativePath(card.preview)) {
+      errors.push(`${at}.preview must be a relative path inside the worker archive, with no empty, '.', or '..' segments`);
+    }
+    // Android reads a null faceShown as absent; the author's config does not.
+    if (card.faceShown !== undefined && !(card.faceShown === null && !strict) && typeof card.faceShown !== "boolean") {
+      errors.push(`${at}.faceShown must be a boolean when present`);
+    }
+  });
+  return errors;
+}
+
+function validateWorkerFields(
+  input: Record<string, unknown>,
+  p: string,
+  strict: boolean,
+): string[] {
   const errors: string[] = [];
   if (!isNonEmptyString(input.entrypoint)) {
     errors.push(`${p}entrypoint must be a non-empty string`);
-  } else if (input.entrypoint.startsWith("/") || input.entrypoint.split("/").includes("..")) {
+  } else if (strict && !isArchiveRelativePath(input.entrypoint)) {
+    errors.push(`${p}entrypoint must be a relative path with no empty, '.', or '..' segments`);
+  } else if (
+    !strict &&
+    (input.entrypoint.startsWith("/") || input.entrypoint.split("/").includes(".."))
+  ) {
+    // Read path: keep the pre-#1714 rule. Hosts still accept forms like
+    // "./index.js", and a record already on chain must not turn invalid on read.
     errors.push(`${p}entrypoint must be a relative path with no '..' segments`);
   }
   if (!isPlainObject(input.includes)) {
@@ -445,6 +580,13 @@ function validateWorkerFields(input: Record<string, unknown>, p: string): string
   }
   if (inc.chat === false && inc.pocket === false && inc.funding !== true) {
     errors.push(`${p}includes must have at least one of chat / pocket / funding = true`);
+  }
+  // Hosts read a null pocket, or one with no cards, as "no cards"; only the
+  // author's config insists on a real list.
+  if (input.pocket !== undefined && !(!strict && isNoPocketCards(input.pocket))) {
+    // #1708: hosts read a card list only when the worker declares the Pocket ceiling.
+    if (inc.pocket !== true) errors.push(`${p}pocket requires includes.pocket = true`);
+    errors.push(...validatePocket(input.pocket, p, strict));
   }
   return errors;
 }
@@ -498,7 +640,7 @@ export function validateExecutableManifest(input: unknown): ValidationResult<Exe
     } else if (kind === KIND_FUNDING) {
       errors.push(...validateFundingFields(input, p));
     } else if (kind === KIND_WORKER) {
-      errors.push(...validateWorkerFields(input, p));
+      errors.push(...validateWorkerFields(input, p, false));
     } else {
       errors.push(`${p}kind must be one of ${EXECUTABLE_KINDS.join(", ")} (got ${JSON.stringify(kind)})`);
     }
@@ -582,7 +724,7 @@ function validateExecutableConfig(input: unknown, index: number): string[] {
     } else if (kind === KIND_FUNDING) {
       errors.push(...validateFundingFields(input, p));
     } else if (kind === KIND_WORKER) {
-      errors.push(...validateWorkerFields(input, p));
+      errors.push(...validateWorkerFields(input, p, true));
     } else {
       errors.push(`${p}kind must be one of ${EXECUTABLE_KINDS.join(", ")} (got ${JSON.stringify(kind)})`);
     }

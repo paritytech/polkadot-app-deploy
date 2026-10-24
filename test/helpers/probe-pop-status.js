@@ -6,36 +6,28 @@
  *
  * COUPLING NOTE: the derivation path applied here comes from the caller via
  * `opts.derivationPath` — it must match whatever the scenario actually deploys
- * with (see `directSignerDerivationPath()` / `buildArgs` in test/e2e.test.js).
- * If a caller omits `derivationPath` entirely, this falls back to the legacy
- * default: `//e2e-direct` when `signer === "direct"`, none otherwise. Passing
- * an explicit `null` means "probe the bare mnemonic account" and is distinct
- * from omitting the option.
+ * with (see `probeDerivationPathFor()` / `directSignerArgsFor()` in
+ * test/e2e.test.js). Omitted or `null` means "probe the bare mnemonic account"
+ * (ROOT); there is deliberately no signer-based default (#1695).
  *
  * @param {object} opts
  * @param {() => object} opts.dotnsFactory      — returns a fresh DotNS-like instance
- * @param {string}       opts.signer             — E2E_SIGNER value ("pool" | "direct")
  * @param {string|null}  opts.bulletinDeployEnv  — PAD_ENV value (or null)
  * @param {() => Promise<object>} opts.resolveEnvConnectOptions — resolves extra connect
  *   options from environments.json when bulletinDeployEnv is set
  * @param {string}       opts.defaultMnemonic    — DEFAULT_MNEMONIC constant from the module
  * @param {string|null}  [opts.derivationPath]   — explicit derivation path for the actual
- *   per-scenario signer (see COUPLING NOTE above); omit to get the legacy default
+ *   per-scenario signer (see COUPLING NOTE above); omit/null = bare ROOT
  * @returns {Promise<number>} PoP status as a plain JS number; 0 on any failure
  */
 export async function probeSignerPopStatus(opts) {
   const {
     dotnsFactory,
-    signer,
     bulletinDeployEnv,
     resolveEnvConnectOptions,
     defaultMnemonic,
   } = opts;
-  // Distinguish "caller passed derivationPath (including explicit null = bare
-  // mnemonic)" from "caller omitted it (legacy default)".
-  const derivationPath = "derivationPath" in opts
-    ? opts.derivationPath
-    : (signer === "direct" ? "//e2e-direct" : null);
+  const derivationPath = opts.derivationPath ?? null;
 
   const dotns = dotnsFactory();
   try {

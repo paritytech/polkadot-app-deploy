@@ -35,6 +35,20 @@ export default defineConfig({
 | `executables` | yes | Non-empty; one entry per `kind` |
 | `trustedProducts` | no | Cross-product grants, keyed by the other product's bare label |
 
+### PolkaVM storage-buffer requirements
+
+App v2 manifests using the `webgpu-raster` graphics profile may declare these
+minimums in `capabilities.graphics.requiredLimits`:
+
+| Limit | Profile ceiling |
+|---|---|
+| `maxStorageBufferBindingSize` | 16 MiB (16,777,216 bytes) |
+| `maxStorageBuffersPerShaderStage` | 8 |
+
+Values must be positive safe integers within the profile ceiling. Unknown limits
+and values above the ceiling are rejected before upload. The host must also check
+that its graphics device can meet the declared minimums.
+
 ## Trusted products
 
 `trustedProducts` pre-approves cross-product interactions that the Host would otherwise prompt for. Each entry names what another product may do **to this one**, and says nothing about the reverse direction:

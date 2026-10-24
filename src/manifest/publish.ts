@@ -342,7 +342,7 @@ async function connectDotNS(
   );
 
   const dotns = new DotNS();
-  await dotns.connect(connectOpts);
+  await dotns.connect({ ...connectOpts, recordStorageDeposit: resolved.recordStorageDeposit });
   return dotns;
 }
 

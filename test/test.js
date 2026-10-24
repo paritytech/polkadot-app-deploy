@@ -4165,11 +4165,9 @@ describe("DotNS initial state", () => {
         },
       };
       let fundingGate;
-      w.setSubmissionFundingGate(async (operation, storageDepositLimit, value) => {
-        fundingGate = { operation, storageDepositLimit, value };
-      });
-      w.signAndSubmitWithRetry = async (buildExtrinsic) => {
+      w.signAndSubmitWithRetry = async (buildExtrinsic, _signer, _cb, _label, opts) => {
         buildExtrinsic();
+        fundingGate = opts?.fundingGate;
         return { kind: "hash", hash: "0xbatch" };
       };
 
@@ -4188,6 +4186,86 @@ describe("DotNS initial state", () => {
         assert.strictEqual(call.storage_deposit_limit, MINIMUM_RECORD_STORAGE_DEPOSIT,
           ">> FAIL: every Revive.call inside submitBatchedTransactions must receive the per-call record floor");
       }
+    });
+
+    const GATE_ARGS = { operation: "Revive.call", storageDepositLimit: 1n, value: 0n };
+
+    test("signAndSubmitWithRetry runs the funding gate on every attempt", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      const order = [];
+      let attempts = 0;
+      w.signAndSubmitExtrinsic = async () => {
+        order.push(`sign${++attempts}`);
+        if (attempts === 1) throw new Error("socket closed");
+        return { kind: "hash", hash: "0xok" };
+      };
+      w.setSubmissionFundingGate(async () => { order.push("gate"); });
+      const res = await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(res.hash, "0xok");
+      assert.deepStrictEqual(order, ["gate", "sign1", "gate", "sign2"],
+        ">> FAIL: #1706: a re-sign submitted without re-reading the balance, so a signer drained by a concurrent deploy stays underfunded for every remaining attempt");
+    });
+
+    test("signAndSubmitWithRetry gates once when the first attempt lands", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let gateCalls = 0;
+      w.signAndSubmitExtrinsic = async () => ({ kind: "hash", hash: "0xok" });
+      w.setSubmissionFundingGate(async () => { gateCalls++; });
+      await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(gateCalls, 1,
+        ">> FAIL: #1706: the gate must run once per attempt, and a landed first attempt is exactly one");
+    });
+
+    test("a signer drained mid-flight is topped up and retried, not aborted", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let attempts = 0;
+      let toppedUp = false;
+      w.signAndSubmitExtrinsic = async () => {
+        if (++attempts === 1) throw new Error('dispatch error {"type":"TransferFailed"}');
+        return { kind: "hash", hash: "0xok" };
+      };
+      w.setSubmissionFundingGate(async () => { toppedUp = true; });
+      const res = await w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS });
+      assert.strictEqual(res.hash, "0xok",
+        ">> FAIL: #1706: TransferFailed aborted instead of retrying, so a deploy that lost a funding race fails where a top-up and one more attempt would have landed it");
+      assert.ok(toppedUp, ">> FAIL: #1706: the drained signer was retried without topping it back up, so the second attempt is short by the same amount");
+    });
+
+    test("a drain that outlives every attempt names concurrency in the error", async () => {
+      const { ReviveClientWrapper, DOTNS_TX_MAX_ATTEMPTS } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      let attempts = 0;
+      w.setSubmissionFundingGate(async () => {});
+      w.signAndSubmitExtrinsic = async () => {
+        attempts++;
+        throw new Error('dispatch error {"type":"TransferFailed"}');
+      };
+      await assert.rejects(
+        () => w.signAndSubmitWithRetry(() => ({}), {}, () => {}, "Revive.call", { fundingGate: GATE_ARGS }),
+        (e) => {
+          assert.match(e.message, /sharing this signer/,
+            ">> FAIL: #1706: a bare TransferFailed gives the reader nothing to act on, and a shared signer is its most common cause");
+          return true;
+        },
+      );
+      assert.strictEqual(attempts, DOTNS_TX_MAX_ATTEMPTS,
+        `>> FAIL: #1706: a drained signer must use every attempt before giving up, got ${attempts}`);
+    });
+
+    test("every submission path hands its funding-gate args to the retry loop", () => {
+      const src = fs.readFileSync("src/dotns.ts", "utf-8");
+      const submits = src.split("\n").filter((line) => /signAndSubmitWithRetry\(/.test(line) && !/async signAndSubmitWithRetry/.test(line));
+      // map_account and the auto-map trigger carry no storage deposit, so they
+      // have no gate to re-run.
+      const funded = submits.filter((line) => !/map_account|^\s*await this\.clientWrapper\.signAndSubmitWithRetry\($/.test(line));
+      for (const line of funded) {
+        assert.match(line, /fundingGate/,
+          `>> FAIL: #1706: a submission retries without re-reading the balance, so a signer drained by a concurrent deploy stays underfunded: ${line.trim()}`);
+      }
+      assert.ok(funded.length >= 2, `>> FAIL: #1706: expected the Revive.call and batch submission sites, found ${funded.length}`);
     });
 
     // recreateReviveClient constructs the only ReviveClientWrapper a DotNS instance
@@ -7257,9 +7335,6 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
     d.substrateAddress = "5Signer";
     d.signer = {};
     let fundingGate;
-    d.ensureSubmissionFunding = async (operation, storageDepositLimit, value) => {
-      fundingGate = { operation, storageDepositLimit, value };
-    };
     const capturedCalls = [];
     // storageDeposit values deliberately both exceed computeStorageDepositLimit's
     // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT floor (2e12) so the floor can't mask
@@ -7282,8 +7357,9 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
           },
         },
       },
-      signAndSubmitWithRetry: async (buildBatch) => {
+      signAndSubmitWithRetry: async (buildBatch, _signer, _cb, _label, opts) => {
         buildBatch();
+        fundingGate = opts?.fundingGate;
         return { kind: "hash", hash: "0xbatch" };
       },
     };
@@ -20956,9 +21032,6 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
     d.substrateAddress = "5Signer";
     d.signer = {};
     let fundingGate;
-    d.ensureSubmissionFunding = async (operation, storageDepositLimit, value) => {
-      fundingGate = { operation, storageDepositLimit, value };
-    };
     d["_registerStorageDeposit"] = 50_000_000_000n; // 5 PAS — the measured paseo-next-v2 floor
     const capturedCalls = [];
     d.clientWrapper = {
@@ -20978,8 +21051,9 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
           },
         },
       },
-      signAndSubmitWithRetry: async (buildBatch) => {
+      signAndSubmitWithRetry: async (buildBatch, _signer, _cb, _label, opts) => {
         buildBatch();
+        fundingGate = opts?.fundingGate;
         return { kind: "hash", hash: "0xbatch" };
       },
     };
@@ -22716,12 +22790,11 @@ describe("signAndSubmitExtrinsic silent-watcher branch wiring (#990)", () => {
     const src = fs.readFileSync("src/dotns.ts", "utf-8");
     const idx = src.indexOf("async signAndSubmitWithRetry(");
     assert.ok(idx >= 0, ">> FAIL: #990 wiring: could not locate signAndSubmitWithRetry in src/dotns.ts");
-    // Window sized to cover the method's catch region (both calls live well
-    // before the next method decl). Widened from 2000→4000 for #1158: the
-    // nonce-contention branch now sits between the two calls — still BEFORE
-    // the general retry classification, which is the invariant this test
-    // guards; the old fixed window just no longer reached it.
-    const body = src.slice(idx, idx + 4000);
+    // Bounded by the next method, not a fixed offset: a fixed window had to be
+    // widened twice as branches landed between the two calls.
+    const after = src.slice(idx + 1);
+    const end = after.search(/\n  (?:async |private )/);
+    const body = after.slice(0, end === -1 ? undefined : end);
     const fastFailIdx = body.indexOf("classifyWatcherSilentFastFail(");
     const retryDecisionIdx = body.indexOf("classifyTxRetryDecision(");
     assert.ok(fastFailIdx >= 0, ">> FAIL: #990 wiring: signAndSubmitWithRetry must call classifyWatcherSilentFastFail");

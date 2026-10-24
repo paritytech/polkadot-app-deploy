@@ -22,7 +22,7 @@ import {
   namehash,
 } from "viem";
 import { CID } from "multiformats/cid";
-import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath } from "./telemetry.js";
+import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath, classifyErrorKind } from "./telemetry.js";
 import { CODE_PATHS } from "./code-paths.js";
 import { isTestnetSpecName, testnetFromNetworkField } from "./pool.js";
 import { validateContractAddresses } from "./environments.js";
@@ -500,11 +500,14 @@ export class WatcherSilentNoEventError extends Error {
 // Retry decision for DotNS extrinsic submission errors. Stale / Future /
 // connection errors mean the tx didn't land due to mortality or network
 // timing, so a rebuild-and-resubmit with fresh nonce has a real chance.
-// Dispatch errors (contract revert, insufficient balance) fail identically
-// on retry and abort.
-export function classifyTxRetryDecision(err: unknown): "retry" | "abort" {
+// Dispatch errors (contract revert, insufficient balance) fail identically on
+// retry and abort, except TransferFailed when a top-up can clear it.
+export function classifyTxRetryDecision(err: unknown, { canRefund = false } = {}): "retry" | "abort" {
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
+  // Revive raises TransferFailed when a concurrent deploy spent the signer's
+  // balance after the funding gate cleared it (#1706).
+  if (canRefund && classifyErrorKind(msg) === "funding.transfer_failed") return "retry";
   if (lower.includes("nonce-advance fallback")) return "retry";
   if (/\bstale\b/.test(lower)) return "retry";
   if (/"type"\s*:\s*"future"|\binvalid::future\b/.test(lower)) return "retry";
@@ -2436,7 +2439,7 @@ export class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: PhoneOnResign; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: PhoneOnResign; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number; fundingGate?: { operation: string; storageDepositLimit: bigint; value: bigint } } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
@@ -2449,6 +2452,11 @@ export class ReviveClientWrapper {
         await opts.onResign?.(attempt);
       }
       try {
+        // Inside the loop: a concurrent deploy can spend the balance an
+        // earlier attempt's gate cleared (#1706).
+        if (opts.fundingGate) {
+          await this._submissionFundingGate?.(opts.fundingGate.operation, opts.fundingGate.storageDepositLimit, opts.fundingGate.value);
+        }
         // Rebuilt + re-signed each attempt → papi reads a fresh on-chain nonce
         // (retries never reuse the stale one).
         return await this.signAndSubmitExtrinsic(buildExtrinsic(), signer, filter.callback, opts);
@@ -2493,7 +2501,7 @@ export class ReviveClientWrapper {
           }
         }
 
-        const decision = classifyTxRetryDecision(e);
+        const decision = classifyTxRetryDecision(e, { canRefund: Boolean(opts.fundingGate && this._submissionFundingGate) });
         const msg = e?.message ?? String(e);
         if (!shouldRetryTxAttempt(attempt, DOTNS_TX_MAX_ATTEMPTS, decision)) {
           // Final attempt or non-retryable error: announce it (don't break
@@ -2510,6 +2518,9 @@ export class ReviveClientWrapper {
       }
     }
     filter.flush(); // surface "failed" when the overall operation truly failed
+    if (opts.fundingGate && this._submissionFundingGate && classifyErrorKind(lastError instanceof Error ? lastError.message : String(lastError)) === "funding.transfer_failed") {
+      throw new Error(`${label}: the signer's balance was spent between the funding check and this transaction, and ${DOTNS_TX_MAX_ATTEMPTS} top-ups did not recover it. Another deploy is most likely sharing this signer. Underlying error: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+    }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
@@ -2585,7 +2596,7 @@ export class ReviveClientWrapper {
       { "chain.function_name": functionName ?? "Revive.call" },
       () => this.dryRunReviveCall(contractAddress, value, encodedData, signerSubstrateAddress, { functionName, args, contracts, depositPolicy }),
     );
-    await this._submissionFundingGate?.(functionName ?? "Revive.call", prep.storage_deposit_limit, value);
+    const fundingGate = { operation: functionName ?? "Revive.call", storageDepositLimit: prep.storage_deposit_limit, value };
     const buildExtrinsic = () => this.client.tx.Revive.call({ dest: contractAddress, value, weight_limit: prep.weight_limit, storage_deposit_limit: prep.storage_deposit_limit, data: Binary.fromHex(encodedData) });
     let nonceFallback: { rpcs: string[]; senderSS58: string; expectedNonce: number } | undefined;
     if (useNoncePolling) {
@@ -2598,7 +2609,7 @@ export class ReviveClientWrapper {
       "chain.tx.submit",
       `sign+submit ${functionName ?? "Revive.call"}`,
       { "chain.function_name": functionName ?? "Revive.call", "chain.use_nonce_polling": Boolean(useNoncePolling) },
-      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner, onResign }),
+      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner, onResign, fundingGate }),
     );
   }
 
@@ -2626,7 +2637,7 @@ export class ReviveClientWrapper {
       bufferedEstimate: prep.buffered_storage_deposit_estimate,
     })));
     const totalValue = calls.reduce((sum, call) => sum + call.value, 0n);
-    await this._submissionFundingGate?.("Utility.batch_all", storageDepositLimit, totalValue);
+    const fundingGate = { operation: "Utility.batch_all", storageDepositLimit, value: totalValue };
     const buildExtrinsic = () => {
       const inners = calls.map((c, i) => this.client.tx.Revive.call({
         dest: c.contractAddress,
@@ -2641,7 +2652,7 @@ export class ReviveClientWrapper {
       "chain.tx.submit",
       "sign+submit Utility.batch_all",
       { "chain.function_name": "Utility.batch_all" },
-      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Utility.batch_all"),
+      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Utility.batch_all", { fundingGate }),
     );
   }
 }
@@ -4563,7 +4574,7 @@ export class DotNS {
         limit: storage_deposit_limit,
         bufferedEstimate,
       })));
-    await this.ensureSubmissionFunding(label, storageDepositRequirement, totalValue);
+    const fundingGate = { operation: label, storageDepositLimit: storageDepositRequirement, value: totalValue };
 
     const client = this.clientWrapper.client;
     const buildBatch = () => {
@@ -4580,7 +4591,7 @@ export class DotNS {
     };
 
     return await withTimeout(
-      this.clientWrapper.signAndSubmitWithRetry(buildBatch, this.signer!, statusCallback, label, { verifyEffect }),
+      this.clientWrapper.signAndSubmitWithRetry(buildBatch, this.signer!, statusCallback, label, { verifyEffect, fundingGate }),
       OPERATION_TIMEOUT_MS,
       label,
     );

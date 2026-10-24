@@ -602,16 +602,14 @@ function stubbedWrapper({ storageDeposit = 0n } = {}) {
     storageDeposit,
   });
   const gated = [];
-  wrapper.setSubmissionFundingGate(async (operation, storageDepositLimit, value) => {
-    gated.push({ operation, storageDepositLimit, value });
-  });
   const captured = [];
   wrapper.client = { tx: {
     Revive: { call: (args) => { captured.push(args); return { decodedCall: {} }; } },
     Utility: { batch_all: () => ({}) },
   } };
-  wrapper.signAndSubmitWithRetry = async (buildExtrinsic) => {
+  wrapper.signAndSubmitWithRetry = async (buildExtrinsic, _signer, _cb, _label, opts) => {
     buildExtrinsic();
+    if (opts?.fundingGate) gated.push(opts.fundingGate);
     return { kind: "hash", hash: "0xtx" };
   };
   return { wrapper, gated, captured };

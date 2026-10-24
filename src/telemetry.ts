@@ -290,6 +290,10 @@ const DEPLOY_SEED_OUTCOME: Record<string, string> = {
 // getWsProvider's onStatusChanged when papi connects to a non-primary endpoint.
 const DEPLOY_SEED_RPC: Record<string, string> = {
   "deploy.rpc.failed_over": "false",
+  // Recovered-path flags (their warnings no longer send Sentry events): seeded
+  // "false", flipped in deploy.ts at the chunk-retry site / doReconnect.
+  "deploy.chunk.retried": "false",
+  "deploy.reconnected": "false",
 };
 
 // DotNS / naming layer: balance gate flags + tx resolution kind + backend identity.
@@ -1091,9 +1095,9 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
               outputDir: reportContext.outputDir,
               onSentryAttach: (r: MemoryReport) => {
                 try {
-                  Sentry!.captureMessage(`deploy memory threshold crossed (${r.threshold.peakRssMb} MB)`, {
+                  Sentry!.captureMessage("deploy memory threshold crossed", {
                     level: "warning",
-                    tags: { "deploy.mem.report": "1" },
+                    tags: { "deploy.mem.report": "1", "deploy.mem.peak_rss_mb": String(r.threshold.peakRssMb) },
                     extra: { memoryReport: r },
                   });
                 } catch { /* telemetry must never break the deploy */ }
@@ -1254,11 +1258,15 @@ export function markCodePath(id: CodePath): void {
   setDeployAttribute(`code.path.${id}`, "true");
 }
 
-export function captureWarning(message: string, context?: Record<string, unknown>): void {
+/**
+ * Record a recovered-path warning: breadcrumb + deploy.sad / sad-reason tracking,
+ * but NO Sentry event. Use for handled-and-recovered paths; exhaustion/failure
+ * is captured by the deploy's own error. captureWarning adds the event.
+ */
+export function noteWarning(message: string, context?: Record<string, unknown>): void {
   if (!Sentry) return;
   try {
     Sentry.addBreadcrumb({ level: "warning", message, data: context });
-    Sentry.captureMessage(message, { level: "warning", extra: context });
     if (deployRootSpan) deployRootSpan.setAttribute("deploy.sad", "true");
     const reason = classifySadReason(message);
     const priority = SAD_REASON_PRIORITY[reason] ?? 0;
@@ -1267,6 +1275,14 @@ export function captureWarning(message: string, context?: Record<string, unknown
       currentSadReasonPriority = priority;
     }
     currentDeploySad = true;
+  } catch { /* telemetry must never break the deploy */ }
+}
+
+export function captureWarning(message: string, context?: Record<string, unknown>): void {
+  if (!Sentry) return;
+  noteWarning(message, context);
+  try {
+    Sentry.captureMessage(message, { level: "warning", extra: context });
   } catch { /* telemetry must never break the deploy */ }
 }
 

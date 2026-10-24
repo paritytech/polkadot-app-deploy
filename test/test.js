@@ -29,7 +29,7 @@ import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveR
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
-import { captureWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
+import { captureWarning, noteWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
   isTelemetryDisabled, scrubPaths, truncateAddress, sanitizeBranch,
@@ -3443,6 +3443,8 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.expected": "false",
     // rpc
     "deploy.rpc.failed_over": "false",
+    "deploy.chunk.retried": "false",
+    "deploy.reconnected": "false",
     // dotns
     "deploy.dotns.signer_below_floor": "false",
     "deploy.dotns.toppedup": "false",
@@ -17890,8 +17892,11 @@ describe("setDeployAttribute → root span (regression guard)", () => {
 
   test("source: captureWarning uses deployRootSpan for deploy.sad, not getRootSpan/getActiveSpan", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
-    const match = src.match(/export function captureWarning[\s\S]*?\n\}/);
-    assert.ok(match, "captureWarning must be present in src/telemetry.ts");
+    // The sad-tracking logic lives once, in noteWarning (captureWarning delegates to it).
+    const match = src.match(/export function noteWarning[\s\S]*?\n\}/);
+    assert.ok(match, "noteWarning must be present in src/telemetry.ts");
+    assert.match(src.match(/export function captureWarning[\s\S]*?\n\}/)[0], /noteWarning\(/,
+      "captureWarning must delegate its sad tracking to noteWarning");
     const body = match[0];
     assert.ok(
       !body.includes("getRootSpan"),
@@ -28338,5 +28343,88 @@ describe("e2e.yml: per-leg e2e-result files (#1625)", () => {
       assert.match(open, /labels: \(\[\$label\] \+ \(if \$cause == "" then \[\] else \[\$cause\] end\)\)/);
       assert.match(open, /"\$API_URL\/repos\/\$REPO\/labels"[\s\S]*?CAUSE_LABEL|CAUSE_LABEL[\s\S]*?"\$API_URL\/repos\/\$REPO\/labels"/, ">> FAIL: e2e-result: the cause label must be created on demand");
     });
+  });
+});
+
+describe("Sentry error diet: events only for failures", () => {
+  const fakeRoot = () => ({ attrs: new Map(), atEnd: null, setAttribute(k, v) { this.attrs.set(k, v); }, setStatus() {}, end() { this.atEnd ??= new Map(this.attrs); } });
+  const stub = (root, counts) => ({
+    startSpan: async (_o, fn) => fn(root), setTags() {}, setTag() {}, getActiveSpan: () => null,
+    captureMessage() { counts.messages++; }, addBreadcrumb() { counts.crumbs++; }, captureException() {}, withScope() {}, flush: async () => true, close: async () => true,
+  });
+  const run = async (fn) => {
+    const root = fakeRoot();
+    const counts = { messages: 0, crumbs: 0 };
+    const prev = __setSentryForTest(stub(root, counts));
+    try {
+      await withDeploySpan("diet.dot", async () => { fn(); });
+    } finally {
+      __setSentryForTest(prev);
+    }
+    return { root, counts };
+  };
+
+  test("noteWarning tracks sad + reason like captureWarning but sends no event", async () => {
+    const note = await run(() => noteWarning("deploy process terminated: SIGINT"));
+    const cap = await run(() => captureWarning("deploy process terminated: SIGINT"));
+    assert.equal(note.counts.messages, 0, ">> FAIL: noteWarning: must not call captureMessage");
+    assert.equal(note.counts.crumbs, 1, ">> FAIL: noteWarning: must still leave a breadcrumb");
+    assert.equal(cap.counts.messages, 1, ">> FAIL: captureWarning: must still send one event");
+    assert.equal(note.root.attrs.get("deploy.sad"), "true", ">> FAIL: noteWarning: must set deploy.sad");
+    assert.equal(note.root.attrs.get("deploy.outcome"), cap.root.attrs.get("deploy.outcome"),
+      ">> FAIL: noteWarning: sad reason/outcome must match captureWarning");
+    assert.equal(classifySadReason("deploy process terminated: SIGINT"), "killed");
+  });
+
+  const deploySrc = fs.readFileSync("src/deploy.ts", "utf-8");
+  const count = (src, needle) => src.split(needle).length - 1;
+  for (const title of [
+    "Bulletin RPC failover",
+    "WebSocket connection lost, reconnecting",
+    "Chunk upload failed, retrying",
+    "nonce-advance collision: re-uploading missing chunks",
+    "root-node nonce collision: resubmitting",
+  ]) {
+    test(`source: "${title}" is a note, not an event`, () => {
+      assert.ok(count(deploySrc, `noteWarning("${title}"`) >= 1, `>> FAIL: deploy.ts: "${title}" must use noteWarning`);
+      assert.equal(count(deploySrc, `captureWarning("${title}"`), 0, `>> FAIL: deploy.ts: "${title}" must not use captureWarning`);
+    });
+  }
+
+  test('source: "Chunk retry failed" is a note per attempt and ONE event when retries are exhausted', () => {
+    assert.equal(count(deploySrc, 'noteWarning("Chunk retry failed"'), 1, ">> FAIL: per-attempt retry failure must be noteWarning");
+    assert.equal(count(deploySrc, 'captureWarning("Chunk retry failed"'), 1, ">> FAIL: exactly one captureWarning(\"Chunk retry failed\")");
+    const event = deploySrc.indexOf('captureWarning("Chunk retry failed"');
+    const exhausted = deploySrc.lastIndexOf("if (!retried)", event);
+    const nextThrow = deploySrc.indexOf("throw ", exhausted);
+    assert.ok(exhausted >= 0 && event < nextThrow,
+      ">> FAIL: the event must sit inside the `if (!retried)` exhausted block, before its throw");
+  });
+
+  test("source: memory threshold event has a fixed title and the peak in a tag", () => {
+    const src = fs.readFileSync("src/telemetry.ts", "utf-8");
+    assert.ok(src.includes('captureMessage("deploy memory threshold crossed"'), ">> FAIL: memory event title must be a fixed string");
+    assert.ok(!/captureMessage\(`deploy memory threshold/.test(src), ">> FAIL: memory event title must not interpolate");
+    assert.match(src, /"deploy\.mem\.peak_rss_mb":\s*String\(r\.threshold\.peakRssMb\)/);
+    assert.equal(src.split("onSentryAttach:").length - 1, 1, ">> FAIL: memory report is attached from exactly one site (inside withDeploySpan finally)");
+  });
+
+  test("recovered-path flags default to \"false\" on a clean deploy span", () => {
+    const attrs = getDeployAttributes("diet.dot");
+    assert.equal(attrs["deploy.chunk.retried"], "false");
+    assert.equal(attrs["deploy.reconnected"], "false");
+  });
+
+  test("source: retry/reconnect flags are set at exactly one site each", () => {
+    for (const site of ['setDeployAttribute("deploy.chunk.retried", "true")', 'setDeployAttribute("deploy.reconnected", "true")', 'setDeployAttribute("deploy.chunk.retry_count",']) {
+      assert.equal(count(deploySrc, site), 1, `>> FAIL: deploy.ts: ${site} must appear exactly once`);
+    }
+  });
+
+  test("source: bin finalize notes signals and captures crashes", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+    assert.match(bin, /isSignal \? noteWarning : captureWarning/);
+    assert.match(bin, /finalize\(sig, exitCode, true\)/);
+    assert.match(bin, /finalize\(kind, 2\)/);
   });
 });

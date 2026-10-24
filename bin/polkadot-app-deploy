@@ -7,7 +7,7 @@
 import "../dist/suppress-localstorage-warning.js";
 
 import { deploy, DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner } from "../dist/deploy.js";
-import { VERSION, setDeployAttribute, captureWarning, closeTelemetry, markDeployFatal, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
+import { VERSION, setDeployAttribute, captureWarning, noteWarning, closeTelemetry, markDeployFatal, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion, isInteractive } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
 import { loadRunState, writeRunState, shouldSkipStaleWarning, shouldShowOomHint, probablyOomRssMb } from "../dist/run-state.js";
@@ -348,11 +348,13 @@ if (!flags.help && !flags.version) {
   // Guard against re-entry: if a handler itself throws (e.g. Sentry close
   // rejects), unhandledRejection must not recursively call finalize.
   let finalizing = false;
-  const finalize = async (reason, exitCode) => {
+  const finalize = async (reason, exitCode, isSignal = false) => {
     if (finalizing) return;
     finalizing = true;
     try {
-      captureWarning(`deploy process terminated: ${reason}`);
+      // Signals are user/CI cancels (breadcrumb + sad tracking only); crashes stay events.
+      const warn = isSignal ? noteWarning : captureWarning;
+      warn(`deploy process terminated: ${reason}`);
     } catch { /* telemetry best-effort */ }
     try { await closeTelemetry(1000); } catch { /* ignore */ }
     try {
@@ -399,7 +401,7 @@ if (!flags.help && !flags.version) {
       setDeployAttribute("deploy.status", "killed");
       setDeployAttribute("deploy.killed", sig);
     } catch { /* telemetry best-effort */ }
-    finalize(sig, exitCode);
+    finalize(sig, exitCode, true);
   };
   process.on("SIGINT", () => onSignal("SIGINT", 130));
   process.on("SIGTERM", () => onSignal("SIGTERM", 143));

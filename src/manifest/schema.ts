@@ -238,18 +238,28 @@ function rejectUnknownEntries<T extends string>(
     );
 }
 
+/** A path inside an executable's archive: relative, '/'-separated, no empty, '.', or '..' segments. */
+function isArchiveRelativePath(value: string): boolean {
+  return (
+    !value.startsWith("/") &&
+    !value.includes("\\") &&
+    !value
+      .split("/")
+      .some((segment) => segment === "" || segment === "." || segment === "..")
+  );
+}
+
 function validateRelativeEntrypoint(
   value: unknown,
   suffix: string,
   prefix: string,
 ): string[] {
-  if (!isNonEmptyString(value)) return [`${prefix}entrypoint must be a non-empty string`];
-  if (
-    value.startsWith("/") ||
-    value.includes("\\") ||
-    value.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
-  ) {
-    return [`${prefix}entrypoint must be a relative path with no empty, '.', or '..' segments`];
+  if (!isNonEmptyString(value))
+    return [`${prefix}entrypoint must be a non-empty string`];
+  if (!isArchiveRelativePath(value)) {
+    return [
+      `${prefix}entrypoint must be a relative path with no empty, '.', or '..' segments`,
+    ];
   }
   if (!value.toLowerCase().endsWith(suffix)) {
     return [`${prefix}entrypoint must end with ${suffix}`];
@@ -424,7 +434,82 @@ function validateFundingFields(input: Record<string, unknown>, p: string): strin
   return rejectUnknownEntries(input.modes, FUNDING_MODES, `${p}modes`);
 }
 
-function validateWorkerFields(input: Record<string, unknown>, p: string): string[] {
+/** Largest card id a host accepts, in UTF-8 bytes after trimming and NFC (truapi `CHAT_FIELD_MAX_BYTES`). */
+const POCKET_CARD_ID_MAX_BYTES = 256;
+
+/**
+ * Characters a host refuses in a card id, copied from the truapi core's
+ * screening of chat identifiers (`normalize_chat_identifier` →
+ * `is_identifier_unsafe` and `is_display_unsafe`, rust/crates/truapi/src/platform.rs
+ * in paritytech/trinity-user-agents at 801d13b1, 2026-10-15): controls,
+ * invisible joiners and separators, bidi marks, variation selectors, tag
+ * characters, and whitespace other than a plain space. Hosts drop every card
+ * of a product when one id fails this.
+ */
+const POCKET_CARD_ID_UNSAFE =
+  /[\p{Cc}\u00AD\u061C\u200B-\u200D\u2028\u2029\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{E0000}-\u{E007F}]|[^\S ]/u;
+
+const POCKET_CARD_FIELDS = ["id", "title", "preview", "faceShown"] as const;
+
+const UTF8 = new TextEncoder();
+
+/** Why a host would refuse this card id, or undefined when it accepts it. */
+function pocketCardIdError(id: unknown): string | undefined {
+  if (!isNonEmptyString(id)) return "must be a non-empty string";
+  // A host trims and NFC-normalizes the id; publishing it already so keeps the
+  // add link and the record naming the same card.
+  if (id !== id.trim().normalize("NFC")) return `must be trimmed and NFC-normalized (got ${JSON.stringify(id)})`;
+  if (UTF8.encode(id).length > POCKET_CARD_ID_MAX_BYTES) return `must be at most ${POCKET_CARD_ID_MAX_BYTES} bytes`;
+  if (POCKET_CARD_ID_UNSAFE.test(id)) {
+    return "contains a character hosts refuse (invisible, control, or whitespace other than a space)";
+  }
+  return undefined;
+}
+
+/**
+ * Validate a worker's Pocket card list (Pocket modality RFC). Hosts drop all
+ * of a product's cards when one definition is invalid, with only a log line,
+ * so the shape is checked on both sides. Unknown fields are refused only when
+ * `strict` (the author's config), as for icon formats and grants: a reader of
+ * a published record tolerates fields a newer publisher added.
+ */
+function validatePocket(value: unknown, p: string, strict: boolean): string[] {
+  if (!isPlainObject(value)) return [`${p}pocket must be an object with a cards array`];
+  const errors = strict ? rejectUnknownFields(value, ["cards"], `${p}pocket `) : [];
+  if (!Array.isArray(value.cards) || value.cards.length === 0) {
+    return [...errors, `${p}pocket.cards must be a non-empty array`];
+  }
+  const seen = new Set<string>();
+  value.cards.forEach((card, i) => {
+    const at = `${p}pocket.cards[${i}]`;
+    if (!isPlainObject(card)) {
+      errors.push(`${at} must be an object`);
+      return;
+    }
+    if (strict) errors.push(...rejectUnknownFields(card, POCKET_CARD_FIELDS, `${at} `));
+    const idError = pocketCardIdError(card.id);
+    if (idError) errors.push(`${at}.id ${idError}`);
+    else if (seen.has(card.id as string)) errors.push(`${at}.id ${JSON.stringify(card.id)} repeats an earlier card`);
+    else seen.add(card.id as string);
+    if (!isNonEmptyString(card.title)) errors.push(`${at}.title must be a non-empty string`);
+    // A path inside the worker archive, never a URL: hosts refuse a card that names one.
+    if (!isNonEmptyString(card.preview)) {
+      errors.push(`${at}.preview must be a non-empty string`);
+    } else if (!isArchiveRelativePath(card.preview) || card.preview.includes(":")) {
+      errors.push(`${at}.preview must be a relative path inside the worker archive, with no empty, '.', or '..' segments`);
+    }
+    if (card.faceShown !== undefined && typeof card.faceShown !== "boolean") {
+      errors.push(`${at}.faceShown must be a boolean when present`);
+    }
+  });
+  return errors;
+}
+
+function validateWorkerFields(
+  input: Record<string, unknown>,
+  p: string,
+  strict: boolean,
+): string[] {
   const errors: string[] = [];
   if (!isNonEmptyString(input.entrypoint)) {
     errors.push(`${p}entrypoint must be a non-empty string`);
@@ -445,6 +530,11 @@ function validateWorkerFields(input: Record<string, unknown>, p: string): string
   }
   if (inc.chat === false && inc.pocket === false && inc.funding !== true) {
     errors.push(`${p}includes must have at least one of chat / pocket / funding = true`);
+  }
+  if (input.pocket !== undefined) {
+    // #1708: hosts read a card list only when the worker declares the Pocket ceiling.
+    if (inc.pocket !== true) errors.push(`${p}pocket requires includes.pocket = true`);
+    errors.push(...validatePocket(input.pocket, p, strict));
   }
   return errors;
 }
@@ -498,7 +588,7 @@ export function validateExecutableManifest(input: unknown): ValidationResult<Exe
     } else if (kind === KIND_FUNDING) {
       errors.push(...validateFundingFields(input, p));
     } else if (kind === KIND_WORKER) {
-      errors.push(...validateWorkerFields(input, p));
+      errors.push(...validateWorkerFields(input, p, false));
     } else {
       errors.push(`${p}kind must be one of ${EXECUTABLE_KINDS.join(", ")} (got ${JSON.stringify(kind)})`);
     }
@@ -582,7 +672,7 @@ function validateExecutableConfig(input: unknown, index: number): string[] {
     } else if (kind === KIND_FUNDING) {
       errors.push(...validateFundingFields(input, p));
     } else if (kind === KIND_WORKER) {
-      errors.push(...validateWorkerFields(input, p));
+      errors.push(...validateWorkerFields(input, p, true));
     } else {
       errors.push(`${p}kind must be one of ${EXECUTABLE_KINDS.join(", ")} (got ${JSON.stringify(kind)})`);
     }

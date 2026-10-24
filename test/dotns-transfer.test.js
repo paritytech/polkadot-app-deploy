@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient, computeSubnodeIds, DEFAULT_TLD } from "../dist/dotns.js";
+import { weiToNative, DotNS, feeFloorFor, parseDomainName, classifyRegistrability, assertNotZeroRecipient, computeSubnodeIds, DEFAULT_TLD, storageDepositFloorForCall, MINIMUM_RECORD_STORAGE_DEPOSIT, ReviveClientWrapper } from "../dist/dotns.js";
 import { namehash, zeroAddress, decodeFunctionData, toFunctionSelector } from "viem";
 
 // bulletin-deploy #1443: transferSubname now ALSO probes isAuthorised
@@ -488,6 +488,83 @@ test("transferSubname: refuses a signer who is neither the parent owner nor appr
     () => d.transferSubname("app", "foo", "0xRECIP"),
     (err) => new RegExp(ADDR_OWNER, "i").test(err.message) && err.message.includes(ADDR_STRANGER),
     ">> FAIL: transferSubname operator-for-all refusal: expected an error naming both the parent's owner and the refused signer",
+  );
+});
+
+const PAS = 10_000_000_000n;
+
+test("storageDepositFloorForCall: register keeps the configured registration floor", () => {
+  assert.equal(storageDepositFloorForCall("register", 5n * PAS), 5n * PAS,
+    ">> FAIL: register must keep the environment's conservative storage-deposit floor");
+  assert.equal(storageDepositFloorForCall("commit", 5n * PAS), 5n * PAS,
+    ">> FAIL: commit is registration step 1 and must pre-fund the reveal path with the registration floor");
+});
+
+test("storageDepositFloorForCall: dry-runnable record writes use the measured small floor", () => {
+  for (const functionName of ["setText", "setContenthash", "setResolver", "setSubnodeOwner"]) {
+    assert.equal(storageDepositFloorForCall(functionName, 5n * PAS), MINIMUM_RECORD_STORAGE_DEPOSIT,
+      `>> FAIL: ${functionName} is dry-runnable and must not inherit the register-only 5 PAS floor`);
+  }
+});
+
+test("storageDepositFloorForCall: record writes never reserve more than the configured registration floor", () => {
+  assert.equal(storageDepositFloorForCall("setText", 1n * PAS), 1n * PAS,
+    ">> FAIL: a low-floor environment must not reserve more for setText than it does for registration");
+});
+
+test("storageDepositFloorForCall: unknown calls fail closed with the registration floor", () => {
+  assert.equal(storageDepositFloorForCall("futureWrite", 7n * PAS), 7n * PAS,
+    ">> FAIL: an unclassified future call must fail closed instead of silently receiving the small record-write floor");
+});
+
+test("submitTransaction: a setText gate receives the small measured floor", async () => {
+  const wrapper = new ReviveClientWrapper({});
+  wrapper.ensureAccountMapped = async () => {};
+  wrapper.estimateGasForCall = async () => ({
+    success: true,
+    gasRequired: { referenceTime: 1n, proofSize: 1n },
+    storageDeposit: 0n,
+  });
+  let gated;
+  wrapper.setSubmissionFundingGate(async (operation, storageDepositLimit, value) => {
+    gated = { operation, storageDepositLimit, value };
+  });
+  wrapper.client = { tx: { Revive: { call: () => ({}) } } };
+  wrapper.signAndSubmitWithRetry = async (buildExtrinsic) => {
+    buildExtrinsic();
+    return { kind: "hash", hash: "0xtx" };
+  };
+
+  await wrapper.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, {
+    rpcs: [],
+    functionName: "setText",
+  });
+
+  assert.deepEqual(gated, {
+    operation: "setText",
+    storageDepositLimit: MINIMUM_RECORD_STORAGE_DEPOSIT,
+    value: 0n,
+  }, ">> FAIL: the funding gate must use the concrete setText limit, not the register-only floor");
+});
+
+test("submitTransaction: missing storage estimate fails closed before funding or signing", async () => {
+  const wrapper = new ReviveClientWrapper({});
+  wrapper.ensureAccountMapped = async () => {};
+  wrapper.estimateGasForCall = async () => ({
+    success: true,
+    gasRequired: { referenceTime: 1n, proofSize: 1n },
+    storageDeposit: undefined,
+  });
+  wrapper.setSubmissionFundingGate(async () => assert.fail("funding gate must not run without an estimate"));
+  wrapper.signAndSubmitWithRetry = async () => assert.fail("submission must not run without an estimate");
+
+  await assert.rejects(
+    () => wrapper.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, {
+      rpcs: [],
+      functionName: "setText",
+    }),
+    /storage-deposit estimate unavailable.*setText/,
+    ">> FAIL: unavailable record-write estimates must fail closed before submission",
   );
 });
 

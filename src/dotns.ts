@@ -267,6 +267,15 @@ export const AUTO_MAP_RENT_HEADROOM = ONE_PAS * 20n; // 20 PAS
 // Minimum storage deposit required for a fresh TLD register() on paseo-next-v2.
 // pallet-revive dry-run returns flags=1 data=0x when free balance < this amount.
 export const MINIMUM_REGISTER_STORAGE_DEPOSIT = 2_000_000_000_000n; // 200 PAS
+// bulletin #1712: read-only dry runs on 2026-10-17 measured the exact write
+// calls on paseo-next-v2 and preview: setText 0.02064 PAS, setContenthash 0 PAS,
+// setResolver 0 PAS, and a fresh setSubnodeOwner 0.14448 PAS. Keep just over
+// 10x the largest measurement as a runtime/storage-cost variance floor without
+// making an owned-name write reserve the registration-only floor above.
+// Independently dry-runnable calls still receive the normal 20% buffer, so a
+// higher future estimate wins this floor. A dependent batch whose tail cannot
+// be dry-run honestly keeps the registration floor for every inner call.
+export const MINIMUM_RECORD_STORAGE_DEPOSIT = 15_000_000_000n; // 1.5 PAS
 // The register() msg.value is the tier-resolved deposit from PopRules, NOT a
 // fixed RENT_PRICE: 0 for a verified (Lite/Full) signer, PopRules's live
 // deposit read for a NoStatus signer. It is a refundable escrow deposit, not a
@@ -2059,6 +2068,80 @@ export function storageDepositLimitFor(
   return buffered < floor ? floor : buffered;
 }
 
+const DRY_RUNNABLE_RECORD_WRITES = new Set([
+  "setContenthash",
+  "setResolver",
+  "setSubnodeOwner",
+  "setText",
+]);
+
+/**
+ * Select the conservative floor for the concrete call being submitted.
+ * register is the reveal/finalize path whose pre-commit estimate cannot be
+ * truthful, so it retains the configured registration floor. Known record
+ * writes are dry-run against their exact calldata immediately before
+ * submission and therefore use the measured small floor. Commit remains a
+ * registration call: its balance gate must leave enough for the later reveal.
+ * Unknown or absent function names fail closed at the registration floor.
+ */
+export function storageDepositFloorForCall(
+  functionName: string | undefined,
+  registerFloor: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT,
+): bigint {
+  return functionName !== undefined && DRY_RUNNABLE_RECORD_WRITES.has(functionName)
+    ? (MINIMUM_RECORD_STORAGE_DEPOSIT < registerFloor ? MINIMUM_RECORD_STORAGE_DEPOSIT : registerFloor)
+    : registerFloor;
+}
+
+/**
+ * Convert one concrete dry-run result into the storage limit submitted for
+ * that call. The type guard is defensive: current adapters always normalize
+ * storageDeposit to bigint, but submitting without a concrete estimate would
+ * silently bypass the measurement-based policy.
+ */
+export function storageDepositLimitForCall(
+  functionName: string | undefined,
+  estimate: unknown,
+  registerFloor: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT,
+): bigint {
+  if (typeof estimate !== "bigint") {
+    throw new Error(
+      `Dry-run storage-deposit estimate unavailable for ${functionName ?? "Revive.call"}; refusing to submit without a concrete limit`,
+    );
+  }
+  return storageDepositLimitFor(estimate, storageDepositFloorForCall(functionName, registerFloor));
+}
+
+function bufferedStorageDepositEstimate(estimate: bigint): bigint {
+  return (estimate * 120n) / 100n;
+}
+
+function estimatedBatchStorageRequirement(
+  entries: { limit: bigint; bufferedEstimate: bigint }[],
+): bigint {
+  if (entries.length === 0) return 0n;
+  // Each inner call is checked against its own declared limit when it runs;
+  // only storage actually charged by earlier calls reduces the balance seen by
+  // later siblings. Cover the largest declared limit once, then add buffered
+  // estimates for every other call. When limits tie, let that one limit cover
+  // the largest estimate so floors are not multiplied by the batch length.
+  let coveredIndex = 0;
+  for (let i = 1; i < entries.length; i++) {
+    if (
+      entries[i].limit > entries[coveredIndex].limit
+      || (entries[i].limit === entries[coveredIndex].limit
+        && entries[i].bufferedEstimate > entries[coveredIndex].bufferedEstimate)
+    ) {
+      coveredIndex = i;
+    }
+  }
+  return entries.reduce(
+    (required, entry, index) => required + (index === coveredIndex ? entry.limit : entry.bufferedEstimate),
+    0n,
+  );
+}
+
+
 /**
  * The weight ceiling to declare on a Revive call, given the dry run's
  * measured gasRequired. weight_limit used to be declared at exactly the
@@ -2436,7 +2519,7 @@ export class ReviveClientWrapper {
     encodedData: string,
     signerSubstrateAddress: string,
     context: { functionName?: string; args?: unknown[]; contracts?: Record<string, string> },
-  ): Promise<{ weight_limit: { ref_time: bigint; proof_size: bigint }; storage_deposit_limit: bigint }> {
+  ): Promise<{ weight_limit: { ref_time: bigint; proof_size: bigint }; storage_deposit_limit: bigint; buffered_storage_deposit_estimate: bigint }> {
     const gasEstimate = await this.estimateGasForCall(signerSubstrateAddress, contractAddress, value, encodedData);
     if (!gasEstimate.success) {
       const signerEvmAddress = await this.getEvmAddress(signerSubstrateAddress);
@@ -2455,7 +2538,12 @@ export class ReviveClientWrapper {
     }
     return {
       weight_limit: weightLimitFor(gasEstimate.gasRequired),
-      storage_deposit_limit: storageDepositLimitFor(gasEstimate.storageDeposit, this._storageDepositFloor),
+      storage_deposit_limit: storageDepositLimitForCall(
+        context.functionName,
+        gasEstimate.storageDeposit,
+        this._storageDepositFloor,
+      ),
+      buffered_storage_deposit_estimate: bufferedStorageDepositEstimate(gasEstimate.storageDeposit),
     };
   }
 
@@ -2527,10 +2615,10 @@ export class ReviveClientWrapper {
       () => Promise.all(calls.map((c) =>
         this.dryRunReviveCall(c.contractAddress, c.value, c.encodedData, signerSubstrateAddress, { functionName: c.functionName, args: c.args }))),
     );
-    const storageDepositLimit = preps.reduce(
-      (max, prep) => prep.storage_deposit_limit > max ? prep.storage_deposit_limit : max,
-      0n,
-    );
+    const storageDepositLimit = estimatedBatchStorageRequirement(preps.map(prep => ({
+      limit: prep.storage_deposit_limit,
+      bufferedEstimate: prep.buffered_storage_deposit_estimate,
+    })));
     const totalValue = calls.reduce((sum, call) => sum + call.value, 0n);
     await this._submissionFundingGate?.("Utility.batch_all", storageDepositLimit, totalValue);
     const buildExtrinsic = () => {
@@ -4416,7 +4504,6 @@ export class DotNS {
       }),
       { referenceTime: 0n, proofSize: 0n },
     );
-    const maxStorageDeposit = estimates.reduce((max: bigint, e: any) => (e.storageDeposit > max ? e.storageDeposit : max), 0n);
 
     // Route through the same storageDepositLimitFor()/weightLimitFor() helpers
     // ReviveClientWrapper.dryRunReviveCall uses, instead of recomputing the
@@ -4428,9 +4515,34 @@ export class DotNS {
     // Revive.call extrinsics directly rather than going through the wrapper's
     // dryRunReviveCall, so it must be passed explicitly here too.
     const weight_limit = weightLimitFor(maxGasRequired);
-    const storage_deposit_limit = storageDepositLimitFor(maxStorageDeposit, this._registerStorageDeposit);
+    const estimatedStorageLimits = estimates.map((estimate: any, index: number) =>
+      storageDepositLimitForCall(
+        calls[index].functionName,
+        estimate.storageDeposit,
+        this._registerStorageDeposit,
+      ));
+    const hasUnestimatedTails = !independentCalls && calls.length > 1;
+    const storage_deposit_limit = hasUnestimatedTails
+      // Undefined deliberately selects the fail-closed registration floor:
+      // this limit is shared with tails that have no honest independent dry run.
+      ? storageDepositLimitForCall(undefined, estimates[0].storageDeposit, this._registerStorageDeposit)
+      : estimatedStorageLimits.reduce(
+        (max: bigint, limit: bigint) => limit > max ? limit : max,
+        0n,
+      );
     const totalValue = encoded.reduce((sum, call) => sum + call.value, 0n);
-    await this.ensureSubmissionFunding(label, storage_deposit_limit, totalValue);
+    const bufferedStorageEstimates = estimates.map((estimate: any) =>
+      bufferedStorageDepositEstimate(estimate.storageDeposit));
+    const storageDepositRequirement = hasUnestimatedTails
+      // The conservative shared limit covers the unestimated tail. Add the
+      // head's buffered measured charge because it executes first and can
+      // reduce the balance available when that tail is checked.
+      ? storage_deposit_limit + bufferedStorageEstimates[0]
+      : estimatedBatchStorageRequirement(bufferedStorageEstimates.map(bufferedEstimate => ({
+        limit: storage_deposit_limit,
+        bufferedEstimate,
+      })));
+    await this.ensureSubmissionFunding(label, storageDepositRequirement, totalValue);
 
     const client = this.clientWrapper.client;
     const buildBatch = () => {
@@ -4537,7 +4649,9 @@ export class DotNS {
           ],
           (status) => console.log(`      ${status}`),
           "Utility.batch_all(setContenthash+setText)",
-          { verifyEffect: stateMatches },
+          // Both writes target independent resolver fields and are valid in
+          // either order, so each can be dry-run with its exact calldata.
+          { verifyEffect: stateMatches, independentCalls: true },
         );
         logTxResolution(txResolution);
 

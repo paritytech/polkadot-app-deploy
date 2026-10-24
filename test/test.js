@@ -6934,6 +6934,8 @@ describe("DotNS.setContenthashAndTextRecord", () => {
     assert.deepStrictEqual(submitted.calls[0].args.slice(1), ["executable", "new manifest"]);
     assert.strictEqual(submitted.calls[1].args[1], "0x1234");
     assert.strictEqual(submitted.label, "Utility.batch_all(setContenthash+setText)");
+    assert.strictEqual(submitted.options.independentCalls, true,
+      ">> FAIL: contenthash+text are independent writes and both must be dry-run instead of leaving an unmeasured tail");
     assert.strictEqual(await submitted.options.verifyEffect(), true);
     assert.deepStrictEqual(result, {
       node: result.node,
@@ -7147,6 +7149,10 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    let fundingGate;
+    d.ensureSubmissionFunding = async (operation, storageDepositLimit, value) => {
+      fundingGate = { operation, storageDepositLimit, value };
+    };
     const capturedCalls = [];
     // storageDeposit values deliberately both exceed computeStorageDepositLimit's
     // REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT floor (2e12) so the floor can't mask
@@ -7193,6 +7199,11 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
       ">> FAIL: submitBatchedContractCalls estimate count: every inner call must be dry-run individually, not just the head call");
     assert.strictEqual(capturedCalls.length, 2,
       ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
+    assert.deepStrictEqual(fundingGate, {
+      operation: "test batch",
+      storageDepositLimit: ((20_000_000_000_000n * 120n) / 100n) + ((2_000_000_000_000n * 120n) / 100n),
+      value: 0n,
+    }, ">> FAIL: independent batches must gate the largest shared limit once plus the other call's buffered estimate");
     for (const call of capturedCalls) {
       assert.deepStrictEqual(call.weight_limit, { ref_time: (9_000_000_000n * 120n) / 100n, proof_size: (900_000n * 120n) / 100n },
         ">> FAIL: submitBatchedContractCalls max-estimate weight_limit: must declare the LARGER (tail-call) buffered estimate, not the head call's smaller one — a head-only estimate would under-provision the tail call");
@@ -20677,12 +20688,14 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
   // (bulletin #1522, same 20% factor applied to ref_time and proof_size
   // separately) legitimately contributes 2 more — both inside the one
   // canonical function, so this is still a single source of truth per helper.
+  // bulletin #1712 adds bufferedStorageDepositEstimate (the shared buffered
+  // estimate the batch-funding arithmetic reuses) as the 4th.
   test("dotns.ts: the 20% buffer formula appears only inside storageDepositLimitFor and weightLimitFor", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
     const matches = dotnsSrc.match(/\*\s*120n\)\s*\/\s*100n/g) || [];
-    assert.equal(matches.length, 3,
+    assert.equal(matches.length, 4,
       `>> FAIL: 20%-buffer drift-guard: found the "* 120n) / 100n" formula ${matches.length} time(s) in dotns.ts, ` +
-      `expected exactly 3 (1 inside storageDepositLimitFor + 2 inside weightLimitFor for ref_time/proof_size) — ` +
+      `expected exactly 4 (1 inside storageDepositLimitFor + 1 inside bufferedStorageDepositEstimate + 2 inside weightLimitFor for ref_time/proof_size) — ` +
       `any other count means a call site grew its own inline copy again`);
   });
 
@@ -20702,7 +20715,9 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
     // call's own estimate (headEstimate.storageDeposit, the pre-#1164 shape) — see
     // the independentCalls/multi-dry-run block above this call site. The floor
     // argument itself is unaffected by that change.
-    assert.match(dotnsSrc, /storageDepositLimitFor\(maxStorageDeposit,\s*this\._registerStorageDeposit\)/,
+    // bulletin #1712: the limit is now chosen per inner call (record writes get the
+    // measured record floor, register/unknown calls the per-env registration floor).
+    assert.match(dotnsSrc, /storageDepositLimitForCall\(\s*calls\[index\]\.functionName,\s*estimate\.storageDeposit,\s*this\._registerStorageDeposit,?\s*\)/,
       ">> FAIL: submitBatchedContractCalls must pass this._registerStorageDeposit as the floor — the per-env config, " +
       "otherwise it silently falls back to the generic 200 PAS default regardless of environments.json");
   });
@@ -20807,6 +20822,46 @@ describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitt
   });
 });
 
+describe("ReviveClientWrapper record-write storage floor (bulletin #1712)", () => {
+  test("submitBatchedTransactions gives known record writes the measured record floor", async () => {
+    const { ReviveClientWrapper, MINIMUM_RECORD_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+    const w = new ReviveClientWrapper({});
+    w.ensureAccountMapped = async () => {};
+    w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+    const captured = [];
+    w.client = {
+      tx: {
+        Revive: { call: (args) => { captured.push(args); return { decodedCall: {} }; } },
+        Utility: { batch_all: () => ({}) },
+      },
+    };
+    let fundingGate;
+    w.setSubmissionFundingGate(async (operation, storageDepositLimit, value) => {
+      fundingGate = { operation, storageDepositLimit, value };
+    });
+    w.signAndSubmitWithRetry = async (buildExtrinsic) => {
+      buildExtrinsic();
+      return { kind: "hash", hash: "0xbatch" };
+    };
+
+    await w.submitBatchedTransactions([
+      { contractAddress: "0xText", value: 0n, encodedData: "0x", functionName: "setText", args: [] },
+      { contractAddress: "0xContent", value: 0n, encodedData: "0x", functionName: "setContenthash", args: [] },
+    ], "5Signer", {}, () => {});
+
+    assert.deepStrictEqual(fundingGate, {
+      operation: "Utility.batch_all",
+      storageDepositLimit: MINIMUM_RECORD_STORAGE_DEPOSIT,
+      value: 0n,
+    }, ">> FAIL: submitBatchedTransactions must gate one shared floor plus other calls' buffered estimates, not multiply the floor by batch length");
+    assert.strictEqual(captured.length, 2);
+    for (const call of captured) {
+      assert.strictEqual(call.storage_deposit_limit, MINIMUM_RECORD_STORAGE_DEPOSIT,
+        ">> FAIL: every Revive.call inside submitBatchedTransactions must receive the per-call record floor");
+    }
+  });
+});
+
 describe("DotNS: recreateReviveClient wires the connected instance's registerStorageDeposit into the wrapper (#1518)", () => {
   test("dotns.ts: recreateReviveClient calls setStorageDepositFloor(this._registerStorageDeposit) right after construction", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
@@ -20841,7 +20896,7 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
       estimateGasForCall: async () => ({
         success: true,
         gasRequired: { referenceTime: 2_000_000_000n, proofSize: 200_000n },
-        storageDeposit: 0n, // overwrite-shaped call — zero estimate must still floor at the env value, not 200 PAS
+        storageDeposit: 1_000_000_000n, // a small measured head estimate must not lower the dependent batch below the env floor
       }),
       client: {
         tx: {
@@ -20873,9 +20928,9 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
     assert.strictEqual(result.kind, "hash", ">> FAIL: submitBatchedContractCalls setup: fake signAndSubmitWithRetry must resolve — check the fake clientWrapper wiring above");
     assert.deepStrictEqual(fundingGate, {
       operation: "test batch",
-      storageDepositLimit: 50_000_000_000n,
+      storageDepositLimit: 50_000_000_000n + ((1_000_000_000n * 120n) / 100n),
       value: 0n,
-    }, ">> FAIL: submitBatchedContractCalls must gate the concrete batch using its declared storage limit");
+    }, ">> FAIL: a dependent two-call batch must gate one registration-floor limit plus the measured head's 20%-buffered estimate, not double the floor");
     assert.strictEqual(capturedCalls.length, 2, ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
     for (const call of capturedCalls) {
       assert.deepStrictEqual(call.weight_limit, { ref_time: 2_400_000_000n, proof_size: 240_000n },

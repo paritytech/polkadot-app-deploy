@@ -4120,6 +4120,103 @@ describe("DotNS initial state", () => {
     assert.strictEqual(submitOptions.contracts, d["_contracts"]);
   });
 
+  // #1518: ReviveClientWrapper (not DotNS) is the object that actually declares
+  // storage_deposit_limit on every Revive.call it dry-runs (dryRunReviveCall, called
+  // from submitTransaction/submitBatchedTransactions — the path finalizeRegistration/
+  // commit/setContenthash submit through). Before this fix it had NO way to learn the
+  // per-env/measured floor at all: it always used the module's hardcoded default, so a
+  // per-env registerStorageDeposit override moved the PREFLIGHT gate but left the REAL
+  // submitted extrinsic's declared limit unchanged — the exact failure mode #1518 warns
+  // against (preflight clears a lower balance, the real call still demands the old,
+  // higher amount mid-deploy). setStorageDepositFloors is DotNS.recreateReviveClient's
+  // one wiring point (the only place a wrapper is ever constructed) — these tests go
+  // straight at the wrapper, the actual owner of the value, rather than at a threaded
+  // parameter that a future call site could add without remembering to pass it.
+  describe("ReviveClientWrapper storage-deposit floor (#1518)", () => {
+    test("setStorageDepositFloors changes the limit dryRunReviveCall declares", async () => {
+      const { ReviveClientWrapper } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      w.setStorageDepositFloors({ register: 12_345_000_000n, record: 1n }); // a distinctive, obviously-not-the-default value
+      const prep = await w["dryRunReviveCall"]("0xContract", 0n, "0x", "5Signer", {});
+      assert.strictEqual(prep.storage_deposit_limit, 12_345_000_000n,
+        ">> FAIL: ReviveClientWrapper.setStorageDepositFloors: dryRunReviveCall must declare the floor set via setStorageDepositFloors, not a hardcoded default");
+    });
+
+    test("a wrapper nobody configured still declares the measured module default (fail closed)", async () => {
+      const { ReviveClientWrapper, MINIMUM_REGISTER_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({}); // setStorageDepositFloors never called
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      const prep = await w["dryRunReviveCall"]("0xContract", 0n, "0x", "5Signer", {});
+      assert.strictEqual(prep.storage_deposit_limit, MINIMUM_REGISTER_STORAGE_DEPOSIT,
+        ">> FAIL: ReviveClientWrapper unconfigured floor: must fall back to the measured module constant, never undefined/0");
+    });
+
+    test("submitBatchedTransactions gives known record writes the measured record floor", async () => {
+      const { ReviveClientWrapper, MINIMUM_RECORD_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      const w = new ReviveClientWrapper({});
+      w.ensureAccountMapped = async () => {};
+      w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
+      const captured = [];
+      w.client = {
+        tx: {
+          Revive: { call: (args) => { captured.push(args); return { decodedCall: {} }; } },
+          Utility: { batch_all: () => ({}) },
+        },
+      };
+      let fundingGate;
+      w.setSubmissionFundingGate(async (operation, storageDepositLimit, value) => {
+        fundingGate = { operation, storageDepositLimit, value };
+      });
+      w.signAndSubmitWithRetry = async (buildExtrinsic) => {
+        buildExtrinsic();
+        return { kind: "hash", hash: "0xbatch" };
+      };
+
+      await w.submitBatchedTransactions([
+        { contractAddress: "0xText", value: 0n, encodedData: "0x", functionName: "setText", depositPolicy: "record", args: [] },
+        { contractAddress: "0xContent", value: 0n, encodedData: "0x", functionName: "setContenthash", depositPolicy: "record", args: [] },
+      ], "5Signer", {}, () => {});
+
+      assert.deepStrictEqual(fundingGate, {
+        operation: "Utility.batch_all",
+        storageDepositLimit: MINIMUM_RECORD_STORAGE_DEPOSIT,
+        value: 0n,
+      }, ">> FAIL: submitBatchedTransactions must gate one shared floor plus other calls' buffered estimates, not multiply the floor by batch length");
+      assert.strictEqual(captured.length, 2);
+      for (const call of captured) {
+        assert.strictEqual(call.storage_deposit_limit, MINIMUM_RECORD_STORAGE_DEPOSIT,
+          ">> FAIL: every Revive.call inside submitBatchedTransactions must receive the per-call record floor");
+      }
+    });
+
+    // recreateReviveClient constructs the only ReviveClientWrapper a DotNS instance
+    // ever holds — asserting it applies this._registerStorageDeposit right after
+    // construction is what closes the "future call site forgets to thread it" gap:
+    // every dry-run path through this.clientWrapper picks the floor up automatically.
+    for (const { label, field, wrapperField, value, expected } of [
+      { label: "register", field: "_registerStorageDeposit", wrapperField: "_storageDepositFloor", value: 98_765_000_000n, expected: 98_765_000_000n },
+      { label: "record", field: "_recordStorageDeposit", wrapperField: "_recordStorageDepositFloor", value: 12_345_000_000n, expected: 12_345_000_000n },
+      // The record floor is resolved against the registration floor once, in DotNS.
+      { label: "record (capped at a lower registration floor)", field: "_recordStorageDeposit", wrapperField: "_recordStorageDepositFloor", value: 2n ** 62n, expected: "register" },
+    ]) {
+      test(`DotNS.recreateReviveClient applies the ${label} floor to the new wrapper`, () => {
+        const d = new DotNS();
+        d[field] = value;
+        d["recreateReviveClient"]("wss://invalid.invalid.test"); // never awaited/connected — only the synchronous wiring is under test
+        assert.strictEqual(d.clientWrapper[wrapperField], expected === "register" ? d["_registerStorageDeposit"] : expected,
+          `>> FAIL: recreateReviveClient wiring (${label}): the freshly constructed wrapper must receive the configured floor immediately, not stay on the class default`);
+        d.client?.destroy?.();
+      });
+    }
+
+    test("a DotNS nobody configured defaults the record floor to MINIMUM_RECORD_STORAGE_DEPOSIT", async () => {
+      const { MINIMUM_RECORD_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
+      assert.strictEqual(new DotNS()["_recordStorageDeposit"], MINIMUM_RECORD_STORAGE_DEPOSIT,
+        ">> FAIL: an unconfigured DotNS must default to the measured record floor");
+    });
+  });
+
   test("getUserPopStatus surfaces Personhood precompile read failures", async () => {
     const d = new DotNS();
     d.connected = true;
@@ -6933,7 +7030,15 @@ describe("DotNS.setContenthashAndTextRecord", () => {
     );
     assert.deepStrictEqual(submitted.calls[0].args.slice(1), ["executable", "new manifest"]);
     assert.strictEqual(submitted.calls[1].args[1], "0x1234");
-    assert.strictEqual(submitted.label, "Utility.batch_all(setContenthash+setText)");
+    assert.deepStrictEqual(
+      submitted.calls.map(({ depositPolicy }) => depositPolicy),
+      ["record", "record"],
+      ">> FAIL: setContenthash+setText batch: both inner writes must declare the record deposit policy",
+    );
+    assert.strictEqual(
+      submitted.label,
+      "Utility.batch_all(setContenthash+setText)",
+    );
     assert.strictEqual(submitted.options.independentCalls, true,
       ">> FAIL: contenthash+text are independent writes and both must be dry-run instead of leaving an unmeasured tail");
     assert.strictEqual(await submitted.options.verifyEffect(), true);
@@ -7067,6 +7172,8 @@ describe("DotNS.ensureResolverAndSetTextRecord", () => {
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: setText's value arg must be the new value");
     assert.strictEqual(submitted.label, "Utility.batch_all(setResolver+setText[manifest])",
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: unexpected batch label");
+    assert.deepStrictEqual(submitted.calls.map(({ depositPolicy }) => depositPolicy), ["record", "record"],
+      ">> FAIL: ensureResolverAndSetTextRecord both-stale: resolver+text writes must declare the record deposit policy");
     assert.strictEqual(submitted.options.independentCalls, true,
       ">> FAIL: ensureResolverAndSetTextRecord both-stale: must pass independentCalls: true — setResolver and setText have no on-chain data dependency on each other");
     assert.strictEqual(await submitted.options.verifyEffect(), true,
@@ -7394,6 +7501,8 @@ describe("DotNS.setTextRecord", () => {
     assert.strictEqual(capturedOpts.length, 1, "contractTransaction should be called once");
     assert.strictEqual(typeof capturedOpts[0].verifyEffect, "function",
       "setTextRecord must pass verifyEffect to contractTransaction");
+    assert.strictEqual(capturedOpts[0].depositPolicy, "record",
+      ">> FAIL: setTextRecord must declare the record deposit policy at its call site");
   });
 
   test("verifyEffect reads text(node, key) and returns true when value matches", async () => {
@@ -20622,7 +20731,7 @@ describe("readPreviousContenthashSafe (subdomain contenthash read — double-TLD
 // so an operator's configured floor never reached the DECLARED
 // storage_deposit_limit on a submitted Revive.call. Fixed by giving
 // ReviveClientWrapper a settable `_storageDepositFloor` (defaulted to the
-// module constant, overridden via setStorageDepositFloor from
+// module constant, overridden via setStorageDepositFloors from
 // DotNS.recreateReviveClient with this._registerStorageDeposit) and by
 // threading this._registerStorageDeposit directly at the
 // submitBatchedContractCalls call site, which builds its own Revive.call
@@ -20715,9 +20824,10 @@ describe("storageDepositLimitFor (storage_deposit_limit buffer helper)", () => {
     // call's own estimate (headEstimate.storageDeposit, the pre-#1164 shape) — see
     // the independentCalls/multi-dry-run block above this call site. The floor
     // argument itself is unaffected by that change.
-    // bulletin #1712: the limit is now chosen per inner call (record writes get the
-    // measured record floor, register/unknown calls the per-env registration floor).
-    assert.match(dotnsSrc, /storageDepositLimitForCall\(\s*calls\[index\]\.functionName,\s*estimate\.storageDeposit,\s*this\._registerStorageDeposit,?\s*\)/,
+    // bulletin #1712/#1716: the limit is chosen per inner call from its declared
+    // depositPolicy (record writes get the record floor, everything else the per-env
+    // registration floor).
+    assert.match(dotnsSrc, /storageDepositLimitForCall\(\s*calls\[index\]\.functionName,\s*estimate\.storageDeposit,\s*calls\[index\]\.depositPolicy,\s*this\._registerStorageDeposit,/,
       ">> FAIL: submitBatchedContractCalls must pass this._registerStorageDeposit as the floor — the per-env config, " +
       "otherwise it silently falls back to the generic 200 PAS default regardless of environments.json");
   });
@@ -20759,7 +20869,7 @@ describe("weightLimitFor (weight_limit buffer helper, #1522)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// ReviveClientWrapper.setStorageDepositFloor — verifies the per-env floor
+// ReviveClientWrapper.setStorageDepositFloors — verifies the per-env floor
 // actually reaches the SUBMITTED extrinsic's storage_deposit_limit (and that
 // the buffered weight_limit rides along), not just dryRunReviveCall's return
 // value. Drives submitTransaction end to end with a fake client capturing the
@@ -20787,7 +20897,7 @@ describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitt
 
     // Env floor: 5 PAS (bulletin's measured paseo-next-v2 value), well below
     // the 200 PAS generic default this wrapper would otherwise fall back to.
-    w.setStorageDepositFloor(50_000_000_000n);
+    w.setStorageDepositFloors({ register: 50_000_000_000n, record: 1n });
     await w.submitTransaction("0xContract", 0n, "0x", "5Signer", {}, () => {}, { rpcs: [] });
 
     assert.ok(captured, ">> FAIL: submitTransaction setup: fake signAndSubmitWithRetry must trigger buildExtrinsic — check the fake client wiring above");
@@ -20822,53 +20932,13 @@ describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitt
   });
 });
 
-describe("ReviveClientWrapper record-write storage floor (bulletin #1712)", () => {
-  test("submitBatchedTransactions gives known record writes the measured record floor", async () => {
-    const { ReviveClientWrapper, MINIMUM_RECORD_STORAGE_DEPOSIT } = await import("../dist/dotns.js");
-    const w = new ReviveClientWrapper({});
-    w.ensureAccountMapped = async () => {};
-    w.estimateGasForCall = async () => ({ success: true, gasRequired: { referenceTime: 1n, proofSize: 1n }, storageDeposit: 0n });
-    const captured = [];
-    w.client = {
-      tx: {
-        Revive: { call: (args) => { captured.push(args); return { decodedCall: {} }; } },
-        Utility: { batch_all: () => ({}) },
-      },
-    };
-    let fundingGate;
-    w.setSubmissionFundingGate(async (operation, storageDepositLimit, value) => {
-      fundingGate = { operation, storageDepositLimit, value };
-    });
-    w.signAndSubmitWithRetry = async (buildExtrinsic) => {
-      buildExtrinsic();
-      return { kind: "hash", hash: "0xbatch" };
-    };
-
-    await w.submitBatchedTransactions([
-      { contractAddress: "0xText", value: 0n, encodedData: "0x", functionName: "setText", args: [] },
-      { contractAddress: "0xContent", value: 0n, encodedData: "0x", functionName: "setContenthash", args: [] },
-    ], "5Signer", {}, () => {});
-
-    assert.deepStrictEqual(fundingGate, {
-      operation: "Utility.batch_all",
-      storageDepositLimit: MINIMUM_RECORD_STORAGE_DEPOSIT,
-      value: 0n,
-    }, ">> FAIL: submitBatchedTransactions must gate one shared floor plus other calls' buffered estimates, not multiply the floor by batch length");
-    assert.strictEqual(captured.length, 2);
-    for (const call of captured) {
-      assert.strictEqual(call.storage_deposit_limit, MINIMUM_RECORD_STORAGE_DEPOSIT,
-        ">> FAIL: every Revive.call inside submitBatchedTransactions must receive the per-call record floor");
-    }
-  });
-});
-
 describe("DotNS: recreateReviveClient wires the connected instance's registerStorageDeposit into the wrapper (#1518)", () => {
-  test("dotns.ts: recreateReviveClient calls setStorageDepositFloor(this._registerStorageDeposit) right after construction", () => {
+  test("dotns.ts: recreateReviveClient calls setStorageDepositFloors with this._registerStorageDeposit right after construction", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
     const recreateFnMatch = dotnsSrc.match(/private recreateReviveClient\(endpoint: string\): void \{[\s\S]*?\n  \}/);
     assert.ok(recreateFnMatch, ">> FAIL: recreateReviveClient not found — did the method get renamed/restructured?");
-    assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloor\(this\._registerStorageDeposit\)/,
-      ">> FAIL: recreateReviveClient must call setStorageDepositFloor(this._registerStorageDeposit) — this is the ONLY place a " +
+    assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloors\(\{\s*register: this\._registerStorageDeposit,/,
+      ">> FAIL: recreateReviveClient must call setStorageDepositFloors({ register: this._registerStorageDeposit, ... }) — this is the ONLY place a " +
       "ReviveClientWrapper is constructed, so missing this call here means the per-env floor never reaches a fresh wrapper");
   });
 });
@@ -22089,6 +22159,19 @@ describe("environments.ts: ipfs propagation through resolveEndpoints", () => {
       /gateway:\s*envIpfs/.test(src),
       "deploy.ts: must pass `gateway: envIpfs` into storeDirectoryV2 so the env-specific gateway URL flows through"
     );
+  });
+});
+
+describe("recordStorageDeposit propagation (bulletin #1716)", () => {
+  test("deploy.ts, publish.ts and transfer.ts pass the env's recordStorageDeposit into DotNS.connect()", () => {
+    const deploySrc = fs.readFileSync("src/deploy.ts", "utf8");
+    assert.strictEqual((deploySrc.match(/recordStorageDeposit: envRecordStorageDeposit,/g) ?? []).length, 3,
+      ">> FAIL: deploy.ts: all three DotNS.connect() sites (preflight, owner, deploy) must pass recordStorageDeposit: envRecordStorageDeposit");
+    assert.match(fs.readFileSync("src/manifest/publish.ts", "utf8"),
+      /dotns\.connect\(\{\s*\.\.\.connectOpts,\s*recordStorageDeposit: resolved\.recordStorageDeposit\s*\}\)/,
+      ">> FAIL: manifest/publish.ts connectDotNS(): must pass resolved.recordStorageDeposit into connect, or an env's record floor is ignored on manifest publishes");
+    assert.match(fs.readFileSync("src/commands/transfer.ts", "utf8"), /recordStorageDeposit: resolved\.recordStorageDeposit,/,
+      ">> FAIL: commands/transfer.ts: must pass resolved.recordStorageDeposit into DotNS.connect()");
   });
 });
 

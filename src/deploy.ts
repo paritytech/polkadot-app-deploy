@@ -3735,6 +3735,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   let envContracts: Record<string, string> = {};
   let envNativeToEthRatio: bigint | undefined;
   let envRegisterStorageDeposit: bigint | undefined;
+  let envRecordStorageDeposit: bigint | undefined;
   let envPopSelfServe: PopSelfServeConfig | null = null;
   let envTld: string = DEFAULT_TLD;
   // Undefined-preserving twin of envTld: unlike envTld (defaulted to "dot"
@@ -3775,6 +3776,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       envContracts = resolved.contracts;
       envNativeToEthRatio = resolved.nativeToEthRatio;
       envRegisterStorageDeposit = resolved.registerStorageDeposit;
+      envRecordStorageDeposit = resolved.recordStorageDeposit;
       envTld = resolved.tld ?? DEFAULT_TLD;
       envConfiguredTld = resolved.tld;
       envPopSelfServe = getPopSelfServeConfig(doc, envId);
@@ -4052,6 +4054,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       const preflight = new DotNS();
       await preflight.connect({
         ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+        recordStorageDeposit: envRecordStorageDeposit,
         // bulletin #1221: plannedAction isn't known until preflight() runs below, so
         // assume "register" (see AUTO_MAP_RENT_HEADROOM's doc comment in dotns.ts for the cost).
         autoMapTopUpTarget: topUpTargetFor("register", envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
@@ -4369,6 +4372,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           };
           await ownerDotns.connect({
             ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+            recordStorageDeposit: envRecordStorageDeposit,
             // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
             // real plannedAction rather than a hardcoded "register".
             autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
@@ -4387,6 +4391,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         const dotns = new DotNS();
         await dotns.connect({
           ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
+          recordStorageDeposit: envRecordStorageDeposit,
           // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
           // real plannedAction rather than a hardcoded "register".
           autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),

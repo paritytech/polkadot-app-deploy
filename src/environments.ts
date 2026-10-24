@@ -56,6 +56,8 @@ export interface Environment {
   autoAccountMapping?: boolean;
   nativeToEthRatio?: number;
   registerStorageDeposit?: number;
+  /** Optional record-write storage-deposit floor; defaults to MINIMUM_RECORD_STORAGE_DEPOSIT, capped at the registration floor. */
+  recordStorageDeposit?: number;
   contracts?: Record<string, string>;
   popSelfServe?: PopSelfServeConfig;
   /**
@@ -132,6 +134,7 @@ export interface ResolvedEndpoints {
   contracts: Record<string, string>;
   nativeToEthRatio: bigint;
   registerStorageDeposit?: bigint;
+  recordStorageDeposit?: bigint;
   /**
    * Undefined when the env doesn't declare one (e.g. devnet — community-
    * operated, authorizer unknown). Read-only naming for bin/polkadot-app-bootstrap;
@@ -489,6 +492,7 @@ export function resolveEndpoints(
     contracts: env.contracts ?? {},
     nativeToEthRatio: BigInt(env.nativeToEthRatio ?? 1_000_000),
     ...(env.registerStorageDeposit !== undefined ? { registerStorageDeposit: BigInt(env.registerStorageDeposit) } : {}),
+    ...(env.recordStorageDeposit !== undefined ? { recordStorageDeposit: BigInt(env.recordStorageDeposit) } : {}),
     ...(env.bulletinAuthorizer !== undefined ? { bulletinAuthorizer: env.bulletinAuthorizer } : {}),
   };
 }

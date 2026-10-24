@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import pkg from "../package.json";
-import { SHIPPED_CONFIG_ORIGIN, FALLBACK_CONFIG_ORIGIN } from "./errors.js";
+import { InsufficientFundsError, SHIPPED_CONFIG_ORIGIN, FALLBACK_CONFIG_ORIGIN } from "./errors.js";
 import { maybeWriteMemoryReport, sampleFromBytes, type MemorySampleMb, type DeployContextForReport, type MemoryReport } from "./memory-report.js";
 import { writeRunState } from "./run-state.js";
 import type { CodePath } from "./code-paths.js";
@@ -840,11 +840,17 @@ export const ERROR_KIND_CATEGORY: Record<DeployErrorKind, DeployErrorCategory> =
 // span's `error.message`) must derive kind/message/pattern from here so no
 // path can end up with the raw error recorded but the classification left
 // null.
-function classifyErrorForSpan(msg: string): { kind: DeployErrorKind; message: string; pattern: string } {
+function classifyErrorForSpan(errorOrMessage: unknown): { kind: DeployErrorKind; message: string; pattern: string; raw: string } {
+  const raw = typeof errorOrMessage === "string"
+    ? errorOrMessage
+    : (errorOrMessage as Error | undefined)?.message ?? String(errorOrMessage);
   return {
-    kind: classifyErrorKind(msg),
-    message: sanitizeErrorMessage(msg),
-    pattern: analyseErrorPattern(msg),
+    kind: errorOrMessage instanceof InsufficientFundsError
+      ? errorOrMessage.deployErrorKind
+      : classifyErrorKind(raw),
+    message: sanitizeErrorMessage(raw),
+    pattern: analyseErrorPattern(raw),
+    raw,
   };
 }
 
@@ -902,7 +908,7 @@ export async function withSpan<T>(op: string, description: string, attributes: R
       return await fn();
     } catch (error) {
       const msg = (error as Error).message ?? String(error);
-      const { kind, message, pattern } = classifyErrorForSpan(msg);
+      const { kind, message, pattern } = classifyErrorForSpan(error);
       span.setAttribute("error.message", msg);
       span.setAttribute("deploy.error_kind", kind);
       span.setAttribute("deploy.error_message", message);
@@ -1138,9 +1144,9 @@ export function setDeployAttribute(key: string, value: string | number | boolean
 // `deploy.error_message`, `deploy.error_pattern_signature`) on `span` in one
 // call. Used by recordDeployFailure, and by setDeployError for the active root
 // span; route error recording through it rather than setting deploy.error alone.
-function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | number | boolean) => void }, msg: string): void {
-  const { kind, message, pattern } = classifyErrorForSpan(msg);
-  span.setAttribute("deploy.error", msg.slice(0, 500));
+function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | number | boolean) => void }, errorOrMessage: unknown): void {
+  const { kind, message, pattern, raw } = classifyErrorForSpan(errorOrMessage);
+  span.setAttribute("deploy.error", raw.slice(0, 500));
   span.setAttribute("deploy.error_kind", kind);
   span.setAttribute("deploy.error_message", message);
   span.setAttribute("deploy.error_pattern_signature", pattern);
@@ -1158,8 +1164,9 @@ function recordDeployFailure(span: any, error: unknown): void {
   // Mechanism classification (how it failed, not whose fault).
   // Propagated from the leaf chain-op span up to the root deploy span so
   // dashboards can group by deploy.error_kind without drilling into child spans.
-  setDeployErrorOnSpan(span, msg);
-  const errorCategory = classifyDeployError(msg);
+  setDeployErrorOnSpan(span, error);
+  const typedKind = error instanceof InsufficientFundsError ? error.deployErrorKind : undefined;
+  const errorCategory = typedKind ? categoryOf(typedKind, msg) : classifyDeployError(msg);
   span.setAttribute("deploy.error_category", errorCategory);
   currentErrorCategory = errorCategory;
   // Expected refusals (owned-by, reserved label, insufficient balance…)
@@ -1168,7 +1175,7 @@ function recordDeployFailure(span: any, error: unknown): void {
   // widgets) reflect the tool's health, not the user's typing. A later
   // captureWarning during the refusal flow will still flip sad back to
   // "true". That is intended: friction during a refusal is still friction.
-  const isExpected = isExpectedError(msg);
+  const isExpected = typedKind ? errorCategory === "user" : isExpectedError(msg);
   span.setAttribute("deploy.expected", isExpected ? "true" : "false");
   span.setAttribute("deploy.sad", isExpected ? "false" : "true");
   if (!isExpected) {

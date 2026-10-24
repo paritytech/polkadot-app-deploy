@@ -25,7 +25,7 @@ import { createRequire } from "node:module";
 // `node`), so it's loaded here via createRequire rather than converted to
 // ESM just for this test file.
 const require = createRequire(import.meta.url);
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, InsufficientFundsError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
 import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
@@ -2558,6 +2558,29 @@ describe("sanitizeErrorMessage", () => {
 // 8d. deploy.error_kind / deploy.error_message propagation via withSpan
 // ---------------------------------------------------------------------------
 describe("withSpan error attribute propagation", () => {
+  test("typed InsufficientFundsError sets funding.insufficient_balance without prose matching", async () => {
+    const span = {
+      attrs: new Map(),
+      setAttribute(key, value) { this.attrs.set(key, value); },
+      setStatus() {},
+    };
+    const stub = {
+      startSpan: async (_options, fn) => fn(span),
+    };
+    const previous = __setSentryForTest(stub);
+    try {
+      await assert.rejects(
+        () => withSpan("test", "typed funding", {}, async () => {
+          throw new InsufficientFundsError("opaque gate refusal");
+        }),
+        InsufficientFundsError,
+      );
+      assert.strictEqual(span.attrs.get("deploy.error_kind"), "funding.insufficient_balance");
+    } finally {
+      __setSentryForTest(previous);
+    }
+  });
+
   test("source: withSpan catch sets deploy.error_kind on the span", () => {
     const src = fs.readFileSync("src/telemetry.ts", "utf-8");
     assert.ok(
@@ -6366,19 +6389,58 @@ describe("DotNS.preflight", () => {
     assert.match(r.reason ?? "", /Top up the signer/);
   });
 
-  test("already-owned-by-us uses the lower setContenthash floor (0.01 PAS)", async () => {
-    // 0.05 PAS — above the OWNED floor (0.01) but below the REGISTER floor (0.10).
-    // For an owned label, this should clear without top-up.
+  test("already-owned-by-us keeps the lightweight preflight floor; actual submissions apply their dry-run storage limit", async () => {
     const d = stubDotns({
       checkOwnership: ownedByUs,
       isTestnet: true,
       signerFreeBalance: 500_000_000n,
-      attemptTestnetTopUp: async () => { throw new Error("must not be called"); },
+      attemptTestnetTopUp: async () => { throw new Error("must not be called before an actual submission"); },
     });
     const r = await d.preflight("e2epool00");
     assert.strictEqual(r.canProceed, true);
     assert.strictEqual(r.plannedAction, "already-owned-by-us");
-    assert.strictEqual(r.feeFloor, 100_000_000n); // 0.01 PAS
+    assert.strictEqual(r.feeFloor, 100_000_000n);
+  });
+
+  test("per-submission funding gate uses the dry-run storage limit, tops up on testnet, and fails closed on mainnet", async () => {
+    const testnet = new DotNS();
+    testnet.connected = true;
+    testnet.substrateAddress = "5Signer";
+    testnet.readFreeBalance = async () => 130_000_000n;
+    testnet.isTestnet = async () => true;
+    let toppedUpTo = 0n;
+    testnet.attemptTestnetTopUp = async (_recipient, targetAmount) => {
+      toppedUpTo = targetAmount;
+      return { source: "Bob", transferred: targetAmount };
+    };
+    await testnet["ensureSubmissionFunding"]("setText", 50_000_000_000n);
+    assert.strictEqual(toppedUpTo, 55_000_000_000n,
+      ">> FAIL: submission gate target must include that transaction's declared storage limit plus refill headroom");
+
+    const mainnet = new DotNS();
+    mainnet.connected = true;
+    mainnet.substrateAddress = "5MainnetSigner";
+    mainnet.readFreeBalance = async () => 130_000_000n;
+    mainnet.isTestnet = async () => false;
+    mainnet.attemptTestnetTopUp = async () => assert.fail("mainnet must never auto-top-up");
+    const error = await mainnet["ensureSubmissionFunding"]("setContenthash", 50_000_000_000n)
+      .then(() => null, (cause) => cause);
+    assert.ok(error instanceof InsufficientFundsError,
+      ">> FAIL: an actual underfunded submission must throw the typed funding error");
+    assert.match(error.message, /needs ≥5\.0100 PAS for setContenthash.*Top up the signer's balance/i);
+  });
+
+  test("unrelated Payment and bare-0x errors retain their original mechanism", () => {
+    assert.strictEqual(
+      classifyErrorKind('{"type":"Invalid","value":{"type":"Payment"}}'),
+      "chain.tx_invalid",
+      ">> FAIL: DotNS must not globally relabel Payment as signer funding",
+    );
+    assert.strictEqual(
+      classifyErrorKind("Contract execution would revert during setText\nrevert: flags=1 data=0x"),
+      "contract-revert",
+      ">> FAIL: a resolver/permission bare revert must retain contract-revert classification",
+    );
   });
 
   // -----------------------------------------------------------------
@@ -6881,11 +6943,15 @@ describe("DotNS.setContenthashAndTextRecord", () => {
     });
   });
 
-  test("skips the batch only when both resolver records already match", async () => {
+  test("skips the batch without a funding gate when both resolver records already match, even for a low-balance signer", async () => {
     const d = new DotNS();
     d.connected = true;
+    d.substrateAddress = "5LowBalanceSigner";
     d.getContenthash = async () => "0x1234";
     d.getTextRecord = async () => "manifest";
+    d.ensureSubmissionFunding = async () => {
+      assert.fail("unchanged resolver state must not run the per-submission funding gate");
+    };
     d.submitBatchedContractCalls = async () => {
       assert.fail("unchanged resolver state must not submit a batch");
     };
@@ -7029,6 +7095,7 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    d.ensureSubmissionFunding = async () => {};
     let estimateCalls = 0;
     d.clientWrapper = {
       ensureAccountMapped: async () => {},
@@ -20763,6 +20830,10 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
     d.connected = true;
     d.substrateAddress = "5Signer";
     d.signer = {};
+    let fundingGate;
+    d.ensureSubmissionFunding = async (operation, storageDepositLimit, value) => {
+      fundingGate = { operation, storageDepositLimit, value };
+    };
     d["_registerStorageDeposit"] = 50_000_000_000n; // 5 PAS — the measured paseo-next-v2 floor
     const capturedCalls = [];
     d.clientWrapper = {
@@ -20800,6 +20871,11 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
     );
 
     assert.strictEqual(result.kind, "hash", ">> FAIL: submitBatchedContractCalls setup: fake signAndSubmitWithRetry must resolve — check the fake clientWrapper wiring above");
+    assert.deepStrictEqual(fundingGate, {
+      operation: "test batch",
+      storageDepositLimit: 50_000_000_000n,
+      value: 0n,
+    }, ">> FAIL: submitBatchedContractCalls must gate the concrete batch using its declared storage limit");
     assert.strictEqual(capturedCalls.length, 2, ">> FAIL: submitBatchedContractCalls call count: both inner calls must reach client.tx.Revive.call");
     for (const call of capturedCalls) {
       assert.deepStrictEqual(call.weight_limit, { ref_time: 2_400_000_000n, proof_size: 240_000n },

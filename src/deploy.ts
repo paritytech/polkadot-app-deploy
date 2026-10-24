@@ -78,7 +78,7 @@ export interface DeployResult {
 
 export type DeployContent = string | Uint8Array | Uint8Array[];
 
-export { NonRetryableError, EXIT_CODE_NO_RETRY } from "./errors.js";
+export { InsufficientFundsError, NonRetryableError, EXIT_CODE_NO_RETRY } from "./errors.js";
 import { NonRetryableError } from "./errors.js";
 import { e2eNonceSeedBarrier } from "./e2e-nonce-barrier.js";
 

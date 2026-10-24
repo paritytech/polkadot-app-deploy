@@ -27,7 +27,7 @@ import { CODE_PATHS } from "./code-paths.js";
 import { isTestnetSpecName, testnetFromNetworkField } from "./pool.js";
 import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
-import { NonRetryableError } from "./errors.js";
+import { InsufficientFundsError, NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
@@ -232,7 +232,8 @@ export interface DotnsPreflightResult {
 const ONE_PAS = 10_000_000_000n;
 // Threshold for `setContenthash` on an already-owned label. ~0.001 PAS in
 // observed runs; cap at 0.01 PAS to absorb fee variance and a one-off
-// map_account if the signer hasn't been mapped yet.
+// map_account if the signer hasn't been mapped yet. Each actual Revive.call
+// separately gates on its dry-run-derived storage-deposit limit before submit.
 const FEE_FLOOR_OWNED = ONE_PAS / 100n;
 // Threshold for `register` (commit + reveal + optional map_account). Worst-case
 // observed ~0.05 PAS; cap at 0.1 PAS so the signer can absorb at least one
@@ -2109,11 +2110,16 @@ export class ReviveClientWrapper {
   // automatically; no per-call parameter to thread (and forget) at each new
   // call site.
   private _storageDepositFloor: bigint = REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT;
+  private _submissionFundingGate: ((operation: string, storageDepositLimit: bigint, value: bigint) => Promise<void>) | null = null;
 
   constructor(client: any) { this.client = client; this.mappedAccounts = new Set(); }
 
   setStorageDepositFloor(floor: bigint): void {
     this._storageDepositFloor = floor;
+  }
+
+  setSubmissionFundingGate(gate: (operation: string, storageDepositLimit: bigint, value: bigint) => Promise<void>): void {
+    this._submissionFundingGate = gate;
   }
 
   async getEvmAddress(substrateAddress: string): Promise<string> {
@@ -2485,6 +2491,7 @@ export class ReviveClientWrapper {
       { "chain.function_name": functionName ?? "Revive.call" },
       () => this.dryRunReviveCall(contractAddress, value, encodedData, signerSubstrateAddress, { functionName, args, contracts }),
     );
+    await this._submissionFundingGate?.(functionName ?? "Revive.call", prep.storage_deposit_limit, value);
     const buildExtrinsic = () => this.client.tx.Revive.call({ dest: contractAddress, value, weight_limit: prep.weight_limit, storage_deposit_limit: prep.storage_deposit_limit, data: Binary.fromHex(encodedData) });
     let nonceFallback: { rpcs: string[]; senderSS58: string; expectedNonce: number } | undefined;
     if (useNoncePolling) {
@@ -2520,6 +2527,12 @@ export class ReviveClientWrapper {
       () => Promise.all(calls.map((c) =>
         this.dryRunReviveCall(c.contractAddress, c.value, c.encodedData, signerSubstrateAddress, { functionName: c.functionName, args: c.args }))),
     );
+    const storageDepositLimit = preps.reduce(
+      (max, prep) => prep.storage_deposit_limit > max ? prep.storage_deposit_limit : max,
+      0n,
+    );
+    const totalValue = calls.reduce((sum, call) => sum + call.value, 0n);
+    await this._submissionFundingGate?.("Utility.batch_all", storageDepositLimit, totalValue);
     const buildExtrinsic = () => {
       const inners = calls.map((c, i) => this.client.tx.Revive.call({
         dest: c.contractAddress,
@@ -2937,6 +2950,8 @@ export class DotNS {
     // read-back retry, connect's own ReviveApi.address retry), so
     // re-applying it here on every recreation is always correct, never stale.
     this.clientWrapper.setStorageDepositFloor(this._registerStorageDeposit);
+    this.clientWrapper.setSubmissionFundingGate((operation, storageDepositLimit, value) =>
+      this.ensureSubmissionFunding(operation, storageDepositLimit, value));
   }
 
   async connect(options: DotNSConnectOptions = {}): Promise<this> {
@@ -3309,6 +3324,58 @@ export class DotNS {
     if (!this.clientWrapper) throw new Error("readFreeBalance: polkadot-api client not available");
     const acc = await this.clientWrapper.client.query.System.Account.getValue(ss58);
     return BigInt(acc?.data?.free ?? 0n);
+  }
+
+  private async maybeTopUpToFloor(
+    freeBalance: bigint,
+    requiredBalance: bigint,
+    targetBalance: bigint,
+    operation: string,
+    isTestnet: boolean,
+  ): Promise<{ effectiveBalance: bigint; toppedUp?: { source: "Alice" | "Bob"; transferred: bigint } }> {
+    if (freeBalance >= requiredBalance) return { effectiveBalance: freeBalance };
+    setDeployAttribute("deploy.dotns.signer_below_floor", "true");
+    if (!isTestnet) return { effectiveBalance: freeBalance };
+
+    console.log(`   DotNS signer ${this.substrateAddress?.slice(0, 8)}... balance ${fmtPas(freeBalance)} PAS < ${fmtPas(requiredBalance)} PAS ${operation} floor — attempting testnet auto top-up...`);
+    const toppedUp = (await this.attemptTestnetTopUp(this.substrateAddress!, targetBalance)) ?? undefined;
+    if (!toppedUp) return { effectiveBalance: freeBalance };
+
+    setDeployAttribute("deploy.dotns.toppedup", "true");
+    setDeployAttribute("deploy.dotns.toppedup_source", toppedUp.source);
+    console.log(`   Topped up ${fmtPas(toppedUp.transferred)} PAS from ${toppedUp.source} for ${operation}`);
+    return { effectiveBalance: freeBalance + toppedUp.transferred, toppedUp };
+  }
+
+  /** Last-mile guard for one concrete Revive submission. It runs only after
+   * the dry run has produced the exact declared storage-deposit limit, so a
+   * no-op record update never tops up or fails. */
+  private async ensureSubmissionFunding(
+    operation: string,
+    storageDepositLimit: bigint,
+    value = 0n,
+  ): Promise<void> {
+    this.ensureConnected();
+    if (!this.substrateAddress) throw new Error("ensureSubmissionFunding: signer address unavailable");
+    const requiredBalance = storageDepositLimit + value + FEE_FLOOR_OWNED;
+    const targetBalance = storageDepositLimit + value + TOP_UP_TARGET;
+    const freeBalance = await this.readFreeBalance(this.substrateAddress);
+    const isTestnet = await this.isTestnet();
+    const funded = await this.maybeTopUpToFloor(
+      freeBalance,
+      requiredBalance,
+      targetBalance,
+      operation,
+      isTestnet,
+    );
+    if (funded.effectiveBalance >= requiredBalance) return;
+
+    const tail = isTestnet
+      ? ` Testnet auto-top-up via Alice/Bob failed. Fund the signer or top-up source; faucet: ${PASEO_FAUCET_URL}.`
+      : ` Top up the signer's balance and re-deploy.`;
+    throw new InsufficientFundsError(
+      `DotNS signer ${this.substrateAddress} has ${fmtPas(funded.effectiveBalance)} PAS free; needs ≥${fmtPas(requiredBalance)} PAS for ${operation}.${tail}`,
+    );
   }
 
   // Testnet-only: try to top the deploy signer up from the well-known dev
@@ -4362,6 +4429,8 @@ export class DotNS {
     // dryRunReviveCall, so it must be passed explicitly here too.
     const weight_limit = weightLimitFor(maxGasRequired);
     const storage_deposit_limit = storageDepositLimitFor(maxStorageDeposit, this._registerStorageDeposit);
+    const totalValue = encoded.reduce((sum, call) => sum + call.value, 0n);
+    await this.ensureSubmissionFunding(label, storage_deposit_limit, totalValue);
 
     const client = this.clientWrapper.client;
     const buildBatch = () => {
@@ -5948,31 +6017,16 @@ export class DotNS {
       rentPriceNative = bufferedWeiToNative(depositWei, this._nativeToEthRatio);
     }
     const feeFloor = feeFloorFor(candidate.plannedAction, this._registerStorageDeposit, rentPriceNative, transferFeeNative);
-    let effectiveBalance = signerFreeBalance;
-    let toppedUp: { source: "Alice" | "Bob"; transferred: bigint } | undefined;
-
-    if (effectiveBalance < feeFloor && isTestnet) {
-      setDeployAttribute("deploy.dotns.signer_below_floor", "true");
-      console.log(`   DotNS signer ${this.substrateAddress?.slice(0, 8)}... balance ${fmtPas(effectiveBalance)} PAS < ${fmtPas(feeFloor)} PAS floor — attempting testnet auto top-up...`);
-      const result = await this.attemptTestnetTopUp(this.substrateAddress!, topUpTargetFor(candidate.plannedAction, this._registerStorageDeposit, rentPriceNative, transferFeeNative));
-      if (result) {
-        console.log(`   Topped up ${fmtPas(result.transferred)} PAS from ${result.source}`);
-        // submitTransfer only resolves on event.ok, so the transferred amount
-        // is guaranteed to land. The deploy signer is idle until preflight
-        // returns, so no concurrent debit is possible — skip the re-read.
-        effectiveBalance += result.transferred;
-        toppedUp = result;
-        setDeployAttribute("deploy.dotns.toppedup", "true");
-        setDeployAttribute("deploy.dotns.toppedup_source", result.source);
-      }
-    } else if (effectiveBalance < feeFloor) {
-      // Mainnet (or non-testnet) below-floor: still record the boolean so
-      // dashboards can count the abort.
-      setDeployAttribute("deploy.dotns.signer_below_floor", "true");
-    }
+    const op = candidate.plannedAction === "already-owned-by-us" ? "setContenthash" : "register";
+    const { effectiveBalance, toppedUp } = await this.maybeTopUpToFloor(
+      signerFreeBalance,
+      feeFloor,
+      topUpTargetFor(candidate.plannedAction, this._registerStorageDeposit, rentPriceNative, transferFeeNative),
+      op,
+      isTestnet,
+    );
 
     if (effectiveBalance < feeFloor) {
-      const op = candidate.plannedAction === "already-owned-by-us" ? "setContenthash" : "register";
       const tail = isTestnet
         ? ` Testnet auto-top-up via Alice/Bob failed (both also low). Top up at ${PASEO_FAUCET_URL}.`
         : ` Top up the signer's balance and re-deploy.`;

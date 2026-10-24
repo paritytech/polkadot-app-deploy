@@ -34,6 +34,43 @@ async function fileProblem(abs: string): Promise<"not found" | "is not a file" |
 }
 
 /**
+ * Why `preview` (an archive path) is not a file the uploaded worker archive
+ * will hold under that exact name, or undefined when it is.
+ *
+ * The archive walker (`walkDirectoryLazy`, src/merkle.ts) lists directory
+ * entries by their real name and leaves out symlinks, so each component is
+ * looked up in its parent's entry list (exact case, even on a case-insensitive
+ * disk) and checked with lstat, which does not follow links.
+ */
+async function archivePreviewProblem(root: string, preview: string): Promise<string | undefined> {
+  const parts = preview.split("/");
+  let current = root;
+  for (const [i, part] of parts.entries()) {
+    const last = i === parts.length - 1;
+    let names: string[];
+    try {
+      names = await fs.readdir(current);
+    } catch {
+      return "not found";
+    }
+    if (!names.includes(part)) {
+      const actual = names.find((name) => name.toLowerCase() === part.toLowerCase());
+      return actual === undefined ? "not found" : `differs in case from "${actual}" on disk, and hosts look it up with exact case`;
+    }
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = await fs.lstat(current);
+    } catch {
+      return "not found";
+    }
+    if (stat.isSymbolicLink()) return "is a symlink, which the worker archive leaves out";
+    if (last ? !stat.isFile() : !stat.isDirectory()) return last ? "is not a file" : `has a non-directory component "${part}"`;
+  }
+  return undefined;
+}
+
+/**
  * Check that every file a product config references exists on disk, resolved
  * relative to the config's own directory. Returns a list of human-readable
  * error strings (empty when everything is present). The icon must be a regular
@@ -75,13 +112,14 @@ export async function checkProductConfigFilesExist(
         );
         continue;
       }
-      for (const card of exec.pocket.cards) {
-        const previewAbs = path.resolve(execAbs, card.preview);
-        const problem = await fileProblem(previewAbs);
-        if (problem) {
-          errors.push(`executables[worker].pocket card "${card.id}" preview "${card.preview}" ${problem} in the worker directory (${previewAbs})`);
+      const problems = await Promise.all(
+        exec.pocket.cards.map((card) => archivePreviewProblem(execAbs, card.preview)),
+      );
+      exec.pocket.cards.forEach((card, i) => {
+        if (problems[i]) {
+          errors.push(`executables[worker].pocket card "${card.id}" preview "${card.preview}" ${problems[i]} in the worker directory (${path.resolve(execAbs, card.preview)})`);
         }
-      }
+      });
     }
   }
 

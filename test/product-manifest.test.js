@@ -392,6 +392,20 @@ describe("validateExecutableManifest — worker", () => {
     assert.equal(result.ok, true);
   });
 
+  test("read path keeps the pre-#1714 entrypoint rule so published records stay valid", () => {
+    const worker = (entrypoint) => validateExecutableManifest({
+      $v: 1, kind: "worker", appVersion: [1, 0, 0], entrypoint, includes: { chat: true, pocket: false },
+    });
+    for (const ok of ["./index.js", "a//index.js", "a/./index.js", "a\\index.js"]) {
+      assert.equal(worker(ok).ok, true,
+        `>> FAIL: tolerant read: entrypoint ${JSON.stringify(ok)} was accepted before #1714 and by hosts, so it must stay valid on read`);
+    }
+    for (const bad of ["/index.js", "../index.js", "a/../index.js"]) {
+      assert.equal(worker(bad).ok, false,
+        `>> FAIL: tolerant read: entrypoint ${JSON.stringify(bad)} escapes the archive and must still be rejected`);
+    }
+  });
+
   test("rejects worker missing entrypoint", () => {
     const result = validateExecutableManifest({
       $v: 1, kind: "worker", appVersion: [1, 0, 0],
@@ -1720,9 +1734,15 @@ describe("worker pocket cards (#1708)", () => {
     ["without includes.pocket", { cards: [card()] }, /pocket requires includes.pocket = true/, { chat: true, pocket: false }],
     ["pocket not an object", "cards", /pocket must be an object/],
     ["no cards", {}, /pocket.cards must be a non-empty array/],
-    ["empty cards", { cards: [] }, /pocket.cards must be a non-empty array/],
     ["card not an object", { cards: ["vaults"] }, /cards\[0\] must be an object/],
     ["missing title", { cards: [card({ title: "" })] }, /title must be a non-empty string/],
+    ["title blank", { cards: [card({ title: "   " })] }, /title must not be blank after trimming/],
+    ["title over 256 bytes", { cards: [card({ title: "\u00e9".repeat(129) })] }, /title must be at most 256 bytes/],
+    ["title bidi override", { cards: [card({ title: "Coffer\u202e" })] }, /title contains a character hosts refuse/],
+    ["title control", { cards: [card({ title: "Cof\u0007fer" })] }, /title contains a character hosts refuse/],
+    ["title zero-width space", { cards: [card({ title: "Cof\u200bfer" })] }, /title contains a character hosts refuse/],
+    ["title BOM at the edge", { cards: [card({ title: "Coffer\ufeff" })] }, /title contains a character hosts refuse/],
+    ["title not a string", { cards: [card({ title: 7 })] }, /title must be a non-empty string/],
     ["non-boolean faceShown", { cards: [card({ faceShown: "no" })] }, /faceShown must be a boolean/],
     ["id untrimmed", { cards: [card({ id: " vaults" })] }, /trimmed and NFC/],
     ["id not NFC", { cards: [card({ id: "cafe\u0301" })] }, /trimmed and NFC/],
@@ -1785,5 +1805,77 @@ describe("worker pocket cards (#1708)", () => {
       errs.length === 1 && errs[0].includes("must be a directory for Pocket cards"),
       `>> FAIL: preflight pocket-worker-file: a single-file worker has no archive to hold a preview; errors: ${errs.join("; ")}`,
     );
+  });
+
+  test("a title the host trims and normalizes is accepted, as is one with a joiner", () => {
+    for (const title of ["  Coffer  ", "cafe\u0301", "\u{1F468}\u200d\u{1F469}", "\u00e9".repeat(128)]) {
+      assert.deepEqual(errorsOf(record({ cards: [card({ title })] })), [], `>> FAIL: validate pocket-title ${JSON.stringify(title)}: hosts trim, NFC and accept it`);
+    }
+  });
+
+  test("tolerant reader accepts faceShown null, pocket null and an empty card list; config does not", () => {
+    for (const [name, pocket] of [
+      ["faceShown null", { cards: [card({ faceShown: null })] }],
+      ["pocket null", null],
+      ["empty cards", { cards: [] }],
+    ]) {
+      assert.deepEqual(errorsOf(record(pocket)), [], `>> FAIL: read pocket-${name}: hosts read it as no cards / absent`);
+      if (name !== "faceShown null") assert.deepEqual(errorsOf(record(pocket, { chat: true, pocket: false })), [], `>> FAIL: read pocket-${name}-no-ceiling: nothing to gate`);
+      assert.ok(configErrorsOf({ ...PLAIN_WORKER, pocket }).length > 0, `>> FAIL: config pocket-${name}: the author's config stays strict`);
+    }
+  });
+
+  test("config refuses an empty card list", () => {
+    assert.ok(configErrorsOf({ ...PLAIN_WORKER, pocket: { cards: [] } }).some((e) => /pocket.cards must be a non-empty array/.test(e)));
+  });
+
+  test("a preview path may contain ':' (an archive path, never a URL)", () => {
+    assert.deepEqual(errorsOf(record({ cards: [card({ preview: "faces/v1:dark.json" })] })), [], ">> FAIL: validate preview-colon: hosts read it as an archive path");
+  });
+
+  test("worker entrypoint uses the archive path rule", () => {
+    for (const entrypoint of ["./index.js", "a//b.js", "a/./b.js", "a\\b.js"]) {
+      const errs = configErrorsOf({ ...PLAIN_WORKER, entrypoint });
+      assert.ok(errs.some((e) => /entrypoint must be a relative path with no empty/.test(e)), `>> FAIL: entrypoint ${JSON.stringify(entrypoint)}: ${errs.join("; ")}`);
+    }
+    assert.deepEqual(configErrorsOf({ ...PLAIN_WORKER, entrypoint: "dist/index.js" }), []);
+  });
+
+  const withPreviews = async (name, previews, setup) => {
+    const config = { ...VALID_CONFIG, executables: [VALID_CONFIG.executables[0], { ...PLAIN_WORKER, pocket: { cards: previews.map((preview, i) => card({ id: `c${i}`, preview })) } }] };
+    const dir = await mkTmp(name);
+    await seedFiles(dir, { execs: ["dist/app", "dist/worker"] });
+    const worker = path.join(dir, "dist/worker");
+    await fs.mkdir(path.join(worker, "faces"), { recursive: true });
+    await setup(worker);
+    return checkProductConfigFilesExist(config, dir);
+  };
+
+  test("preflight refuses a symlinked preview and a preview behind a symlinked directory", async () => {
+    const errs = await withPreviews("pcfg-pocket-link-", ["faces/link.json", "linked/real.json"], async (worker) => {
+      await fs.writeFile(path.join(worker, "real.json"), "{}");
+      await fs.symlink(path.join(worker, "real.json"), path.join(worker, "faces/link.json"));
+      await fs.mkdir(path.join(worker, "elsewhere"));
+      await fs.writeFile(path.join(worker, "elsewhere/real.json"), "{}");
+      await fs.symlink(path.join(worker, "elsewhere"), path.join(worker, "linked"));
+    });
+    assert.equal(errs.length, 2, `>> FAIL: preflight pocket-symlink: the archive leaves symlinks out; errors: ${errs.join("; ")}`);
+    assert.ok(errs.every((e) => e.includes("is a symlink")), errs.join("; "));
+  });
+
+  test("preflight refuses a preview whose case differs from the file on disk", async () => {
+    const errs = await withPreviews("pcfg-pocket-case-", ["faces/Vaults.json", "Faces/vaults.json"], async (worker) => {
+      await fs.writeFile(path.join(worker, "faces/vaults.json"), "{}");
+    });
+    assert.equal(errs.length, 2, `>> FAIL: preflight pocket-case: hosts look the path up with exact case; errors: ${errs.join("; ")}`);
+    assert.ok(errs.every((e) => e.includes("differs in case")), errs.join("; "));
+  });
+
+  test("preflight reports preview problems in card order", async () => {
+    const errs = await withPreviews("pcfg-pocket-order-", ["faces/a.json", "faces/b.json", "faces/c.json"], async (worker) => {
+      await fs.writeFile(path.join(worker, "faces/b.json"), "{}");
+    });
+    assert.equal(errs.length, 2);
+    assert.ok(errs[0].includes('card "c0"') && errs[1].includes('card "c2"'), `>> FAIL: preflight pocket-order: ${errs.join("; ")}`);
   });
 });

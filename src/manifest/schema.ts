@@ -436,24 +436,40 @@ function validateFundingFields(input: Record<string, unknown>, p: string): strin
   return rejectUnknownEntries(input.modes, FUNDING_MODES, `${p}modes`);
 }
 
-/** Largest card id a host accepts, in UTF-8 bytes after trimming and NFC (truapi `CHAT_FIELD_MAX_BYTES`). */
-const POCKET_CARD_ID_MAX_BYTES = 256;
+/** Largest card id or title a host accepts, in UTF-8 bytes after trimming and NFC (truapi `CHAT_FIELD_MAX_BYTES`). */
+const POCKET_CARD_TEXT_MAX_BYTES = 256;
 
 /**
- * Characters a host refuses in a card id, copied from the truapi core's
- * screening of chat identifiers (`normalize_chat_identifier` →
- * `is_identifier_unsafe` and `is_display_unsafe`, rust/crates/truapi/src/platform.rs
- * in paritytech/trinity-user-agents at 801d13b1, 2026-10-15): controls,
- * invisible joiners and separators, bidi marks, variation selectors, tag
- * characters, and whitespace other than a plain space. Hosts drop every card
- * of a product when one id fails this.
+ * Characters a host refuses in a card title, copied from the truapi core's
+ * `validate_chat_name` → `normalize_chat_text` → `is_display_unsafe`
+ * (rust/crates/truapi/src/platform.rs in paritytech/trinity-user-agents at
+ * a12214e1, lines 509-526 and 851-864): controls, zero-width space, bidi
+ * marks and overrides, line and paragraph separators, BOM and tag characters.
+ * A name keeps joiners (ZWJ builds emoji, ZWNJ is needed by Persian).
  */
-const POCKET_CARD_ID_UNSAFE =
-  /[\p{Cc}\u00AD\u061C\u200B-\u200D\u2028\u2029\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFE00-\uFE0F\uFEFF\u{E0000}-\u{E007F}]|[^\S ]/u;
+const DISPLAY_UNSAFE_CLASS =
+  String.raw`\p{Cc}\u200B\u061C\u2028\u2029\u202A-\u202E\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}`;
+const POCKET_CARD_TITLE_UNSAFE = new RegExp(`[${DISPLAY_UNSAFE_CLASS}]`, "u");
+
+/**
+ * Characters a host refuses in a card id: the display-unsafe set plus the
+ * invisible characters a name legitimately needs, from `normalize_chat_identifier`
+ * → `is_identifier_unsafe` (same file, lines 497-506 and 821-830): soft
+ * hyphen, joiners, invisible operators, variation selectors, and whitespace
+ * other than a plain space. Hosts drop every card of a product when one id
+ * fails this.
+ */
+const POCKET_CARD_ID_UNSAFE = new RegExp(
+  `[${DISPLAY_UNSAFE_CLASS}\\u00AD\\u200C\\u200D\\u2060-\\u2064\\uFE00-\\uFE0F]|[^\\S ]`,
+  "u",
+);
 
 const POCKET_CARD_FIELDS = ["id", "title", "preview", "faceShown"] as const;
 
 const UTF8 = new TextEncoder();
+
+/** Rust's `str::trim` strips Unicode White_Space; JS `trim` also strips U+FEFF, which a host screens out instead. */
+const WHITE_SPACE_EDGES = /^\p{White_Space}+|\p{White_Space}+$/gu;
 
 /** Why a host would refuse this card id, or undefined when it accepts it. */
 function pocketCardIdError(id: unknown): string | undefined {
@@ -461,11 +477,34 @@ function pocketCardIdError(id: unknown): string | undefined {
   // A host trims and NFC-normalizes the id; publishing it already so keeps the
   // add link and the record naming the same card.
   if (id !== id.trim().normalize("NFC")) return `must be trimmed and NFC-normalized (got ${JSON.stringify(id)})`;
-  if (UTF8.encode(id).length > POCKET_CARD_ID_MAX_BYTES) return `must be at most ${POCKET_CARD_ID_MAX_BYTES} bytes`;
+  if (UTF8.encode(id).length > POCKET_CARD_TEXT_MAX_BYTES) return `must be at most ${POCKET_CARD_TEXT_MAX_BYTES} bytes`;
   if (POCKET_CARD_ID_UNSAFE.test(id)) {
     return "contains a character hosts refuse (invisible, control, or whitespace other than a space)";
   }
   return undefined;
+}
+
+/**
+ * Why a host would refuse this card title, or undefined when it accepts it.
+ * Unlike an id, a title is trimmed and normalized by the host rather than
+ * refused for being untrimmed, so only what survives that is screened.
+ */
+function pocketCardTitleError(title: unknown): string | undefined {
+  if (typeof title !== "string" || title === "") return "must be a non-empty string";
+  const normalized = title.replace(WHITE_SPACE_EDGES, "").normalize("NFC");
+  if (normalized === "") return "must not be blank after trimming";
+  if (UTF8.encode(normalized).length > POCKET_CARD_TEXT_MAX_BYTES) {
+    return `must be at most ${POCKET_CARD_TEXT_MAX_BYTES} bytes after trimming and NFC`;
+  }
+  if (POCKET_CARD_TITLE_UNSAFE.test(normalized)) {
+    return "contains a character hosts refuse (control, bidi override, or other display-unsafe character)";
+  }
+  return undefined;
+}
+
+/** A pocket value hosts read as "no cards": null, or a card list that is empty. */
+function isNoPocketCards(value: unknown): boolean {
+  return value === null || (isPlainObject(value) && Array.isArray(value.cards) && value.cards.length === 0);
 }
 
 /**
@@ -493,14 +532,16 @@ function validatePocket(value: unknown, p: string, strict: boolean): string[] {
     if (idError) errors.push(`${at}.id ${idError}`);
     else if (seen.has(card.id as string)) errors.push(`${at}.id ${JSON.stringify(card.id)} repeats an earlier card`);
     else seen.add(card.id as string);
-    if (!isNonEmptyString(card.title)) errors.push(`${at}.title must be a non-empty string`);
+    const titleError = pocketCardTitleError(card.title);
+    if (titleError) errors.push(`${at}.title ${titleError}`);
     // A path inside the worker archive, never a URL: hosts refuse a card that names one.
     if (!isNonEmptyString(card.preview)) {
       errors.push(`${at}.preview must be a non-empty string`);
-    } else if (!isArchiveRelativePath(card.preview) || card.preview.includes(":")) {
+    } else if (!isArchiveRelativePath(card.preview)) {
       errors.push(`${at}.preview must be a relative path inside the worker archive, with no empty, '.', or '..' segments`);
     }
-    if (card.faceShown !== undefined && typeof card.faceShown !== "boolean") {
+    // Android reads a null faceShown as absent; the author's config does not.
+    if (card.faceShown !== undefined && !(card.faceShown === null && !strict) && typeof card.faceShown !== "boolean") {
       errors.push(`${at}.faceShown must be a boolean when present`);
     }
   });
@@ -515,7 +556,14 @@ function validateWorkerFields(
   const errors: string[] = [];
   if (!isNonEmptyString(input.entrypoint)) {
     errors.push(`${p}entrypoint must be a non-empty string`);
-  } else if (input.entrypoint.startsWith("/") || input.entrypoint.split("/").includes("..")) {
+  } else if (strict && !isArchiveRelativePath(input.entrypoint)) {
+    errors.push(`${p}entrypoint must be a relative path with no empty, '.', or '..' segments`);
+  } else if (
+    !strict &&
+    (input.entrypoint.startsWith("/") || input.entrypoint.split("/").includes(".."))
+  ) {
+    // Read path: keep the pre-#1714 rule. Hosts still accept forms like
+    // "./index.js", and a record already on chain must not turn invalid on read.
     errors.push(`${p}entrypoint must be a relative path with no '..' segments`);
   }
   if (!isPlainObject(input.includes)) {
@@ -533,7 +581,9 @@ function validateWorkerFields(
   if (inc.chat === false && inc.pocket === false && inc.funding !== true) {
     errors.push(`${p}includes must have at least one of chat / pocket / funding = true`);
   }
-  if (input.pocket !== undefined) {
+  // Hosts read a null pocket, or one with no cards, as "no cards"; only the
+  // author's config insists on a real list.
+  if (input.pocket !== undefined && !(!strict && isNoPocketCards(input.pocket))) {
     // #1708: hosts read a card list only when the worker declares the Pocket ceiling.
     if (inc.pocket !== true) errors.push(`${p}pocket requires includes.pocket = true`);
     errors.push(...validatePocket(input.pocket, p, strict));

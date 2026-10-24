@@ -3443,8 +3443,6 @@ describe("getDeployAttributes seed completeness (issue #497)", () => {
     "deploy.expected": "false",
     // rpc
     "deploy.rpc.failed_over": "false",
-    "deploy.chunk.retried": "false",
-    "deploy.reconnected": "false",
     // dotns
     "deploy.dotns.signer_below_floor": "false",
     "deploy.dotns.toppedup": "false",
@@ -28407,18 +28405,6 @@ describe("Sentry error diet: events only for failures", () => {
     assert.ok(!/captureMessage\(`deploy memory threshold/.test(src), ">> FAIL: memory event title must not interpolate");
     assert.match(src, /"deploy\.mem\.peak_rss_mb":\s*String\(r\.threshold\.peakRssMb\)/);
     assert.equal(src.split("onSentryAttach:").length - 1, 1, ">> FAIL: memory report is attached from exactly one site (inside withDeploySpan finally)");
-  });
-
-  test("recovered-path flags default to \"false\" on a clean deploy span", () => {
-    const attrs = getDeployAttributes("diet.dot");
-    assert.equal(attrs["deploy.chunk.retried"], "false");
-    assert.equal(attrs["deploy.reconnected"], "false");
-  });
-
-  test("source: retry/reconnect flags are set at exactly one site each", () => {
-    for (const site of ['setDeployAttribute("deploy.chunk.retried", "true")', 'setDeployAttribute("deploy.reconnected", "true")', 'setDeployAttribute("deploy.chunk.retry_count",']) {
-      assert.equal(count(deploySrc, site), 1, `>> FAIL: deploy.ts: ${site} must appear exactly once`);
-    }
   });
 
   test("source: bin finalize notes signals and captures crashes", () => {

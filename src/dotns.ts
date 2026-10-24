@@ -5671,7 +5671,7 @@ export class DotNS {
       if (needsCommit) {
         console.log(`\n   Stored commitment for ${label}.${this._tld} is not on-chain yet (its commit tx may still be pending, or never landed). Re-submitting the SAME commitment instead of a fresh one.\n`);
       } else {
-        const nowMs = await this.clientWrapper!.client.query.Timestamp.Now.getValue();
+        const nowMs = await withTimeout(this.clientWrapper!.client.query.Timestamp.Now.getValue(), 30000, "Timestamp.Now (resume check)");
         const chainNowSeconds = Math.floor(Number(nowMs) / 1000);
         if (isCommitmentExpired(chainNowSeconds, commitTimestamp, maximumAge)) {
           // Waiting out an expired commitment fails at reveal (#1412). #1659:
@@ -5820,6 +5820,11 @@ export class DotNS {
     // dry-run racing commitment maturity), not for "no usable stored
     // commitment".
     const resumable = await this.resolveResumableCommitment(label, reverse);
+    if (resumable) {
+      // The preflight plan announced a Commitment signature. A resume that
+      // needs no commit tx never asks for it (#1570).
+      if (!resumable.needsCommit && this._phoneSignatureTotal > 0) this._phoneSignatureTotal -= 1;
+    }
 
     try {
       await doCommitAndRegister(resumable);

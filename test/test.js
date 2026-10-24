@@ -59,7 +59,7 @@ import { fetchPreviousManifest, readPersistentLocalManifest, writePersistentLoca
 import { computeStats, telemetryAttributes, renderSummary } from "../dist/incremental-stats.js";
 import { buildFilesMap, detectFramework, applyManifestFetchAttributes, usesIncrementalCache, computePhaseACounts, formatUploadInclusionLine } from "../dist/deploy.js";
 import { buildFixture, fixtureFiles } from "./helpers/e2e-incremental-fixture.js";
-import { directSignerArgsFor, pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
+import { directSignerArgsFor, probeDerivationPathFor, pickFreshRunLabel, noStatusRunLabel, buildFreshLabelFromTag, registerOrConverge, registerOrConvergeChecked, buildBase8TwoDigitLabel, buildOneTrailingDigitLabel } from "./e2e.test.js";
 import { SIGNERS as BALANCE_SIGNERS } from "../tools/check-balances.mjs";
 import { NON_GATING_LABELS } from "../tools/check-env-readiness.mjs";
 import * as nodeCrypto from "node:crypto";
@@ -18183,6 +18183,23 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
   });
 
+  test("#1695: the PoP probe path comes from the same map as the direct signer args", () => {
+    assert.strictEqual(probeDerivationPathFor("s1", "direct"), null,
+      ">> FAIL: #1695: a non-isolated direct scenario deploys as bare Alice ROOT, so it must probe ROOT (null), not //e2e-direct");
+    assert.strictEqual(probeDerivationPathFor("s9", "direct"), "//e2e-s9",
+      ">> FAIL: #1695: s9 must probe its isolated signer");
+    assert.strictEqual(probeDerivationPathFor("s1", "pool"), null,
+      ">> FAIL: #1695: pool probes stay on the bare mnemonic");
+    assert.strictEqual(probeDerivationPathFor("s9", "pool"), null,
+      ">> FAIL: #1695: the isolated direct signer must not leak into a pool probe");
+    for (const sc of ["s1", "s2", "s9", "s-grandpa-reupload"]) {
+      const args = directSignerArgsFor(sc, "SEED");
+      const i = args.indexOf("--derivation-path");
+      assert.strictEqual(i === -1 ? null : args[i + 1], probeDerivationPathFor(sc, "direct"),
+        `>> FAIL: #1695: ${sc}: probe path and deploy signer path diverged`);
+    }
+  });
+
   test("S9 signs as its own derivation path, and the funding check watches it", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
     assert.deepEqual(
@@ -18202,7 +18219,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
     assert.match(
       e2e,
-      /probeSignerPopStatus\(\{[\s\S]{0,600}?derivationPath: isolated/,
+      /probeSignerPopStatus\(\{[\s\S]{0,600}?derivationPath: probeDerivationPathFor\(SCENARIO, SIGNER\)/,
       ">> FAIL: S9: the PoP probe must use the scenario's own derivation path, or S9 picks its label from //e2e-direct's tier (probe-pop-status.js COUPLING NOTE)",
     );
     assert.ok(
@@ -23328,7 +23345,6 @@ describe("probeSignerPopStatus", () => {
   }
 
   const defaultArgs = {
-    signer: "pool",
     bulletinDeployEnv: null,
     resolveEnvConnectOptions: async () => ({}),
     defaultMnemonic: "//Alice",
@@ -23382,38 +23398,35 @@ describe("probeSignerPopStatus", () => {
     assert.strictEqual(result, 0, ">> FAIL: case 5: expected 0 when popStatus is null");
   });
 
-  test("case 6: signer=direct + no bulletinDeployEnv -> connect called with derivationPath //e2e-direct", async () => {
+  test("case 6: derivationPath omitted -> probes the bare mnemonic (ROOT), not //e2e-direct (#1695)", async () => {
     const mock = makeMock({ popStatus: 2n });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       dotnsFactory: () => mock,
     });
     assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 6: connect must be called exactly once");
-    assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-direct",
-      ">> FAIL: case 6: connect must be called with derivationPath '//e2e-direct' when signer=direct; if buildArgs changes this path, probe-pop-status must change too");
+    assert.ok(!("derivationPath" in mock.connectCalls[0]),
+      ">> FAIL: case 6: omitting derivationPath must probe bare ROOT (what directSignerArgsFor deploys as), not silently //e2e-direct (#1695)");
   });
 
-  test("case 7: explicit derivationPath overrides the signer=direct default -> connect called with caller's path", async () => {
+  test("case 7: an explicit derivationPath is probed as given", async () => {
     const mock = makeMock({ popStatus: 0 });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       derivationPath: "//e2e-s9",
       dotnsFactory: () => mock,
     });
     assert.strictEqual(mock.connectCalls.length, 1, ">> FAIL: case 7: connect must be called exactly once");
     assert.strictEqual(mock.connectCalls[0].derivationPath, "//e2e-s9",
-      ">> FAIL: case 7: an explicitly-passed derivationPath must win over the signer=direct default, so isolated per-scenario signers (e.g. //e2e-s9) get probed instead of //e2e-direct");
+      ">> FAIL: case 7: an explicitly-passed derivationPath must be probed as given, so isolated per-scenario signers (e.g. //e2e-s9) get probed instead of //e2e-direct");
   });
 
   test("case 8: explicit derivationPath=null -> connect called with NO derivationPath key (bare mnemonic)", async () => {
     const mock = makeMock({ popStatus: 2n });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: null,
       derivationPath: null,
       dotnsFactory: () => mock,
@@ -23427,7 +23440,6 @@ describe("probeSignerPopStatus", () => {
     const mock = makeMock({ popStatus: 0 });
     await probeSignerPopStatus({
       ...defaultArgs,
-      signer: "direct",
       bulletinDeployEnv: "paseo-next-v2",
       resolveEnvConnectOptions: async () => ({ rpc: "wss://example" }),
       derivationPath: "//e2e-sgrandpa",

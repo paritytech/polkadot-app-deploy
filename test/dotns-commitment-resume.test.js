@@ -974,7 +974,7 @@ describe("DotNS resume hardening (#1570)", () => {
     });
   });
 
-  test("a resumed commitment drops the phone-signature total by the skipped commit", async () => {
+  test("a resumed commitment flips deploy.dotns.commitment_resumed to \"true\" and drops the phone-signature total by the skipped commit", async () => {
     await withIsolatedHome(async () => {
       writeCommitmentRecord(baseRecord());
       const d = makeDotNS();
@@ -989,11 +989,12 @@ describe("DotNS resume hardening (#1570)", () => {
       } finally {
         __setDeployRootSpanForTest(null);
       }
+      assert.equal(root.attrs.get("deploy.dotns.commitment_resumed"), "true", ">> FAIL: #1570: a resumed commitment must be marked on the span");
       assert.equal(d._phoneSignatureTotal, 2, ">> FAIL: #1570: a resumed run skips the commit signature, so the announced total must drop by one");
     });
   });
 
-  test("a fresh commit leaves the phone-signature total alone", async () => {
+  test("a fresh commit does not mark the span resumed and leaves the phone-signature total alone", async () => {
     await withIsolatedHome(async () => {
       const d = makeDotNS();
       wireHappyPathSpies(d);
@@ -1005,6 +1006,7 @@ describe("DotNS resume hardening (#1570)", () => {
       } finally {
         __setDeployRootSpanForTest(null);
       }
+      assert.notEqual(root.attrs.get("deploy.dotns.commitment_resumed"), "true", ">> FAIL: #1570: a fresh commit is not a resume");
       assert.equal(d._phoneSignatureTotal, 3, ">> FAIL: #1570: a fresh commit keeps the announced signature total");
     });
   });

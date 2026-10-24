@@ -5821,6 +5821,7 @@ export class DotNS {
     // commitment".
     const resumable = await this.resolveResumableCommitment(label, reverse);
     if (resumable) {
+      setDeployAttribute("deploy.dotns.commitment_resumed", "true");
       // The preflight plan announced a Commitment signature. A resume that
       // needs no commit tx never asks for it (#1570).
       if (!resumable.needsCommit && this._phoneSignatureTotal > 0) this._phoneSignatureTotal -= 1;

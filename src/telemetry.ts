@@ -290,6 +290,10 @@ const DEPLOY_SEED_OUTCOME: Record<string, string> = {
 // getWsProvider's onStatusChanged when papi connects to a non-primary endpoint.
 const DEPLOY_SEED_RPC: Record<string, string> = {
   "deploy.rpc.failed_over": "false",
+  // Recovered-path flags (their warnings no longer send Sentry events): seeded
+  // "false", flipped in deploy.ts at the chunk-retry site / doReconnect.
+  "deploy.chunk.retried": "false",
+  "deploy.reconnected": "false",
 };
 
 // DotNS / naming layer: balance gate flags + tx resolution kind + backend identity.
@@ -298,6 +302,8 @@ const DEPLOY_SEED_DOTNS: Record<string, string> = {
   // for "% hitting the floor" and "% recovered via testnet auto-top-up". Flipped by gateOnFeeBalance.
   "deploy.dotns.signer_below_floor": "false",
   "deploy.dotns.toppedup": "false",
+  // #1570: flipped by commitAndRegister when a stored commit-reveal commitment is resumed.
+  "deploy.dotns.commitment_resumed": "false",
   // Seeded "hash" so spans for non-DotNS deploys group cleanly in the "hash" bucket.
   "deploy.dotns.tx_resolution_kind": "hash",
   // Backend identity (module constants — stable across calls).

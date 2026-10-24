@@ -1436,6 +1436,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   }
 
   let reconnectionsUsed = 0;
+  let chunkRetryCount = 0;
   // Sliding window of recovery-attempt timestamps (#216). Each chunk retry
   // and each reconnect appends; if more than RETRY_BUDGET_MAX_EVENTS land
   // within RETRY_BUDGET_WINDOW_MS, we bail to bound peak in-flight bytes
@@ -1465,6 +1466,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     recordRecoveryAndCheckBudget("reconnect");
     reconnectionsUsed++;
     setDeployAttribute("deploy.reconnects", reconnectionsUsed);
+    setDeployAttribute("deploy.reconnected", "true");
     const delay = Math.min(RETRY_BASE_DELAY_MS * Math.pow(2, reconnectionsUsed - 1), RETRY_MAX_DELAY_MS);
     console.log(`\n   Connection lost, reconnecting to Bulletin in ${(delay / 1000).toFixed(0)}s (${reconnectionsUsed}/${MAX_RECONNECTIONS})...`);
     noteWarning("WebSocket connection lost, reconnecting", { reconnection: reconnectionsUsed, maxReconnections: MAX_RECONNECTIONS });
@@ -1776,6 +1778,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           markProvisional(fail.index);
           continue;
         }
+        chunkRetryCount++;
+        setDeployAttribute("deploy.chunk.retried", "true");
+        setDeployAttribute("deploy.chunk.retry_count", chunkRetryCount);
         noteWarning("Chunk upload failed, retrying", { chunkIndex: fail.index + 1, maxRetries: MAX_CHUNK_RETRIES, error: fail.error?.message?.slice(0, 200) });
         const isExpiryFailure = fail.error?.message?.includes("isValid:false");
         if (isExpiryFailure) {

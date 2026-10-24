@@ -303,6 +303,8 @@ const GPU_LIMIT_CEILINGS: Readonly<Record<string, number>> = {
   maxVertexBuffers: 8,
   maxVertexAttributes: 16,
   maxColorAttachments: 4,
+  maxStorageBufferBindingSize: 16 * 1024 * 1024,
+  maxStorageBuffersPerShaderStage: 8,
 };
 
 function validateGraphicsRequirement(value: unknown, prefix: string): string[] {

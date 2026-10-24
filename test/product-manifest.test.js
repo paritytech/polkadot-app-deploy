@@ -246,6 +246,39 @@ describe("validateExecutableManifest — App v2", () => {
     );
   });
 
+  test("accepts storage-buffer requirements within the raster profile ceilings", () => {
+    const manifest = structuredClone(APP_V2_MANIFEST);
+    manifest.capabilities.graphics.profile = "webgpu-raster";
+    for (const requiredLimits of [
+      { maxStorageBufferBindingSize: 1, maxStorageBuffersPerShaderStage: 1 },
+      {
+        maxStorageBufferBindingSize: 16 * 1024 * 1024,
+        maxStorageBuffersPerShaderStage: 8,
+      },
+    ]) {
+      manifest.capabilities.graphics.requiredLimits = requiredLimits;
+      assert.equal(validateExecutableManifest(manifest).ok, true);
+    }
+  });
+
+  test("rejects invalid storage-buffer minima and unknown GPU limits", () => {
+    const manifest = structuredClone(APP_V2_MANIFEST);
+    manifest.capabilities.graphics.profile = "webgpu-raster";
+    for (const [name, ceiling] of [
+      ["maxStorageBufferBindingSize", 16 * 1024 * 1024],
+      ["maxStorageBuffersPerShaderStage", 8],
+    ]) {
+      for (const minimum of [0, -1, 0.5, ceiling + 1]) {
+        manifest.capabilities.graphics.requiredLimits = { [name]: minimum };
+        assert.equal(validateExecutableManifest(manifest).ok, false);
+      }
+    }
+    manifest.capabilities.graphics.requiredLimits = {
+      maxStorageTexturesPerShaderStage: 1,
+    };
+    assert.equal(validateExecutableManifest(manifest).ok, false);
+  });
+
   test("rejects PolkaVM manifests without graphics", () => {
     const missingGraphics = structuredClone(APP_V2_MANIFEST);
     delete missingGraphics.capabilities.graphics;

@@ -48,7 +48,7 @@ function storageValue(block, index) {
 //                   long after submission, silently (the watch never sees it).
 //   sibling:        the first submit finds the slot taken by another deploy's
 //                   tx on the same signer (S9), which lands at once; ours is
-//                   rejected by the pool (isValid:false).
+//                   rejected by the pool.
 //   reportInclusion: a tx included by the sim is also reported to its watch.
 // ---------------------------------------------------------------------------
 function makeSim({ onchain, stuck = 0, clientOn = "A", picks = [], includeAfterMs = null, sibling = false, reportInclusion = false }) {
@@ -115,8 +115,8 @@ function makeApi() {
     tx: {
       TransactionStorage: {
         store_with_cid_config: ({ data }) => ({
-          signSubmitAndWatch: (_signer, opts) => ({
-            subscribe({ next }) {
+          createSubmitAndWatch: (_signer, opts) => ({
+            subscribe({ next, error }) {
               const k = opts.nonce;
               const key = contentKey(data);
               sim.signed.push(k);
@@ -125,19 +125,19 @@ function makeApi() {
                 sim.sibling = false;
                 sim.pool.A.set(k, "sibling");
                 sim.include(k);
-                setImmediate(() => next({ type: "txBestBlocksState", found: false, isValid: false }));
+                setImmediate(() => error(Object.assign(new Error('{"type":"Invalid","value":{"type":"Stale"}}'), { name: "InvalidTxError" })));
                 return { unsubscribe() {} };
               }
               const pool = sim.pool[sim.clientOn];
               const view = sim.clientOn === "A" ? sim.pool.A : new Map([...sim.pool.B, ...sim.pool.A]);
               if (k < sim.onchain || view.has(k)) {
-                setImmediate(() => next({ type: "txBestBlocksState", found: false, isValid: false }));
+                setImmediate(() => error(Object.assign(new Error('{"type":"Invalid","value":{"type":"Stale"}}'), { name: "InvalidTxError" })));
                 return { unsubscribe() {} };
               }
               pool.set(k, key);
               if (sim.includeAfterMs != null && sim.clientOn === "A") {
                 timer = setTimeout(() => {
-                  if (sim.include(k) && sim.reportInclusion) next({ type: "txBestBlocksState", found: true, ok: true });
+                  if (sim.include(k) && sim.reportInclusion) next({ type: "inBestBlock", ok: true });
                 }, sim.includeAfterMs);
               }
               return { unsubscribe() { /* the tx stays in the pool; inclusion is the chain's business */ } };
@@ -184,7 +184,7 @@ async function runStore(simOpts, { probeFails = false, clientNonce = false } = {
     result = await storeChunkedContent([CHUNK], {
       client: makeClient({ probeFails, clientNonce }),
       unsafeApi: makeApi(),
-      signer: {},
+      signer: () => {},
       ss58: SS58,
       skipRootStore: true,
     });

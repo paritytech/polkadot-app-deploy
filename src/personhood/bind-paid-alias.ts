@@ -2,11 +2,14 @@
 // Ported from the citizenship monorepo (bindPaidAliasToAccount.ts).
 
 import { getSs58AddressInfo, Binary } from "polkadot-api";
-import type { PolkadotSigner, SS58String } from "polkadot-api";
+import { SUBMIT_MORTALITY } from "../mortality.js";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
+import type { SS58String } from "polkadot-api";
 import { bytesToHex, encodeMembers, hexToBytes } from "./encoding.js";
 import {
   PGAS_ASSET_ID,
   PGAS_ASSET_LOCATION,
+  PGAS_FEE_OPTIONS,
   PEOPLE_MEMBER_IDENTIFIER_HEX,
   PROOF_BYTES,
 } from "./constants.js";
@@ -76,19 +79,13 @@ type AhApi = {
 };
 
 interface SubmitOptions {
-  customSignedExtensions?: {
-    ChargeAssetTxPayment?: {
-      value: {
-        tip: bigint;
-        asset_id: typeof PGAS_ASSET_LOCATION;
-      };
-    };
-  };
+  asset?: typeof PGAS_ASSET_LOCATION;
+  mortality?: { mortal: true; period: number };
 }
 
 interface PaidAliasTx {
-  signSubmitAndWatch: (
-    signer: PolkadotSigner,
+  createSubmitAndWatch: (
+    signer: SignerTxCreator,
     options?: SubmitOptions,
   ) => {
     subscribe: (observer: {
@@ -188,7 +185,7 @@ export interface BindPaidAliasParams {
   account: SS58String;
   memberKey: Uint8Array;
   contextBytes: Uint8Array;
-  signCall: PolkadotSigner;
+  signCall: SignerTxCreator;
   buildRingProof: BuildRingProof;
   progress?: PaidAliasBindingProgress;
 }
@@ -351,14 +348,8 @@ export const bindPaidAliasToAccount = async ({
     proof_valid_at: proofValidAt,
   });
 
-  // 9. Submit and watch. Route fees through ChargeAssetTxPayment → PGAS.
-  const submitOptions: SubmitOptions = {
-    customSignedExtensions: {
-      ChargeAssetTxPayment: {
-        value: { tip: 0n, asset_id: PGAS_ASSET_LOCATION },
-      },
-    },
-  };
+  // 9. Submit and watch, paying the fee in PGAS.
+  const submitOptions: SubmitOptions = { ...PGAS_FEE_OPTIONS, mortality: SUBMIT_MORTALITY };
 
   const blockHash = await new Promise<string>((resolve, reject) => {
     let settled = false;
@@ -373,7 +364,7 @@ export const bindPaidAliasToAccount = async ({
       resolve(h);
     };
 
-    tx.signSubmitAndWatch(signCall, submitOptions).subscribe({
+    tx.createSubmitAndWatch(signCall, submitOptions).subscribe({
       next: (event) => {
         if (settled) return;
         const ev = event as {
@@ -387,7 +378,7 @@ export const bindPaidAliasToAccount = async ({
           progress?.onBroadcasted?.();
           return;
         }
-        if (ev.type === "txBestBlocksState" && ev.found) {
+        if (ev.type === "inBestBlock") {
           if (ev.ok === false) {
             fail(
               new PaidAliasBindingError(

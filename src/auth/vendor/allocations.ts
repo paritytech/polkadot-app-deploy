@@ -36,6 +36,7 @@
  * `AllowanceHostCalls.kt` and routes the user through an approval UI.
  */
 
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import type { UserSession } from "@parity/product-sdk-terminal";
 import type { TerminalAdapter } from "@parity/product-sdk-terminal";
 import {
@@ -151,6 +152,6 @@ export async function createSlotAccountSigner(
     adapter: TerminalAdapter,
     resource: AllocatableResource,
     productId: string,
-): Promise<import("polkadot-api").PolkadotSigner | null> {
+): Promise<SignerTxCreator | null> {
     return terminalCreateSlotAccountSigner(adapter, resource, productId);
 }

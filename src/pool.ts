@@ -1,12 +1,13 @@
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { DEV_PHRASE, entropyToMiniSecret, mnemonicToEntropy } from "@polkadot-labs/hdkd-helpers";
 import { createClient, Enum } from "polkadot-api";
-import type { PolkadotSigner } from "polkadot-api";
-import { getPolkadotSigner } from "polkadot-api/signer";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
+import { getTxCreator } from "polkadot-api/tx-creator";
 import { getWsProvider } from "./ws.js";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { NonRetryableError } from "./errors.js";
+import { SUBMIT_MORTALITY } from "./mortality.js";
 
 // Both Paseo Asset Hub and Paseo Bulletin report `tokenDecimals: 10` via
 // system_properties — same on Polkadot Asset Hub. Display formatter for tools
@@ -21,7 +22,7 @@ export interface PoolAccount {
   index: number;
   path: string;
   publicKey: Uint8Array;
-  signer: PolkadotSigner;
+  signer: SignerTxCreator;
   address: string;
 }
 
@@ -116,7 +117,7 @@ export function derivePoolAccounts(poolSize: number = 10, mnemonic: string = DEV
   for (let i = 0; i < poolSize; i++) {
     const path = `${DEPLOY_PATH_PREFIX}/${i}`;
     const keyPair = derive(path);
-    const signer = getPolkadotSigner(keyPair.publicKey, "Sr25519", keyPair.sign);
+    const signer = getTxCreator(keyPair.publicKey, "Sr25519", keyPair.sign);
     const address = keyring.encodeAddress(keyPair.publicKey);
     accounts.push({ index: i, path, publicKey: keyPair.publicKey, signer, address });
   }
@@ -776,7 +777,7 @@ export async function ensurePoolAccountsFundedOnAssetHub(
   const miniSecret = entropyToMiniSecret(entropy);
   const derive = sr25519CreateDerive(miniSecret);
   const funderKeyPair = derive(opts.funderDerivationPath ?? "");
-  const funderSigner = getPolkadotSigner(funderKeyPair.publicKey, "Sr25519", funderKeyPair.sign);
+  const funderSigner = getTxCreator(funderKeyPair.publicKey, "Sr25519", funderKeyPair.sign);
 
   console.log(`Pre-funding ${accounts.length} pool account(s) on Asset Hub (${assetHubRpc})...\n`);
 
@@ -806,7 +807,7 @@ export async function ensurePoolAccountsFundedOnAssetHub(
         dest: Enum("Id", acct.address),
         value: topUp,
       });
-      const result = await tx.signAndSubmit(funderSigner);
+      const result = await tx.createAndSubmit(funderSigner, { mortality: SUBMIT_MORTALITY });
       if (!result?.ok) {
         throw new Error(`Asset Hub pre-fund transfer to ${acct.address} failed: dispatch was rejected.`);
       }
@@ -915,12 +916,12 @@ export async function bootstrapPool(
     }
 
     // --- Step 3: resolve authorizer ---
-    let authorizerSigner: PolkadotSigner | undefined;
+    let authorizerSigner: SignerTxCreator | undefined;
     const keyring = new Keyring({ type: "sr25519" });
 
     if (opts.authorizerMnemonic) {
       const authKey = keyring.addFromUri(opts.authorizerMnemonic);
-      authorizerSigner = getPolkadotSigner(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
+      authorizerSigner = getTxCreator(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
       console.log(`Using provided authorizer: ${authKey.address}\n`);
     } else if (opts.envAuthorizer) {
       // The env declares which key holds authorizer rights on its Bulletin
@@ -929,7 +930,7 @@ export async function bootstrapPool(
       // flag, and so an env with no known authorizer (e.g. devnet) never
       // gets one guessed on its behalf.
       const authKey = keyring.addFromUri(opts.envAuthorizer);
-      authorizerSigner = getPolkadotSigner(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
+      authorizerSigner = getTxCreator(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
       console.log(`Using environment authorizer ${opts.envAuthorizer} (${authKey.address})\n`);
     } else {
       // Deliberately NOT defaulting to //Alice here. That default used to
@@ -957,7 +958,7 @@ export async function bootstrapPool(
           transactions: clampU32(BigInt(TOPUP_TRANSACTIONS), "transactions"),
           bytes: TOPUP_BYTES,
         });
-        const result = await tx.signAndSubmit(authorizerSigner);
+        const result = await tx.createAndSubmit(authorizerSigner, { mortality: SUBMIT_MORTALITY });
         if (!result.ok) throw new Error("dispatch failed");
         console.log(`    granted: ${TOPUP_TRANSACTIONS} txs / ${Number(TOPUP_BYTES) / 1_000_000}MB`);
       } catch (e: any) {

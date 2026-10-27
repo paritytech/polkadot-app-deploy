@@ -12,7 +12,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import {
   BLAKE2B_256_MULTIHASH_CODE,
   encodeContenthash,
@@ -26,7 +26,7 @@ import {
   selectStorageReconnect,
   type DeployOptions,
 } from "../deploy.js";
-import { DotNS, DEFAULT_TLD, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
+import { DotNS, assertTxCreator, DEFAULT_TLD, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
 import {
   loadEnvironments,
@@ -73,7 +73,7 @@ export interface PublishManifestOptions {
    * while the content it belongs to went to the user's slot, and on a chain whose pool holds
    * no quota the manifest would be the only part that fails.
    */
-  storageSigner?: PolkadotSigner;
+  storageSigner?: SignerTxCreator;
   /** SS58 address of the slot account. Required when storageSigner is set. */
   storageSignerAddress?: string;
 }
@@ -93,6 +93,7 @@ export interface PublishManifestResult {
  * content resolver before any `setText`.
  */
 export async function publishManifest(opts: PublishManifestOptions): Promise<PublishManifestResult> {
+  assertTxCreator(opts.storageSigner, "PublishManifestOptions.storageSigner");
   const { config, sourcePath } = opts.loaded;
   // #1156/#1572: domain reconciliation happens below, once envTld is known —
   // see reconcileManifestDomain. The check that used to live here compared

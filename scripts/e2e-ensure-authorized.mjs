@@ -44,10 +44,11 @@ import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { createClient, Enum } from "polkadot-api";
 import { getWsProvider } from "polkadot-api/ws";
-import { getPolkadotSigner } from "polkadot-api/signer";
+import { getTxCreator } from "polkadot-api/tx-creator";
 import { loadEnvironments, resolveEndpoints } from "../dist/environments.js";
 import { readAccountAuthorization, isAuthorizationSufficient, assetHubTopUpAmount, formatPasBalance, TOPUP_TRANSACTIONS, TOPUP_BYTES } from "../dist/pool.js";
 import { stripYamlCommentLines, extractJobBlocks } from "./lib/workflow-jobs.mjs";
+import { SUBMIT_MORTALITY } from "../dist/mortality.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.join(__dirname, "..");
@@ -292,7 +293,7 @@ function deriveSignerKeypair(keyring, account) {
 async function runCheckAndAct({ accounts, rpc, signerUri, prepare, checkFn, actFn, onRow }) {
   const keyring = new Keyring({ type: "sr25519" });
   const primaryKey = keyring.addFromUri(signerUri);
-  const primarySigner = getPolkadotSigner(primaryKey.publicKey, "Sr25519", (d) => primaryKey.sign(d));
+  const primarySigner = getTxCreator(primaryKey.publicKey, "Sr25519", (d) => primaryKey.sign(d));
 
   const client = createClient(getWsProvider(rpc, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
   const api = client.getUnsafeApi();
@@ -339,7 +340,7 @@ async function checkAndGrantAuthorizations({ accounts, bulletinRpc, authorizerUr
       const tx = api.tx.TransactionStorage.authorize_account({
         who: key.address, transactions: TOPUP_TRANSACTIONS, bytes: TOPUP_BYTES,
       });
-      const r = await tx.signAndSubmit(authorizerSigner);
+      const r = await tx.createAndSubmit(authorizerSigner, { mortality: SUBMIT_MORTALITY });
       if (!r?.ok) throw new Error("dispatch was rejected");
       return "granted";
     },
@@ -380,7 +381,7 @@ async function checkAndFundAssetHub({ accounts, assetHubRpc, funderUri, floorRaw
         );
       }
       const tx = api.tx.Balances.transfer_allow_death({ dest: Enum("Id", key.address), value: topUp });
-      const r = await tx.signAndSubmit(funderSigner);
+      const r = await tx.createAndSubmit(funderSigner, { mortality: SUBMIT_MORTALITY });
       if (!r?.ok) throw new Error("dispatch was rejected");
       return `topped up +${formatPasBalance(topUp)} PAS`;
     },

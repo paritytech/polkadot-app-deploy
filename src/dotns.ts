@@ -1,9 +1,10 @@
 import crypto from "crypto";
 import { createReadStream } from "fs";
 import { createClient, Enum } from "polkadot-api";
-import { getPolkadotSigner } from "polkadot-api/signer";
+import { getTxCreator } from "polkadot-api/tx-creator";
 import { getWsProvider } from "./ws.js";
-import { PGAS_ASSET_LOCATION } from "./personhood/constants.js";
+import { PGAS_ASSET_LOCATION, PGAS_FEE_OPTIONS } from "./personhood/constants.js";
+import { SUBMIT_MORTALITY } from "./mortality.js";
 import { resolveEffectiveMnemonic, mnemonicConflictNotice } from "./mnemonic.js";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -28,7 +29,7 @@ import { isTestnetSpecName, testnetFromNetworkField } from "./pool.js";
 import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
 import { InsufficientFundsError, NonRetryableError } from "./errors.js";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
 import { loadCommitmentRecord, replaceCommitmentRecord, clearCommitmentRecord, commitmentRecordKey, tryAcquireCommitmentLock, FALLBACK_MAX_COMMITMENT_AGE_SECONDS } from "./run-state.js";
@@ -41,7 +42,21 @@ export type PhoneSignatureStep = "Commitment" | "Register" | "Link content";
 // Exported constants and types
 // ---------------------------------------------------------------------------
 
-export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?: string; derivationPath?: string; signer?: PolkadotSigner; signerAddress?: string; /**
+/**
+ * papi v3 made a signer callable. A v2 `PolkadotSigner` object still typechecks
+ * for JS callers, so name the break here instead of failing later inside papi
+ * (#811/S7: playground-cli and other library callers inject their own).
+ */
+export function assertTxCreator(signer: unknown, option: string): void {
+  if (signer === undefined || signer === null) return;
+  if (typeof signer === "function") return;
+  const hint = typeof signer === "object" && signer !== null && "signTx" in signer
+    ? " It looks like a polkadot-api v2 PolkadotSigner: rebuild it with getTxCreator from polkadot-api/tx-creator."
+    : "";
+  throw new NonRetryableError(`${option} must be a callable polkadot-api v3 TxCreator.${hint}`);
+}
+
+export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?: string; derivationPath?: string; signer?: SignerTxCreator; signerAddress?: string; /**
    * Optional override for the Asset Hub RPC failover list. When provided, the
    * primary RPC (this.rpc) is followed by these endpoints for retries. When
    * omitted, the legacy hardcoded RPC_ENDPOINTS list (paseo) is used —
@@ -409,7 +424,7 @@ export const TX_CHAIN_TIME_BUDGET_MS: number = 180_000;
 // itself is stalled (no blocks produced). Lowered to 240s so this fires before
 // the outer OPERATION_TIMEOUT_MS=300s kill: 180s chain-time → 240s wall-clock → 300s outer.
 export const TX_WALL_CLOCK_CEILING_MS: number = 240_000;
-// Maximum allowed gap between signSubmitAndWatch observable events. If no event
+// Maximum allowed gap between createSubmitAndWatch observable events. If no event
 // arrives for this long, the watch is considered silently stalled (papi observable
 // + dead WS) and the promise rejects with a 'transaction watcher silent for Ns
 // after <lastEvent>' error that signAndSubmitWithRetry can retry.
@@ -1242,14 +1257,6 @@ const BARE_REVERT_DIAGNOSTIC_FUNCTIONS = new Set(["register", "commit", "setCont
 function isBareRevertResult(revertData: string | undefined, revertFlags: bigint | undefined): boolean {
   return (revertData === undefined || revertData.trim() === "0x") && revertFlags === 1n;
 }
-
-// Fee election (#885): route Asset-Hub tx fees through ChargeAssetTxPayment → PGAS.
-// Passed to signSubmitAndWatch when the signer is a PGAS-funded session account
-// (e.g. the owner-signs update path), so a zero-native account can pay fees in PGAS.
-// Proven against paseo-next-v2 in the #885 probe; PGAS covers fees only (not msg.value).
-const PGAS_FEE_OPTIONS = {
-  customSignedExtensions: { ChargeAssetTxPayment: { value: { tip: 0n, asset_id: PGAS_ASSET_LOCATION } } },
-} as const;
 
 function formatContractDryRunFailure(
   gasEstimate: {
@@ -2268,7 +2275,7 @@ export class ReviveClientWrapper {
     } catch { return false; }
   }
 
-  async ensureAccountMapped(substrateAddress: string, signer: PolkadotSigner): Promise<void> {
+  async ensureAccountMapped(substrateAddress: string, signer: SignerTxCreator): Promise<void> {
     if (isAddress(substrateAddress)) throw new Error("ensureAccountMapped requires SS58 Substrate address, not EVM H160 address");
     if (this.mappedAccounts.has(substrateAddress)) return;
     const isMapped = await this.checkIfAccountMapped(substrateAddress);
@@ -2288,7 +2295,7 @@ export class ReviveClientWrapper {
 
   signAndSubmitExtrinsic(
     extrinsic: any,
-    signer: PolkadotSigner,
+    signer: SignerTxCreator,
     statusCallback: (status: string) => void,
     opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean } = {},
   ): Promise<TxResolution> {
@@ -2401,22 +2408,19 @@ export class ReviveClientWrapper {
       deadlinePoller = setTimeout(poll, 6_000);
 
       try {
-        sub = extrinsic.signSubmitAndWatch(signer, { mortality: { mortal: true, period: 256 }, ...(opts.feeAsset === "pgas" ? PGAS_FEE_OPTIONS : {}) }).subscribe({
+        sub = extrinsic.createSubmitAndWatch(signer, { mortality: { mortal: true, period: 256 }, ...(opts.feeAsset === "pgas" ? PGAS_FEE_OPTIONS : {}) }).subscribe({
           next: (event: any) => {
             lastEventAt = Date.now();
             lastEventType = event.type;
             const transactionHash = event.txHash?.toString();
             switch (event.type) {
-              case "signed": statusCallback("signing"); break;
+              case "created": statusCallback("signing"); break;
               case "broadcasted": statusCallback("broadcasting"); break;
-              case "txBestBlocksState":
-                // #1108: track best-block membership BOTH ways. found=false is a
-                // reorg eviction — withdraw the best-block claim so the poll loop
-                // won't resolve on a tx that's no longer in the canonical best
-                // chain (verifyEffect is the second guard; this is the first).
-                if (event.found) { statusCallback("included"); bestBlockIncluded = true; }
-                else bestBlockIncluded = false;
-                break;
+              // #1108: track best-block membership BOTH ways. notInBestBlock is a
+              // reorg eviction, so withdraw the best-block claim: the poll loop
+              // must not resolve on a tx that left the canonical best chain.
+              case "inBestBlock": statusCallback("included"); bestBlockIncluded = true; break;
+              case "notInBestBlock": bestBlockIncluded = false; break;
               case "finalized": {
                 if (event.dispatchError || event.ok === false) { statusCallback("failed"); finish(reject)(new Error(`Transaction failed: ${formatDispatchError(event.dispatchError)}`)); return; }
                 const block = event.block
@@ -2438,7 +2442,7 @@ export class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: PhoneOnResign; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number; fundingGate?: { operation: string; storageDepositLimit: bigint; value: bigint } } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: SignerTxCreator, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: PhoneOnResign; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number; fundingGate?: { operation: string; storageDepositLimit: bigint; value: bigint } } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
@@ -2568,7 +2572,7 @@ export class ReviveClientWrapper {
     value: bigint,
     encodedData: string,
     signerSubstrateAddress: string,
-    signer: PolkadotSigner,
+    signer: SignerTxCreator,
     statusCallback: (status: string) => void,
     { rpcs, useNoncePolling, functionName, depositPolicy, args, contracts, verifyEffect, feeAsset, isPhoneSigner, onResign }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; depositPolicy?: DepositPolicy; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> },
   ): Promise<TxResolution> {
@@ -2619,7 +2623,7 @@ export class ReviveClientWrapper {
   async submitBatchedTransactions(
     calls: { contractAddress: string; value: bigint; encodedData: string; functionName?: string; depositPolicy?: DepositPolicy; args?: unknown[] }[],
     signerSubstrateAddress: string,
-    signer: PolkadotSigner,
+    signer: SignerTxCreator,
     statusCallback: (status: string) => void,
   ): Promise<TxResolution> {
     if (calls.length === 0) throw new Error("submitBatchedTransactions: at least one call required");
@@ -2857,7 +2861,7 @@ export class DotNS {
   rpc: string | null;
   substrateAddress: string | null;
   evmAddress: string | null;
-  signer: PolkadotSigner | null;
+  signer: SignerTxCreator | null;
   connected: boolean;
   // Per-instance failover list. Populated from options.assetHubEndpoints when
   // bulletin-deploy resolves the asset-hub list via environments.json; falls
@@ -3067,6 +3071,7 @@ export class DotNS {
   }
 
   async connect(options: DotNSConnectOptions = {}): Promise<this> {
+    assertTxCreator(options.signer, "DotNSConnectOptions.signer");
     if (options.assetHubEndpoints && options.assetHubEndpoints.length > 0) {
       this.assetHubEndpoints = options.assetHubEndpoints;
     }
@@ -3148,7 +3153,7 @@ export class DotNS {
       const account = isKeyUri || options.derivationPath
         ? keyring.addFromUri(source)
         : keyring.addFromMnemonic(source);
-      this.signer = getPolkadotSigner(account.publicKey, "Sr25519", async (input: Uint8Array) => account.sign(input));
+      this.signer = getTxCreator(account.publicKey, "Sr25519", async (input: Uint8Array) => account.sign(input));
       this.substrateAddress = account.address;
     }
     console.log(`   SS58 Address: ${this.substrateAddress}`);
@@ -3528,7 +3533,7 @@ export class DotNS {
         });
         continue;
       }
-      const signer = getPolkadotSigner(
+      const signer = getTxCreator(
         account.publicKey,
         "Sr25519",
         async (input: Uint8Array) => account.sign(input),
@@ -3560,7 +3565,7 @@ export class DotNS {
   // Companion in tools/setup-e2e-derivation-signers.mjs uses best-block only;
   // that's a one-time setup script, not a runtime gate, so the trade-off there
   // is different.
-  private submitTransfer(signer: PolkadotSigner, destSubstrate: string, valueRaw: bigint): Promise<void> {
+  private submitTransfer(signer: SignerTxCreator, destSubstrate: string, valueRaw: bigint): Promise<void> {
     const api = this.clientWrapper!.client;
     const tx = api.tx.Balances.transfer_allow_death({
       dest: Enum("Id", destSubstrate),
@@ -3569,11 +3574,11 @@ export class DotNS {
     return new Promise<void>((resolve, reject) => {
       let settled = false;
       let bestBlockSeen = false;
-      const sub = tx.signSubmitAndWatch(signer).subscribe({
+      const sub = tx.createSubmitAndWatch(signer, { mortality: SUBMIT_MORTALITY }).subscribe({
         next: (event: any) => {
           if (settled) return;
           // First confirmation: in best block. Log and keep waiting for finality.
-          if (event.type === "txBestBlocksState" && event.found && !bestBlockSeen) {
+          if (event.type === "inBestBlock" && !bestBlockSeen) {
             bestBlockSeen = true;
             if (!event.ok) {
               settled = true;
@@ -6388,7 +6393,7 @@ export class DotNS {
    * Behaviour:
    * - confirmPhoneReady provided → await it (counts re-signs via attempt map).
    * - not provided → proceed without a gate (opt-in only; an in-process
-   *   external signer, e.g. injected PolkadotSigner or mnemonic, needs no
+   *   external signer, e.g. injected SignerTxCreator or mnemonic, needs no
    *   phone gate — _usesExternalSigner alone cannot distinguish phone from
    *   in-process).
    * After the gate resolves, fires onPhoneSigningRequired (the "check your
@@ -6406,7 +6411,7 @@ export class DotNS {
     if (this._confirmPhoneReady) {
       await this._confirmPhoneReady({ label, attempt, total: this._phoneSignatureTotal, approvalBudgetMs: PHONE_APPROVAL_MS, reason });
     }
-    // No hook → proceed; in-process external signers (injected PolkadotSigner,
+    // No hook → proceed; in-process external signers (injected SignerTxCreator,
     // mnemonic) need no human gate. Phone signers must supply confirmPhoneReady.
     // Fire "check your phone" notification AFTER gate resolves, immediately
     // before the chain request goes out.

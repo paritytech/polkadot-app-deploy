@@ -16,6 +16,7 @@
  *  7. Destroy adapters and exit
  */
 
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { renderLoginStatus, requestResourceAllocation, DEFAULT_RESOURCES, summarizeOutcomes, createSlotAccountSigner, BULLETIN_RESOURCE } from "../auth/index.js";
 import type { AllocationSummary } from "../auth/index.js";
 import { getAuthClient, resolveBulletinEndpoints, getPeopleChainEndpoints } from "../auth-config.js";
@@ -338,7 +339,9 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
                 `Bulletin slot read timed out after ${Math.round(ALLOCATION_TIMEOUT_MS / 1000)}s — ` +
                     `the wallet did not respond.`,
             );
-            if (fallbackResult.isOk()) slotSigner = fallbackResult.value;
+            // The adapter types this as a bare TxCreator, but the allowance
+            // signer carries publicKey/signBytes, which ss58Encode below reads.
+            if (fallbackResult.isOk()) slotSigner = fallbackResult.value as SignerTxCreator;
         }
 
         if (slotSigner) {

@@ -2763,14 +2763,12 @@ jobs:
             mkdir -p /tmp/bd-s-ext
             echo '{"type":"module"}' > /tmp/bd-s-ext/package.json
             # Install the product FIRST, then pin polkadot-api to whatever version it
-            # actually resolved. A bare `polkadot-api` here takes the registry's latest,
-            # which drifted ahead of our dependency range the moment polkadot-api 3.0.0
-            # shipped (2026-08-18) and DROPPED the `./signer` subpath — so this scenario's
-            # `import { getPolkadotSigner } from "polkadot-api/signer"` dies with
-            # ERR_PACKAGE_PATH_NOT_EXPORTED against papi 3 while the product itself is fine
-            # on its nested 2.x. Pinning to the resolved version also makes the test honest:
-            # an "external PolkadotSigner" must come from the SAME papi instance the product
-            # uses, not a different major.
+            # actually resolved. Installing a bare `polkadot-api` here used to take the
+            # registry's latest, which drifted ahead of our dependency range the moment
+            # polkadot-api 3.0.0 shipped (2026-08-18) and dropped the `./signer` subpath.
+            # Pinning to the resolved version also makes the test honest: an external
+            # TxCreator must come from the SAME papi instance the product uses, not a
+            # different major.
             cd /tmp/bd-s-ext && npm install "@parity/polkadot-app-deploy@${V}" @polkadot/keyring
             PAPI=$(node -p "require('/tmp/bd-s-ext/node_modules/polkadot-api/package.json').version")
             echo "@parity/polkadot-app-deploy@${V} resolved polkadot-api ${PAPI} — pinning the scenario to it"
@@ -2785,7 +2783,7 @@ jobs:
           import { DotNS, loadEnvironments, resolveEndpoints } from "@parity/polkadot-app-deploy";
           import { Keyring } from "@polkadot/keyring";
           import { cryptoWaitReady } from "@polkadot/util-crypto";
-          import { getPolkadotSigner } from "polkadot-api/signer";
+          import { readFileSync } from "node:fs";
           import { CID } from "multiformats/cid";
           import { base32 } from "multiformats/bases/base32";
           import { base58btc } from "multiformats/bases/base58";
@@ -2820,7 +2818,16 @@ jobs:
           await cryptoWaitReady();
           const keyring = new Keyring({ type: "sr25519" });
           const account = keyring.addFromMnemonic(ALICE_MNEMONIC);
-          const polkadotSigner = getPolkadotSigner(
+          // This job installs whatever papi the published product resolved.
+          // papi 3 made the signer callable and moved it from ./signer to
+          // ./tx-creator, so pick the subpath the installed major actually has.
+          const papiPkg = new URL("node_modules/polkadot-api/package.json", import.meta.url);
+          const papiMajor = Number(JSON.parse(readFileSync(papiPkg, "utf-8")).version.split(".")[0]);
+          const buildSigner = papiMajor >= 3
+            ? (await import("polkadot-api/tx-creator")).getTxCreator
+            : (await import("polkadot-api/signer")).getPolkadotSigner;
+          console.log(`[S-ext-signer] polkadot-api ${papiMajor}.x, using ${papiMajor >= 3 ? "getTxCreator" : "getPolkadotSigner"}`);
+          const polkadotSigner = buildSigner(
             account.publicKey, "Sr25519", async (input) => account.sign(input),
           );
 

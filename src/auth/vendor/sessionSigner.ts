@@ -15,7 +15,7 @@
 // limitations under the License.
 
 /**
- * Session-backed `PolkadotSigner` for a product account, built on
+ * Session-backed `SignerTxCreator` for a product account, built on
  * product-sdk-terminal's `createSessionSignerForAccount`.
  *
  * RFC-0022 puts the product account at `//product//{productId}/{index}`. The
@@ -32,7 +32,7 @@ import {
     type ProductSubtreeOptions,
     type UserSession,
 } from "@parity/product-sdk-terminal";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { NonRetryableError } from "../../errors.js";
 import { CLI_NAME } from "../../cli-name.js";
 
@@ -84,13 +84,12 @@ export async function createSessionSigner(
     session: UserSession,
     ref: ProductAccountRef,
     options?: ProductSubtreeOptions,
-): Promise<PolkadotSigner> {
+): Promise<SignerTxCreator> {
     const signer = await createSessionSignerForAccount(session, ref, options);
-    return {
+    return Object.assign(withExpiredAllowanceHint(signer), {
         publicKey: signer.publicKey,
-        signTx: withExpiredAllowanceHint(signer.signTx),
         signBytes: withExpiredAllowanceHint(signer.signBytes),
-    };
+    }) as SignerTxCreator;
 }
 
 /**

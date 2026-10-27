@@ -2,16 +2,15 @@
 // Ported from the citizenship monorepo (bindPersonalIdToAccount.ts).
 
 import { Enum } from "polkadot-api";
-import type { PolkadotClient, PolkadotSigner, SS58String } from "polkadot-api";
+import type { PolkadotClient, SS58String } from "polkadot-api";
 import {
   buildImplicationMessage,
   buildV5GeneralExtrinsic,
   bytesToHex,
   hexToBytes,
-  readExtensionOrder,
   toHex,
-  type ExtensionValues,
 } from "./encoding.js";
+import { captureExtensions, type CapturedExtensions } from "./capture.js";
 import { BANDERSNATCH_SIGNATURE_BYTES } from "./constants.js";
 
 // ---------------------------------------------------------------------------
@@ -36,7 +35,7 @@ type PeopleApi = {
 
 interface SetPersonalIdAccountTx {
   getEncodedData: () => Promise<Uint8Array>;
-  sign: (signer: PolkadotSigner, options: SignOptions) => Promise<string>;
+  create: (creator: unknown, options: SignOptions) => Promise<Uint8Array>;
 }
 
 interface SignOptions {
@@ -176,10 +175,11 @@ export const bindPersonalIdToAccount = async ({
   });
   const callBytes = await innerTx.getEncodedData();
 
-  // Pass 1: capture extension bytes with AsPerson = empty (to compute implication).
+  // Pass 1: capture extension bytes with AsPerson = None (to compute implication).
+  // `undefined` is the None variant; raw bytes do not encode through the codec.
   const passEmpty = await capturePass({
     innerTx,
-    asPersonValue: new Uint8Array(),
+    asPersonValue: undefined,
   });
 
   const msgHash = buildImplicationMessage(
@@ -214,47 +214,23 @@ export const bindPersonalIdToAccount = async ({
 // Internals
 // ---------------------------------------------------------------------------
 
-interface CapturePass {
-  callData: Uint8Array;
-  extensions: ExtensionValues;
-}
-
 const capturePass = async ({
   innerTx,
   asPersonValue,
 }: {
   innerTx: SetPersonalIdAccountTx;
   asPersonValue: unknown;
-}): Promise<CapturePass> => {
-  let captured: CapturePass | null = null;
-
-  const sentinel = new Error("__personhood_capture_sentinel__");
-  const signer: PolkadotSigner = {
-    publicKey: new Uint8Array(32),
-    signTx: async (callData, signedExtensions, metadata) => {
-      const order = await readExtensionOrder(metadata);
-      const byIdentifier: ExtensionValues["byIdentifier"] = {};
-      for (const id of order) {
-        const ext = signedExtensions[id];
-        if (!ext) {
-          throw new PersonalIdBindingError(
-            `papi did not produce signed extension '${id}'`,
-          );
-        }
-        byIdentifier[id] = {
-          value: ext.value,
-          additionalSigned: ext.additionalSigned,
-        };
-      }
-      captured = { callData, extensions: { order, byIdentifier } };
-      // Abort papi's signing flow — we only needed the extension bytes.
-      throw sentinel;
-    },
-    signBytes: async () => new Uint8Array(64),
-  };
-
+}): Promise<CapturedExtensions> => {
+  // Anything papi's enhancers throw (an extension this cannot fill, malformed
+  // metadata) arrives here untyped, so callers would lose `kind`.
+  let captured: CapturedExtensions | null;
   try {
-    await innerTx.sign(signer, {
+    captured = await captureExtensions(innerTx, {
+      // Immortal, as claim-pgas is. CheckMortality sits after AsPerson in the
+      // People pipeline, so its bytes are inside the implication the proof signs.
+      // A mortal era moves with the finalized head, so pass 1 and pass 2 could
+      // capture different bytes and the signature would not match the wire.
+      mortality: { mortal: false },
       customSignedExtensions: {
         [AS_PERSON_IDENTIFIER]: {
           value: asPersonValue,
@@ -269,15 +245,15 @@ const capturePass = async ({
         },
       },
     });
-  } catch (err) {
-    if (err !== sentinel) throw err;
+  } catch (err: any) {
+    throw new PersonalIdBindingError(`extension capture failed: ${err?.message ?? String(err)}`, {
+      kind: "client_error",
+    });
   }
-
   if (!captured) {
-    throw new PersonalIdBindingError(
-      "extension capture failed — papi never invoked signTx",
-      { kind: "client_error" },
-    );
+    throw new PersonalIdBindingError("extension capture failed", {
+      kind: "client_error",
+    });
   }
   return captured;
 };
@@ -307,7 +283,7 @@ const submitExtrinsic = (
           progress?.onBroadcasted?.();
           return;
         }
-        if (event.type === "txBestBlocksState" && event.found) {
+        if (event.type === "inBestBlock") {
           if (event.ok === false) {
             fail(
               new PersonalIdBindingError(

@@ -6,7 +6,7 @@ import { setupIsolatedHome } from "./helpers/isolated-home.js";
 // Personhood bootstrap imports (loaded after build)
 import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason } from "../dist/dotns.js";
 import { getAdapter, HIGHEST_VERIFIED_DOTNS_RELEASE } from "../dist/dotns-protocol.js";
-import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes } from "../dist/personhood/encoding.js";
+import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes, indexExtensions } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
 import { probeBootstrapState, nextBootstrapAction, runBootstrap } from "../dist/personhood/bootstrap.js";
 import { reproveAliasToAccount } from "../dist/personhood/reprove.js";
@@ -1327,7 +1327,7 @@ describe("signAndSubmitWithRetry non-TTY safety (issue 3)", () => {
   function makeStubWrapper({ throwOnce, resolveAfterThrow = false } = {}) {
     let calls = 0;
     return {
-      client: { tx: { Revive: { map_account: () => ({ signSubmitAndWatch: () => ({ subscribe: () => {} }) }) } } },
+      client: { tx: { Revive: { map_account: () => ({ createSubmitAndWatch: () => ({ subscribe: () => {} }) }) } } },
       checkIfAccountMapped: async () => true,
       ensureAccountMapped: async () => {},
       signAndSubmitExtrinsic: async function(_extrinsic, _signer, statusCallback, _opts) {
@@ -1793,7 +1793,26 @@ describe("classifyErrorKind", () => {
   });
 
   test("nonce-stale: tx rejected by pool", () => {
-    assert.strictEqual(classifyErrorKind("commit tx rejected by pool (isValid:false)"), "nonce-stale");
+    assert.strictEqual(classifyErrorKind('commit tx rejected by pool: {"type":"Invalid","value":{"type":"Stale"}}'), "nonce-stale",
+      ">> FAIL: classifyErrorKind: a pool rejection carrying the Stale variant was not filed as nonce-stale, so the retry loop reissues at the same nonce instead of a fresh one");
+  });
+
+  // papi v3 delivers every invalid-transaction reason as InvalidTxError on the
+  // subscription's error channel, where v2 only sent nonce rejections that way.
+  // The "tx rejected by pool" phrase above is matched ahead of the BadProof and
+  // AncientBirth rules, so deploy.ts only uses it for the nonce-class variants.
+  test("chain.bad_proof: a BadProof rejection is not filed as nonce-stale", () => {
+    assert.strictEqual(
+      classifyErrorKind('store subscription error: {"type":"Invalid","value":{"type":"BadProof"}}'),
+      "chain.bad_proof",
+      '>> FAIL: telemetry: a BadProof rejection classified as something else, so signature failures would be counted as nonce collisions');
+  });
+
+  test("chain.extrinsic_expired: an AncientBirthBlock rejection is not filed as nonce-stale", () => {
+    assert.strictEqual(
+      classifyErrorKind('store subscription error: {"type":"Invalid","value":{"type":"AncientBirthBlock"}}'),
+      "chain.extrinsic_expired",
+      '>> FAIL: telemetry: an expired-extrinsic rejection classified as something else, so mortality expiry would be counted as a nonce collision');
   });
 
   test("connection: WebSocket closed", () => {
@@ -2389,21 +2408,57 @@ describe("createSessionSigner (vendored)", () => {
     };
   }
 
-  test("signTx never routes through signPayload (anti-regression: message-too-big)", async () => {
+  /** Smallest papi v3 TxPayloadV1 that reaches the signer's metadata decode. */
+  const fakeTxPayload = () => ({
+    version: 1,
+    signer: null,
+    callData: "0x" + "01".repeat(300),
+    extensions: [],
+    txExtVersion: null,
+    context: {
+      metadata: "0x",
+      token: null,
+      bestBlockHeight: 0,
+      bestBlockHash: "0x" + "00".repeat(32),
+      genesisHash: "0x" + "00".repeat(32),
+    },
+  });
+
+  test("creating a tx never routes through signPayload (anti-regression: message-too-big)", async () => {
     // Core regression guard: the old PJS-based path called session.signPayload,
     // sending the full 2 MB chunk calldata as the 'method' field. Android rejects
-    // that with "message too big". signTx goes through session.createTransaction
-    // and must never call signPayload. Empty metadata makes signTx throw before
-    // it sends anything, which is enough to check signPayload stays unused.
+    // that with "message too big". Tx creation goes through
+    // session.createTransaction and must never call signPayload. Empty metadata
+    // makes it throw before it sends anything, which is enough to check
+    // signPayload stays unused.
     const { createSessionSigner } = await import("../dist/auth/vendor/index.js");
     const session = await makeStubSession();
     const signer = await createSessionSigner(session, { productId: "test", derivationIndex: 0 }, subtreeOptions);
 
+    let threw = false;
     try {
-      await signer.signTx(new Uint8Array(300), {}, new Uint8Array(0), 0);
-    } catch { /* expected — decAnyMetadata throws on empty metadata bytes */ }
+      await signer(fakeTxPayload(), {}, {}, false);
+    } catch { threw = true; /* expected — decAnyMetadata throws on empty metadata */ }
 
-    assert.strictEqual(session.captured.signPayload.length, 0, "signPayload must never be called");
+    assert.ok(threw,
+      ">> FAIL: session signer: creating a tx with empty metadata resolved instead of throwing, so the metadata decode no longer rejects a payload it cannot read");
+    assert.strictEqual(session.captured.signPayload.length, 0,
+      ">> FAIL: session signer: signPayload was called while building a tx, which sends the whole chunk calldata as the method field and Android rejects it as message-too-big");
+  });
+
+  test("tx creation is wired to createTransaction, never signPayload", () => {
+    // The assertion above stops at the metadata decode, which throws before the
+    // signer picks a call, so it cannot see a regression past that point. The
+    // choice belongs to the SDK and a payload this suite can build without real
+    // chain metadata never reaches it, so check the wiring directly.
+    const sdk = fs.readFileSync("node_modules/@parity/product-sdk-terminal/dist/index.js", "utf-8");
+    assert.match(sdk, /session\.createTransaction\(/,
+      ">> FAIL: session signer: the SDK no longer calls session.createTransaction, so tx creation moved to a path this guard does not cover");
+    assert.ok(!/session\.signPayload\b/.test(sdk),
+      ">> FAIL: session signer: the SDK calls session.signPayload again, which sends the whole chunk calldata as the method field and Android rejects it as message-too-big");
+    const vendored = fs.readFileSync("src/auth/vendor/sessionSigner.ts", "utf-8");
+    assert.ok(!/signPayload/.test(vendored),
+      ">> FAIL: session signer: the vendored wrapper references signPayload, which is the message-too-big path the SDK migration removed");
   });
 
   test("signBytes routes through signRaw with Bytes tag", async () => {
@@ -2473,9 +2528,12 @@ describe("storage-signer", async () => {
     const dir = mkdtempSync(pathJoin(tmpdir(), "bd-slot-test-"));
     writeCache(dir, "dot-cli", FAKE_KEY_HEX);
     const result = await readBulletinSlotSigner("dot-cli", dir);
-    assert.ok(result !== null, "should find the key");
-    assert.ok(typeof result.ss58 === "string" && result.ss58.length > 0);
-    assert.ok(result.signer && typeof result.signer.signTx === "function");
+    assert.ok(result !== null,
+      ">> FAIL: readBulletinSlotSigner: a cached slot key was not found, so the deploy falls back to the shared pool instead of the login session's own slot");
+    assert.ok(typeof result.ss58 === "string" && result.ss58.length > 0,
+      ">> FAIL: readBulletinSlotSigner: the slot signer carries no ss58 address, so the caller cannot read its nonce or allowance");
+    assert.ok(result.signer && typeof result.signer === "function" && typeof result.signer.signBytes === "function",
+      ">> FAIL: readBulletinSlotSigner: the slot signer is not a callable papi v3 TxCreator with signBytes, so every submission through it throws inside papi");
   });
 
   test("readBulletinSlotSigner returns null for corrupt JSON", async () => {
@@ -6756,7 +6814,7 @@ describe("DotNS.preflight", () => {
   function makeSubmitTransferHarness() {
     let observerCb = null;
     const tx = {
-      signSubmitAndWatch: () => ({
+      createSubmitAndWatch: () => ({
         subscribe: (cb) => {
           observerCb = cb;
           return { unsubscribe: () => {} };
@@ -6779,7 +6837,7 @@ describe("DotNS.preflight", () => {
     let resolved = false;
     promise.then(() => { resolved = true; }, () => { resolved = true; });
 
-    emit({ type: "txBestBlocksState", found: true, ok: true });
+    emit({ type: "inBestBlock", ok: true });
     // Yield twice to let any erroneous resolution flush.
     await Promise.resolve(); await Promise.resolve();
     assert.strictEqual(resolved, false, "must keep waiting for finalization");
@@ -6791,14 +6849,14 @@ describe("DotNS.preflight", () => {
   test("submitTransfer: rejects on best-block ok=false (dispatch error)", async () => {
     const { d, emit } = makeSubmitTransferHarness();
     const promise = d.submitTransfer({}, "5".padEnd(48, "y"), 1n);
-    emit({ type: "txBestBlocksState", found: true, ok: false });
+    emit({ type: "inBestBlock", ok: false });
     await assert.rejects(promise, /dispatch error/);
   });
 
   test("submitTransfer: rejects on finalized ok=false (finalization error)", async () => {
     const { d, emit } = makeSubmitTransferHarness();
     const promise = d.submitTransfer({}, "5".padEnd(48, "y"), 1n);
-    emit({ type: "txBestBlocksState", found: true, ok: true });
+    emit({ type: "inBestBlock", ok: true });
     emit({ type: "finalized", ok: false });
     await assert.rejects(promise, /finalization error/);
   });
@@ -6806,7 +6864,7 @@ describe("DotNS.preflight", () => {
   test("submitTransfer: rejects when subscription completes without finalization", async () => {
     const { d, emit, complete } = makeSubmitTransferHarness();
     const promise = d.submitTransfer({}, "5".padEnd(48, "y"), 1n);
-    emit({ type: "txBestBlocksState", found: true, ok: true });
+    emit({ type: "inBestBlock", ok: true });
     complete();
     await assert.rejects(promise, /closed without finalization/);
   });
@@ -7296,7 +7354,7 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
       client: {
         tx: {
           Revive: { call: () => ({ decodedCall: {} }) },
-          Utility: { batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }) },
+          Utility: { batch_all: (args) => ({ createSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }) },
         },
       },
       signAndSubmitWithRetry: async (buildBatch) => { buildBatch(); return { kind: "hash", hash: "0xbatch" }; },
@@ -7356,7 +7414,7 @@ describe("DotNS.submitBatchedContractCalls independentCalls + multi-dry-run (#11
             call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
           },
           Utility: {
-            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+            batch_all: (args) => ({ createSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
           },
         },
       },
@@ -10334,7 +10392,7 @@ describe("bootstrapPool authorizer resolution (#1213 port) — no self-authorize
     const ensureBody = poolSrc.slice(ensureStart, nextExportAfterEnsure);
     assert.doesNotMatch(
       ensureBody,
-      /authorize_account|signAndSubmit|addFromUri/,
+      /authorize_account|createAndSubmit|addFromUri/,
       ">> FAIL: #1213 no-self-authorize: ensureAuthorized must never sign or submit authorize_account — this repo's deploy path only ever throws, it never grants",
     );
 
@@ -11182,12 +11240,12 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 31. watchTransaction "found:false" handling — isValid distinction
+// 31. watchTransaction "not in best block" handling
 // ---------------------------------------------------------------------------
-// polkadot-api's TxInBestBlocksNotFound carries an `isValid` flag:
-//   isValid:true  → tx is in the pool, just not yet in a block. Normal pre-
+// papi v3 splits the old txBestBlocksState event in two:
+//   notInBestBlock → tx is in the pool, just not yet in a block. Normal pre-
 //                   inclusion state. Must keep waiting.
-//   isValid:false → pool rejected the tx (will never include). Must reject
+//   InvalidTxError → pool rejected the tx (will never include). Must reject
 //                   (after a nonce-fallback check, in case a peer disagrees).
 // Earlier code counted every found:false as a "drop" and failed after 5,
 // producing spurious "tx dropped from best chain 5 times" failures whenever
@@ -11196,7 +11254,7 @@ describe("CHUNK_MORTALITY_PERIOD", () => {
 // Helpers build the minimal stub required by storeChunkedContent:
 // - unsafeApi.apis.BulletinTransactionStorageApi.account_authorization() → ample quota
 // - unsafeApi.tx.TransactionStorage.store_with_cid_config() → a tx with
-//   .signSubmitAndWatch() that returns a controllable Subscribable
+//   .createSubmitAndWatch() that returns a controllable Subscribable
 // - fetchNonce DI (avoids hitting live RPC)
 // - reconnect spy
 function makeStubApi(makeSubscribable) {
@@ -11212,7 +11270,7 @@ function makeStubApi(makeSubscribable) {
     tx: {
       TransactionStorage: {
         store_with_cid_config: () => ({
-          signSubmitAndWatch: (_signer, _opts) => makeSubscribable(),
+          createSubmitAndWatch: (_signer, _opts) => makeSubscribable(),
         }),
       },
     },
@@ -11228,17 +11286,17 @@ function makeSequencedStubApi(...makers) {
   });
 }
 
-// Subscribable that immediately emits txBestBlocksState { found: true, ok: true }.
+// Subscribable that immediately emits inBestBlock { ok: true }.
 function normalSubscribable() {
   return {
     subscribe({ next }) {
-      setImmediate(() => next({ type: "txBestBlocksState", found: true, ok: true }));
+      setImmediate(() => next({ type: "inBestBlock", ok: true }));
       return { unsubscribe() {} };
     },
   };
 }
 
-// Subscribable that emits N waiting events ({found:false, isValid:true}) and
+// Subscribable that emits N waiting events (notInBestBlock) and
 // then a final success event. Models a slow-block chain that eventually
 // includes the tx.
 function waitingThenSuccessSubscribable(waits) {
@@ -11247,11 +11305,11 @@ function waitingThenSuccessSubscribable(waits) {
       let emitted = 0;
       const id = setInterval(() => {
         if (emitted < waits) {
-          next({ type: "txBestBlocksState", found: false, isValid: true });
+          next({ type: "notInBestBlock" });
           emitted++;
         } else {
           clearInterval(id);
-          next({ type: "txBestBlocksState", found: true, ok: true });
+          next({ type: "inBestBlock", ok: true });
         }
       }, 1);
       return { unsubscribe() { clearInterval(id); } };
@@ -11259,24 +11317,32 @@ function waitingThenSuccessSubscribable(waits) {
   };
 }
 
-// Subscribable that emits a single rejection event ({found:false,isValid:false}).
+// Subscribable for a pool rejection. papi v3 raises InvalidTxError on the error
+// channel where v2 emitted txBestBlocksState {found:false, isValid:false}.
 function poolRejectSubscribable() {
   return {
-    subscribe({ next }) {
-      setImmediate(() => next({ type: "txBestBlocksState", found: false, isValid: false }));
+    subscribe({ error }) {
+      setImmediate(() => error(invalidTxError("Stale")));
       return { unsubscribe() {} };
     },
   };
 }
 
-// Subscribable that emits a single dispatch-error event (found:true, ok:false).
-// Not a connection error and not isValid:false — models a tx-level failure
+/** The shape papi throws for a tx the pool rejected: name plus the JSON body. */
+function invalidTxError(variant) {
+  const err = new Error(JSON.stringify({ type: "Invalid", value: { type: variant } }, null, 2));
+  err.name = "InvalidTxError";
+  return err;
+}
+
+// Subscribable that emits a single dispatch-error event (inBestBlock, ok:false).
+// Not a connection error and not a pool rejection — models a tx-level failure
 // (e.g. the #1051 timeout path standing in for a real 180s watchTransaction
 // timeout) that must fall through to the per-chunk MAX_CHUNK_RETRIES loop.
 function dispatchErrorSubscribable() {
   return {
     subscribe({ next }) {
-      setImmediate(() => next({ type: "txBestBlocksState", found: true, ok: false }));
+      setImmediate(() => next({ type: "inBestBlock", ok: false }));
       return { unsubscribe() {} };
     },
   };
@@ -11291,8 +11357,9 @@ function connectionErrorSubscribable() {
   };
 }
 
-// Minimal signer stub (watchTransaction only passes it to signSubmitAndWatch).
-const stubSigner = {};
+// Minimal signer stub (watchTransaction only passes it to createSubmitAndWatch).
+// papi v3 creators are callable; an object is the v2 shape assertTxCreator rejects.
+const stubSigner = () => {};
 const STUB_SS58 = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
 const ONE_BYTE_CHUNK = new Uint8Array([0x42]);
 
@@ -11310,7 +11377,7 @@ describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/wa
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({
-            signSubmitAndWatch: (_signer, _opts) => normalSubscribable(),
+            createSubmitAndWatch: (_signer, _opts) => normalSubscribable(),
           }),
         },
       },
@@ -11333,7 +11400,7 @@ describe("storeChunkedContent: quota-exhausted warning (bulletin #1547, check/wa
       });
       assert.ok(warnings.some(w => /exhausted/i.test(w)),
         ">> FAIL: bulletin #1547: a one-line warning naming the exhausted allowance must be printed");
-      assert.ok(!warnings.some(w => /granting|granted|signAndSubmit/i.test(w)),
+      assert.ok(!warnings.some(w => /granting|granted|createAndSubmit/i.test(w)),
         ">> FAIL: bulletin #1547 (check/warn half only): the warning must not claim or perform any re-authorization");
     } finally {
       console.warn = savedWarn;
@@ -11400,10 +11467,10 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT be called on normal success");
   });
 
-  // Regression: 100 found:false isValid:true events used to trip the old
+  // Regression: 100 notInBestBlock events used to trip the old
   // MAX_BEST_CHAIN_DROPS=5 counter and reject the chunk with
   // "tx dropped from best chain 5 times" before the chain had a chance to
-  // include it. New semantics: isValid:true is still-pending, keep waiting.
+  // include it. New semantics: notInBestBlock is still-pending, keep waiting.
   test("100 waiting events then success: chunk completes without spurious failure", async () => {
     let reconnectCalled = false;
     const reconnect = async () => {
@@ -11423,12 +11490,12 @@ describe("watchTransaction found:false handling", () => {
     assert.strictEqual(reconnectCalled, false, "reconnect must NOT be called when waiting events are followed by success");
   });
 
-  // isValid:false + CID present at best: tx was actually included even though
+  // Pool rejection + CID present at best: tx was actually included even though
   // the pool said invalid (peer disagreement). The best-block probe resolves
   // the chunk; reconnect is NOT called because the WS subscription itself was
   // healthy — only the tx was a problem. Pre-#1656 this was decided by the
   // nonce advancing, which counts the pool's own pending tx: a false positive.
-  test("isValid:false + CID present at best: chunk resolves via the chain fallback, no reconnect", async () => {
+  test("pool rejection + CID present at best: chunk resolves via the chain fallback, no reconnect", async () => {
     _resetProbeSession(); _bypassMetadataCheckForTest();
     let reconnectCalled = false;
     const reconnect = async () => {
@@ -15182,7 +15249,7 @@ describe("waitForChainLiveness (#1051)", () => {
 // ---------------------------------------------------------------------------
 // storeChunkedContent reconcile-before-resubmit regression (#1051): a chunk
 // whose tx fails at the WS layer (dispatch error — not a connection error,
-// not isValid:false) must be reconciled via a best-block CID probe before
+// not a pool rejection) must be reconciled via a best-block CID probe before
 // the per-chunk retry loop spends a resubmit on it. If the probe finds the
 // CID already present, storeChunk must NOT be called a second time — a
 // resubmit here would be a duplicate content write and, on a real chain, the
@@ -16028,8 +16095,8 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: chunk-numbering: the batch upload line must display the 1-based chunk index `chunk ${i + 1}`");
     assert.match(src, /Chunk \$\{idx \+ 1\}: nonce/,
       ">> FAIL: chunk-numbering: the nonce-consumed heuristic line must use 1-based `${idx + 1}`");
-    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: isValid:false but CID was probe-failed/,
-      ">> FAIL: chunk-numbering: the isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: pool-rejected but CID was probe-failed/,
+      ">> FAIL: chunk-numbering: the pool-rejection backstop line must use 1-based `${fail.index + 1}`");
     assert.match(src, /Chunk \$\{fail\.index \+ 1\}: tx rejected/,
       ">> FAIL: chunk-numbering: the mortal-expiry note must use 1-based `${fail.index + 1}`");
     assert.match(src, /Retrying chunk \$\{fail\.index \+ 1\} \(attempt/,
@@ -16038,8 +16105,8 @@ describe("incremental-stats v3 summary", () => {
       ">> FAIL: chunk-numbering: the reconcile-found line must use 1-based `${fail.index + 1}`");
     assert.match(src, /Chunk \$\{fail\.index \+ 1\}: chain still frozen/,
       ">> FAIL: chunk-numbering: the frozen-chain-wait line must use 1-based `${fail.index + 1}`");
-    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: retry isValid:false/,
-      ">> FAIL: chunk-numbering: the retry isValid:false backstop line must use 1-based `${fail.index + 1}`");
+    assert.match(src, /Chunk \$\{fail\.index \+ 1\}: retry pool-rejected/,
+      ">> FAIL: chunk-numbering: the retry pool-rejection backstop line must use 1-based `${fail.index + 1}`");
     assert.match(src, /Chunk \$\{fail\.index \+ 1\} failed after \$\{MAX_CHUNK_RETRIES\} retries/,
       ">> FAIL: chunk-numbering: the final chunk-failure throw must use 1-based `${fail.index + 1}`");
     assert.match(src, /Nonce-collision re-upload: chunk \$\{idx \+ 1\} \(attempt/,
@@ -16868,7 +16935,57 @@ describe("portability: Phase A upload set is a subset of Phase B's final CAR (#1
   });
 });
 
-describe("storeChunkedContent isValid:false backstop", () => {
+// papi v3 made a signer callable. A v2 PolkadotSigner object still satisfies the
+// types for a JS library caller (playground-cli, #811/S7), so the break has to be
+// named at the boundary rather than surfacing from inside papi.
+describe("assertTxCreator (papi v2 signer at the API boundary)", () => {
+  test("a v2 PolkadotSigner object is rejected by name, with the migration hint", async () => {
+    const { assertTxCreator } = await import("../dist/dotns.js");
+    const v2Signer = { publicKey: new Uint8Array(32), signTx: async () => new Uint8Array(), signBytes: async () => new Uint8Array() };
+    assert.throws(
+      () => assertTxCreator(v2Signer, "DeployOptions.signer"),
+      (err) => err.name === "NonRetryableError" && /getTxCreator/.test(err.message),
+      ">> FAIL: assertTxCreator: a papi v2 signer was accepted, so a library caller would fail somewhere inside papi with no hint about the migration",
+    );
+  });
+
+  test("a callable creator and an absent signer both pass", async () => {
+    const { assertTxCreator } = await import("../dist/dotns.js");
+    const creator = Object.assign(async () => "0x", { publicKey: new Uint8Array(32), signBytes: async () => new Uint8Array() });
+    assert.doesNotThrow(() => assertTxCreator(creator, "DeployOptions.signer"),
+      ">> FAIL: assertTxCreator: a valid v3 TxCreator was rejected");
+    assert.doesNotThrow(() => assertTxCreator(undefined, "DeployOptions.signer"),
+      ">> FAIL: assertTxCreator: an absent signer must be allowed, the mnemonic path supplies one later");
+  });
+});
+
+// papi reads the first entry for a repeated extension id (raw-tx-creator's
+// getExtensionData uses Array.prototype.find), so the capture must agree.
+describe("indexExtensions (papi v3 payload shape)", () => {
+  const ext = (id, extra) => ({ id, extra, additionalSigned: "0x" });
+
+  test("a duplicate extension id keeps the first entry, matching papi's own reader", () => {
+    const got = indexExtensions(["CheckGenesis"], [ext("CheckGenesis", "0xaa"), ext("CheckGenesis", "0xbb")]);
+    assert.equal(bytesToHex(got.byIdentifier.CheckGenesis.value), "0xaa",
+      ">> FAIL: indexExtensions: a duplicate id kept the last entry, but papi reads the first, so the extrinsic body would not match the bytes that were signed");
+  });
+
+  test("an ordered extension missing from the payload throws instead of building a short extrinsic", () => {
+    assert.throws(
+      () => indexExtensions(["CheckGenesis", "CheckNonce"], [ext("CheckGenesis", "0xaa")]),
+      /CheckNonce/,
+      ">> FAIL: indexExtensions: a missing extension was dropped silently, which assembles an extrinsic the chain will reject with no local diagnostic",
+    );
+  });
+
+  test("the pipeline order is preserved, not the payload's array order", () => {
+    const got = indexExtensions(["CheckNonce", "CheckGenesis"], [ext("CheckGenesis", "0xaa"), ext("CheckNonce", "0xbb")]);
+    assert.deepEqual(got.order, ["CheckNonce", "CheckGenesis"],
+      ">> FAIL: indexExtensions: the payload's array order leaked into the pipeline order, which decides the byte order of the extrinsic body");
+  });
+});
+
+describe("storeChunkedContent pool-rejection backstop", () => {
   test("ExistingProvider accepts probeFailedCids without TypeError", async () => {
     // Smoke-test: verify that storeChunkedContent destructures probeFailedCids
     // without throwing a TypeError. The function will throw later (no real chain),
@@ -17231,7 +17348,7 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
   const ACCOUNT_A = "5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY";
   const ACCOUNT_B = "5FHneW46xGXgs5mUiveU4sbTyGBzmstUspZC92UhjJM694ty";
 
-  // Capture-enabled stub api: records the nonce from each signSubmitAndWatch call.
+  // Capture-enabled stub api: records the nonce from each createSubmitAndWatch call.
   function makeCapturingStubApi(makeSubscribable, capturedNonces) {
     return {
       query: {
@@ -17241,7 +17358,7 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({
-            signSubmitAndWatch: (_signer, opts) => {
+            createSubmitAndWatch: (_signer, opts) => {
               capturedNonces.push(opts?.nonce);
               return makeSubscribable();
             },
@@ -17375,7 +17492,7 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
   // loop) must ALSO rebase on rotation. Before the fix it called doReconnect()
   // directly (not doReconnectAndRebase), so a rotation there left assignedNonces
   // keyed to the OLD account → the next batch submitted stale old-account nonces
-  // (isValid:false). Since that's NOT a connection error, the per-failure retry
+  // (pool rejection). Since that's NOT a connection error, the per-failure retry
   // never reconnects and the consumed-heuristic false-positives. Unlike #951's
   // tests (connection-error path), this drives the halt via the real Bulletin
   // status handler firing a WS ERROR between batches with no chunk error.
@@ -17393,7 +17510,7 @@ describe("storeChunkedContent account rotation on reconnect (#951)", () => {
       tx: {
         TransactionStorage: {
           store_with_cid_config: () => ({
-            signSubmitAndWatch: (_signer, opts) => {
+            createSubmitAndWatch: (_signer, opts) => {
               target.push(opts?.nonce);
               if (!halted) {
                 halted = true;
@@ -19610,12 +19727,12 @@ function buildReproveApis({
     tx: {
       AliasAccounts: {
         reprove_alias_account: (args) => ({
-          signSubmitAndWatch: (signer) => ({
+          createSubmitAndWatch: (signer) => ({
             subscribe: ({ next }) => {
-              // Return events: broadcasted → txBestBlocksState → finalized
+              // Return events: broadcasted → inBestBlock → finalized
               Promise.resolve().then(() => {
                 next({ type: "broadcasted" });
-                next({ type: "txBestBlocksState", found: true, ok: true, block: { hash: txResult } });
+                next({ type: "inBestBlock", ok: true, block: { hash: txResult } });
                 next({ type: "finalized", ok: true, block: { hash: txResult } });
               });
               return { unsubscribe: () => {} };
@@ -19802,11 +19919,11 @@ describe("reproveAliasToAccount (mock APIs)", () => {
       tx: {
         AliasAccounts: {
           reprove_alias_account: () => ({
-            signSubmitAndWatch: () => ({
+            createSubmitAndWatch: () => ({
               subscribe: ({ next }) => {
                 Promise.resolve().then(() => {
                   next({ type: "broadcasted" });
-                  next({ type: "txBestBlocksState", found: true, ok: false, dispatchError });
+                  next({ type: "inBestBlock", ok: false, dispatchError });
                 });
                 return { unsubscribe: () => {} };
               },
@@ -19860,31 +19977,11 @@ function buildClaimPgasApis({
   ringRoots = [{ revision: 5, root: new Uint8Array(32) }],
   nowMs = 1_716_000_000_000n,
 } = {}) {
-  // Minimal mock tx that supports getEncodedData() and sign()
+  // Minimal mock tx. No claimPgas unit test reaches the extension capture, which
+  // needs the real enhancer chain and SCALE metadata; the E2E on Alice covers it.
   const mockTx = {
     getEncodedData: async () => new Uint8Array([0x01, 0x02, 0x03]),
-    sign: async (signer, opts) => {
-      // Simulate papi invoking signTx with extension bytes
-      const fakeExtensions = {
-        AsPgas: { value: opts?.customSignedExtensions?.AsPgas?.value, additionalSigned: new Uint8Array() },
-        CheckNonce: { value: new Uint8Array([0x00]), additionalSigned: new Uint8Array() },
-        CheckMortality: { value: new Uint8Array([0x00]), additionalSigned: new Uint8Array(8) },
-        AuthorizeCall: { value: new Uint8Array(), additionalSigned: new Uint8Array() },
-        StorageWeightReclaim: { value: new Uint8Array(), additionalSigned: new Uint8Array() },
-      };
-      // Invoke signTx to trigger the sentinel
-      try {
-        await signer.signTx(
-          new Uint8Array([0x01, 0x02, 0x03]),
-          fakeExtensions,
-          // Fake metadata bytes (enough to not crash readExtensionOrder — we override it)
-          new Uint8Array(0),
-        );
-      } catch (e) {
-        if (e?.message !== "__pgas_capture_sentinel__") throw e;
-      }
-      return "0xsignedtx";
-    },
+    create: async () => new Uint8Array([0x01, 0x02, 0x03]),
   };
 
   const ahUnsafeApi = {
@@ -19938,7 +20035,7 @@ function buildClaimPgasApis({
       subscribe: ({ next }) => {
         Promise.resolve().then(() => {
           next({ type: "broadcasted" });
-          next({ type: "txBestBlocksState", found: true, ok: true, block: { hash: "0xcafebabe" } });
+          next({ type: "inBestBlock", ok: true, block: { hash: "0xcafebabe" } });
           next({ type: "finalized", ok: true, block: { hash: "0xcafebabe" } });
         });
         return { unsubscribe: () => {} };
@@ -20064,7 +20161,7 @@ describe("bindPersonalIdToAccount (mock APIs)", () => {
       subscribe: ({ next }) => {
         Promise.resolve().then(() => {
           next({ type: "broadcasted" });
-          next({ type: "txBestBlocksState", found: true, ok: true, block: { hash: "0xfeed" } });
+          next({ type: "inBestBlock", ok: true, block: { hash: "0xfeed" } });
           next({ type: "finalized", ok: true, block: { hash: "0xfeed" } });
         });
         return { unsubscribe: () => {} };
@@ -20092,12 +20189,57 @@ describe("bindPersonalIdToAccount (mock APIs)", () => {
     );
   });
 
-  test("throws client_error when extension capture fails (sign never calls signTx)", async () => {
-    // Simulate papi's sign() returning without calling signTx — captured stays null
+  test("the capture is immortal, so both passes sign the same CheckMortality bytes", async () => {
+    // CheckMortality sits after AsPerson in the People pipeline, so its bytes are
+    // inside the implication. A mortal era moves with the finalized head.
+    const seen = [];
     const mockTx = {
       getEncodedData: async () => new Uint8Array([0x01, 0x02]),
-      // sign() returns without invoking signer.signTx → captured = null → "extension capture failed"
-      sign: async (_signer, _opts) => "0xdead",
+      create: async (_creator, opts) => { seen.push(opts); return new Uint8Array([0xde, 0xad]); },
+    };
+    const typedApi = {
+      tx: { People: { set_personal_id_account: () => mockTx } },
+      query: { System: { Number: { getValue: async () => 1 } } },
+    };
+    await assert.rejects(
+      bindPersonalIdToAccount({ typedApi, client: baseClient, personalId: 0n, account: MOCK_ALICE, signMember }),
+      () => true,
+    );
+    assert.ok(seen.length > 0, ">> FAIL: bind-personal-id: the capture never called create, so the test asserts nothing");
+    for (const opts of seen) {
+      assert.deepEqual(opts.mortality, { mortal: false },
+        ">> FAIL: bind-personal-id: the capture pass is mortal, so a block finalising between pass 1 and pass 2 changes the CheckMortality bytes the proof signed and the chain rejects the extrinsic");
+    }
+  });
+
+  test("the first capture pass offers AsPerson as None, not empty bytes", async () => {
+    // Pass 1 has no proof yet. The AsPerson value is an Option, so it must be
+    // undefined: an empty Uint8Array is not a valid encoding of None and the
+    // codec throws before papi reaches the creator.
+    const seen = [];
+    const mockTx = {
+      getEncodedData: async () => new Uint8Array([0x01, 0x02]),
+      create: async (_creator, opts) => { seen.push(opts); return new Uint8Array([0xde, 0xad]); },
+    };
+    const typedApi = {
+      tx: { People: { set_personal_id_account: () => mockTx } },
+      query: { System: { Number: { getValue: async () => 1 } } },
+    };
+    await assert.rejects(
+      bindPersonalIdToAccount({ typedApi, client: baseClient, personalId: 0n, account: MOCK_ALICE, signMember }),
+      () => true,
+    );
+    assert.ok(seen.length > 0, ">> FAIL: bind-personal-id: the capture never called create, so the test asserts nothing");
+    assert.strictEqual(seen[0].customSignedExtensions.AsPerson.value, undefined,
+      ">> FAIL: bind-personal-id: the first capture pass sends an AsPerson value instead of None, so the codec rejects it and the binding never reaches the proof pass");
+  });
+
+  test("throws client_error when extension capture fails (create never calls the creator)", async () => {
+    // Simulate papi's create() returning without invoking the creator — captured stays null
+    const mockTx = {
+      getEncodedData: async () => new Uint8Array([0x01, 0x02]),
+      // create() returns without invoking the creator → captured = null → "extension capture failed"
+      create: async (_creator, _opts) => new Uint8Array([0xde, 0xad]),
     };
     const typedApi = {
       tx: { People: { set_personal_id_account: () => mockTx } },
@@ -20173,11 +20315,11 @@ function buildPaidAliasApis({
         set_alias_account: (args) => {
           capturedTxArgs.push(args);
           return {
-            signSubmitAndWatch: (signer, opts) => ({
+            createSubmitAndWatch: (signer, opts) => ({
               subscribe: ({ next }) => {
                 Promise.resolve().then(() => {
                   next({ type: "broadcasted" });
-                  next({ type: "txBestBlocksState", found: true, ok: true, block: { hash: "0xbaadf00d" } });
+                  next({ type: "inBestBlock", ok: true, block: { hash: "0xbaadf00d" } });
                   next({ type: "finalized", ok: true, block: { hash: "0xbaadf00d" } });
                 });
                 return { unsubscribe: () => {} };
@@ -21070,7 +21212,7 @@ describe("DotNS.submitBatchedContractCalls declares a buffered weight_limit and 
             call: (args) => { capturedCalls.push(args); return { decodedCall: { marker: capturedCalls.length } }; },
           },
           Utility: {
-            batch_all: (args) => ({ signSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
+            batch_all: (args) => ({ createSubmitAndWatch: () => ({ subscribe: () => ({ unsubscribe() {} }) }), __batchArgs: args }),
           },
         },
       },
@@ -22449,13 +22591,12 @@ describe("INVARIANT: no orphan chunks per deploy", () => {
 // 35. Block + tx hash capture for Bulletin uploads and DotNS writes (#537)
 // ---------------------------------------------------------------------------
 
-// Subscribable that emits a txBestBlocksState event carrying block receipt info.
+// Subscribable that emits an inBestBlock event carrying block receipt info.
 function receiptSubscribable(txHash = "0xabcd1234", blockHash = "0xdeadbeef", blockNumber = 42) {
   return {
     subscribe({ next }) {
       setImmediate(() => next({
-        type: "txBestBlocksState",
-        found: true,
+        type: "inBestBlock",
         ok: true,
         txHash,
         block: { hash: blockHash, number: blockNumber, index: 0 },
@@ -23594,7 +23735,8 @@ describe("fetchVersionInfo", () => {
 //   neither                            → "pool"   (getProvider)
 // ---------------------------------------------------------------------------
 describe("storage provider selection precedence (#673)", () => {
-  const stubSigner = {};
+  // papi v3 creators are callable; an object is the v2 shape assertTxCreator rejects.
+  const stubSigner = () => {};
 
   // signer+signerAddress activates "signer" storage mode since #811 (phone signing uses same signer for storage).
   test("signer+signerAddress (no storageSigner, no mnemonic) → signer mode (#811: phone signing uses signer for storage)", () => {
@@ -23966,7 +24108,7 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
           set_alias_account: (args) => {
             capturedTxArgs.push(args);
             return {
-              signSubmitAndWatch: () => ({
+              createSubmitAndWatch: () => ({
                 subscribe: ({ next }) => {
                   Promise.resolve().then(() => {
                     next({ type: "broadcasted" });
@@ -24059,7 +24201,7 @@ describe("bind-paid-alias tx-shape: set_alias_account with proof_valid_at (indiv
       tx: {
         AliasAccounts: {
           set_alias_account: () => ({
-            signSubmitAndWatch: () => ({
+            createSubmitAndWatch: () => ({
               subscribe: ({ next }) => {
                 Promise.resolve().then(() => {
                   next({ type: "finalized", ok: true, block: { hash: "0x1234" } });
@@ -24180,7 +24322,7 @@ describe("reprove tx-shape: proof_valid_at in reprove_alias_account (individuali
           reprove_alias_account: (args) => {
             capturedTxArgs.push(args);
             return {
-              signSubmitAndWatch: () => ({
+              createSubmitAndWatch: () => ({
                 subscribe: ({ next }) => {
                   Promise.resolve().then(() => {
                     next({ type: "broadcasted" });
@@ -25841,16 +25983,16 @@ describe("makeRetryStatusFilter", () => {
     );
   });
 
-  test("deduplicates 'included': repeated txBestBlocksState found=true events emit 'included' only once (#891)", () => {
-    // papi's txBestBlocksState subscription can emit found=true multiple times as
+  test("deduplicates 'included': repeated inBestBlock events emit 'included' only once (#891)", () => {
+    // papi's inBestBlock subscription can emit multiple times as
     // the tx appears/reappears across best-block updates. Without dedup the status
     // line would print twice (one per emit).
     const received = [];
     const filter = makeRetryStatusFilter((s) => received.push(s));
     filter.callback("signing");
     filter.callback("broadcasting");
-    filter.callback("included"); // first txBestBlocksState found=true
-    filter.callback("included"); // second txBestBlocksState found=true (reorg/reappear)
+    filter.callback("included"); // first inBestBlock
+    filter.callback("included"); // second inBestBlock (reorg/reappear)
     filter.callback("finalized");
     assert.deepStrictEqual(
       received,
@@ -27534,13 +27676,13 @@ describe("#1108 best-block resolution (transient finality hardening)", () => {
   process.env.BULLETIN_DOTNS_BESTBLOCK_GRACE_MS = "0";
   // The poll loop reads only Timestamp.Now; a constant keeps chain-time budget at 0.
   const fakeClient = () => ({ query: { Timestamp: { Now: { getValue: async () => 1000n } } } });
-  // A fake extrinsic whose signSubmitAndWatch replays `events` to the observer.
+  // A fake extrinsic whose createSubmitAndWatch replays `events` to the observer.
   const fakeExtrinsic = (events) => ({
-    signSubmitAndWatch() {
+    createSubmitAndWatch() {
       return { subscribe(observer) { for (const ev of events) queueMicrotask(() => observer.next(ev)); return { unsubscribe() {} }; } };
     },
   });
-  const bestBlock = { type: "txBestBlocksState", found: true, txHash: { toString: () => "0xabc" } };
+  const bestBlock = { type: "inBestBlock", txHash: { toString: () => "0xabc" } };
   const finalized = { type: "finalized", ok: true, block: { hash: "0xdef", number: 42 }, txHash: { toString: () => "0xabc" } };
 
   test("resolves best-block on inclusion + verifyEffect=true, without any finalized event", async () => {
@@ -28420,6 +28562,77 @@ describe("Sentry error diet: events only for failures", () => {
     for (const site of ['setDeployAttribute("deploy.chunk.retried", "true")', 'setDeployAttribute("deploy.reconnected", "true")', 'setDeployAttribute("deploy.chunk.retry_count",']) {
       assert.equal(count(deploySrc, site), 1, `>> FAIL: deploy.ts: ${site} must appear exactly once`);
     }
+  });
+
+  test("source: every chain submission names its mortality era", () => {
+    // papi's default era is 20 blocks plus the best-to-finalized gap, shorter
+    // than the 64 this repo's retry timing was built around. Parse the argument
+    // list rather than regex the call: a signer can be any expression, options
+    // can be built elsewhere, and a trailing comma breaks a shape match.
+    const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory() ? walk(path.join(dir, e.name))
+        : /\.(ts|mjs)$/.test(e.name) ? [path.join(dir, e.name)] : []);
+    const offenders = [];
+    for (const file of [...walk("src"), ...walk("tools")]) {
+      const src = fs.readFileSync(file, "utf-8");
+      const call = /\.(createSubmitAndWatch|createAndSubmit)\s*\(/g;
+      let m;
+      while ((m = call.exec(src)) !== null) {
+        // Walk to the matching close paren so nested calls and object literals
+        // in the argument list do not end the scan early.
+        let depth = 0, open = m.index + m[0].length - 1, end = open;
+        for (; end < src.length; end++) {
+          if (src[end] === "(") depth++;
+          else if (src[end] === ")" && --depth === 0) break;
+        }
+        const args = src.slice(open + 1, end);
+        // Split on the top-level comma: one argument means signer only.
+        let d = 0, split = -1;
+        for (let i = 0; i < args.length; i++) {
+          if ("([{".includes(args[i])) d++;
+          else if (")]}".includes(args[i])) d--;
+          else if (args[i] === "," && d === 0) { split = i; break; }
+        }
+        const opts = split === -1 ? "" : args.slice(split + 1).trim();
+        // An options argument that is an identifier or a spread is built
+        // elsewhere, so only inspect a literal for the era.
+        const literal = opts.startsWith("{") && !opts.includes("...");
+        if (opts === "" || opts === "undefined" || (literal && !opts.includes("mortality"))) {
+          offenders.push(`${file}:${src.slice(0, m.index).split("\n").length}`);
+        }
+      }
+    }
+    assert.deepEqual(offenders, [],
+      `>> FAIL: ${offenders.join(", ")}: a submission names no mortality era, so it silently takes papi's short default instead of the repo's 64`);
+  });
+
+  test("pool rejections that a resubmission cannot fix are not treated as reissuable", async () => {
+    // papi reports every invalid-transaction reason as InvalidTxError, where v2
+    // only sent nonce rejections that way. The chunk backstops read this to
+    // decide "may already be on chain, reissue at a fresh nonce".
+    const { REISSUABLE_REJECTIONS } = await import("../dist/deploy.js");
+    for (const v of ["Stale", "Future", "AncientBirthBlock"]) {
+      assert.ok(REISSUABLE_REJECTIONS.has(v),
+        `>> FAIL: REISSUABLE_REJECTIONS: ${v} is no longer reissuable, so a chunk the chain may already hold is retried as a hard failure instead of being deferred to verification`);
+    }
+    for (const v of ["Payment", "BadProof", "BadSigner", "ExhaustsResources", "Call"]) {
+      assert.ok(!REISSUABLE_REJECTIONS.has(v),
+        `>> FAIL: REISSUABLE_REJECTIONS: ${v} is treated as reissuable, so a chunk that fails identically on every attempt is deferred to the verify loop and ends as "Nonce-collision re-upload failed"`);
+    }
+  });
+
+  test("PGAS fees are elected through papi's own asset option", async () => {
+    const { PGAS_FEE_OPTIONS, PGAS_ASSET_LOCATION } = await import("../dist/personhood/constants.js");
+    // A customSignedExtensions entry lands behind the standard enhancer's native
+    // one and papi reads the first entry for an id, so the fee silently falls
+    // back to native and a zero-native PGAS account cannot pay.
+    assert.deepEqual(PGAS_FEE_OPTIONS.asset, PGAS_ASSET_LOCATION,
+      ">> FAIL: PGAS_FEE_OPTIONS: the fee asset is not papi's own `asset` option, so Asset-Hub fees are charged in native and a zero-native PGAS account fails to pay");
+    assert.ok(!("customSignedExtensions" in PGAS_FEE_OPTIONS),
+      ">> FAIL: PGAS_FEE_OPTIONS: fees are elected through customSignedExtensions again, which papi orders behind its own native entry");
+    const dotns = fs.readFileSync("src/dotns.ts", "utf-8");
+    assert.match(dotns, /feeAsset === "pgas" \? PGAS_FEE_OPTIONS/,
+      ">> FAIL: dotns: the pgas fee election no longer forwards PGAS_FEE_OPTIONS, so a contract call requested with feeAsset \"pgas\" pays in native");
   });
 
   test("source: bin finalize notes signals and captures crashes", () => {

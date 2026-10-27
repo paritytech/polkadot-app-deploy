@@ -100,7 +100,11 @@ export function buildResult({ scenario, env, signer, merkle, job, status, log, h
   const signature = str(h.signature) || extractSignature(text);
   let cls = "pass";
   if (code !== 0) {
-    cls = informative(h.class) ? h.class : classifyLeg({ exit: code, text: text || signature, status });
+    if (informative(h.class)) cls = h.class;
+    // No harness file and no scenario output: a setup step (npm ci, artifact
+    // download) failed before the scenario ran (#1731).
+    else if (harness == null && !text.trim() && !signature && status !== "cancelled") cls = "ci_setup";
+    else cls = classifyLeg({ exit: code, text: text || signature, status });
     if (cls === "unknown" && harnessExit === 0) cls = "post_suite_failure";
   }
   const attempt = Number.parseInt(runAttempt ?? h.run_attempt, 10);

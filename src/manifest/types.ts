@@ -135,10 +135,33 @@ export interface WorkerIncludes {
   funding?: boolean;
 }
 
+/**
+ * One Pocket card a worker can back (Pocket modality RFC, trinity-user-agents
+ * `docs/rfcs/pocket-modality.md`). Hosts list a card for a product only when
+ * the worker's published record names it, and drop every card of the product
+ * when one definition is invalid.
+ */
+export interface PocketCardDefinition {
+  /** Card label, unique within the product; screened by hosts as a chat identifier is. */
+  id: string;
+  /** Shown in the host's approval dialog and chrome. */
+  title: string;
+  /** Path inside the worker archive to the card's static face (a RendererNode tree as JSON). */
+  preview: string;
+  /** Whether the face shows above the expanded card when it opens. Hosts default to true. */
+  faceShown?: boolean;
+}
+
+/** The cards a worker backs. Allowed only with `includes.pocket: true`. */
+export interface WorkerPocket {
+  cards: PocketCardDefinition[];
+}
+
 export interface WorkerManifest extends CommonExecutableFieldsV1 {
   kind: "worker";
   entrypoint: string;
   includes: WorkerIncludes;
+  pocket?: WorkerPocket;
 }
 
 export type ExecutableManifest = AppManifest | WidgetManifest | FundingManifest | WorkerManifest;
@@ -180,6 +203,7 @@ export interface WorkerExecutableConfig {
   appVersion: AppVersion;
   entrypoint: string;
   includes: WorkerIncludes;
+  pocket?: WorkerPocket;
 }
 
 export type ExecutableConfig =

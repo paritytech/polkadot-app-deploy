@@ -128,5 +128,7 @@ export function composeExecutable(exec: ExecutableConfig): ExecutableManifest {
     appVersion: exec.appVersion,
     entrypoint: exec.entrypoint,
     includes: exec.includes,
+    // #1708: the card list is what makes a published Pocket card addable.
+    ...(exec.pocket !== undefined ? { pocket: exec.pocket } : {}),
   };
 }

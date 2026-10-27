@@ -9,7 +9,7 @@
 //      DotNS instance with generateCommitment/submitCommitment/
 //      waitForCommitmentAge/getPriceAndValidate/finalizeRegistration
 //      stubbed as call-counting spies, so this runs with no live chain.
-import { test, describe } from "node:test";
+import { test, describe, mock } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -25,6 +25,7 @@ import {
   resolveStateDir,
 } from "../dist/run-state.js";
 import { withIsolatedHome } from "./helpers/isolated-home.js";
+import { __setDeployRootSpanForTest } from "../dist/telemetry.js";
 
 const ENV_ID = "test-env";
 const TLD = "dot";
@@ -910,6 +911,103 @@ describe("DotNS.commitAndRegister — v0.6.0 priced-profile resume (#1412)", () 
 
       assert.equal(d.generateCommitment.calls.length, 1, ">> FAIL: commit-resume-priced-price-exceeded: a live price above the committed maxPrice ceiling must be discarded in favour of a fresh commit");
       assert.equal(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), null, ">> FAIL: commit-resume-priced-price-exceeded: the record must be discarded, not left around to fail the same way at reveal");
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1570 hardening follow-ups
+// ---------------------------------------------------------------------------
+describe("commitment pruning: read failure vs parse failure (#1570)", () => {
+  const HEX = "1".repeat(32);
+  test("a record the sweep cannot READ is kept; one that cannot PARSE is removed", { skip: process.platform === "win32" || (process.getuid && process.getuid() === 0) }, () => {
+    withIsolatedHome(() => {
+      const dir = resolveStateDir();
+      fs.mkdirSync(dir, { recursive: true });
+      const unreadable = path.join(dir, `commitment-${HEX}.json`);
+      const garbage = path.join(dir, `commitment-${"2".repeat(32)}.json`);
+      fs.writeFileSync(unreadable, JSON.stringify(baseRecord({ savedAt: 1 })));
+      fs.chmodSync(unreadable, 0o000);
+      fs.writeFileSync(garbage, "{not json");
+      try {
+        loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL);
+        assert.ok(fs.existsSync(unreadable), ">> FAIL: #1570: a transient read failure (EACCES) is not evidence the record is stale, so the sweep must keep it");
+        assert.ok(!fs.existsSync(garbage), ">> FAIL: #1570: a record that can never parse must be pruned");
+      } finally {
+        fs.chmodSync(unreadable, 0o600);
+      }
+    });
+  });
+});
+
+describe("DotNS resume hardening (#1570)", () => {
+  function rootSpan() {
+    const attrs = new Map();
+    return { attrs, setAttribute: (k, v) => { attrs.set(k, v); } };
+  }
+  function wireValidChain(d, commitTimestamp = 1_000) {
+    d.contractCall = spy(async (_a, _b, fn) => {
+      if (fn === "makeCommitment") return COMMITMENT_HASH;
+      if (fn === "commitments") return BigInt(commitTimestamp);
+      if (fn === "maxCommitmentAge") return BigInt(86_400);
+      throw new Error(`unexpected contractCall: ${fn}`);
+    });
+  }
+
+  test("a Timestamp.Now read that never answers is bounded: no resume, record kept, no hang", async () => {
+    await withIsolatedHome(async () => {
+      const record = baseRecord();
+      writeCommitmentRecord(record);
+      const d = makeDotNS();
+      wireValidChain(d);
+      d.clientWrapper = { client: { query: { Timestamp: { Now: { getValue: () => new Promise(() => {}) } } } } };
+      mock.timers.enable({ apis: ["setTimeout"] });
+      try {
+        const pending = d.resolveResumableCommitment(LABEL, false);
+        for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+        mock.timers.tick(30_000);
+        assert.equal(await pending, null, ">> FAIL: #1570: a hung Timestamp.Now read must time out into 'do not resume', not block the deploy forever");
+      } finally {
+        mock.timers.reset();
+      }
+      assert.deepEqual(loadCommitmentRecord(ENV_ID, TLD, OWNER, LABEL), record, ">> FAIL: #1570: a timeout is transient, the record must stay");
+    });
+  });
+
+  test("a resumed commitment flips deploy.dotns.commitment_resumed to \"true\" and drops the phone-signature total by the skipped commit", async () => {
+    await withIsolatedHome(async () => {
+      writeCommitmentRecord(baseRecord());
+      const d = makeDotNS();
+      wireHappyPathSpies(d);
+      wireValidChain(d);
+      d.clientWrapper = { client: { query: { Timestamp: { Now: { getValue: async () => BigInt(4_600 * 1000) } } } } };
+      d.setPhoneSignatureTotal(3);
+      const root = rootSpan();
+      __setDeployRootSpanForTest(root);
+      try {
+        await d.commitAndRegister(LABEL, false);
+      } finally {
+        __setDeployRootSpanForTest(null);
+      }
+      assert.equal(root.attrs.get("deploy.dotns.commitment_resumed"), "true", ">> FAIL: #1570: a resumed commitment must be marked on the span");
+      assert.equal(d._phoneSignatureTotal, 2, ">> FAIL: #1570: a resumed run skips the commit signature, so the announced total must drop by one");
+    });
+  });
+
+  test("a fresh commit does not mark the span resumed and leaves the phone-signature total alone", async () => {
+    await withIsolatedHome(async () => {
+      const d = makeDotNS();
+      wireHappyPathSpies(d);
+      d.setPhoneSignatureTotal(3);
+      const root = rootSpan();
+      __setDeployRootSpanForTest(root);
+      try {
+        await d.commitAndRegister(LABEL, false);
+      } finally {
+        __setDeployRootSpanForTest(null);
+      }
+      assert.notEqual(root.attrs.get("deploy.dotns.commitment_resumed"), "true", ">> FAIL: #1570: a fresh commit is not a resume");
+      assert.equal(d._phoneSignatureTotal, 3, ">> FAIL: #1570: a fresh commit keeps the announced signature total");
     });
   });
 });

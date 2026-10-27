@@ -3,9 +3,20 @@
 // circular imports between deploy.ts and modules deploy.ts depends on).
 
 export class NonRetryableError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "NonRetryableError";
+  }
+}
+
+/** A signer cannot fund one concrete chain submission. The stable kind lets
+ * telemetry classify the mechanism without depending on mutable prose. */
+export class InsufficientFundsError extends NonRetryableError {
+  readonly deployErrorKind = "funding.insufficient_balance" as const;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "InsufficientFundsError";
   }
 }
 

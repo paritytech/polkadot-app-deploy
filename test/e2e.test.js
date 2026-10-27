@@ -215,8 +215,20 @@ const ALICE_MNEMONIC = DEFAULT_MNEMONIC;
 // this, so a scenario gets its own signer from the map alone. Exported pure
 // form so unit tests can assert the mapping without running a deploy.
 export function directSignerArgsFor(scenario, mnemonic = ALICE_MNEMONIC) {
-  const p = ISOLATED_DIRECT_SIGNERS[scenario] ?? null;
+  const p = directSignerPathFor(scenario);
   return ["--mnemonic", mnemonic, ...(p ? ["--derivation-path", p] : [])];
+}
+
+// Single source of truth for which derivation path a direct leg signs with
+// (null = bare Alice ROOT). Used by both the deploy args and the PoP probe.
+function directSignerPathFor(scenario) {
+  return ISOLATED_DIRECT_SIGNERS[scenario] ?? null;
+}
+
+// The derivation path the PoP probe must read: the account that actually signs.
+// Pool legs sign through the pool, so their probe stays on the bare mnemonic.
+export function probeDerivationPathFor(scenario, signer) {
+  return signer === "direct" ? directSignerPathFor(scenario) : null;
 }
 
 function directSignerArgs() {
@@ -611,16 +623,14 @@ describe("e2e", { skip: !ENABLED }, () => {
   installE2eResultHook({ scenario: SCENARIO, signer: SIGNER, merkle: MERKLE, env: E2E_ENV_ID });
   after(() => armExitGuard());
   before(async () => {
-    const isolated = directSignerDerivationPath();
     signerPopStatus = await probeSignerPopStatus({
       dotnsFactory: () => new DotNS(),
-      signer: SIGNER,
       bulletinDeployEnv: E2E_ENV_ID,
       resolveEnvConnectOptions: resolveDotnsEnvConnectOptions,
       defaultMnemonic: DEFAULT_MNEMONIC,
-      // Probe the path the scenario deploys with (probe-pop-status.js COUPLING
-      // NOTE). Spread: an explicit null would mean "probe the bare account".
-      ...(isolated ? { derivationPath: isolated } : {}),
+      // Probe the account the scenario actually signs with (probe-pop-status.js
+      // COUPLING NOTE); null = bare ROOT.
+      derivationPath: probeDerivationPathFor(SCENARIO, SIGNER),
     });
   });
 

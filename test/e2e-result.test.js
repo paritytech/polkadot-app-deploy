@@ -86,8 +86,20 @@ describe("buildResult", () => {
     assert.equal(r.scenario, "");
     assert.equal(r.job, "");
     assert.equal(r.run_attempt, 1);
-    assert.equal(r.class, "unknown");
+    assert.equal(r.class, "ci_setup");
     assert.equal(r.exit, 1);
+  });
+  test("failed leg with no or blank log is ci_setup; one with an unrecognised log is unknown (#1731)", () => {
+    for (const log of ["", undefined, "  \n"]) assert.equal(buildResult({ status: "failure", log }).class, "ci_setup");
+    assert.equal(buildResult({ status: "failure", log: "who knows" }).class, "unknown");
+  });
+  test("cancelled leg with no log stays cancelled (#1731)", () => {
+    assert.equal(buildResult({ status: "cancelled" }).class, "cancelled");
+  });
+  test("a harness-written result means the scenario ran: never ci_setup (#1731)", () => {
+    assert.equal(buildResult({ status: "failure", harness: { exit: 1, class: "contract_revert" } }).class, "contract_revert");
+    assert.equal(buildResult({ status: "failure", harness: { exit: 1, class: "unknown" } }).class, "unknown");
+    assert.equal(buildResult({ status: "failure", harness: { exit: 0, class: "pass" } }).class, "post_suite_failure");
   });
   test("harness file supplies class and signature when there is no log", () => {
     const harness = { exit: 1, class: "contract_revert", signature: ">> FAIL: S1: reverted", scenario: "s1", env: "x", signer: "pool", merkle: "kubo" };
@@ -229,7 +241,7 @@ describe("e2e-result CLI", () => {
     assert.equal(r.status, 0, r.stderr);
     const [f] = fs.readdirSync(dir);
     const j = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
-    assert.equal(j.class, "unknown");
+    assert.equal(j.class, "ci_setup");
   });
 
   test("index: latest attempt per job, normalised names, TSV of job/class/signature", async () => {

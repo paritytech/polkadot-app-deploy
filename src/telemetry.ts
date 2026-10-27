@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import pkg from "../package.json";
-import { SHIPPED_CONFIG_ORIGIN, FALLBACK_CONFIG_ORIGIN } from "./errors.js";
+import { InsufficientFundsError, SHIPPED_CONFIG_ORIGIN, FALLBACK_CONFIG_ORIGIN } from "./errors.js";
 import { maybeWriteMemoryReport, sampleFromBytes, type MemorySampleMb, type DeployContextForReport, type MemoryReport } from "./memory-report.js";
 import { writeRunState } from "./run-state.js";
 import type { CodePath } from "./code-paths.js";
@@ -290,6 +290,10 @@ const DEPLOY_SEED_OUTCOME: Record<string, string> = {
 // getWsProvider's onStatusChanged when papi connects to a non-primary endpoint.
 const DEPLOY_SEED_RPC: Record<string, string> = {
   "deploy.rpc.failed_over": "false",
+  // Recovered-path flags (their warnings no longer send Sentry events): seeded
+  // "false", flipped in deploy.ts at the chunk-retry site / doReconnect.
+  "deploy.chunk.retried": "false",
+  "deploy.reconnected": "false",
 };
 
 // DotNS / naming layer: balance gate flags + tx resolution kind + backend identity.
@@ -298,6 +302,8 @@ const DEPLOY_SEED_DOTNS: Record<string, string> = {
   // for "% hitting the floor" and "% recovered via testnet auto-top-up". Flipped by gateOnFeeBalance.
   "deploy.dotns.signer_below_floor": "false",
   "deploy.dotns.toppedup": "false",
+  // #1570: flipped by commitAndRegister when a stored commit-reveal commitment is resumed.
+  "deploy.dotns.commitment_resumed": "false",
   // Seeded "hash" so spans for non-DotNS deploys group cleanly in the "hash" bucket.
   "deploy.dotns.tx_resolution_kind": "hash",
   // Backend identity (module constants — stable across calls).
@@ -840,11 +846,17 @@ export const ERROR_KIND_CATEGORY: Record<DeployErrorKind, DeployErrorCategory> =
 // span's `error.message`) must derive kind/message/pattern from here so no
 // path can end up with the raw error recorded but the classification left
 // null.
-function classifyErrorForSpan(msg: string): { kind: DeployErrorKind; message: string; pattern: string } {
+function classifyErrorForSpan(errorOrMessage: unknown): { kind: DeployErrorKind; message: string; pattern: string; raw: string } {
+  const raw = typeof errorOrMessage === "string"
+    ? errorOrMessage
+    : (errorOrMessage as Error | undefined)?.message ?? String(errorOrMessage);
   return {
-    kind: classifyErrorKind(msg),
-    message: sanitizeErrorMessage(msg),
-    pattern: analyseErrorPattern(msg),
+    kind: errorOrMessage instanceof InsufficientFundsError
+      ? errorOrMessage.deployErrorKind
+      : classifyErrorKind(raw),
+    message: sanitizeErrorMessage(raw),
+    pattern: analyseErrorPattern(raw),
+    raw,
   };
 }
 
@@ -902,7 +914,7 @@ export async function withSpan<T>(op: string, description: string, attributes: R
       return await fn();
     } catch (error) {
       const msg = (error as Error).message ?? String(error);
-      const { kind, message, pattern } = classifyErrorForSpan(msg);
+      const { kind, message, pattern } = classifyErrorForSpan(error);
       span.setAttribute("error.message", msg);
       span.setAttribute("deploy.error_kind", kind);
       span.setAttribute("deploy.error_message", message);
@@ -1085,9 +1097,9 @@ export async function withDeploySpan<T>(domain: string, fn: () => T | Promise<T>
               outputDir: reportContext.outputDir,
               onSentryAttach: (r: MemoryReport) => {
                 try {
-                  Sentry!.captureMessage(`deploy memory threshold crossed (${r.threshold.peakRssMb} MB)`, {
+                  Sentry!.captureMessage("deploy memory threshold crossed", {
                     level: "warning",
-                    tags: { "deploy.mem.report": "1" },
+                    tags: { "deploy.mem.report": "1", "deploy.mem.peak_rss_mb": String(r.threshold.peakRssMb) },
                     extra: { memoryReport: r },
                   });
                 } catch { /* telemetry must never break the deploy */ }
@@ -1138,9 +1150,9 @@ export function setDeployAttribute(key: string, value: string | number | boolean
 // `deploy.error_message`, `deploy.error_pattern_signature`) on `span` in one
 // call. Used by recordDeployFailure, and by setDeployError for the active root
 // span; route error recording through it rather than setting deploy.error alone.
-function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | number | boolean) => void }, msg: string): void {
-  const { kind, message, pattern } = classifyErrorForSpan(msg);
-  span.setAttribute("deploy.error", msg.slice(0, 500));
+function setDeployErrorOnSpan(span: { setAttribute: (k: string, v: string | number | boolean) => void }, errorOrMessage: unknown): void {
+  const { kind, message, pattern, raw } = classifyErrorForSpan(errorOrMessage);
+  span.setAttribute("deploy.error", raw.slice(0, 500));
   span.setAttribute("deploy.error_kind", kind);
   span.setAttribute("deploy.error_message", message);
   span.setAttribute("deploy.error_pattern_signature", pattern);
@@ -1158,8 +1170,9 @@ function recordDeployFailure(span: any, error: unknown): void {
   // Mechanism classification (how it failed, not whose fault).
   // Propagated from the leaf chain-op span up to the root deploy span so
   // dashboards can group by deploy.error_kind without drilling into child spans.
-  setDeployErrorOnSpan(span, msg);
-  const errorCategory = classifyDeployError(msg);
+  setDeployErrorOnSpan(span, error);
+  const typedKind = error instanceof InsufficientFundsError ? error.deployErrorKind : undefined;
+  const errorCategory = typedKind ? categoryOf(typedKind, msg) : classifyDeployError(msg);
   span.setAttribute("deploy.error_category", errorCategory);
   currentErrorCategory = errorCategory;
   // Expected refusals (owned-by, reserved label, insufficient balance…)
@@ -1168,7 +1181,7 @@ function recordDeployFailure(span: any, error: unknown): void {
   // widgets) reflect the tool's health, not the user's typing. A later
   // captureWarning during the refusal flow will still flip sad back to
   // "true". That is intended: friction during a refusal is still friction.
-  const isExpected = isExpectedError(msg);
+  const isExpected = typedKind ? errorCategory === "user" : isExpectedError(msg);
   span.setAttribute("deploy.expected", isExpected ? "true" : "false");
   span.setAttribute("deploy.sad", isExpected ? "false" : "true");
   if (!isExpected) {
@@ -1247,11 +1260,15 @@ export function markCodePath(id: CodePath): void {
   setDeployAttribute(`code.path.${id}`, "true");
 }
 
-export function captureWarning(message: string, context?: Record<string, unknown>): void {
+/**
+ * Record a recovered-path warning: breadcrumb + deploy.sad / sad-reason tracking,
+ * but NO Sentry event. Use for handled-and-recovered paths; exhaustion/failure
+ * is captured by the deploy's own error. captureWarning adds the event.
+ */
+export function noteWarning(message: string, context?: Record<string, unknown>): void {
   if (!Sentry) return;
   try {
     Sentry.addBreadcrumb({ level: "warning", message, data: context });
-    Sentry.captureMessage(message, { level: "warning", extra: context });
     if (deployRootSpan) deployRootSpan.setAttribute("deploy.sad", "true");
     const reason = classifySadReason(message);
     const priority = SAD_REASON_PRIORITY[reason] ?? 0;
@@ -1260,6 +1277,14 @@ export function captureWarning(message: string, context?: Record<string, unknown
       currentSadReasonPriority = priority;
     }
     currentDeploySad = true;
+  } catch { /* telemetry must never break the deploy */ }
+}
+
+export function captureWarning(message: string, context?: Record<string, unknown>): void {
+  if (!Sentry) return;
+  noteWarning(message, context);
+  try {
+    Sentry.captureMessage(message, { level: "warning", extra: context });
   } catch { /* telemetry must never break the deploy */ }
 }
 

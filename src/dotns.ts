@@ -22,12 +22,12 @@ import {
   namehash,
 } from "viem";
 import { CID } from "multiformats/cid";
-import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath } from "./telemetry.js";
+import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath, classifyErrorKind } from "./telemetry.js";
 import { CODE_PATHS } from "./code-paths.js";
 import { isTestnetSpecName, testnetFromNetworkField } from "./pool.js";
 import { validateContractAddresses } from "./environments.js";
 import type { PopSelfServeConfig } from "./environments.js";
-import { NonRetryableError } from "./errors.js";
+import { InsufficientFundsError, NonRetryableError } from "./errors.js";
 import type { PolkadotSigner } from "polkadot-api";
 import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
 import type { DotnsProtocolAdapter, DotnsAbiProfile, DotnsPricingInput } from "./dotns-protocol.js";
@@ -82,6 +82,8 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   popSelfServe?: PopSelfServeConfig | null;
   /** Optional override for the storage deposit required for a fresh TLD register(). Loaded from environments.json per-env. */
   registerStorageDeposit?: bigint;
+  /** Optional record-write storage-deposit floor (default MINIMUM_RECORD_STORAGE_DEPOSIT, capped at the registration floor), from environments.json. */
+  recordStorageDeposit?: bigint;
   /**
    * Optional per-environment DotNS TLD (e.g. "paseo" on paseo-next-v2; "dot"
    * on every other env). See environments.json's per-env `tld` field. When
@@ -232,7 +234,8 @@ export interface DotnsPreflightResult {
 const ONE_PAS = 10_000_000_000n;
 // Threshold for `setContenthash` on an already-owned label. ~0.001 PAS in
 // observed runs; cap at 0.01 PAS to absorb fee variance and a one-off
-// map_account if the signer hasn't been mapped yet.
+// map_account if the signer hasn't been mapped yet. Each actual Revive.call
+// separately gates on its dry-run-derived storage-deposit limit before submit.
 const FEE_FLOOR_OWNED = ONE_PAS / 100n;
 // Threshold for `register` (commit + reveal + optional map_account). Worst-case
 // observed ~0.05 PAS; cap at 0.1 PAS so the signer can absorb at least one
@@ -266,6 +269,15 @@ export const AUTO_MAP_RENT_HEADROOM = ONE_PAS * 20n; // 20 PAS
 // Minimum storage deposit required for a fresh TLD register() on paseo-next-v2.
 // pallet-revive dry-run returns flags=1 data=0x when free balance < this amount.
 export const MINIMUM_REGISTER_STORAGE_DEPOSIT = 2_000_000_000_000n; // 200 PAS
+// Read-only dry runs on 2026-10-17 measured the exact write calls identically
+// on paseo-next-v2 and preview: setText 0.02064 PAS, setContenthash 0 PAS,
+// setResolver 0 PAS, and a fresh setSubnodeOwner 0.14448 PAS. Keep just over
+// 10x the largest measurement as a runtime/storage-cost variance floor without
+// making an owned-name write reserve the registration-only floor above.
+// Independently dry-runnable calls still receive the normal 20% buffer, so a
+// higher future estimate wins this floor. A dependent batch whose tail cannot
+// be dry-run honestly keeps the registration floor for every inner call.
+export const MINIMUM_RECORD_STORAGE_DEPOSIT = 15_000_000_000n; // 1.5 PAS
 // The register() msg.value is the tier-resolved deposit from PopRules, NOT a
 // fixed RENT_PRICE: 0 for a verified (Lite/Full) signer, PopRules's live
 // deposit read for a NoStatus signer. It is a refundable escrow deposit, not a
@@ -488,11 +500,14 @@ export class WatcherSilentNoEventError extends Error {
 // Retry decision for DotNS extrinsic submission errors. Stale / Future /
 // connection errors mean the tx didn't land due to mortality or network
 // timing, so a rebuild-and-resubmit with fresh nonce has a real chance.
-// Dispatch errors (contract revert, insufficient balance) fail identically
-// on retry and abort.
-export function classifyTxRetryDecision(err: unknown): "retry" | "abort" {
+// Dispatch errors (contract revert, insufficient balance) fail identically on
+// retry and abort, except TransferFailed when a top-up can clear it.
+export function classifyTxRetryDecision(err: unknown, { canRefund = false } = {}): "retry" | "abort" {
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
+  // Revive raises TransferFailed when a concurrent deploy spent the signer's
+  // balance after the funding gate cleared it (#1706).
+  if (canRefund && classifyErrorKind(msg) === "funding.transfer_failed") return "retry";
   if (lower.includes("nonce-advance fallback")) return "retry";
   if (/\bstale\b/.test(lower)) return "retry";
   if (/"type"\s*:\s*"future"|\binvalid::future\b/.test(lower)) return "retry";
@@ -2031,7 +2046,7 @@ function parsePersonhoodStatusResult(result: unknown): number {
 // and never reach the actual DECLARED storage_deposit_limit on a submitted
 // Revive.call — so an operator lowering (or raising) the env's configured
 // floor saw no effect on what the chain actually required. Fixed by giving
-// ReviveClientWrapper a settable floor (see setStorageDepositFloor below),
+// ReviveClientWrapper a settable floor (see setStorageDepositFloors below),
 // defaulted to this constant and overridden with the connected DotNS
 // instance's this._registerStorageDeposit right after construction
 // (recreateReviveClient) — see storageDepositLimitFor's call sites.
@@ -2057,6 +2072,82 @@ export function storageDepositLimitFor(
   const buffered = (estimatedStorageDeposit * 120n) / 100n;
   return buffered < floor ? floor : buffered;
 }
+
+/**
+ * Explicit storage-deposit policy declared by each call site.
+ * - "record": an owned-name record write (setText, setContenthash,
+ *   setResolver, setSubnodeOwner) dry-run against its exact calldata right
+ *   before submission, so it uses the measured record floor
+ *   (MINIMUM_RECORD_STORAGE_DEPOSIT or the env override).
+ * - "registration": the conservative registration floor, for work whose cost
+ *   cannot be measured honestly before submission (commit, register,
+ *   transferFrom).
+ * Absent means "registration": an unclassified call fails closed.
+ */
+export type DepositPolicy = "record" | "registration";
+
+/**
+ * Select the conservative floor for the call's declared deposit policy. The
+ * record floor never exceeds the registration floor.
+ */
+export function storageDepositFloorForCall(
+  depositPolicy: DepositPolicy | undefined,
+  registerFloor: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT,
+  recordFloor: bigint = MINIMUM_RECORD_STORAGE_DEPOSIT,
+): bigint {
+  return depositPolicy === "record" && recordFloor < registerFloor ? recordFloor : registerFloor;
+}
+
+/**
+ * Convert one concrete dry-run result into the storage limit submitted for
+ * that call. The type guard is defensive: current adapters always normalize
+ * storageDeposit to bigint, but submitting without a concrete estimate would
+ * silently bypass the measurement-based policy.
+ */
+export function storageDepositLimitForCall(
+  functionName: string | undefined,
+  estimate: unknown,
+  depositPolicy: DepositPolicy | undefined,
+  registerFloor: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT,
+  recordFloor: bigint = MINIMUM_RECORD_STORAGE_DEPOSIT,
+): bigint {
+  if (typeof estimate !== "bigint") {
+    throw new Error(
+      `Dry-run storage-deposit estimate unavailable for ${functionName ?? "Revive.call"}; refusing to submit without a concrete limit`,
+    );
+  }
+  return storageDepositLimitFor(estimate, storageDepositFloorForCall(depositPolicy, registerFloor, recordFloor));
+}
+
+function bufferedStorageDepositEstimate(estimate: bigint): bigint {
+  return (estimate * 120n) / 100n;
+}
+
+function estimatedBatchStorageRequirement(
+  entries: { limit: bigint; bufferedEstimate: bigint }[],
+): bigint {
+  if (entries.length === 0) return 0n;
+  // Each inner call is checked against its own declared limit when it runs;
+  // only storage actually charged by earlier calls reduces the balance seen by
+  // later siblings. Cover the largest declared limit once, then add buffered
+  // estimates for every other call. When limits tie, let that one limit cover
+  // the largest estimate so floors are not multiplied by the batch length.
+  let coveredIndex = 0;
+  for (let i = 1; i < entries.length; i++) {
+    if (
+      entries[i].limit > entries[coveredIndex].limit
+      || (entries[i].limit === entries[coveredIndex].limit
+        && entries[i].bufferedEstimate > entries[coveredIndex].bufferedEstimate)
+    ) {
+      coveredIndex = i;
+    }
+  }
+  return entries.reduce(
+    (required, entry, index) => required + (index === coveredIndex ? entry.limit : entry.bufferedEstimate),
+    0n,
+  );
+}
+
 
 /**
  * The weight ceiling to declare on a Revive call, given the dry run's
@@ -2096,24 +2187,28 @@ export class ReviveClientWrapper {
 
   client: any;
   mappedAccounts: Set<string>;
-  // bulletin-deploy #1518: the storage-deposit floor this wrapper declares on
-  // every Revive.call it dry-runs/submits (dryRunReviveCall, used by
-  // submitTransaction and submitBatchedTransactions). Defaults to the module
-  // constant so a wrapper nobody configured (e.g. a bare
-  // `new ReviveClientWrapper(client)` in a test) still declares a safe,
-  // known floor rather than silently falling back to 0.
-  // DotNS.recreateReviveClient — the only place a wrapper is ever
-  // constructed — calls setStorageDepositFloor right after construction, so
-  // every dry-run path through this wrapper picks up the owning DotNS
-  // instance's configured/measured this._registerStorageDeposit
-  // automatically; no per-call parameter to thread (and forget) at each new
-  // call site.
+  // #1518: the storage-deposit floors available to every Revive.call dry-run/
+  // submission. dryRunReviveCall selects the registration floor for calls with
+  // no explicit depositPolicy or "registration"; "record" calls use the record
+  // floor. Defaults to the module constants so a wrapper nobody configured (e.g.
+  // a bare `new ReviveClientWrapper(api)` in a test) still declares a SAFE,
+  // measured floor rather than 0. DotNS.recreateReviveClient — the only place a
+  // wrapper is ever constructed — calls setStorageDepositFloors right after
+  // construction, so every dry-run path picks up the owning DotNS instance's
+  // values; no per-call parameter to thread (and forget) at each call site.
   private _storageDepositFloor: bigint = REVIVE_CALL_MINIMUM_STORAGE_DEPOSIT;
+  private _recordStorageDepositFloor: bigint = MINIMUM_RECORD_STORAGE_DEPOSIT;
+  private _submissionFundingGate: ((operation: string, storageDepositLimit: bigint, value: bigint) => Promise<void>) | null = null;
 
   constructor(client: any) { this.client = client; this.mappedAccounts = new Set(); }
 
-  setStorageDepositFloor(floor: bigint): void {
-    this._storageDepositFloor = floor;
+  setStorageDepositFloors({ register, record }: { register: bigint; record: bigint }): void {
+    this._storageDepositFloor = register;
+    this._recordStorageDepositFloor = record;
+  }
+
+  setSubmissionFundingGate(gate: (operation: string, storageDepositLimit: bigint, value: bigint) => Promise<void>): void {
+    this._submissionFundingGate = gate;
   }
 
   async getEvmAddress(substrateAddress: string): Promise<string> {
@@ -2343,7 +2438,7 @@ export class ReviveClientWrapper {
     });
   }
 
-  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: PhoneOnResign; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number } = {}): Promise<TxResolution> {
+  async signAndSubmitWithRetry(buildExtrinsic: () => any, signer: PolkadotSigner, statusCallback: (status: string) => void, label: string, opts: { nonceFallback?: { rpcs: string[]; senderSS58: string; expectedNonce: number }; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: PhoneOnResign; fetchNonce?: (rpcs: string[], ss58: string) => Promise<number>; sleep?: (ms: number) => Promise<void>; nonceContentionBackoffMs?: (attempt: number) => number; fundingGate?: { operation: string; storageDepositLimit: bigint; value: bigint } } = {}): Promise<TxResolution> {
     const filter = makeRetryStatusFilter(statusCallback);
     let lastError: unknown;
     for (let attempt = 1; attempt <= DOTNS_TX_MAX_ATTEMPTS; attempt++) {
@@ -2356,6 +2451,11 @@ export class ReviveClientWrapper {
         await opts.onResign?.(attempt);
       }
       try {
+        // Inside the loop: a concurrent deploy can spend the balance an
+        // earlier attempt's gate cleared (#1706).
+        if (opts.fundingGate) {
+          await this._submissionFundingGate?.(opts.fundingGate.operation, opts.fundingGate.storageDepositLimit, opts.fundingGate.value);
+        }
         // Rebuilt + re-signed each attempt → papi reads a fresh on-chain nonce
         // (retries never reuse the stale one).
         return await this.signAndSubmitExtrinsic(buildExtrinsic(), signer, filter.callback, opts);
@@ -2400,7 +2500,7 @@ export class ReviveClientWrapper {
           }
         }
 
-        const decision = classifyTxRetryDecision(e);
+        const decision = classifyTxRetryDecision(e, { canRefund: Boolean(opts.fundingGate && this._submissionFundingGate) });
         const msg = e?.message ?? String(e);
         if (!shouldRetryTxAttempt(attempt, DOTNS_TX_MAX_ATTEMPTS, decision)) {
           // Final attempt or non-retryable error: announce it (don't break
@@ -2417,6 +2517,9 @@ export class ReviveClientWrapper {
       }
     }
     filter.flush(); // surface "failed" when the overall operation truly failed
+    if (opts.fundingGate && this._submissionFundingGate && classifyErrorKind(lastError instanceof Error ? lastError.message : String(lastError)) === "funding.transfer_failed") {
+      throw new Error(`${label}: the signer's balance was spent between the funding check and this transaction, and ${DOTNS_TX_MAX_ATTEMPTS} top-ups did not recover it. Another deploy is most likely sharing this signer. Underlying error: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+    }
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
@@ -2429,8 +2532,8 @@ export class ReviveClientWrapper {
     value: bigint,
     encodedData: string,
     signerSubstrateAddress: string,
-    context: { functionName?: string; args?: unknown[]; contracts?: Record<string, string> },
-  ): Promise<{ weight_limit: { ref_time: bigint; proof_size: bigint }; storage_deposit_limit: bigint }> {
+    context: { functionName?: string; args?: unknown[]; contracts?: Record<string, string>; depositPolicy?: DepositPolicy },
+  ): Promise<{ weight_limit: { ref_time: bigint; proof_size: bigint }; storage_deposit_limit: bigint; buffered_storage_deposit_estimate: bigint }> {
     const gasEstimate = await this.estimateGasForCall(signerSubstrateAddress, contractAddress, value, encodedData);
     if (!gasEstimate.success) {
       const signerEvmAddress = await this.getEvmAddress(signerSubstrateAddress);
@@ -2449,7 +2552,14 @@ export class ReviveClientWrapper {
     }
     return {
       weight_limit: weightLimitFor(gasEstimate.gasRequired),
-      storage_deposit_limit: storageDepositLimitFor(gasEstimate.storageDeposit, this._storageDepositFloor),
+      storage_deposit_limit: storageDepositLimitForCall(
+        context.functionName,
+        gasEstimate.storageDeposit,
+        context.depositPolicy,
+        this._storageDepositFloor,
+        this._recordStorageDepositFloor,
+      ),
+      buffered_storage_deposit_estimate: bufferedStorageDepositEstimate(gasEstimate.storageDeposit),
     };
   }
 
@@ -2460,7 +2570,7 @@ export class ReviveClientWrapper {
     signerSubstrateAddress: string,
     signer: PolkadotSigner,
     statusCallback: (status: string) => void,
-    { rpcs, useNoncePolling, functionName, args, contracts, verifyEffect, feeAsset, isPhoneSigner, onResign }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> },
+    { rpcs, useNoncePolling, functionName, depositPolicy, args, contracts, verifyEffect, feeAsset, isPhoneSigner, onResign }: { rpcs: string[]; useNoncePolling?: boolean; functionName?: string; depositPolicy?: DepositPolicy; args?: unknown[]; contracts?: Record<string, string>; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; isPhoneSigner?: boolean; onResign?: (attempt: number) => Promise<void> },
   ): Promise<TxResolution> {
     await this.ensureAccountMapped(signerSubstrateAddress, signer);
     // For register specifically, re-check mapping immediately before the dry-run.
@@ -2483,8 +2593,9 @@ export class ReviveClientWrapper {
       "chain.dry_run",
       `dry-run ${functionName ?? "Revive.call"}`,
       { "chain.function_name": functionName ?? "Revive.call" },
-      () => this.dryRunReviveCall(contractAddress, value, encodedData, signerSubstrateAddress, { functionName, args, contracts }),
+      () => this.dryRunReviveCall(contractAddress, value, encodedData, signerSubstrateAddress, { functionName, args, contracts, depositPolicy }),
     );
+    const fundingGate = { operation: functionName ?? "Revive.call", storageDepositLimit: prep.storage_deposit_limit, value };
     const buildExtrinsic = () => this.client.tx.Revive.call({ dest: contractAddress, value, weight_limit: prep.weight_limit, storage_deposit_limit: prep.storage_deposit_limit, data: Binary.fromHex(encodedData) });
     let nonceFallback: { rpcs: string[]; senderSS58: string; expectedNonce: number } | undefined;
     if (useNoncePolling) {
@@ -2497,7 +2608,7 @@ export class ReviveClientWrapper {
       "chain.tx.submit",
       `sign+submit ${functionName ?? "Revive.call"}`,
       { "chain.function_name": functionName ?? "Revive.call", "chain.use_nonce_polling": Boolean(useNoncePolling) },
-      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner, onResign }),
+      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Revive.call", { nonceFallback, verifyEffect, feeAsset, isPhoneSigner, onResign, fundingGate }),
     );
   }
 
@@ -2506,7 +2617,7 @@ export class ReviveClientWrapper {
   // batch operations whose rollback-together is acceptable (e.g. cosmetic
   // setText writes).
   async submitBatchedTransactions(
-    calls: { contractAddress: string; value: bigint; encodedData: string; functionName?: string; args?: unknown[] }[],
+    calls: { contractAddress: string; value: bigint; encodedData: string; functionName?: string; depositPolicy?: DepositPolicy; args?: unknown[] }[],
     signerSubstrateAddress: string,
     signer: PolkadotSigner,
     statusCallback: (status: string) => void,
@@ -2518,8 +2629,14 @@ export class ReviveClientWrapper {
       "dry-run Utility.batch_all",
       { "chain.function_name": "Utility.batch_all" },
       () => Promise.all(calls.map((c) =>
-        this.dryRunReviveCall(c.contractAddress, c.value, c.encodedData, signerSubstrateAddress, { functionName: c.functionName, args: c.args }))),
+        this.dryRunReviveCall(c.contractAddress, c.value, c.encodedData, signerSubstrateAddress, { functionName: c.functionName, args: c.args, depositPolicy: c.depositPolicy }))),
     );
+    const storageDepositLimit = estimatedBatchStorageRequirement(preps.map(prep => ({
+      limit: prep.storage_deposit_limit,
+      bufferedEstimate: prep.buffered_storage_deposit_estimate,
+    })));
+    const totalValue = calls.reduce((sum, call) => sum + call.value, 0n);
+    const fundingGate = { operation: "Utility.batch_all", storageDepositLimit, value: totalValue };
     const buildExtrinsic = () => {
       const inners = calls.map((c, i) => this.client.tx.Revive.call({
         dest: c.contractAddress,
@@ -2534,7 +2651,7 @@ export class ReviveClientWrapper {
       "chain.tx.submit",
       "sign+submit Utility.batch_all",
       { "chain.function_name": "Utility.batch_all" },
-      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Utility.batch_all"),
+      () => this.signAndSubmitWithRetry(buildExtrinsic, signer, statusCallback, "Utility.batch_all", { fundingGate }),
     );
   }
 }
@@ -2761,6 +2878,11 @@ export class DotNS {
   private _network: string | null = null;
   private _popSelfServe: PopSelfServeConfig | null = null;
   private _registerStorageDeposit: bigint = MINIMUM_REGISTER_STORAGE_DEPOSIT;
+  private _recordStorageDeposit: bigint = MINIMUM_RECORD_STORAGE_DEPOSIT;
+  // The record floor never exceeds the registration floor; resolved once here.
+  private get _effectiveRecordStorageDeposit(): bigint {
+    return this._recordStorageDeposit < this._registerStorageDeposit ? this._recordStorageDeposit : this._registerStorageDeposit;
+  }
   private _tld: string = DEFAULT_TLD;
   // Injectable for tests (#1659): the commit-resume re-probe and lock waits.
   private _sleep: (ms: number) => Promise<void> = (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -2936,7 +3058,12 @@ export class DotNS {
     // calling this), and it persists across reconnects (setContenthash's
     // read-back retry, connect's own ReviveApi.address retry), so
     // re-applying it here on every recreation is always correct, never stale.
-    this.clientWrapper.setStorageDepositFloor(this._registerStorageDeposit);
+    this.clientWrapper.setStorageDepositFloors({
+      register: this._registerStorageDeposit,
+      record: this._effectiveRecordStorageDeposit,
+    });
+    this.clientWrapper.setSubmissionFundingGate((operation, storageDepositLimit, value) =>
+      this.ensureSubmissionFunding(operation, storageDepositLimit, value));
   }
 
   async connect(options: DotNSConnectOptions = {}): Promise<this> {
@@ -2961,6 +3088,9 @@ export class DotNS {
     }
     if (options.registerStorageDeposit !== undefined) {
       this._registerStorageDeposit = options.registerStorageDeposit;
+    }
+    if (options.recordStorageDeposit !== undefined) {
+      this._recordStorageDeposit = options.recordStorageDeposit;
     }
     if (options.tld !== undefined) {
       this._tld = options.tld;
@@ -3309,6 +3439,58 @@ export class DotNS {
     if (!this.clientWrapper) throw new Error("readFreeBalance: polkadot-api client not available");
     const acc = await this.clientWrapper.client.query.System.Account.getValue(ss58);
     return BigInt(acc?.data?.free ?? 0n);
+  }
+
+  private async maybeTopUpToFloor(
+    freeBalance: bigint,
+    requiredBalance: bigint,
+    targetBalance: bigint,
+    operation: string,
+    isTestnet: boolean,
+  ): Promise<{ effectiveBalance: bigint; toppedUp?: { source: "Alice" | "Bob"; transferred: bigint } }> {
+    if (freeBalance >= requiredBalance) return { effectiveBalance: freeBalance };
+    setDeployAttribute("deploy.dotns.signer_below_floor", "true");
+    if (!isTestnet) return { effectiveBalance: freeBalance };
+
+    console.log(`   DotNS signer ${this.substrateAddress?.slice(0, 8)}... balance ${fmtPas(freeBalance)} PAS < ${fmtPas(requiredBalance)} PAS ${operation} floor — attempting testnet auto top-up...`);
+    const toppedUp = (await this.attemptTestnetTopUp(this.substrateAddress!, targetBalance)) ?? undefined;
+    if (!toppedUp) return { effectiveBalance: freeBalance };
+
+    setDeployAttribute("deploy.dotns.toppedup", "true");
+    setDeployAttribute("deploy.dotns.toppedup_source", toppedUp.source);
+    console.log(`   Topped up ${fmtPas(toppedUp.transferred)} PAS from ${toppedUp.source} for ${operation}`);
+    return { effectiveBalance: freeBalance + toppedUp.transferred, toppedUp };
+  }
+
+  /** Last-mile guard for one concrete Revive submission. It runs only after
+   * the dry run has produced the exact declared storage-deposit limit, so a
+   * no-op record update never tops up or fails. */
+  private async ensureSubmissionFunding(
+    operation: string,
+    storageDepositLimit: bigint,
+    value = 0n,
+  ): Promise<void> {
+    this.ensureConnected();
+    if (!this.substrateAddress) throw new Error("ensureSubmissionFunding: signer address unavailable");
+    const requiredBalance = storageDepositLimit + value + FEE_FLOOR_OWNED;
+    const targetBalance = storageDepositLimit + value + TOP_UP_TARGET;
+    const freeBalance = await this.readFreeBalance(this.substrateAddress);
+    const isTestnet = await this.isTestnet();
+    const funded = await this.maybeTopUpToFloor(
+      freeBalance,
+      requiredBalance,
+      targetBalance,
+      operation,
+      isTestnet,
+    );
+    if (funded.effectiveBalance >= requiredBalance) return;
+
+    const tail = isTestnet
+      ? ` Testnet auto-top-up via Alice/Bob failed. Fund the signer or top-up source; faucet: ${PASEO_FAUCET_URL}.`
+      : ` Top up the signer's balance and re-deploy.`;
+    throw new InsufficientFundsError(
+      `DotNS signer ${this.substrateAddress} has ${fmtPas(funded.effectiveBalance)} PAS free; needs ≥${fmtPas(requiredBalance)} PAS for ${operation}.${tail}`,
+    );
   }
 
   // Testnet-only: try to top the deploy signer up from the well-known dev
@@ -3677,7 +3859,7 @@ export class DotNS {
     return decodeFunctionResult({ abi: contractAbi, functionName, data: rawData as `0x${string}` });
   }
 
-  async contractTransaction(contractAddress: string, value: bigint, contractAbi: readonly any[], functionName: string, args: any[] = [], statusCallback: (status: string) => void = () => {}, { useNoncePolling, verifyEffect, feeAsset, phoneLabel }: { useNoncePolling?: boolean; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; phoneLabel?: string } = {}): Promise<TxResolution> {
+  async contractTransaction(contractAddress: string, value: bigint, contractAbi: readonly any[], functionName: string, args: any[] = [], statusCallback: (status: string) => void = () => {}, { useNoncePolling, verifyEffect, feeAsset, phoneLabel, depositPolicy }: { useNoncePolling?: boolean; verifyEffect?: () => Promise<boolean>; feeAsset?: "pgas"; phoneLabel?: string; depositPolicy?: DepositPolicy } = {}): Promise<TxResolution> {
     this.ensureConnected();
     if (!this.clientWrapper) throw new Error("contractTransaction: polkadot-api client not available");
     const encodedCallData = encodeFunctionData({ abi: contractAbi, functionName, args });
@@ -3694,7 +3876,7 @@ export class DotNS {
     // re-arms.
     const submitOnce = (): Promise<TxResolution> => withTimeout(
       this.clientWrapper!.submitTransaction(contractAddress, value, encodedCallData, this.substrateAddress!, this.signer!, statusCallback, {
-        rpcs, useNoncePolling, functionName, args, contracts: this._contracts, verifyEffect, feeAsset,
+        rpcs, useNoncePolling, functionName, depositPolicy, args, contracts: this._contracts, verifyEffect, feeAsset,
         // Re-gate phone-signer retries (#39): a verifyEffect false-negative
         // makes signAndSubmitWithRetry re-sign; for a phone signer that needs
         // another tap, so pause via _awaitPhoneReady ("Re-sign needed … Check
@@ -3925,6 +4107,8 @@ export class DotNS {
     const txRes = await this.contractTransaction(
       this._contracts.DOTNS_REGISTRAR, feeNative, DOTNS_REGISTRAR_TRANSFER_ABI, "transferFrom",
       [this.evmAddress, toH160, tokenId], statusCallback,
+      // Ownership rewrite: stays on the conservative registration floor.
+      { depositPolicy: "registration" },
     );
     const after = (await withTimeout(this.contractCall(this._contracts.DOTNS_REGISTRAR, DOTNS_REGISTRAR_TRANSFER_ABI, "ownerOf", [tokenId]), 30000, "ownerOf")) as string;
     if (after.toLowerCase() !== toH160.toLowerCase()) {
@@ -4145,7 +4329,7 @@ export class DotNS {
     const { abi: setSubnodeOwnerAbi, args: setSubnodeOwnerArgs } = await this.buildSetSubnodeOwnerCall(subnodeRecord);
     const txRes = await this.contractTransaction(
       this._contracts.DOTNS_REGISTRY, 0n, setSubnodeOwnerAbi, "setSubnodeOwner",
-      setSubnodeOwnerArgs, statusCallback,
+      setSubnodeOwnerArgs, statusCallback, { depositPolicy: "record" },
     );
     const after = (await withTimeout(
       this.contractCallNullable(this._contracts.DOTNS_REGISTRY, DOTNS_REGISTRY_ABI, "owner", [subnode]),
@@ -4251,8 +4435,8 @@ export class DotNS {
       // flags=1 data=0x1648fd01 (caller is not the node owner).
       const txResolution = await this.submitBatchedContractCalls(
         [
-          { contractAddress: this._contracts.DOTNS_REGISTRY, abi: setSubnodeOwnerAbi, functionName: "setSubnodeOwner", args: setSubnodeOwnerArgs },
-          { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setResolver", args: [subnodeNode, this._contracts.DOTNS_CONTENT_RESOLVER] },
+          { contractAddress: this._contracts.DOTNS_REGISTRY, abi: setSubnodeOwnerAbi, functionName: "setSubnodeOwner", depositPolicy: "record", args: setSubnodeOwnerArgs },
+          { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setResolver", depositPolicy: "record", args: [subnodeNode, this._contracts.DOTNS_CONTENT_RESOLVER] },
         ],
         (s: string) => console.log(`      ${s}`),
         `Utility.batch_all (register ${sublabel}.${parentLabel}.${this._tld})`,
@@ -4303,7 +4487,7 @@ export class DotNS {
    * inner call; only ever raises the declared limits, never lowers them.
    */
   private async submitBatchedContractCalls(
-    calls: { contractAddress: string; abi: readonly any[]; functionName: string; args: any[]; value?: bigint }[],
+    calls: { contractAddress: string; abi: readonly any[]; functionName: string; args: any[]; value?: bigint; depositPolicy?: DepositPolicy }[],
     statusCallback: (status: string) => void,
     label: string,
     { verifyEffect, independentCalls }: { verifyEffect?: () => Promise<boolean>; independentCalls?: boolean } = {},
@@ -4349,19 +4533,47 @@ export class DotNS {
       }),
       { referenceTime: 0n, proofSize: 0n },
     );
-    const maxStorageDeposit = estimates.reduce((max: bigint, e: any) => (e.storageDeposit > max ? e.storageDeposit : max), 0n);
 
     // Route through the same storageDepositLimitFor()/weightLimitFor() helpers
     // ReviveClientWrapper.dryRunReviveCall uses, instead of recomputing the
     // buffer formulas inline — the two had drifted into separate copies of the
     // same arithmetic (issue: storage_deposit_limit buffer formula duplicated
     // past its own helper). this._registerStorageDeposit is the same per-env
-    // floor threaded into ReviveClientWrapper via setStorageDepositFloor
+    // floor threaded into ReviveClientWrapper via setStorageDepositFloors
     // (bulletin-deploy #1491/#1518) — this call site builds its own
     // Revive.call extrinsics directly rather than going through the wrapper's
     // dryRunReviveCall, so it must be passed explicitly here too.
     const weight_limit = weightLimitFor(maxGasRequired);
-    const storage_deposit_limit = storageDepositLimitFor(maxStorageDeposit, this._registerStorageDeposit);
+    const estimatedStorageLimits = estimates.map((estimate: any, index: number) =>
+      storageDepositLimitForCall(
+        calls[index].functionName,
+        estimate.storageDeposit,
+        calls[index].depositPolicy,
+        this._registerStorageDeposit,
+        this._effectiveRecordStorageDeposit,
+      ));
+    const hasUnestimatedTails = !independentCalls && calls.length > 1;
+    const storage_deposit_limit = hasUnestimatedTails
+      // The registration floor is deliberate: this limit is shared with
+      // tails that have no honest independent dry run.
+      ? storageDepositLimitFor(estimates[0].storageDeposit, this._registerStorageDeposit)
+      : estimatedStorageLimits.reduce(
+        (max: bigint, limit: bigint) => limit > max ? limit : max,
+        0n,
+      );
+    const totalValue = encoded.reduce((sum, call) => sum + call.value, 0n);
+    const bufferedStorageEstimates = estimates.map((estimate: any) =>
+      bufferedStorageDepositEstimate(estimate.storageDeposit));
+    const storageDepositRequirement = hasUnestimatedTails
+      // The conservative shared limit covers the unestimated tail. Add the
+      // head's buffered measured charge because it executes first and can
+      // reduce the balance available when that tail is checked.
+      ? storage_deposit_limit + bufferedStorageEstimates[0]
+      : estimatedBatchStorageRequirement(bufferedStorageEstimates.map(bufferedEstimate => ({
+        limit: storage_deposit_limit,
+        bufferedEstimate,
+      })));
+    const fundingGate = { operation: label, storageDepositLimit: storageDepositRequirement, value: totalValue };
 
     const client = this.clientWrapper.client;
     const buildBatch = () => {
@@ -4378,7 +4590,7 @@ export class DotNS {
     };
 
     return await withTimeout(
-      this.clientWrapper.signAndSubmitWithRetry(buildBatch, this.signer!, statusCallback, label, { verifyEffect }),
+      this.clientWrapper.signAndSubmitWithRetry(buildBatch, this.signer!, statusCallback, label, { verifyEffect, fundingGate }),
       OPERATION_TIMEOUT_MS,
       label,
     );
@@ -4457,18 +4669,22 @@ export class DotNS {
               contractAddress: this._contracts.DOTNS_CONTENT_RESOLVER,
               abi: DOTNS_TEXT_RESOLVER_ABI,
               functionName: "setText",
+              depositPolicy: "record",
               args: [node, key, value],
             },
             {
               contractAddress: this._contracts.DOTNS_CONTENT_RESOLVER,
               abi: DOTNS_CONTENT_RESOLVER_ABI,
               functionName: "setContenthash",
+              depositPolicy: "record",
               args: [node, contenthashHex],
             },
           ],
           (status) => console.log(`      ${status}`),
           "Utility.batch_all(setContenthash+setText)",
-          { verifyEffect: stateMatches },
+          // Both writes target independent resolver fields and are valid in
+          // either order, so each can be dry-run with its exact calldata.
+          { verifyEffect: stateMatches, independentCalls: true },
         );
         logTxResolution(txResolution);
 
@@ -4561,7 +4777,7 @@ export class DotNS {
       };
 
       console.log(`\n   Linking content...`);
-      const txRes = await this.contractTransaction(this._contracts.DOTNS_CONTENT_RESOLVER, 0n, DOTNS_CONTENT_RESOLVER_ABI, "setContenthash", [node, contenthashHex], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect, feeAsset: opts.feeAsset, phoneLabel: "Link content" });
+      const txRes = await this.contractTransaction(this._contracts.DOTNS_CONTENT_RESOLVER, 0n, DOTNS_CONTENT_RESOLVER_ABI, "setContenthash", [node, contenthashHex], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect, feeAsset: opts.feeAsset, phoneLabel: "Link content", depositPolicy: "record" });
 
       // Final read-back catches a rare post-finality reorg. verifyEffect already
       // confirmed the write landed, but a single read can return a stale
@@ -4661,7 +4877,7 @@ export class DotNS {
         return typeof r === "string" && r.toLowerCase() === target.toLowerCase();
       } catch { return false; }
     };
-    await this.contractTransaction(this._contracts.DOTNS_REGISTRY, 0n, DOTNS_REGISTRY_ABI, "setResolver", [node, target], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect: verifyResolverSet });
+    await this.contractTransaction(this._contracts.DOTNS_REGISTRY, 0n, DOTNS_REGISTRY_ABI, "setResolver", [node, target], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect: verifyResolverSet, depositPolicy: "record" });
     return { changed: true };
   }
 
@@ -4741,7 +4957,7 @@ export class DotNS {
         }
       };
 
-      const textTxRes = await this.contractTransaction(this._contracts.DOTNS_CONTENT_RESOLVER, 0n, DOTNS_TEXT_RESOLVER_ABI, "setText", [node, key, value], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect });
+      const textTxRes = await this.contractTransaction(this._contracts.DOTNS_CONTENT_RESOLVER, 0n, DOTNS_TEXT_RESOLVER_ABI, "setText", [node, key, value], (s) => console.log(`      ${s}`), { useNoncePolling: true, verifyEffect, depositPolicy: "record" });
       logTxResolution(textTxRes);
       // verifyEffect above runs a 30s chain-time budget inside contractTransaction;
       // this post-hoc poll adds up to 90s more — worst-case latency is 120s chain time.
@@ -4856,8 +5072,8 @@ export class DotNS {
         };
         const txResolution = await this.submitBatchedContractCalls(
           [
-            { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setResolver", args: [node, target] },
-            { contractAddress: this._contracts.DOTNS_CONTENT_RESOLVER, abi: DOTNS_TEXT_RESOLVER_ABI, functionName: "setText", args: [node, key, value] },
+            { contractAddress: this._contracts.DOTNS_REGISTRY, abi: DOTNS_REGISTRY_ABI, functionName: "setResolver", depositPolicy: "record", args: [node, target] },
+            { contractAddress: this._contracts.DOTNS_CONTENT_RESOLVER, abi: DOTNS_TEXT_RESOLVER_ABI, functionName: "setText", depositPolicy: "record", args: [node, key, value] },
           ],
           (status) => console.log(`      ${status}`),
           `Utility.batch_all(setResolver+setText[${key}])`,
@@ -4902,6 +5118,7 @@ export class DotNS {
           value: 0n,
           encodedData: encodeFunctionData({ abi: DOTNS_TEXT_RESOLVER_ABI, functionName: "setText", args: [node, e.key, e.value] }),
           functionName: "setText",
+          depositPolicy: "record" as const,
           args: [node, e.key, e.value],
         };
       });
@@ -5023,7 +5240,7 @@ export class DotNS {
         return ts != null && BigInt(ts as any) > 0n;
       } catch { return false; }
     };
-    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, this._adapter.controllerAbi, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment", verifyEffect: verifyCommitted });
+    const commitTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, 0n, this._adapter.controllerAbi, "commit", [commitment], (s) => console.log(`      ${s}`), { phoneLabel: "Commitment", verifyEffect: verifyCommitted, depositPolicy: "registration" /* leaves balance for the later reveal; not measurable before commit */ });
     logTxResolution(commitTxRes);
     console.log(`   Committed at: ${new Date().toISOString()}`);
   }
@@ -5191,7 +5408,7 @@ export class DotNS {
         return typeof owner === "string" && owner.toLowerCase() === this.evmAddress!.toLowerCase();
       } catch { return false; }
     };
-    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, this._adapter.controllerAbi, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register", verifyEffect: verifyRegistered });
+    const registerTxRes = await this.contractTransaction(this._contracts.DOTNS_REGISTRAR_CONTROLLER, bufferedPaymentNative, this._adapter.controllerAbi, "register", [registration], (s) => console.log(`      ${s}`), { phoneLabel: "Register", verifyEffect: verifyRegistered, depositPolicy: "registration" /* reveal/finalize cost cannot be measured honestly pre-commit */ });
     logTxResolution(registerTxRes);
     if (registerTxRes.kind === TX_KIND_HASH) {
       setDeployAttribute("deploy.register.tx", registerTxRes.hash);
@@ -5453,7 +5670,7 @@ export class DotNS {
       if (needsCommit) {
         console.log(`\n   Stored commitment for ${label}.${this._tld} is not on-chain yet (its commit tx may still be pending, or never landed). Re-submitting the SAME commitment instead of a fresh one.\n`);
       } else {
-        const nowMs = await this.clientWrapper!.client.query.Timestamp.Now.getValue();
+        const nowMs = await withTimeout(this.clientWrapper!.client.query.Timestamp.Now.getValue(), 30000, "Timestamp.Now (resume check)");
         const chainNowSeconds = Math.floor(Number(nowMs) / 1000);
         if (isCommitmentExpired(chainNowSeconds, commitTimestamp, maximumAge)) {
           // Waiting out an expired commitment fails at reveal (#1412). #1659:
@@ -5602,6 +5819,12 @@ export class DotNS {
     // dry-run racing commitment maturity), not for "no usable stored
     // commitment".
     const resumable = await this.resolveResumableCommitment(label, reverse);
+    if (resumable) {
+      setDeployAttribute("deploy.dotns.commitment_resumed", "true");
+      // The preflight plan announced a Commitment signature. A resume that
+      // needs no commit tx never asks for it (#1570).
+      if (!resumable.needsCommit && this._phoneSignatureTotal > 0) this._phoneSignatureTotal -= 1;
+    }
 
     try {
       await doCommitAndRegister(resumable);
@@ -5948,31 +6171,16 @@ export class DotNS {
       rentPriceNative = bufferedWeiToNative(depositWei, this._nativeToEthRatio);
     }
     const feeFloor = feeFloorFor(candidate.plannedAction, this._registerStorageDeposit, rentPriceNative, transferFeeNative);
-    let effectiveBalance = signerFreeBalance;
-    let toppedUp: { source: "Alice" | "Bob"; transferred: bigint } | undefined;
-
-    if (effectiveBalance < feeFloor && isTestnet) {
-      setDeployAttribute("deploy.dotns.signer_below_floor", "true");
-      console.log(`   DotNS signer ${this.substrateAddress?.slice(0, 8)}... balance ${fmtPas(effectiveBalance)} PAS < ${fmtPas(feeFloor)} PAS floor — attempting testnet auto top-up...`);
-      const result = await this.attemptTestnetTopUp(this.substrateAddress!, topUpTargetFor(candidate.plannedAction, this._registerStorageDeposit, rentPriceNative, transferFeeNative));
-      if (result) {
-        console.log(`   Topped up ${fmtPas(result.transferred)} PAS from ${result.source}`);
-        // submitTransfer only resolves on event.ok, so the transferred amount
-        // is guaranteed to land. The deploy signer is idle until preflight
-        // returns, so no concurrent debit is possible — skip the re-read.
-        effectiveBalance += result.transferred;
-        toppedUp = result;
-        setDeployAttribute("deploy.dotns.toppedup", "true");
-        setDeployAttribute("deploy.dotns.toppedup_source", result.source);
-      }
-    } else if (effectiveBalance < feeFloor) {
-      // Mainnet (or non-testnet) below-floor: still record the boolean so
-      // dashboards can count the abort.
-      setDeployAttribute("deploy.dotns.signer_below_floor", "true");
-    }
+    const op = candidate.plannedAction === "already-owned-by-us" ? "setContenthash" : "register";
+    const { effectiveBalance, toppedUp } = await this.maybeTopUpToFloor(
+      signerFreeBalance,
+      feeFloor,
+      topUpTargetFor(candidate.plannedAction, this._registerStorageDeposit, rentPriceNative, transferFeeNative),
+      op,
+      isTestnet,
+    );
 
     if (effectiveBalance < feeFloor) {
-      const op = candidate.plannedAction === "already-owned-by-us" ? "setContenthash" : "register";
       const tail = isTestnet
         ? ` Testnet auto-top-up via Alice/Bob failed (both also low). Top up at ${PASEO_FAUCET_URL}.`
         : ` Top up the signer's balance and re-deploy.`;

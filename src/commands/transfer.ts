@@ -82,6 +82,7 @@ export async function runTransfer(
     nativeToEthRatio: resolved.nativeToEthRatio,
     popSelfServe: getPopSelfServeConfig(doc, envId),
     registerStorageDeposit: resolved.registerStorageDeposit,
+    recordStorageDeposit: resolved.recordStorageDeposit,
     // resolved.tld, NOT the defaulted `tld` above — undefined-preserving so
     // an env that configures none still gets connect()'s on-chain read.
     tld: resolved.tld,

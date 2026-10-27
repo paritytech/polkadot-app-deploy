@@ -3,7 +3,7 @@
 // session-address lookup. Testnet-only default-to-Alice; mainnet deferred.
 import { resolveSigner, SignerNotAvailableError } from "./auth/index.js";
 import type { ResolvedSigner, AuthClient, AllocatableResource } from "./auth/index.js";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { BULLETIN_RESOURCE } from "./auth/index.js";
 import { DEFAULT_MNEMONIC } from "./dotns.js";
 import { NonRetryableError } from "./errors.js";
@@ -101,7 +101,7 @@ export async function resolveDeployActors(
  * injected by a programmatic caller).
  */
 export interface StorageSignerResult {
-  signer: PolkadotSigner;
+  signer: SignerTxCreator;
   slotAddress: string;
   /** true when the slot comes from the user's own session (not a pre-injected slot). */
   owned: true;
@@ -121,7 +121,7 @@ export interface StorageSignerDeps {
     sessionId: string,
     productId: string,
     adapter: any,
-  ) => Promise<{ isOk(): boolean; isErr(): boolean; value?: PolkadotSigner; error?: { reason: string } }>;
+  ) => Promise<{ isOk(): boolean; isErr(): boolean; value?: SignerTxCreator; error?: { reason: string } }>;
 
   /**
    * Triggers a phone prompt to allocate the BulletInAllowance resource.
@@ -138,7 +138,7 @@ export interface StorageSignerDeps {
    * Read the cached slot account signer written by requestResourceAllocation.
    * Returns null on a miss (graceful fallback).
    */
-  createSlotAccountSigner?: (adapter: any, resource: AllocatableResource, productId: string) => Promise<PolkadotSigner | null>;
+  createSlotAccountSigner?: (adapter: any, resource: AllocatableResource, productId: string) => Promise<SignerTxCreator | null>;
 
   /** Encode a public key as SS58. */
   ss58Encode: (publicKey: Uint8Array) => string;

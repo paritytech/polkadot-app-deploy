@@ -31,8 +31,8 @@ import {
   sr25519Derive,
   ss58Address,
 } from "@polkadot-labs/hdkd-helpers";
-import { getPolkadotSigner } from "polkadot-api/signer";
-import type { PolkadotSigner } from "polkadot-api";
+import { getTxCreator } from "polkadot-api/tx-creator";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 
 const PRODUCT_JUNCTION = "product";
 
@@ -94,7 +94,7 @@ export function normalizeProductName(raw: string): string {
 }
 
 export interface ProductSigner {
-  signer: PolkadotSigner;
+  signer: SignerTxCreator;
   ss58: string;
   publicKey: Uint8Array;
   productName: string;
@@ -118,6 +118,6 @@ export function deriveProductSigner(
     ["hard", productChainCode(name)],
     ["soft", productIndexBytes(index)],
   ]);
-  const signer = getPolkadotSigner(keyPair.publicKey, "Sr25519", keyPair.sign);
+  const signer = getTxCreator(keyPair.publicKey, "Sr25519", keyPair.sign);
   return { signer, ss58: ss58Address(keyPair.publicKey), publicKey: keyPair.publicKey, productName: name };
 }

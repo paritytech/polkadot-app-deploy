@@ -23,6 +23,12 @@ export const PGAS_ASSET_LOCATION = {
   },
 };
 
+// Route Asset-Hub tx fees through ChargeAssetTxPayment to PGAS (#885), so a
+// zero-native account can still pay. Use papi's own `asset` option, not
+// customSignedExtensions: a custom entry lands behind the enhancer's native one
+// and papi reads the first entry for an id.
+export const PGAS_FEE_OPTIONS = { asset: PGAS_ASSET_LOCATION } as const;
+
 // Ring-VRF proof size in bytes (verifiablejs 1.3.0-beta.4, small-ring, exponent 9).
 // beta.2 was 788 (SCALE-prefixed); beta.4 is 785 (raw canonical bytes, no prefix).
 export const PROOF_BYTES = 785;

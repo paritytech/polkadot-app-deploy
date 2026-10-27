@@ -20,7 +20,7 @@ import { encodeContenthash, DEFAULT_BULLETIN_RPC } from "@parity/polkadot-app-de
 import { fetchManifestRoundtrip } from "@parity/polkadot-app-deploy/manifest-roundtrip";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
-import { getPolkadotSigner } from "polkadot-api/signer";
+import { getTxCreator } from "polkadot-api/tx-creator";
 import {
   assertDeploySucceeded,
   assertStdoutMatches,
@@ -1134,14 +1134,14 @@ describe("e2e", { skip: !ENABLED }, () => {
       // through the CLI and gets register() for free).
       const label = signerPopStatus >= 2 ? "e2epool" : "e2epoolns01";
 
-      // Build a signer using the same Keyring + getPolkadotSigner pattern
+      // Build a signer using the same Keyring + getTxCreator pattern
       // that DotNS uses internally (src/dotns.ts:676-680). The difference is
       // that we pass it as an external object to DotNS.connect() rather than
       // letting DotNS construct it from a mnemonic.
       await cryptoWaitReady();
       const keyring = new Keyring({ type: "sr25519" });
       const account = keyring.addFromMnemonic(ALICE_MNEMONIC);
-      const polkadotSigner = getPolkadotSigner(
+      const polkadotSigner = getTxCreator(
         account.publicKey,
         "Sr25519",
         async (input) => account.sign(input),
@@ -1182,7 +1182,7 @@ describe("e2e", { skip: !ENABLED }, () => {
       await cryptoWaitReady();
       const keyring = new Keyring({ type: "sr25519" });
       const account = keyring.addFromMnemonic(ALICE_MNEMONIC);
-      const polkadotSigner = getPolkadotSigner(
+      const polkadotSigner = getTxCreator(
         account.publicKey,
         "Sr25519",
         async (input) => account.sign(input),
@@ -2070,11 +2070,11 @@ describe("e2e", { skip: !ENABLED }, () => {
         // The resilience layer for failed chunk submissions has two log
         // surfaces, depending on how the chain rejected the tx:
         //   - "Retrying chunk N (attempt X/Y)" — generic retry log, fires
-        //     for any failure mode (BadProof, subscription error,
-        //     isValid:false, timeout). storeChunkedContent retry loop.
+        //     for any failure mode (BadProof, subscription error, pool
+        //     rejection, timeout). storeChunkedContent retry loop.
         //   - "mortal era expiry — reissuing with fresh nonce" — specific
-        //     path for isValid:false (clean detection of mortality on the
-        //     submission side, before the chain rejects).
+        //     path for a pool rejection, detected on the submission side
+        //     before the chain rejects.
         // Either log appearing in the deploy output is sufficient evidence
         // the resilience mechanism engaged. With BULLETIN_CHUNK_MORTALITY_PERIOD=4
         // and several chunks, at least one chunk should hit retry under

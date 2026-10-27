@@ -6,9 +6,11 @@
 // the proof window has advanced.
 
 import { getSs58AddressInfo, Binary } from "polkadot-api";
-import type { PolkadotSigner, SS58String } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
+import type { SS58String } from "polkadot-api";
 import { bytesToHex, encodeMembers, hexToBytes } from "./encoding.js";
 import { PEOPLE_MEMBER_IDENTIFIER_HEX, PROOF_BYTES } from "./constants.js";
+import { SUBMIT_MORTALITY } from "../mortality.js";
 import { buildAliasProofMessage, getProofValidAtSec } from "./proof-validity.js";
 
 // ---------------------------------------------------------------------------
@@ -76,7 +78,7 @@ type AhApi = {
 };
 
 interface ReproveTx {
-  signSubmitAndWatch: (signer: PolkadotSigner) => {
+  createSubmitAndWatch: (signer: SignerTxCreator, options?: { mortality?: { mortal: true; period: number } }) => {
     subscribe: (observer: {
       next: (ev: unknown) => void;
       error: (err: unknown) => void;
@@ -176,7 +178,7 @@ export interface ReproveAliasParams {
   ahUnsafeApi: unknown;
   account: SS58String;
   memberKey: Uint8Array;
-  signCall: PolkadotSigner;
+  signCall: SignerTxCreator;
   buildRingProof: BuildRingProof;
   progress?: ReproveAliasProgress;
 }
@@ -348,7 +350,7 @@ export const reproveAliasToAccount = async ({
       resolve(h);
     };
 
-    tx.signSubmitAndWatch(signCall).subscribe({
+    tx.createSubmitAndWatch(signCall, { mortality: SUBMIT_MORTALITY }).subscribe({
       next: (event) => {
         if (settled) return;
         const ev = event as {
@@ -362,7 +364,7 @@ export const reproveAliasToAccount = async ({
           progress?.onBroadcasted?.();
           return;
         }
-        if (ev.type === "txBestBlocksState" && ev.found) {
+        if (ev.type === "inBestBlock") {
           if (ev.ok === false) {
             fail(
               new ReproveAliasError(

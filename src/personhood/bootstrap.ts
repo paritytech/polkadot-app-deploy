@@ -11,7 +11,7 @@
 // after a partial success resumes from the first incomplete step.
 
 import { createClient } from "polkadot-api";
-import { getPolkadotSigner } from "polkadot-api/signer";
+import { getTxCreator } from "polkadot-api/tx-creator";
 import { getWsProvider } from "../ws.js";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -301,7 +301,7 @@ export async function runBootstrap({
     const keyring = new Keyring({ type: "sr25519" });
     const account = keyring.addFromMnemonic(mnemonic);
     const ss58 = account.address as SS58String;
-    const signer = getPolkadotSigner(
+    const signer = getTxCreator(
       account.publicKey,
       "Sr25519",
       async (input: Uint8Array) => account.sign(input),

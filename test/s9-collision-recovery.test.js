@@ -29,7 +29,7 @@ const CHUNK = new Uint8Array([0x42]);
 // JSON of the TransactionValidityError, pretty-printed (polkadot-api submit-fns).
 const STALE = JSON.stringify({ type: "Invalid", value: { type: "Stale" } }, null, 2);
 
-const ok = () => ({ subscribe({ next }) { setImmediate(() => next({ type: "txBestBlocksState", found: true, ok: true })); return { unsubscribe() {} }; } });
+const ok = () => ({ subscribe({ next }) { setImmediate(() => next({ type: "inBestBlock", ok: true })); return { unsubscribe() {} }; } });
 const fails = (msg) => () => ({ subscribe({ error }) { setImmediate(() => error(new Error(msg))); return { unsubscribe() {} }; } });
 
 // Records every submit's nonce; the n-th submit uses makers[n] (the last one repeats).
@@ -43,7 +43,7 @@ function api(makers, nonces = []) {
       can_store: async () => true,
     } },
     tx: { TransactionStorage: { store_with_cid_config: () => ({
-      signSubmitAndWatch: (_s, opts) => { nonces.push(opts.nonce); return makers[Math.min(n++, makers.length - 1)](); },
+      createSubmitAndWatch: (_s, opts) => { nonces.push(opts.nonce); return makers[Math.min(n++, makers.length - 1)](); },
     }) } },
   };
 }
@@ -64,8 +64,8 @@ describe("#1672 root-node submit errors", () => {
     // submit 1: the chunk, ok. submit 2: the root, Stale. submit 3: the root again, ok.
     const a = api([ok, fails(STALE), ok], nonces);
     const { log } = await captureLog(() => storeChunkedContent([CHUNK], {
-      client: client(), unsafeApi: a, signer: {}, ss58: SS58,
-      reconnect: async () => { reconnects++; return { client: client(), unsafeApi: a, signer: {}, ss58: SS58 }; },
+      client: client(), unsafeApi: a, signer: () => {}, ss58: SS58,
+      reconnect: async () => { reconnects++; return { client: client(), unsafeApi: a, signer: () => {}, ss58: SS58 }; },
       fetchNonce: counter(100),
     }));
     assert.equal(reconnects, 0, ">> FAIL: #1672: a pool-rejected root tx was handled as a connection loss (reconnect called)");
@@ -79,8 +79,8 @@ describe("#1672 root-node submit errors", () => {
     let reconnects = 0;
     const a = api([ok, fails("ChainHead disjointed"), ok]);
     await captureLog(() => storeChunkedContent([CHUNK], {
-      client: client(), unsafeApi: a, signer: {}, ss58: SS58,
-      reconnect: async () => { reconnects++; return { client: client(), unsafeApi: a, signer: {}, ss58: SS58 }; },
+      client: client(), unsafeApi: a, signer: () => {}, ss58: SS58,
+      reconnect: async () => { reconnects++; return { client: client(), unsafeApi: a, signer: () => {}, ss58: SS58 }; },
       fetchNonce: counter(100),
     }));
     assert.equal(reconnects, 1, ">> FAIL: #1672: a connection error on the root store must still reconnect");
@@ -91,8 +91,8 @@ describe("#1672 root-node submit errors", () => {
     const nonces = [];
     const a = api([ok, fails(STALE)], nonces);
     await captureLog(() => assert.rejects(() => storeChunkedContent([CHUNK], {
-      client: client(), unsafeApi: a, signer: {}, ss58: SS58,
-      reconnect: async () => { reconnects++; return { client: client(), unsafeApi: a, signer: {}, ss58: SS58 }; },
+      client: client(), unsafeApi: a, signer: () => {}, ss58: SS58,
+      reconnect: async () => { reconnects++; return { client: client(), unsafeApi: a, signer: () => {}, ss58: SS58 }; },
       fetchNonce: counter(100),
     }), /Stale/, ">> FAIL: #1672: a root that never stops colliding must fail with the pool's reason"));
     assert.equal(reconnects, 0);
@@ -102,8 +102,8 @@ describe("#1672 root-node submit errors", () => {
   test("a root store still failing on its last attempt throws instead of returning no root", async () => {
     const a = api([ok, fails("ChainHead disjointed")]);
     const { result } = await captureLog(() => storeChunkedContent([CHUNK], {
-      client: client(), unsafeApi: a, signer: {}, ss58: SS58,
-      reconnect: async () => ({ client: client(), unsafeApi: a, signer: {}, ss58: SS58 }),
+      client: client(), unsafeApi: a, signer: () => {}, ss58: SS58,
+      reconnect: async () => ({ client: client(), unsafeApi: a, signer: () => {}, ss58: SS58 }),
       fetchNonce: counter(100),
     }).then((r) => ({ storageCid: r.storageCid }), (e) => ({ error: e })));
     assert.ok(result.error, `>> FAIL: #1672: the root store gave up silently and returned storageCid=${result.storageCid}`);
@@ -112,9 +112,10 @@ describe("#1672 root-node submit errors", () => {
 
   test("classifyRootSubmitError: pool rejections are collisions, connection errors and anything unknown reconnect", () => {
     const stale = Object.assign(new Error(`root-node subscription error: ${STALE}`), { chainErrorVariant: "Stale" });
-    assert.equal(classifyRootSubmitError(stale, false), "nonce-collision");
+    assert.equal(classifyRootSubmitError(stale, false), "nonce-collision",
+      ">> FAIL: classifyRootSubmitError: a Stale root submission was not read as a nonce collision, so it reconnects instead of reissuing at a fresh nonce");
     assert.equal(classifyRootSubmitError(new Error(`root-node subscription error: ${STALE}`), false), "nonce-collision");
-    assert.equal(classifyRootSubmitError(new Error("root-node tx rejected by pool (isValid:false)"), false), "nonce-collision");
+    assert.equal(classifyRootSubmitError(new Error(`root-node tx rejected by pool: ${STALE}`), false), "nonce-collision");
     assert.equal(classifyRootSubmitError(new Error("ChainHead disjointed"), false), "reconnect");
     assert.equal(classifyRootSubmitError(stale, true), "reconnect", "a WS halt means the client is dead whatever the error says");
     assert.equal(classifyRootSubmitError(new Error("root-node timed out after 180s waiting for block confirmation"), false), "reconnect");
@@ -142,7 +143,7 @@ describe("#1672 re-upload nonce collisions (CI run 37027455287, attempt 1)", () 
         return [{ changes: params[0].map((k) => [k, null]) }];
       } };
       const { log } = await captureLog(() => storeChunkedContent([CHUNK], {
-        client: probeClient, unsafeApi: a, signer: {}, ss58: SS58,
+        client: probeClient, unsafeApi: a, signer: () => {}, ss58: SS58,
         fetchNonce: counter(100), skipRootStore: true,
       }));
       assert.match(log, /left for the next verify round/, ">> FAIL: #1672: a round of colliding re-uploads did not hand the chunk to the next round");
@@ -152,10 +153,13 @@ describe("#1672 re-upload nonce collisions (CI run 37027455287, attempt 1)", () 
     }
   });
 
-  test("isNonceCollisionError: Stale and isValid:false only", () => {
-    assert.equal(isNonceCollisionError(new Error(STALE)), true);
+  test("isNonceCollisionError: Stale only", () => {
+    assert.equal(isNonceCollisionError(new Error(STALE)), true,
+      ">> FAIL: isNonceCollisionError: a Stale rejection was not read as a nonce collision, so the chunk is retried at the nonce the chain already rejected");
     assert.equal(isNonceCollisionError(Object.assign(new Error("x"), { chainErrorVariant: "Stale" })), true);
-    assert.equal(isNonceCollisionError(new Error("chunk(nonce:1) tx rejected by pool (isValid:false)")), true);
+    assert.equal(isNonceCollisionError(new Error(`chunk(nonce:1) tx rejected by pool: ${STALE}`)), true);
+    assert.equal(isNonceCollisionError(new Error("chunk(nonce:1) tx rejected by pool: no variant")), false,
+      ">> FAIL: isNonceCollisionError: a pool rejection with no Stale variant is not a nonce collision, it must not be retried as one");
     assert.equal(isNonceCollisionError(new Error(JSON.stringify({ type: "Invalid", value: { type: "Payment" } }))), false);
     assert.equal(isNonceCollisionError(new Error("ChainHead disjointed")), false);
   });
@@ -166,8 +170,8 @@ describe("#1672 live client after a mid-upload reconnect", () => {
     const fresh = client();
     const a = api([fails("ChainHead disjointed"), ok]);
     return storeChunkedContent([CHUNK], {
-      client: client(), unsafeApi: a, signer: {}, ss58: SS58,
-      reconnect: async () => ({ client: fresh, unsafeApi: a, signer: {}, ss58: SS58 }),
+      client: client(), unsafeApi: a, signer: () => {}, ss58: SS58,
+      reconnect: async () => ({ client: fresh, unsafeApi: a, signer: () => {}, ss58: SS58 }),
       // A constant nonce: the failed chunk was not consumed, so it is simply resubmitted.
       fetchNonce: async () => 100, skipRootStore: true, ...extra,
     }).then((r) => ({ r, fresh }));
@@ -186,8 +190,8 @@ describe("#1672 live client after a mid-upload reconnect", () => {
     const opened = [];
     const a = api([fails("ChainHead disjointed"), fails("dispatch error")]);
     const err = await captureLog(() => storeChunkedContent([CHUNK], {
-      client: client(), unsafeApi: a, signer: {}, ss58: SS58,
-      reconnect: async () => { const c = client(); opened.push(c); return { client: c, unsafeApi: a, signer: {}, ss58: SS58 }; },
+      client: client(), unsafeApi: a, signer: () => {}, ss58: SS58,
+      reconnect: async () => { const c = client(); opened.push(c); return { client: c, unsafeApi: a, signer: () => {}, ss58: SS58 }; },
       fetchNonce: async () => 100, skipRootStore: true, handOffLiveClient: true,
     }).then(() => null, (e) => e));
     assert.ok(err.result, "the deploy must fail: every chunk submit after the reconnect errors");

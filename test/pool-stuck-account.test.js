@@ -21,7 +21,7 @@ const noSleep = async () => {};
 const auths = Array.from({ length: 10 }, (_, i) => ({
   index: i,
   address: `5Addr${i}`,
-  signer: {},
+  signer: () => {},
   transactions: 100n,
   renewBytes: 0n,
   expiration: 1_000_000,

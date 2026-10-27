@@ -553,7 +553,7 @@ export function computeDeployOutcome(
 //   account.mapping_pending        — EVM account auto-mapping submitted but not yet reflected on-chain
 //   chain.api_timeout              — ReviveApi call timed out (EVM address resolution)
 //   chain.tx_timeout               — outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / Revive.call / Utility.batch_all)
-//   chain.tx_silent                — signSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
+//   chain.tx_silent                — createSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
 //   chain.extrinsic_expired        — tx rejected because the mortality window passed (AncientBirthBlock)
 //   chain.quota_exhausted          — Bulletin chain storage quota exhausted
 //   chain.bad_proof                — extrinsic rejected with Invalid::BadProof; the signature did not verify (wrong genesis/mortality/spec version or a re-signed payload mismatch)
@@ -614,7 +614,7 @@ export type DeployErrorKind =
   | 'chain.api_timeout'
   // outer per-op budget hit during signed-tx submission (commit / register / setSubnodeOwner / setResolver / setContenthash / setText / Revive.call / Utility.batch_all)
   | 'chain.tx_timeout'
-  // signSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
+  // createSubmitAndWatch observable emitted no events for the no-progress threshold; watchdog tripped
   | 'chain.tx_silent'
   | 'chain.extrinsic_expired'
   | 'chain.quota_exhausted'

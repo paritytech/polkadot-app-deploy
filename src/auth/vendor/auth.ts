@@ -43,7 +43,7 @@ import {
     type PairingStatus,
     type UserSession,
 } from "@parity/product-sdk-terminal";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { createSessionSigner, deriveProductPublicKey, sessionRootPublicKey } from "./sessionSigner.js";
 import {
     requestResourceAllocation,
@@ -106,7 +106,7 @@ export interface SessionHandle {
     addresses: SessionAddresses;
     /** Product id the account, signer and allowances are scoped to. */
     productId: string;
-    signer: PolkadotSigner;
+    signer: SignerTxCreator;
     userSession: UserSession;
     adapter: TerminalAdapter;
     destroy(): void;

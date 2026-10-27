@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,6 +51,19 @@ function fakeSession(getProductSubtree: () => Promise<unknown>): UserSession {
 const ok = (value: Uint8Array) => ({ isErr: () => false, value });
 
 const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
+
+/** A papi v3 signer is callable, so the SDK mock has to be a function. */
+function mockCreator(
+    create: () => Promise<string>,
+    signBytes: () => Promise<Uint8Array> = async () => new Uint8Array(),
+) {
+    return Object.assign(create, { publicKey: new Uint8Array(32), signBytes });
+}
+
+/** Invoke a creator with the smallest payload its wrapper has to pass through. */
+const callCreator = (creator: SignerTxCreator) =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    creator({} as any, {} as any, {} as any, false);
 
 describe("deriveProductPublicKey", () => {
     let storageDir = "";
@@ -136,11 +150,7 @@ describe("createSessionSigner", () => {
     });
 
     test("passes the product account ref and subtree options to the SDK signer", async () => {
-        createSessionSignerForAccountMock.mockResolvedValue({
-            publicKey: new Uint8Array(32),
-            signTx: async () => new Uint8Array(),
-            signBytes: async () => new Uint8Array(),
-        });
+        createSessionSignerForAccountMock.mockResolvedValue(mockCreator(async () => "0x"));
         const session = fakeSession(async () => ok(new Uint8Array(32)));
         const ref = { productId: "polkadot-app-deploy.paseo", derivationIndex: 0 };
 
@@ -150,19 +160,15 @@ describe("createSessionSigner", () => {
     });
 
     test("an expired statement-store allowance becomes a non-retryable login hint", async () => {
-        createSessionSignerForAccountMock.mockResolvedValue({
-            publicKey: new Uint8Array(32),
-            signTx: async () => {
+        createSessionSignerForAccountMock.mockResolvedValue(mockCreator(async () => {
                 throw new AllowanceExpiredError("statementStore", new Error("NoAllowance"));
-            },
-            signBytes: async () => new Uint8Array(),
-        });
+            }));
         const signer = await createSessionSigner(
             fakeSession(async () => ok(new Uint8Array(32))),
             { productId: "polkadot-app-deploy.paseo", derivationIndex: 0 },
         );
 
-        await expect(signer.signTx(new Uint8Array(), {}, new Uint8Array(), 0)).rejects.toMatchObject({
+        await expect(callCreator(signer)).rejects.toMatchObject({
             name: "NonRetryableError",
             message: expect.stringContaining("allowance has expired"),
         });
@@ -170,13 +176,9 @@ describe("createSessionSigner", () => {
 
     test("other signing errors pass through unchanged", async () => {
         const rejected = new Error("user rejected on phone");
-        createSessionSignerForAccountMock.mockResolvedValue({
-            publicKey: new Uint8Array(32),
-            signTx: async () => new Uint8Array(),
-            signBytes: async () => {
+        createSessionSignerForAccountMock.mockResolvedValue(mockCreator(async () => "0x", async () => {
                 throw rejected;
-            },
-        });
+            }));
         const signer = await createSessionSigner(
             fakeSession(async () => ok(new Uint8Array(32))),
             { productId: "polkadot-app-deploy.paseo", derivationIndex: 0 },

@@ -5,9 +5,9 @@ import { fromHex, toHex } from "@polkadot-api/utils";
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { sr25519, ss58Address } from "@polkadot-labs/hdkd-helpers";
 import { createClient as createPolkadotClient } from "polkadot-api";
-import { getPolkadotSigner } from "polkadot-api/signer";
+import { getTxCreator } from "polkadot-api/tx-creator";
 import { getWsProvider } from "./ws.js";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { BULLETIN_ENDPOINTS, WS_HEARTBEAT_TIMEOUT_MS, makeBulletinStatusHandler } from "./deploy.js";
 import { readAccountAuthorization, type BulletinAuthorization } from "./pool.js";
 import { setDeployAttribute, truncateAddress } from "./telemetry.js";
@@ -37,15 +37,15 @@ function normalizeSchnorrkelKey(key: Uint8Array): Uint8Array {
   return out;
 }
 
-function signerFromSecret(secret: Uint8Array): PolkadotSigner {
+function signerFromSecret(secret: Uint8Array): SignerTxCreator {
   if (secret.length === 32) {
     const kp = sr25519CreateDerive(secret)("");
-    return getPolkadotSigner(kp.publicKey, "Sr25519", async (d) => kp.sign(d));
+    return getTxCreator(kp.publicKey, "Sr25519", async (d) => kp.sign(d));
   }
   if (secret.length === 64) {
     const normalized = normalizeSchnorrkelKey(secret);
     const pub = sr25519.getPublicKey(normalized);
-    return getPolkadotSigner(pub, "Sr25519", async (d) => sr25519.sign(d, normalized));
+    return getTxCreator(pub, "Sr25519", async (d) => sr25519.sign(d, normalized));
   }
   throw new Error(
     `BulletInAllowance slot key: unexpected length ${secret.length} (expected 32 or 64)`,
@@ -71,7 +71,7 @@ function signerFromSecret(secret: Uint8Array): PolkadotSigner {
 export async function readBulletinSlotSigner(
   appId: string,
   storageDir?: string,
-): Promise<{ signer: PolkadotSigner; ss58: string } | null> {
+): Promise<{ signer: SignerTxCreator; ss58: string } | null> {
   let raw: string;
   try {
     raw = await readFile(cacheFilePath(appId, storageDir), "utf-8");
@@ -336,9 +336,9 @@ export async function withTransientRetry<T>(
  * callers can distinguish and produce targeted messages.
  */
 export async function getSlotSignerProvider(
-  signer: PolkadotSigner,
+  signer: SignerTxCreator,
   ss58: string,
-): Promise<{ client: any; unsafeApi: any; signer: PolkadotSigner; ss58: string }> {
+): Promise<{ client: any; unsafeApi: any; signer: SignerTxCreator; ss58: string }> {
   return withTransientRetry(async () => {
     const primary = BULLETIN_ENDPOINTS[0];
     console.log(`   Connecting to Bulletin (slot signer): ${primary}`);

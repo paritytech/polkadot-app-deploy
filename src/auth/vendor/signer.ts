@@ -15,11 +15,11 @@
 // limitations under the License.
 
 /**
- * Unified signer resolution — "give me a PolkadotSigner, I don't care how."
+ * Unified signer resolution — "give me a SignerTxCreator, I don't care how."
  * Lifted from playground-cli `src/utils/signer.ts` (issue #411).
  *
  * Dev accounts (`--suri //Alice`) and QR mobile sessions both produce the same
- * `PolkadotSigner` interface. Consumers call `resolveSigner(authClient)` once at
+ * `SignerTxCreator` interface. Consumers call `resolveSigner(authClient)` once at
  * startup and thread the result through all operations. The `authClient` (from
  * `createAuthClient`) supplies the session branch, so this module stays free of
  * product-specific config.
@@ -28,13 +28,13 @@
 import { ss58Encode } from "@parity/product-sdk-address";
 import { createDevSigner, getDevPublicKey, type DevAccountName } from "@parity/product-sdk-tx";
 import { seedToAccount } from "@parity/product-sdk-keys";
-import type { PolkadotSigner } from "polkadot-api";
+import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import type { AuthClient, SessionAddresses, SessionHandle } from "./auth.js";
 
 export type SignerSource = "dev" | "session";
 
 export interface ResolvedSigner {
-    signer: PolkadotSigner;
+    signer: SignerTxCreator;
     address: string;
     source: SignerSource;
     /** Present for QR/mobile sessions; absent for local dev/SURI signers. */
@@ -65,7 +65,7 @@ export function parseDevAccountName(suri: string): DevAccountName | null {
 }
 
 /**
- * Resolve a PolkadotSigner.
+ * Resolve a SignerTxCreator.
  *
  *   1. `--suri` flag → dev signer (dev name like //Alice, OR a BIP-39 mnemonic
  *      with optional `//<path>` derivation suffix)

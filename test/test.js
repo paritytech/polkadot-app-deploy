@@ -4,7 +4,7 @@ import { collectUnitTestFiles } from "../scripts/run-unit-tests.mjs";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 import { setupIsolatedHome } from "./helpers/isolated-home.js";
 // Personhood bootstrap imports (loaded after build)
-import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason } from "../dist/dotns.js";
+import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason, reservedForOwnClaimReason } from "../dist/dotns.js";
 import { getAdapter, HIGHEST_VERIFIED_DOTNS_RELEASE } from "../dist/dotns-protocol.js";
 import { concatBytes, compactEncode, blake2_256, encodeMembers, bytesToHex, hexToBytes, indexExtensions } from "../dist/personhood/encoding.js";
 import { deriveMemberEntropy } from "../dist/personhood/member-key.js";
@@ -1898,6 +1898,12 @@ describe("classifyErrorKind", () => {
     assert.strictEqual(classifyErrorKind(msg), "naming.governance_reserved",
       `>> FAIL: naming.governance_reserved: owned-by-another variant should classify the same way (uniform 'cannot register it' phrase); got ${classifyErrorKind(msg)}`);
   });
+  test("naming.governance_reserved: a name reserved for the signer's own claim keeps its kind, not pop_required", () => {
+    assert.strictEqual(classifyErrorKind(reservedForOwnClaimReason("mainnet-long-label")), "naming.governance_reserved",
+      ">> FAIL: own-reservation refusal fell through to the generic personhood rule, which tells the user to get verified");
+    assert.strictEqual(classifyErrorKind("Reserved for a device-name holder's personhood claim"), "naming.governance_reserved",
+      ">> FAIL: PopRules' own reservation revert fell through to the generic personhood rule");
+  });
   test("naming.governance_reserved: bare 'Base name is N chars' message is caught only by the looser rule", () => {
     assert.strictEqual(
       classifyErrorKind("Base name is 4 chars; DotNS reserves base names of 5 chars or fewer for governance (PopRules)."),
@@ -2896,6 +2902,8 @@ describe("isExpectedError", () => {
 
   test("classifies reservation errors as expected", () => {
     assert.ok(isExpectedError("Base name reserved for original Lite registrant"));
+    assert.ok(isExpectedError(reservedForOwnClaimReason("mainnet-long-label")));
+    assert.ok(isExpectedError("Reserved for a device-name holder's personhood claim"));
   });
 
   test("classifies domain validation errors as expected", () => {
@@ -6044,15 +6052,17 @@ describe("canRegister", () => {
 describe("getPriceAndValidate eligibility", () => {
   const { ProofOfPersonhoodLite: Lite, NoStatus } = ProofOfPersonhoodStatus;
 
-  function stubForPrice({ requiredStatus, userStatus }) {
+  function stubForPrice({ requiredStatus, userStatus, reservedForSelf = false, ownerQuoteStatus }) {
     const d = new DotNS();
     d.connected = true;
     d.evmAddress = "0xabcd000000000000000000000000000000000001";
     d.substrateAddress = "5".padEnd(48, "x");
     d.getUserPopStatus = async () => userStatus;
-    // All reads are via strict contractCall: isBaseNameReserved, classifyName, priceWithCheck.
+    // All reads are via strict contractCall: isBaseNameReserved, classifyName, priceWithCheck,
+    // and priceWithoutCheck when the base name is reserved for the signer.
     d.contractCall = async (_contract, _abi, fn) => {
-      if (fn === "isBaseNameReserved") return [false, "0x" + "0".repeat(40), 0n];
+      if (fn === "isBaseNameReserved") return reservedForSelf ? [true, d.evmAddress, 9999999999n] : [false, "0x" + "0".repeat(40), 0n];
+      if (fn === "priceWithoutCheck") return { price: 0n, status: ownerQuoteStatus, userStatus, message: "" };
       if (fn === "classifyName") return [requiredStatus, "Available to all"];
       if (fn === "priceWithCheck") return { price: 0n, status: requiredStatus, userStatus, message: "Available to all" };
       throw new Error(`unexpected contractCall in stub: ${fn}`);
@@ -6065,6 +6075,22 @@ describe("getPriceAndValidate eligibility", () => {
     const r = await d.getPriceAndValidate("mainnet-long-label00"); // base 18, td 2 → NoStatus
     assert.strictEqual(r.requiredStatus, NoStatus);
     assert.strictEqual(r.userStatus, Lite);
+    assert.strictEqual(r.priceWei, 0n);
+  });
+
+  // A library caller that skips preflight reaches this check before the
+  // commitment is paid, so it must refuse the owner on its own.
+  test("base name reserved for the signer, PopRules quotes it reserved (DotNS 1.1.0) → throws before pricing", async () => {
+    const d = stubForPrice({ requiredStatus: NoStatus, userStatus: Lite, reservedForSelf: true, ownerQuoteStatus: ProofOfPersonhoodStatus.Reserved });
+    await assert.rejects(
+      () => d.getPriceAndValidate("mainnet-long-label00"),
+      (e) => e.message === reservedForOwnClaimReason("mainnet-long-label"),
+    );
+  });
+
+  test("base name reserved for the signer, PopRules quotes it open (DotNS 1.0.0) → prices it", async () => {
+    const d = stubForPrice({ requiredStatus: NoStatus, userStatus: Lite, reservedForSelf: true, ownerQuoteStatus: NoStatus });
+    const r = await d.getPriceAndValidate("mainnet-long-label00");
     assert.strictEqual(r.priceWei, 0n);
   });
 
@@ -6119,6 +6145,13 @@ describe("DotNS.preflight", () => {
     // reads this via strict contractCall (empty data now surfaces as an error).
     d.contractCall = async (_contract, _abi, fn) => {
       if (fn === "isBaseNameReserved") return overrides.baseReservation ?? [false, "0x" + "0".repeat(40), 0n];
+      // PopRules' quote, read when the base name is reserved for the signer. Omit
+      // the override to leave the read failing, which preflight treats as "no answer".
+      if (fn === "priceWithoutCheck") {
+        if (overrides.ownerQuoteError) throw new Error(overrides.ownerQuoteError);
+        if (overrides.ownerQuoteStatus === undefined) throw new Error("Contract reverted (flags=1) with data: 0x");
+        return { price: 0n, status: overrides.ownerQuoteStatus, userStatus: 0, message: "" };
+      }
       // gateOnFeeBalance reads PopRules.startingPrice live for a NoStatus
       // register (issue #884). Default to the live paseo-next-v2 value (10 ether)
       // so the fee floor matches the historical bufferedRentNative behaviour.
@@ -6464,7 +6497,8 @@ describe("DotNS.preflight", () => {
     assert.ok(r.reason?.toLowerCase().includes(other.toLowerCase()), `reason should mention reservation owner; got: ${r.reason}`);
   });
 
-  test("base name reserved by us → canProceed:true", async () => {
+  // A reverted quote is no answer, the same fallback as isBaseNameReserved's.
+  test("base name reserved by us, PopRules quote reverts → treated as no answer, canProceed:true", async () => {
     const myAddr = "0xabcd000000000000000000000000000000000001";
     const d = stubDotns({
       evmAddress: myAddr,
@@ -6474,6 +6508,50 @@ describe("DotNS.preflight", () => {
     const r = await d.preflight("mainnet-long-label00");
     assert.strictEqual(r.canProceed, true);
     assert.strictEqual(r.plannedAction, "register");
+  });
+
+  // DotNS up to 1.0.0: PopRules' quote lets the reservation's owner register the name.
+  test("base name reserved by us, PopRules quotes it open (DotNS 1.0.0) → canProceed:true", async () => {
+    const myAddr = "0xabcd000000000000000000000000000000000001";
+    const d = stubDotns({
+      evmAddress: myAddr,
+      userStatus: Full,
+      baseReservation: [true, myAddr, 9999999999n],
+      ownerQuoteStatus: Full,
+    });
+    const r = await d.preflight("mainnet-long-label00");
+    assert.strictEqual(r.canProceed, true);
+    assert.strictEqual(r.plannedAction, "register");
+  });
+
+  // DotNS 1.1.0: a live reservation keeps the name off public registration for
+  // every account, its owner included, so preflight must abort before any upload.
+  test("base name reserved by us, PopRules quotes it reserved (DotNS 1.1.0) → abort before upload", async () => {
+    const myAddr = "0xabcd000000000000000000000000000000000001";
+    const d = stubDotns({
+      evmAddress: myAddr,
+      userStatus: Full,
+      baseReservation: [true, myAddr, 9999999999n],
+      ownerQuoteStatus: Reserved,
+    });
+    const r = await d.preflight("mainnet-long-label00");
+    assert.strictEqual(r.canProceed, false,
+      ">> FAIL: owner-reserved on 1.1.0: preflight approved a register that PopRules refuses, so the upload would be paid for and the register would revert");
+    assert.strictEqual(r.plannedAction, "abort");
+    assert.match(r.reason, /reserved for your own personhood claim/);
+  });
+
+  // Only a quote that came back can be read as "no answer"; one that never
+  // completed must fail preflight, or network noise would let the deploy upload.
+  test("base name reserved by us, PopRules quote times out → preflight fails", async () => {
+    const myAddr = "0xabcd000000000000000000000000000000000001";
+    const d = stubDotns({
+      evmAddress: myAddr,
+      userStatus: Full,
+      baseReservation: [true, myAddr, 9999999999n],
+      ownerQuoteError: "priceWithoutCheck timed out after 30000ms",
+    });
+    await assert.rejects(() => d.preflight("mainnet-long-label00"), /timed out after 30000ms/);
   });
 
   // #1185 code review finding: the isBaseNameReserved non-fatal wrapper must

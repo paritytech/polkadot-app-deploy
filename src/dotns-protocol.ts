@@ -128,7 +128,7 @@ export const DOTNS_ABI_PROFILES: Record<DotnsAbiProfile, DotnsAbiProfileInfo> = 
  * so adding to DotnsAbiProfile alone will not fail the build the way
  * DOTNS_ABI_PROFILES and classifyLabelStatus do.
  */
-export const HIGHEST_VERIFIED_DOTNS_RELEASE = "1.0.0";
+export const HIGHEST_VERIFIED_DOTNS_RELEASE = "1.1.0";
 
 /** A usable `protocolVersion()` answer. */
 export interface DeclaredProtocolVersion {

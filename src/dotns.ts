@@ -1936,6 +1936,14 @@ function exampleNoStatusLabel(label: string, tld: string = DEFAULT_TLD): string 
 // default: network noise is not evidence about the chain's state.
 const READ_NEVER_COMPLETED_RE = /timed out after \d+ms|heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i;
 
+// Why a signer cannot publicly register a base name it holds the live
+// reservation for. Up to DotNS 1.0.0 PopRules lets the reservation's owner
+// register it; from 1.1.0 a live reservation keeps the name off public
+// registration for every account, so it is taken only through a gateway claim.
+export function reservedForOwnClaimReason(baseName: string): string {
+  return `Base name ${baseName} is reserved for your own personhood claim, and PopRules keeps a reserved name off public registration for every account, its owner included. Claim it through the gateway, or deploy to another name.`;
+}
+
 // PopRules closes every base length below nine unless shortNamesEnabled is on.
 // Below six is already Reserved and refused earlier, so six to eight is the only
 // range this gate decides.
@@ -5205,6 +5213,22 @@ export class DotNS {
     return { requiredStatus, message };
   }
 
+  // Whether PopRules refuses `owner` the name `label` because its base name is
+  // under a live reservation. Read from PopRules' own quote, which applies the
+  // connected release's rule (see reservedForOwnClaimReason). Null when the
+  // quote could not be read (a revert or empty data); a read that never
+  // completed throws, as for isBaseNameReserved in preflight.
+  private async reservationBlocksOwner(label: string, owner: string): Promise<boolean | null> {
+    try {
+      const quote = await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "priceWithoutCheck", [label, owner]), 30000, "priceWithoutCheck");
+      const status = (quote as any)?.status;
+      return status == null ? null : Number(status) === ProofOfPersonhoodStatus.Reserved;
+    } catch (e: any) {
+      if (READ_NEVER_COMPLETED_RE.test(e?.message ?? String(e))) throw e;
+      return null;
+    }
+  }
+
   async ensureNotRegistered(label: string): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Checking availability of ${label}.${this._tld}...`);
@@ -5313,6 +5337,7 @@ export class DotNS {
     const reservationInfo = await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "isBaseNameReserved", [baseName]), 30000, "isBaseNameReserved");
     const [isReserved, reservationOwner] = reservationInfo;
     if (isReserved && reservationOwner.toLowerCase() !== this.evmAddress!.toLowerCase()) throw new Error("Base name reserved for original Lite registrant");
+    if (isReserved && (await this.reservationBlocksOwner(label, this.evmAddress!)) === true) throw new Error(reservedForOwnClaimReason(baseName));
     const { requiredStatus, message } = await this.classifyName(label);
     const userStatus = await this.getUserPopStatus();
     if (requiredStatus === ProofOfPersonhoodStatus.Reserved) throw new Error(message);
@@ -6035,6 +6060,18 @@ export class DotNS {
           isAvailable: true, existingOwner: null, isBaseNameReserved: true, reservationOwner,
           isTestnet, canProceed: false,
           reason: `Base name ${baseName} is reserved for ${reservationOwner}.`,
+          plannedAction: "abort", needsPopUpgrade: false, signerFreeBalance,
+        };
+      }
+
+      // Base name reserved for this signer: whether that still lets it register
+      // the name publicly depends on the DotNS release, so PopRules decides.
+      if (isReserved && (await this.reservationBlocksOwner(validated, selfAddress)) === true) {
+        return {
+          label: validated, classification, userStatus, trailingDigits, baselength,
+          isAvailable: true, existingOwner: null, isBaseNameReserved: true, reservationOwner,
+          isTestnet, canProceed: false,
+          reason: reservedForOwnClaimReason(baseName),
           plannedAction: "abort", needsPopUpgrade: false, signerFreeBalance,
         };
       }

@@ -692,7 +692,7 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   [/is soulbound and cannot be transferred/i, 'naming.soulbound'],
   // Operator-fixable phrasings, above contract-revert so the actionable kind wins over the wrapper.
   // formatUnregistrableReason's phrase (#1185); above the label rules since it can quote the PopError it explains.
-  [/cannot register it|base name is \d+ chars|reserved for original/i, 'naming.governance_reserved'],
+  [/cannot register it|base name is \d+ chars|reserved for original|reserved for your own personhood claim|reserved for a device-name holder/i, 'naming.governance_reserved'],
   [/NameNotAvailable/i, 'naming.name_unavailable'],
   [/invalid domain label|name must be lowercase/i, 'naming.invalid_label'],
   [/insufficient balance|insufficient funds|signer balance .* < estimated fee/i, 'funding.insufficient_balance'],

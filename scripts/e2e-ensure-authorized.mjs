@@ -32,7 +32,7 @@
 // human-reviewed CI step, not a runtime code path.
 //
 // Testnet-only. Refuses to guess an authorizer key: an environment that does
-// not declare `bulletinAuthorizer` in environments.json (e.g. devnet, which
+// not declare `bulletinAuthorizer` in assets/stack-policy.json (e.g. pcf-devnet, which
 // is community-operated) fails with an actionable message instead of an
 // opaque on-chain rejection from a wrong guess — see #1213/env-authorizer-read
 // and bootstrapPool's identical stance in src/pool.ts.
@@ -45,7 +45,7 @@ import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { createClient, Enum } from "polkadot-api";
 import { getWsProvider } from "polkadot-api/ws";
 import { getTxCreator } from "polkadot-api/tx-creator";
-import { loadEnvironments, resolveEndpoints } from "../dist/environments.js";
+import { loadStack } from "../dist/stacks.js";
 import { readAccountAuthorization, isAuthorizationSufficient, assetHubTopUpAmount, formatPasBalance, TOPUP_TRANSACTIONS, TOPUP_BYTES } from "../dist/pool.js";
 import { stripYamlCommentLines, extractJobBlocks } from "./lib/workflow-jobs.mjs";
 import { SUBMIT_MORTALITY } from "../dist/mortality.js";
@@ -243,7 +243,7 @@ export function assertTestnet(resolved, envId) {
 export function requireBulletinAuthorizer(resolved, envId) {
   if (!resolved.bulletinAuthorizer) {
     throw new Error(
-      `environment '${envId}' does not declare a bulletinAuthorizer in environments.json — likely ` +
+      `stack '${envId}' does not declare a bulletinAuthorizer in assets/stack-policy.json — likely ` +
       `community-operated (e.g. devnet), so the real authorizer key is unknown here. Refusing to ` +
       `guess: a wrong guess (e.g. defaulting to //Alice) produces an opaque on-chain rejection instead ` +
       `of this message (see #1213/env-authorizer-read, the same bug class this guard prevents). Add ` +
@@ -399,8 +399,14 @@ async function main() {
 
   await cryptoWaitReady();
 
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, envId);
+  const stack = await loadStack({ env: envId });
+  const resolved = {
+    network: stack.network,
+    bulletinAuthorizer: stack.bulletinAuthorizer,
+    bulletin: stack.chains.Bulletin.rpc,
+    assetHub: stack.chains.AssetHub.rpc,
+    registerStorageDeposit: stack.registerStorageDeposit,
+  };
 
   assertTestnet(resolved, envId);
   const authorizerUri = requireBulletinAuthorizer(resolved, envId);

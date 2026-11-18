@@ -19,11 +19,12 @@
 import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { renderLoginStatus, requestResourceAllocation, DEFAULT_RESOURCES, summarizeOutcomes, createSlotAccountSigner, BULLETIN_RESOURCE } from "../auth/index.js";
 import type { AllocationSummary } from "../auth/index.js";
-import { getAuthClient, resolveBulletinEndpoints, getPeopleChainEndpoints } from "../auth-config.js";
+import { assertPeopleMatchesStack, getAuthClient } from "../auth-config.js";
+import { NonRetryableError } from "../errors.js";
+import type { Stack } from "../stacks.js";
 import { CLI_NAME } from "../cli-name.js";
 import { statementSigningAccount } from "../sss-allowance.js";
 import { preflightSssAllowance } from "../sss-allowance-cache.js";
-import { loadEnvironments } from "../environments.js";
 import { ss58Encode } from "@parity/product-sdk-address";
 import { waitForBulletinAuthorization } from "../storage-signer.js";
 import { startSpinner } from "../spinner.js";
@@ -178,7 +179,7 @@ export interface LoginOptions {
 /**
  * Run the login command. Prints the QR code to stdout and waits for mobile approval.
  */
-export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise<void> {
+export async function runLogin(stack: Stack, _opts: LoginOptions = {}): Promise<void> {
     // Teardown guard: adapter.destroy() fires a synchronous RxJS finalizer that calls
     // sendUnsubscribe on an already-closed papi WS. polkadot-api's raw client surfaces this
     // as an uncaughtException with "Error: Not connected" (or DestroyedError). The `.catch(()=>{})`
@@ -196,7 +197,8 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
     process.on("uncaughtException", teardownFilter);
     process.on("unhandledRejection", teardownFilter);
 
-    const client = await getAuthClient(envId);
+    await assertPeopleMatchesStack(stack);
+    const client = await getAuthClient(stack);
     const result = await client.connect();
 
     if (result.kind === "existing") {
@@ -218,7 +220,7 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
                 const statementAccount = statementSigningAccount(sessionHandle.userSession);
                 // Cached preflight: skips the chain read on a same-period hit, clears
                 // the cache on a chain-confirmed expiry. See sss-allowance-cache.ts.
-                const allowed = await preflightSssAllowance(statementAccount, () => getPeopleChainEndpoints(envId));
+                const allowed = await preflightSssAllowance(statementAccount, stack.chains.People.rpc);
                 if (allowed === false) {
                     console.error(
                         `\nStatement Store allowance has expired for ${result.address}.\n` +
@@ -355,14 +357,8 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
             // pollUntilBulletinAuthorized rides out flaky reads). The user can
             // Ctrl-C to stop waiting; the session is still saved, so we exit 0
             // with the soft-fallback message rather than failing.
-            // Poll the SELECTED env's bulletin chain — NOT the deploy-only
-            // BULLETIN_ENDPOINTS default. Login never runs deploy's endpoint
-            // reassignment, so without this it would wait on the wrong chain
-            // (paseo-next) and never see the slot's authorization on, e.g.,
-            // paseo-next-v2. Fall back to undefined (→ default) only if the env
-            // somehow has no bulletin endpoint.
-            const { doc } = await loadEnvironments();
-            const bulletinEndpoints = resolveBulletinEndpoints(doc, envId) ?? undefined;
+            // Poll the selected stack's Bulletin chain: login never runs deploy's
+            // endpoint assignment, so no Bulletin chain is selected here.
             const spinner = startSpinner("Confirming Bulletin authorization on-chain");
             const onSigint = (): void => {
                 spinner.stop();
@@ -382,7 +378,7 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
                 authResult = await waitForBulletinAuthorization(slotAddress, {
                     timeoutMs: Infinity,
                     quiet: true,
-                    endpoints: bulletinEndpoints,
+                    stack,
                 });
             } finally {
                 spinner.stop();
@@ -402,6 +398,8 @@ export async function runLogin(envId: string, _opts: LoginOptions = {}): Promise
             );
         }
     } catch (err) {
+        // A stack mismatch (e.g. GenesisMismatchError) is fatal, not a pre-warm failure.
+        if (err instanceof NonRetryableError) throw err;
         // Post-sign-in allowance pre-warm failed (steps 2–4: requestResourceAllocation,
         // createSlotAccountSigner, waitForBulletinAuthorization). The user IS already
         // signed in (session saved in step 1) — this is non-fatal. Best-effort: abort

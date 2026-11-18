@@ -15,6 +15,9 @@ async function buildConnectOpts(envId) {
 // lifetime for one-off reads (post-run CI verification, ad-hoc debugging).
 // Anything inside a running deploy should use dotns.getContenthash directly
 // on its existing connection.
+//
+// Pass envId (e.g. "paseo-next-v2") to read from that built-in stack; omit it
+// for the one the CLI itself defaults to.
 export async function resolveContenthashOnChain(label, envId = null) {
   const dotns = new DotNS();
   try {

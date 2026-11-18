@@ -37,14 +37,15 @@ import { setTimeout as delay } from "node:timers/promises";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { readStackPolicy } from "../tools/lib/stack-copies.mjs";
 
 const FIXTURE_DIR = required("FIXTURE_DIR");
 if (process.env.DOTNS_ENV && !process.env.PAD_ENV) {
   console.warn("DOTNS_ENV is deprecated; use PAD_ENV. Will be removed in a future release.");
 }
-// An unset PAD_ENV is not "no environment": the CLI deploys to DEFAULT_ENV_ID
-// (src/environments.ts), so the fixtures follow it.
-const ENV_ID = process.env.PAD_ENV || process.env.DOTNS_ENV || "paseo-next-v2";
+// An unset PAD_ENV is not "no environment": the CLI deploys to the
+// default stack (assets/stack-policy.json), so the fixtures follow it.
+const ENV_ID = process.env.PAD_ENV || process.env.DOTNS_ENV || readStackPolicy().default;
 const LABEL = process.env.LABEL ?? (ENV_ID === "paseo-next-v2" ? "e2epoolns01" : "e2epool");
 // e2eownedns03, not e2eownedns02: verified live 2026-08-22 via checkOwnership
 // that e2eownedns02.paseo was squatted by a third party (0x237a2b18…) after

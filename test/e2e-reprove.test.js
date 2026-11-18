@@ -20,7 +20,6 @@
 import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
 import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS } from "../dist/dotns.js";
-import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig } from "../dist/environments.js";
 import { trackTimers, armExitGuard } from "./helpers/e2e-exit-guard.js";
 import { installE2eResultHook } from "./helpers/e2e-result.js";
 
@@ -30,19 +29,9 @@ const REPROVE_MNEMONIC = process.env.E2E_REPROVE_MNEMONIC ?? "";
 const PAD_ENV = process.env.PAD_ENV ?? null;
 const DEPLOY_TIMEOUT_MS = 15 * 60 * 1000;
 
-async function resolveDotnsEnvConnectOptions() {
-  if (!PAD_ENV) return {};
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, PAD_ENV);
-  const popSelfServe = getPopSelfServeConfig(doc, PAD_ENV);
-  return {
-    rpc: resolved.assetHub[0],
-    assetHubEndpoints: resolved.assetHub,
-    autoAccountMapping: resolved.autoAccountMapping,
-    contracts: Object.keys(resolved.contracts).length > 0 ? resolved.contracts : undefined,
-    nativeToEthRatio: resolved.nativeToEthRatio,
-    popSelfServe,
-  };
+// The stack supplies Asset Hub endpoints, contracts, popSelfServe and the People chain reprove() uses.
+function resolveDotnsEnvConnectOptions() {
+  return { env: PAD_ENV ?? undefined };
 }
 
 describe("S-REPROVE — auto-reprove on bound-likely-stale", { skip: !ENABLED }, () => {

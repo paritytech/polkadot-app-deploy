@@ -4,14 +4,13 @@ import * as path from "path";
 import { execSync } from "child_process";
 import { CLI_NAME } from "./cli-name.js";
 import { resolveEffectiveMnemonic } from "./mnemonic.js";
-import { hasPersistedSession, STALE_SESSION_DEPLOY_MESSAGE, getPeopleChainEndpoints } from "./auth-config.js";
+import { hasPersistedSession, STALE_SESSION_DEPLOY_MESSAGE } from "./auth-config.js";
 import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { blake2b } from "@noble/hashes/blake2b";
-import { createClient as createPolkadotClient } from "polkadot-api";
+import type { PolkadotClient } from "polkadot-api";
 import { WsEvent } from "polkadot-api/ws";
-import { getWsProvider } from "./ws.js";
 import { CID } from "multiformats/cid";
 import { create as createMultihash } from "multiformats/hashes/digest";
 import { base32 } from "multiformats/bases/base32";
@@ -33,8 +32,9 @@ import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { derivePoolAccounts, fetchPoolAuthorizations, selectHealthyPoolAccount, checkPoolAccountNonceHealth, StuckPoolAccountError, STUCK_NONCE_GAP_THRESHOLD, withTimeout, stuckQueueMessage, parsePoolDerivationIndex, NONCE_HEALTH_SAMPLES, type NonceHealth, ensureAuthorized, isAuthorizationSufficient, readAccountAuthorization, detectTestnet, resolvePoolMnemonic } from "./pool.js";
 import type { BulletinAuthorization, PoolAuthorization } from "./pool.js";
 import { initTelemetry, withSpan, withDeploySpan, setDeployAttribute, setDeploySentryTag, sampleMemory, setDeployReportContext, captureWarning, noteWarning, flush, VERSION, resolveRunner, resolveRunnerType, truncateAddress } from "./telemetry.js";
-import { loadEnvironments, describeContractSources, resolveEndpoints, getPopSelfServeConfig, DEFAULT_ENV_ID } from "./environments.js";
-import type { PopSelfServeConfig } from "./environments.js";
+import { loadStack, describeStackOrigin, stackSelectionFlag, stackSelectionOf, RETIRED_SELECTION_ERRORS, type Stack } from "./stacks.js";
+import { webUrl } from "@parity/trinity-stack";
+import { connectChainClient, type ChainClientConfig } from "./genesis.js";
 import { setDeployContext as setBugReportContext } from "./bug-report.js";
 import { getTxCreator } from "polkadot-api/tx-creator";
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
@@ -55,13 +55,12 @@ export interface DeployResult {
   cid: string;
   ipfsCid?: string;
   /**
-   * The env-aware browser URL for the deployed site — same value browserUrlFor()
-   * produces for the "Check it out here" console line (issue #1157). Exposed here
+   * Where the stack's web gateway serves the deployed site, from its descriptor's
+   * `web-gateway` (issue #1157), or undefined when the stack lists none. Exposed
    * so callers embedding deploy() as a library (and the CLI's GITHUB_OUTPUT write,
-   * and the reusable workflow's PR-comment step) can reuse the ONE resolution
-   * instead of recomputing a gateway URL from a hardcoded default.
+   * and the reusable workflow's PR-comment step) reuse the one resolution.
    */
-  browserUrl: string;
+  browserUrl?: string;
   /**
    * The Bulletin allowance-slot signer this deploy stored its content with, when it resolved
    * one from a login session (`resolveStorageSigner`). Exposed so the CLI can hand the SAME
@@ -129,23 +128,16 @@ interface StoredChunk { cid: CID; len: number; viaFallback?: boolean; receipt?: 
 interface WatchTransactionOptions { label?: string; timeoutMs?: number; confirmIncluded?: () => Promise<boolean>; }
 interface WatchResult<T> { value: T; viaFallback: boolean; receipt?: ChainReceipt; }
 
-export const DEFAULT_BULLETIN_RPC = "wss://paseo-bulletin-rpc.polkadot.io";
 export const DEFAULT_POOL_SIZE = 10;
-// Full endpoint list for multi-endpoint transport. Index 0 is always the
-// effective primary. Only one public Bulletin endpoint is known today — add
-// backups here once the Bulletin team publishes them (no code change needed).
-export let BULLETIN_ENDPOINTS: string[] = [DEFAULT_BULLETIN_RPC];
+/**
+ * The Bulletin chain every connection this module opens goes to: `endpoints` (index 0 is the
+ * primary), the `stack` each new client's genesis hash is checked against (none when only
+ * endpoints were set). Empty until a deploy
+ * (or setBulletinStack) selects a stack.
+ */
+export interface BulletinSelection { readonly stack?: Stack; readonly endpoints: string[]; }
+export let bulletinSelection: BulletinSelection = { endpoints: [] };
 let POOL_SIZE = DEFAULT_POOL_SIZE;
-// bulletin #1362/#1095: the resolved env's environments.json `network` field.
-// Threaded into ensureAuthorized by the provider helpers below so their
-// detectTestnet call decides from the declared env, not a chain spec_name
-// guess, whenever one is available. Module-level (like BULLETIN_ENDPOINTS/
-// POOL_SIZE above) because getProvider/getDirectProvider/getSignerProvider
-// run outside deploy()'s own scope. Also read by isPoolFallbackAllowed below
-// to gate whether a failed Bulletin allowance slot may fall back to the
-// shared pool — the pool is derived from the well-known dev phrase and holds
-// no grant on mainnet.
-let bulletinNetwork: string | undefined;
 
 /**
  * Bulletin RPC override precedence, shared by every caller that resolves an
@@ -164,38 +156,42 @@ export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: st
   return userRpc ? [userRpc, ...envBulletin.filter(e => e !== userRpc)] : envBulletin;
 }
 
-/**
- * Set the module-level Bulletin endpoint list that `getProvider()` (and
- * therefore `storeFile`/`storeDirectory` when called without an explicit
- * client) connects to. `deploy()` sets this from the resolved env/--rpc at
- * the top of every run. Exported so callers outside this module — namely
- * `manifest/publish.ts`'s `publishManifest`, which can run without a
- * preceding in-process `deploy()` call — can point their own storage
- * uploads at the same env instead of silently defaulting to
- * `DEFAULT_BULLETIN_RPC`. ESM named imports are read-only bindings, so a
- * setter is the only way for another module to update this `let`.
- */
+/** Test-only: select `endpoints` with no stack, so no genesis check. */
 export function setBulletinEndpoints(endpoints: string[]): void {
-  BULLETIN_ENDPOINTS = endpoints;
+  bulletinSelection = { endpoints };
 }
 
 /**
- * Set the module-level `bulletinNetwork` context declared above. `manifest/publish.ts`
- * opens its own storage provider and can run without a preceding in-process `deploy()`,
- * in which case `bulletinNetwork` would still be undefined — the historical
- * (testnet-shaped) fallback behavior, not a hard failure on mainnet, and detectTestnet's
- * own spec_name guess would also be skipped. Same reasoning as `setBulletinEndpoints`:
- * ESM named imports are read-only bindings, so a setter is the only way for another
- * module to update this `let`.
+ * Point every Bulletin connection this module opens at `stack`'s Bulletin chain (or
+ * `rpcOverride` / BULLETIN_RPC first), check each new client's genesis hash against the
+ * stack, and take its network. `deploy()` calls it per run; `manifest/publish.ts` calls it
+ * because it can run without a preceding `deploy()`.
  */
-export function setBulletinNetworkContext(network: string | undefined): void {
-  bulletinNetwork = network;
+export function setBulletinStack(stack: Stack, rpcOverride?: string): void {
+  bulletinSelection = {
+    stack,
+    endpoints: resolveBulletinEndpoints(stack.chains.Bulletin.rpc, rpcOverride),
+  };
 }
 
-/** The value above, for tests that assert the wiring without a chain connection. */
-export function __getBulletinNetworkContextForTest(): string | undefined {
-  return bulletinNetwork;
+/** The authorization options every ensureAuthorized call in this module passes. */
+function bulletinAuthorizationOptions(): { network?: string } {
+  return { network: bulletinSelection.stack?.network };
 }
+
+/**
+ * A client to the selected Bulletin endpoints whose genesis hash matches the selected stack's
+ * Bulletin chain; unchecked when no stack is selected. Fails like `connectChainClient`, and
+ * with a NonRetryableError when no endpoint is selected.
+ */
+export async function openBulletinClient(config: ChainClientConfig = {}): Promise<PolkadotClient> {
+  const { stack, endpoints } = bulletinSelection;
+  if (endpoints.length === 0) {
+    throw new NonRetryableError("no Bulletin chain selected: pass a stack or env to deploy(), or call setBulletinStack()");
+  }
+  return connectChainClient(stack, "Bulletin", endpoints, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, ...config });
+}
+
 // Module-level flag: flipped by getWsProvider's onStatusChanged if papi
 // connects to a non-primary endpoint. Flushed into the deploy span at the end
 // of deploy() so the attribute always lands even if the callback fires late
@@ -529,15 +525,29 @@ function toHashingEnum(mhCode: number): { type: string; value: undefined } {
   }
 }
 
+/**
+ * Connect to Bulletin and check the chain is the selected stack's.
+ *
+ * Shared by all three get*Provider variants, so a client cannot be created without
+ * being checked.
+ */
+async function connectBulletinClient(): Promise<{ client: PolkadotClient; unsafeApi: any }> {
+  const primary = bulletinSelection.endpoints[0];
+  if (primary) console.log(`   Connecting to Bulletin: ${primary}`);
+  const client = await openBulletinClient({ onStatusChanged: makeBulletinStatusHandler(primary) });
+  return { client, unsafeApi: client.getUnsafeApi() };
+}
+
 // bulletin #1637: reads for checkPoolAccountNonceHealth. The on-chain nonce comes from the deploy's own
 // client at the BEST block. Each nextIndex sample goes through fetchNonce, which opens a fresh
 // WebSocket per call (a new load-balancer backend pick), the same path chunk nonces are read
 // through. Samples are spread round-robin over the endpoints.
 async function checkSignerQueue(unsafeApi: any, who: string, address: string): Promise<NonceHealth> {
+  const { endpoints } = bulletinSelection;
   const h = await checkPoolAccountNonceHealth(address, {
     readOnchainNonce: async (a: string) => Number((await unsafeApi.query.System.Account.getValue(a, { at: "best" })).nonce),
-    readNextIndex: (a: string, sample: number) => fetchNonce(BULLETIN_ENDPOINTS[sample % BULLETIN_ENDPOINTS.length], a),
-    samples: NONCE_HEALTH_SAMPLES * BULLETIN_ENDPOINTS.length,
+    readNextIndex: (a: string, sample: number) => fetchNonce(endpoints[sample % endpoints.length], a),
+    samples: NONCE_HEALTH_SAMPLES * endpoints.length,
   });
   console.log(h.verdict === "unknown"
     ? `   Could not check ${who}'s pending-tx queue (${h.reason}); continuing`
@@ -551,13 +561,7 @@ function recordStuckSkipped(ids: Array<number | string>): void {
 }
 
 async function getProvider({ checkQueue = true }: { checkQueue?: boolean } = {}): Promise<ProviderResult> {
-  const primary = BULLETIN_ENDPOINTS[0];
-  console.log(`   Connecting to Bulletin: ${primary}`);
-  const client = createPolkadotClient(getWsProvider(
-    BULLETIN_ENDPOINTS,
-    { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, onStatusChanged: makeBulletinStatusHandler(primary) },
-  ));
-  const unsafeApi: any = client.getUnsafeApi();
+  const { client, unsafeApi } = await connectBulletinClient();
 
   try {
     await cryptoWaitReady();
@@ -590,7 +594,7 @@ async function getProvider({ checkQueue = true }: { checkQueue?: boolean } = {})
     const selectedAccount = selectionResult.account;
     const eligibleCount = selectionResult.eligibleCount;
     recordStuckSkipped(selectionResult.skippedStuck.map((s) => s.index));
-    await ensureAuthorized(unsafeApi, selectedAccount.address, `pool account ${selectedAccount.index}`, { network: bulletinNetwork });
+    await ensureAuthorized(unsafeApi, selectedAccount.address, `pool account ${selectedAccount.index}`, bulletinAuthorizationOptions());
 
     console.log(`   Using pool account ${selectedAccount.index}: ${selectedAccount.address}`);
     setDeployAttribute("deploy.signer.mode", "pool");
@@ -605,13 +609,7 @@ async function getProvider({ checkQueue = true }: { checkQueue?: boolean } = {})
 }
 
 async function getDirectProvider(mnemonic: string, derivationPath: string = "", { checkQueue = true }: { checkQueue?: boolean } = {}): Promise<ProviderResult> {
-  const primary = BULLETIN_ENDPOINTS[0];
-  console.log(`   Connecting to Bulletin: ${primary}`);
-  const client = createPolkadotClient(getWsProvider(
-    BULLETIN_ENDPOINTS,
-    { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, onStatusChanged: makeBulletinStatusHandler(primary) },
-  ));
-  const unsafeApi: any = client.getUnsafeApi();
+  const { client, unsafeApi } = await connectBulletinClient();
   const { signer, ss58 } = deriveRootSigner(mnemonic, derivationPath);
 
   console.log(`   Using direct signer: ${ss58}${derivationPath ? ` (path: ${derivationPath})` : ""}`);
@@ -638,7 +636,7 @@ async function getDirectProvider(mnemonic: string, derivationPath: string = "", 
   let now = currentBlock.number;
   if (!isAuthorizationSufficient(auth, now)) {
     try {
-      await ensureAuthorized(unsafeApi, ss58 as string, "direct signer", { network: bulletinNetwork });
+      await ensureAuthorized(unsafeApi, ss58, "direct signer", bulletinAuthorizationOptions());
       [auth, currentBlock] = await Promise.all([
         readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
@@ -657,13 +655,7 @@ async function getDirectProvider(mnemonic: string, derivationPath: string = "", 
 }
 
 async function getSignerProvider(signer: SignerTxCreator, ss58: string): Promise<ProviderResult> {
-  const primary = BULLETIN_ENDPOINTS[0];
-  console.log(`   Connecting to Bulletin: ${primary}`);
-  const client = createPolkadotClient(getWsProvider(
-    BULLETIN_ENDPOINTS,
-    { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, onStatusChanged: makeBulletinStatusHandler(primary) },
-  ));
-  const unsafeApi: any = client.getUnsafeApi();
+  const { client, unsafeApi } = await connectBulletinClient();
 
   console.log(`   Using external signer: ${ss58}`);
 
@@ -674,7 +666,7 @@ async function getSignerProvider(signer: SignerTxCreator, ss58: string): Promise
   let now = currentBlock.number;
   if (!isAuthorizationSufficient(auth, now)) {
     try {
-      await ensureAuthorized(unsafeApi, ss58, "external signer", { network: bulletinNetwork });
+      await ensureAuthorized(unsafeApi, ss58, "external signer", bulletinAuthorizationOptions());
       [auth, currentBlock] = await Promise.all([
         readAccountAuthorization(unsafeApi, ss58),
         client.getFinalizedBlock(),
@@ -707,22 +699,6 @@ async function getSignerProvider(signer: SignerTxCreator, ss58: string): Promise
 export { resolveEffectiveMnemonic, mnemonicConflictNotice } from "./mnemonic.js";
 
 /**
- * Resolve the environment id the CLI should target, in precedence order:
- * `--env` flag > `PAD_ENV` env var. Returns `undefined` when neither is
- * set — callers (deploy(), the bin's other flag sites) already fall back to
- * `DEFAULT_ENV_ID` themselves, so this helper doesn't bake that default in;
- * it only resolves the flag/env-var precedence (mirrors
- * `resolveEffectiveMnemonic`'s pattern so the bin's session default is
- * unit-testable).
- */
-export function resolveEnvId(opts: {
-  flagEnv: string | undefined;
-  envVar: string | undefined;
-}): string | undefined {
-  return opts.flagEnv ?? opts.envVar;
-}
-
-/**
  * Decide whether the deploy should publish product-config manifest records
  * (subname registration + resolver + contenthash + text records), independent
  * of whether `tryLoadProductConfig` found a config on disk. Exists so the
@@ -753,12 +729,12 @@ export function pickPostDeployBannerText(manifestPending: boolean | undefined): 
  * when `manifestPending` is unset/false, and by `bin/polkadot-app-deploy` once
  * its own subsequent `publishManifest()` call succeeds when it is set.
  */
-export function printDeploymentCompleteBanner(fullDomain: string, browserUrl: string): void {
+export function printDeploymentCompleteBanner(fullDomain: string, browserUrl: string | undefined): void {
   console.log("\n" + "=".repeat(60));
   console.log("DEPLOYMENT COMPLETE!");
   console.log("=".repeat(60));
   console.log("\nCheck it out here:");
-  console.log(`   ${browserUrl}`);
+  if (browserUrl) console.log(`   ${browserUrl}`);
   console.log(`   ${fullDomain}  (in a Polkadot app: mobile or desktop)`);
   console.log("\n" + "=".repeat(60) + "\n");
 }
@@ -1002,12 +978,14 @@ export function selectStorageReconnect(options: DeployOptions): () => Promise<Pr
       try {
         return await getSlotSignerProvider(options.storageSigner!, options.storageSignerAddress!);
       } catch (e) {
+        // A wrong chain or a missing selection fails the pool the same way; it is not a slot problem.
+        if (e instanceof NonRetryableError) throw e;
         const reason = describeSlotFallbackReason(e);
         // The pool cannot store on mainnet (dev-phrase accounts, no grant), so falling back
         // would only defer the failure past the upload. Fail here, where the cause is known.
         // Attribute first: the refusal throws, and the reason must reach telemetry either way.
         setDeployAttribute("deploy.signer.fallback_reason", reason);
-        assertPoolFallbackAllowed(bulletinNetwork, reason);
+        assertPoolFallbackAllowed(bulletinSelection.stack?.network, reason);
         useSlot = false;
         setDeployAttribute("deploy.signer.mode", "pool-fallback");
         console.warn(
@@ -1225,7 +1203,7 @@ function boundedNonceReader(p: {
           if (typeof n === "number") return n;
         } catch { /* fall back to a fresh connection */ }
       }
-      return p.fetchNonceFn(BULLETIN_ENDPOINTS, p.ss58());
+      return p.fetchNonceFn(bulletinSelection.endpoints, p.ss58());
     },
   });
 }
@@ -1446,9 +1424,9 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   // this never re-grants — reuses uploadAuth/currentBlockNum read just above instead of a
   // second RPC round trip.
   const authResult = await ensureAuthorized(unsafeApi, ss58 as string, "storage account", {
+    ...bulletinAuthorizationOptions(),
     needs: { transactions: chunks.length, bytes: BigInt(totalBytes) },
     precheckedAuth: { auth: uploadAuth, currentBlock: currentBlockNum },
-    network: bulletinNetwork,
   });
   if (authResult.quotaExhausted) {
     console.warn(
@@ -1579,7 +1557,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
           throw new ChunkInclusionUnverifiedError(
             `Could not verify that chunk ${idxs.join(", ")} is stored on-chain: the TransactionByContentHash probe at the best ` +
             `block gave no answer ${MAX_REPROBE_RETRIES + 1} times (${reason}). Not treating it as stored. Check the Bulletin RPC ` +
-            `(${BULLETIN_ENDPOINTS[0]}) and re-run the deploy; chunks already on-chain are skipped.`,
+            `(${bulletinSelection.endpoints[0]}) and re-run the deploy; chunks already on-chain are skipped.`,
           );
         }
         if (wsHaltDetected && reconnect) {
@@ -2524,15 +2502,23 @@ export function resolveReproducibleTimestamp(source: string): string {
 const PREWARM_TIMEOUT_MS = 15_000;
 // Fire-and-forget HEAD requests for newly uploaded chunks so gateway caches
 // are warm before the first user hits the site. Errors are intentionally
-// swallowed — this is a best-effort optimisation only.
-function preWarmGateway(chunkCids: string[], gateways: string[]): void {
+// swallowed — this is a best-effort optimisation only. A gateway is path style
+// (a stack's ipfs-gateway ends in /ipfs/) or a bare host; either way the URL
+// carries /ipfs/ once.
+export function preWarmGateway(chunkCids: string[], gateways: string[]): void {
+  const bases = gateways.map((gw) => gw.replace(/\/$/, "").replace(/\/ipfs$/, ""));
   for (const cid of chunkCids) {
-    for (const gw of gateways) {
-      const url = `${gw.replace(/\/$/, "")}/ipfs/${cid}`;
+    for (const base of bases) {
       // #1675: bounded, so a hung gateway can't keep an in-process caller alive after deploy() returns.
-      fetch(url, { method: "HEAD", signal: AbortSignal.timeout(PREWARM_TIMEOUT_MS) }).catch(() => {});
+      fetch(`${base}/ipfs/${cid}`, { method: "HEAD", signal: AbortSignal.timeout(PREWARM_TIMEOUT_MS) }).catch(() => {});
     }
   }
+}
+
+/** The full DotNS name `label` gets on `stack`, and where its web gateway serves it (undefined when the stack lists no web-gateway). */
+export function domainUrlsFor(stack: Pick<Stack, "tld" | "descriptor">, label: string): { fullDomain: string; browserUrl: string | undefined } {
+  const fullDomain = `${label}.${stack.tld}`;
+  return { fullDomain, browserUrl: webUrl(stack.descriptor, fullDomain) };
 }
 
 // Set Sentry span attributes for the manifest fetch outcome. Extracted for unit
@@ -2632,8 +2618,8 @@ export async function storeDirectoryV2(
 
   const provider = opts.provider ?? {};
   const prevContenthash = opts.previousContenthash ?? null;
-  // Gateway URL flows from environments.ts via the deploy() wrapper that
-  // passes `gateway: envIpfs` into this function. No hardcoded fallback —
+  // Gateway URL is the stack's ipfs-gateway, passed in by deploy() as
+  // `gateway: stack.ipfsGateway`. No hardcoded fallback —
   // missing gateway means fetchPreviousManifest will skip the network tier
   // and rely on persistent cache + heuristic.
   const gateway = opts.gateway;
@@ -3331,20 +3317,14 @@ export interface DeployOptions {
    */
   reproducibleSource?: string;
   /**
-   * Environment id from environments.json (e.g. "paseo-next-v2", "paseo-review").
-   * Drives both the bulletin RPC and the asset-hub RPC. Defaults to
-   * DEFAULT_ENV_ID. `--rpc` / BULLETIN_RPC still override the bulletin endpoint
-   * within the chosen env.
+   * Built-in stack id or alias (e.g. "paseo-next-v2", "preview"). Drives every
+   * chain endpoint, contract and policy of the run; refreshed from the stack's
+   * published descriptor once. Defaults to DEFAULT_STACK_ID. `--rpc` /
+   * BULLETIN_RPC still override the Bulletin endpoint within it. Exclusive with `stack`.
    */
   env?: string;
-  /**
-   * Pre-resolved bulletin endpoints (escape hatch for tests / library callers
-   * that want to skip environments.json loading). When provided, the loader
-   * is not called and `env` is ignored.
-   */
-  bulletinEndpoints?: string[];
-  /** Pre-resolved asset-hub endpoints. Same escape-hatch semantics. */
-  assetHubEndpoints?: string[];
+  /** Any other stack: a `polkadotapp://stack` link, a descriptor URL or a descriptor file path. Exclusive with `env`. */
+  stack?: string;
   /**
    * Opt-in: write the pre-upload CAR file to disk after merkleization.
    * - `true` → write to `<buildDir>.bulletin.car` (default path).
@@ -3354,14 +3334,6 @@ export interface DeployOptions {
    * CLI: --dump-car[=<path>]
    */
   dumpCar?: string | boolean;
-  /**
-   * Override/supply DotNS contract addresses, shallow-merged OVER the chosen
-   * env's `contracts` map (these win). The `custom` env ships no addresses, so
-   * this is how they are provided. Keys are the DOTNS_* names used in
-   * environments.json (e.g. DOTNS_REGISTRY, DOTNS_CONTENT_RESOLVER).
-   * CLI: --contract <KEY>=<0xADDRESS> (repeatable).
-   */
-  contracts?: Record<string, string>;
   /**
    * Plan of phone signatures this deploy will need. Fired once, at preflight,
    * BEFORE storage. Notification only; used by the CLI bin to print the
@@ -3421,65 +3393,33 @@ export function resolveProductSigner(
 }
 
 // Resolve the DeployOptions that affect DotNS authentication into the shape
-// DotNS.connect expects. Three branches:
+// DotNS.connect expects, on `stack`. Three branches:
 //   1. external signer (QR/mobile): pass signer + signerAddress straight through.
 //   2. mnemonic provided: pass mnemonic + derivationPath; DotNS combines them.
 //   3. no mnemonic: still pass derivationPath if set, so DotNS.connect can
 //      apply it to the MNEMONIC env-var fallback. This is the #209 fix —
 //      pre-fix the derivationPath was silently dropped in pool mode.
-// Pure function exported for unit tests; deploy()'s two DotNS.connect calls
+// Exported for unit tests; deploy()'s DotNS.connect calls and publishManifest()
 // share this resolver to avoid drift.
 export function resolveDotnsConnectOptions(
   options: Pick<DeployOptions, "mnemonic" | "derivationPath" | "signer" | "signerAddress">,
-  assetHubEndpoints?: string[],
-  autoAccountMapping?: boolean,
-  contracts?: Record<string, string>,
-  nativeToEthRatio?: bigint,
-  environmentId?: string,
-  popSelfServe?: PopSelfServeConfig | null,
-  registerStorageDeposit?: bigint,
-  tld?: string,
-  contractSources?: Record<string, string>,
-  // bulletin #1362/#1095: appended AFTER contractSources (rather than
-  // inserted earlier in the positional list, as bulletin-deploy does) so
-  // this port doesn't have to renumber the manifest/publish.ts call site
-  // (a separate, non-deploy() publish flow, left untouched here — same
-  // scoping bulletin's own #1221 applied to that file).
-  network?: string,
-): Pick<
-  DotNSConnectOptions,
-  | "signer"
-  | "signerAddress"
-  | "mnemonic"
-  | "derivationPath"
-  | "assetHubEndpoints"
-  | "autoAccountMapping"
-  | "contracts"
-  | "nativeToEthRatio"
-  | "environmentId"
-  | "popSelfServe"
-  | "registerStorageDeposit"
-  | "tld"
-  | "contractSources"
-  | "network"
-> {
-  const tail = assetHubEndpoints && assetHubEndpoints.length > 0 ? { assetHubEndpoints } : {};
-  const mappingTail = autoAccountMapping ? { autoAccountMapping } : {};
-  const contractsTail = contracts && Object.keys(contracts).length > 0 ? { contracts } : {};
-  const sourcesTail = contractSources && Object.keys(contractSources).length > 0 ? { contractSources } : {};
-  const ratioTail = nativeToEthRatio ? { nativeToEthRatio } : {};
-  const envTail = environmentId ? { environmentId } : {};
-  const popTail = popSelfServe !== undefined ? { popSelfServe } : {};
-  const storageTail = registerStorageDeposit !== undefined ? { registerStorageDeposit } : {};
-  const tldTail = tld !== undefined ? { tld } : {};
-  // bulletin #1362/#1095: only set when defined — omitting it (rather than
-  // sending an explicit undefined) preserves DotNS's own instance-field
-  // default and matches every other optional tail above.
-  const networkTail = network !== undefined ? { network } : {};
+  stack: Stack,
+): Pick<DotNSConnectOptions, "signer" | "signerAddress" | "mnemonic" | "derivationPath" | "env" | "stack"> {
   if (options.signer && options.signerAddress) {
-    return { signer: options.signer, signerAddress: options.signerAddress, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail, ...networkTail };
+    return { signer: options.signer, signerAddress: options.signerAddress, ...stackSelectionOf(stack) };
   }
-  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...tail, ...mappingTail, ...contractsTail, ...sourcesTail, ...ratioTail, ...envTail, ...popTail, ...storageTail, ...tldTail, ...networkTail };
+  return { mnemonic: options.mnemonic, derivationPath: options.derivationPath, ...stackSelectionOf(stack) };
+}
+
+/**
+ * Fails with a NonRetryableError naming the replacement when `options` carries a pre-stack
+ * selection (`contracts`, `bulletinEndpoints`, `assetHubEndpoints`), which would otherwise be
+ * ignored without notice. Shared by deploy() and publishManifest().
+ */
+export function assertNoRemovedSelections(options: object): void {
+  for (const [key, message] of Object.entries(RETIRED_SELECTION_ERRORS.options)) {
+    if ((options as Record<string, unknown>)[key] !== undefined) throw new NonRetryableError(message);
+  }
 }
 
 // bulletin #1221: the planned action to size a post-preflight auto-map
@@ -3639,27 +3579,6 @@ export function formatSubdomainParentError(
   return `Cannot deploy ${fullName}: parent ${formatUnregistrableReason({ label: parentLabel, registrability, existingOwner: null, selfAddress, tld, profile })}`;
 }
 
-/**
- * Returns the browser URL for the given domain name, optionally suffixed
- * with a network query parameter so the SPA opens the right chain.
- * Currently only the "preview" env needs a suffix — the SPA defaults to
- * paseo-next-v2 which would show "no content" for preview deployments.
- *
- * The gateway host defaults to "dot.li" (issue #142: devnet-family names are
- * NOT resolvable via dot.li — they're served by a different gateway, e.g.
- * "dev-dot.li" — so callers must pass the resolved env's `webGateway` when
- * one is set; otherwise the link loads but resolves the name against the
- * wrong network).
- * @param name - the DotNS label (e.g. "myapp")
- * @param envId - the environment id from options.env ?? DEFAULT_ENV_ID
- * @param webGateway - the resolved env's `webGateway`, if any (defaults to "dot.li")
- */
-export function browserUrlFor(name: string, envId: string | undefined, webGateway?: string): string {
-  const host = webGateway ?? "dot.li";
-  const base = `https://${name}.${host}`;
-  return envId === "preview" ? `${base}?network=previewnet` : base;
-}
-
 // ── P2P retrieval liveness probe (issue #456) ─────────────────────────────
 // PROPAGATION/LIVENESS PROXY only — bitswap_v1_get runs from the RPC node's
 // privileged vantage (direct validator links, possibly its own block store).
@@ -3743,7 +3662,6 @@ export async function deploy(content: DeployContent, domainName: string | null =
   if (options.signer && options.signerAddress && options.mnemonic) {
     throw new NonRetryableError("Pass either a mnemonic or an external signer, not both — they identify the signing account and only one can win.");
   }
-  bulletinNetwork = undefined; // bulletin #1362/#1095: reset per-deploy; set from the resolved env below
   assertTxCreator(options.signer, "DeployOptions.signer");
   assertTxCreator(options.storageSigner, "DeployOptions.storageSigner");
   // Product-name deploys resolve to an injected signer up front: the product
@@ -3752,81 +3670,14 @@ export async function deploy(content: DeployContent, domainName: string | null =
   // product at runtime. Resolved here, before signer-choice, so the rest of
   // the pipeline sees a plain injected signer and needs no product awareness.
   options = { ...options, ...resolveProductSigner(options) };
-  // Resolve the target environment. options.bulletinEndpoints / assetHubEndpoints
-  // bypass the loader for tests and library callers.
-  const envId = options.env ?? DEFAULT_ENV_ID;
-  let envBulletin: string[] = [DEFAULT_BULLETIN_RPC];
-  let envAssetHub: string[] | undefined;
-  let envSource: string | undefined;
-  let envUserFilePath: string | undefined;
-  let envUserFileKeys: string[] | undefined;
-  let envNetwork: string | undefined;
-  let envName: string | undefined;
-  let envIpfs: string | undefined;
-  let envWebGateway: string | undefined;
-  let envAutoAccountMapping = false;
-  let envContracts: Record<string, string> = {};
-  let envNativeToEthRatio: bigint | undefined;
-  let envRegisterStorageDeposit: bigint | undefined;
-  let envRecordStorageDeposit: bigint | undefined;
-  let envPopSelfServe: PopSelfServeConfig | null = null;
-  let envTld: string = DEFAULT_TLD;
-  // Undefined-preserving twin of envTld: unlike envTld (defaulted to "dot"
-  // for display/pre-connect parsing), this is what actually reaches
-  // DotNS.connect()'s `tld` option below. If it were defaulted here too,
-  // connect()'s `if (options.tld === undefined)` on-chain-read branch would
-  // NEVER fire for an env that genuinely configures no tld (e.g. devnet) —
-  // the whole point of the dotns PR #218 resolution order (env config >
-  // on-chain read > DEFAULT_TLD) would be dead code. Keep this
-  // `string | undefined` all the way to every resolveDotnsConnectOptions()
-  // call site; never apply `?? DEFAULT_TLD` to it.
-  let envConfiguredTld: string | undefined;
-  if (options.bulletinEndpoints && options.bulletinEndpoints.length > 0) {
-    envBulletin = options.bulletinEndpoints;
-    envAssetHub = options.assetHubEndpoints;
-  } else {
-    try {
-      const { doc, source, userFilePath, userFileContractKeys } = await loadEnvironments();
-      const resolved = resolveEndpoints(doc, envId);
-      envBulletin = resolved.bulletin;
-      envAssetHub = options.assetHubEndpoints ?? resolved.assetHub;
-      envSource = source;
-      envUserFilePath = userFilePath;
-      envUserFileKeys = userFileContractKeys?.[envId];
-      // bulletin #1362/#1095: once an env WAS resolved (this try block
-      // succeeded), a missing `network` field is a config gap, not "no env
-      // context" — normalize to the "unknown" sentinel so
-      // detectTestnet()/isTestnet() fail CLOSED (not-testnet) instead of
-      // falling through to a live spec_name guess. envNetwork stays
-      // genuinely `undefined` only when this whole block is skipped
-      // (options.bulletinEndpoints) or throws — the one case where the
-      // spec_name fallback is still the intended behavior.
-      envNetwork = resolved.network ?? "unknown";
-      envName = resolved.envName;
-      envIpfs = resolved.ipfs;
-      envWebGateway = resolved.webGateway;
-      envAutoAccountMapping = resolved.autoAccountMapping;
-      envContracts = resolved.contracts;
-      envNativeToEthRatio = resolved.nativeToEthRatio;
-      envRegisterStorageDeposit = resolved.registerStorageDeposit;
-      envRecordStorageDeposit = resolved.recordStorageDeposit;
-      envTld = resolved.tld ?? DEFAULT_TLD;
-      envConfiguredTld = resolved.tld;
-      envPopSelfServe = getPopSelfServeConfig(doc, envId);
-      bulletinNetwork = envNetwork; // already normalized (resolved.network ?? "unknown") above
-    } catch (e) {
-      if (e instanceof NonRetryableError) throw e;
-      if (options.env !== undefined) throw e;
-      captureWarning(`environments load failed: ${(e as Error)?.message ?? e}`);
-    }
-  }
-  // CLI/library-supplied contract addresses win over the env's map. The `custom`
-  // env intentionally ships no addresses, so they must be provided this way.
-  const contractSources = describeContractSources(envContracts, options.contracts, envSource, envUserFilePath, envId, envUserFileKeys);
-  if (options.contracts && Object.keys(options.contracts).length > 0) {
-    envContracts = { ...envContracts, ...options.contracts };
-  }
-  BULLETIN_ENDPOINTS = resolveBulletinEndpoints(envBulletin, options.rpc);
+  assertNoRemovedSelections(options);
+  // Resolve the target stack: options.stack (a link, URL or file), else the built-in stack
+  // options.env, refreshed from its published descriptor.
+  const stack = await loadStack({ env: options.env, stack: options.stack });
+  const envNetwork = stack.network;
+  // connect() fails when a registry with tldNode() disagrees with this TLD.
+  const envTld = stack.tld;
+  setBulletinStack(stack, options.rpc);
   _deployRpcFailedOver = false;
   POOL_SIZE = options.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
 
@@ -3843,24 +3694,22 @@ export async function deploy(content: DeployContent, domainName: string | null =
   // bypasses PopRules on-chain). That decision moved to ownership-aware
   // preflight — see classifyRegistrability/decideRegistrabilityOutcome in
   // src/dotns.ts.
-  // `let`, not `const`: refreshed once the preflight connect resolves the
-  // AUTHORITATIVE on-chain TLD (see the `parsed = { ...parsed, fullName: ... }`
-  // reassignment below) — `fullName` embeds whichever `envTld` was current at
-  // THIS parse, which on an env with no configured tld is still the
-  // pre-connect DEFAULT_TLD guess, not necessarily the real one.
-  let parsed: ParsedDomainName | null = domainName ? parseDomainName(domainName, envTld) : null;
-  // bulletin-deploy #1443/#1449: subname depth is observed, not gated —
-  // parseDomainName never refuses on depth grounds. Print a factual,
-  // no-advice notice when nesting goes past the ordinary case (a parent path
-  // containing a dot, i.e. more than 2 labels before the TLD), so a typo or a
-  // doubled suffix is obvious on sight. Nothing is being blocked here, so
-  // there's no remedy to offer.
+  const parsed: ParsedDomainName | null = domainName
+    ? parseDomainName(domainName, envTld)
+    : null;
+  // #1449: subname depth is observed, not gated — parseDomainName never
+  // refuses on depth grounds. Print a factual, no-advice notice when nesting
+  // goes past the ordinary case (a parent path containing a dot, i.e. more
+  // than 2 labels before the TLD), so a typo or a doubled suffix is obvious
+  // on sight. Nothing is being blocked here, so there's no remedy to offer.
   if (parsed?.isSubdomain && parsed.parentLabel!.includes(".")) {
     const levels = subnameNestingLevels(1 + parsed.parentLabel!.split(".").length);
     console.log(`   NOTE: "${domainName}" parses as sublabel "${parsed.sublabel}" under parent path "${parsed.parentLabel}.${envTld}" (${levels} levels of subname nesting).`);
   }
 
   let sessionCleanup: (() => void) | undefined;
+  // Whether assertPeopleMatchesStack has verified People for this deploy's session.
+  let peopleChecked = false;
   // Cheap session-file probe — does NOT load the SSO stack. A logged-in user has
   // the SSO session file on disk; headless/CI deploys don't, so they never enter
   // the "resolve" branch and never load SSO / hit the People chain.
@@ -3888,8 +3737,8 @@ export async function deploy(content: DeployContent, domainName: string | null =
   if (signerChoice === "resolve") {
     // --suri (dev account / mnemonic) OR a persisted login session → resolve a signer.
     const { resolveDeployActors } = await import("./deploy-actors.js");
-    const { getAuthClient } = await import("./auth-config.js");
-    const authClient = await getAuthClient(envId);
+    const { getAuthClient, assertPeopleMatchesStack } = await import("./auth-config.js");
+    const authClient = await getAuthClient(stack);
     // env.network drives the testnet gate without a chain call.
     const isTestnetEnv = envNetwork === "testnet";
     const transferEnabled = options.transferToSignedInUser !== false; // default true
@@ -3911,6 +3760,13 @@ export async function deploy(content: DeployContent, domainName: string | null =
         console.log(`   Worker: ${actors.worker.source} signer ${actors.worker.address} (signs Bulletin storage)`);
       } else {
         console.log(`   Using ${actors.worker.source} signer: ${actors.worker.address}`);
+      }
+      // A session was read and is about to be used, so its product id goes to the wallet: People
+      // must be the stack's chain, with the NetworkSuffix the product id carries. An unreadable or
+      // absent session fails or skips above without touching People.
+      if (actors.worker.source === "session" || actors.recipientH160) {
+        await assertPeopleMatchesStack(stack);
+        peopleChecked = true;
       }
     } catch (e) {
       if ((e as { name?: string } | null)?.name === "SignerNotAvailableError") {
@@ -3947,7 +3803,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       }
       // Cached preflight: skips the chain read on a same-period hit, falls
       // through to the authoritative read on a miss. See sss-allowance-cache.ts.
-      const allowed = await preflightSssAllowance(statementAccount, () => getPeopleChainEndpoints(envId));
+      const allowed = await preflightSssAllowance(statementAccount, stack.chains.People.rpc);
       if (allowed === false) {
         throw new NonRetryableError(SESSION_EXPIRED_MESSAGE);
       }
@@ -4023,7 +3879,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       // filter on deploy.tag work for the warning widgets.
       setDeploySentryTag("deploy.tag", deployTag);
     }
-    setDeployAttribute("deploy.env", envId);
+    setDeployAttribute("deploy.env", stack.id);
     setDeployAttribute("deploy.label", parsed?.label ?? name);
     setDeployAttribute("deploy.subdomain", String(parsed?.isSubdomain ?? false));
     // bulletin-deploy #1443/#1449: recorded on every subname deploy (not only
@@ -4035,24 +3891,16 @@ export async function deploy(content: DeployContent, domainName: string | null =
     if (parsed?.isSubdomain) {
       setDeployAttribute("deploy.dotns.subname_levels", subnameNestingLevels(1 + parsed.parentLabel!.split(".").length));
     }
-    if (envNetwork) setDeployAttribute("deploy.network", envNetwork);
-    if (envSource) setDeployAttribute("deploy.environments_source", envSource);
+    setDeployAttribute("deploy.network", envNetwork);
+    setDeployAttribute("deploy.stack_source", stack.source);
     setDeployAttribute("deploy.transfer.enabled", options.transferTo ? "true" : "false");
 
     let cid: string | undefined;
     let ipfsCid: string | undefined;
     console.log("\n" + "=".repeat(60));
-    console.log(`DEPLOYING TO TESTNET                    v${VERSION}`);
+    console.log(`DEPLOYING TO ${envNetwork === "mainnet" ? "MAINNET" : "TESTNET"}                    v${VERSION}`);
     console.log("=".repeat(60));
-    if (envName) console.log(`   Environment: ${envName}`);
-    // NOT printed here: on an env with no configured `tld`, envTld at this
-    // point is still the pre-connect DEFAULT_TLD guess, not the real
-    // on-chain value — printing it now could show "name.dot" for a
-    // paseo-next-v2-shaped env whose actual TLD is ".paseo". The "Domain:"
-    // line prints below, right after the preflight connect resolves the
-    // AUTHORITATIVE tld (see `envTld = preflight.tld` in the Preflight
-    // section) — no user-visible line ever renders the domain with a
-    // not-yet-confirmed TLD.
+    console.log(`   Environment: ${stack.name} (stack ${stack.id}, ${describeStackOrigin(stack)})`);
     if (deployTag) console.log(`   Tag: ${deployTag}`);
     if (options.inputCar) console.log(`   Input CAR: ${path.resolve(options.inputCar)}`);
     else if (typeof content === "string") console.log(`   Build dir: ${path.resolve(content)}`);
@@ -4086,33 +3934,13 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
       const preflight = new DotNS();
       await preflight.connect({
-        ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
-        recordStorageDeposit: envRecordStorageDeposit,
-        // bulletin #1221: plannedAction isn't known until preflight() runs below, so
-        // assume "register" (see AUTO_MAP_RENT_HEADROOM's doc comment in dotns.ts for the cost).
-        autoMapTopUpTarget: topUpTargetFor("register", envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
+        ...resolveDotnsConnectOptions(options, stack),
+        // #1221: plannedAction isn't known until preflight() runs below, so assume
+        // "register" (see AUTO_MAP_RENT_HEADROOM's doc comment in dotns.ts for the cost).
+        autoMapTopUpTarget: topUpTargetFor("register", stack.registerStorageDeposit, AUTO_MAP_RENT_HEADROOM),
       });
       // connect() now guarantees the account is mapped before returning — no
       // post-connect mapping wait needed here. See DotNS.connect() in dotns.ts.
-      // Adopt the authoritative, chain-resolved TLD for everything downstream
-      // (display strings, the two later resolveDotnsConnectOptions() calls'
-      // pre-connect siblings, etc.) — envTld before this point may still be
-      // DEFAULT_TLD even on an env whose real on-chain TLD differs, because
-      // it was set before connect() had a chance to read the chain.
-      envTld = preflight.tld;
-      // `fullName` was computed by the pre-connect parseDomainName() call
-      // using whatever envTld was current THEN — refresh it now that envTld
-      // is authoritative, so no downstream message (subdomain ownership
-      // errors, previous-contenthash lookups, etc.) can embed a stale TLD.
-      // `fullName` is always `${label}.${tld}` for both the top-level and
-      // subdomain shapes (see parseDomainName), so this is a safe, complete
-      // recomputation without re-invoking the parser (which could spuriously
-      // re-trigger its wrong-TLD guard on an input that already parsed
-      // successfully once).
-      if (parsed) parsed = { ...parsed, fullName: `${parsed.label}.${envTld}` };
-      // First point in this deploy where the domain's REAL TLD is known — see
-      // the comment at the earlier (now TLD-less) banner print above for why
-      // this line doesn't fire any sooner.
       console.log(`   Domain: ${name}.${envTld}`);
 
       // Subdomain deploys use a different on-chain path (setSubnodeOwner on
@@ -4325,7 +4153,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
               allowLargeDeploy: options.allowLargeDeploy,
               reproducibleSource: options.reproducibleSource,
               domain: name,
-              gateway: envIpfs,
+              gateway: stack.ipfsGateway,
               dumpCar: options.dumpCar,
             });
             cid = sCid;
@@ -4386,9 +4214,10 @@ export async function deploy(content: DeployContent, domainName: string | null =
         // is authorised — so re-acquire the session signer and sign as the OWNER.
         if (dotnsPreflight?.plannedAction === "already-owned-by-recipient") {
           console.log(`   You already own ${name}.${envTld} — updating its content needs your signature.`);
-          const { getAuthClient } = await import("./auth-config.js");
+          const { getAuthClient, assertPeopleMatchesStack } = await import("./auth-config.js");
           const { resolveSigner } = await import("./auth/index.js");
-          const authClient = await getAuthClient(envId);
+          if (!peopleChecked) await assertPeopleMatchesStack(stack);
+          const authClient = await getAuthClient(stack);
           const owner = await resolveSigner(authClient, {}); // session signer = the OWNER; ignore --suri
           const ownerDotns = new DotNS();
           // Defer teardown to deploy-end (sessionCleanup, run in the final finally).
@@ -4404,11 +4233,10 @@ export async function deploy(content: DeployContent, domainName: string | null =
             try { owner.destroy(); } catch { /* best-effort */ }
           };
           await ownerDotns.connect({
-            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
-            recordStorageDeposit: envRecordStorageDeposit,
-            // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
+            ...resolveDotnsConnectOptions({ ...options, signer: owner.signer, signerAddress: owner.address }, stack),
+            // #1221: see autoMapPlannedActionFor's doc comment for why this uses the
             // real plannedAction rather than a hardcoded "register".
-            autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
+            autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), stack.registerStorageDeposit, AUTO_MAP_RENT_HEADROOM),
             confirmPhoneReady: options.confirmPhoneReady,
             phoneSigner: true, // owner path is always a real phone/session signer
           });
@@ -4423,11 +4251,10 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
         const dotns = new DotNS();
         await dotns.connect({
-          ...resolveDotnsConnectOptions(options, envAssetHub, envAutoAccountMapping, envContracts, envNativeToEthRatio, envId, envPopSelfServe, envRegisterStorageDeposit, envConfiguredTld, contractSources, envNetwork),
-          recordStorageDeposit: envRecordStorageDeposit,
-          // bulletin #1221: see autoMapPlannedActionFor's doc comment for why this uses the
+          ...resolveDotnsConnectOptions(options, stack),
+          // #1221: see autoMapPlannedActionFor's doc comment for why this uses the
           // real plannedAction rather than a hardcoded "register".
-          autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM),
+          autoMapTopUpTarget: topUpTargetFor(autoMapPlannedActionFor(dotnsPreflight), stack.registerStorageDeposit, AUTO_MAP_RENT_HEADROOM),
           confirmPhoneReady: options.confirmPhoneReady,
           // Transfer mode: phoneSigner=false (local worker signs in-process, no phone gate).
           // Genuine phone/session signer: phoneSigner=true (gate enabled). Fixes #50.
@@ -4490,7 +4317,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
           // setContenthash: attempt 2 sees "Already owned", so the
           // handover this run owed never happens. transferName is idempotent,
           // so the recovery command is always safe to run.
-          console.log(`   If you meant to claim it, run: ${CLI_NAME} transfer ${name} --env ${envId}${options.suri ? ` --mnemonic "<your worker key>"` : ""}`);
+          console.log(`   If you meant to claim it, run: ${CLI_NAME} transfer ${name} ${stackSelectionFlag(stack)}${options.suri ? ` --mnemonic "<your worker key>"` : ""}`);
           setDeployAttribute("deploy.transfer.status", "skipped-existing");
         }
         if (shouldHandoverName({ transferTo: options.transferTo, registeredFresh })) {
@@ -4505,7 +4332,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
               console.log(`   Handed ${name}.${envTld} to ${transferTo} (${transferRes.status}${transferRes.txHash ? `, tx ${transferRes.txHash}` : ""}).`);
             } catch (e) {
               setDeployAttribute("deploy.transfer.status", "failed");
-              const recover = `${CLI_NAME} transfer ${name} --env ${envId}` + (options.suri ? ` --mnemonic "<your worker key>"` : "");
+              const recover = `${CLI_NAME} transfer ${name} ${stackSelectionFlag(stack)}` + (options.suri ? ` --mnemonic "<your worker key>"` : "");
               try { dotns.disconnect(); } catch { /* best-effort */ }
               throw new NonRetryableError(
                 `Deploy succeeded but the handover to ${transferTo} failed: ${(e as Error).message}\n` +
@@ -4535,7 +4362,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
         }
       });
 
-      const browserUrl = browserUrlFor(name, envId, envWebGateway);
+      const { fullDomain, browserUrl } = domainUrlsFor(stack, name);
       // #1164: a manifest publish immediately follows in bin/polkadot-app-deploy
       // when manifestPending is set — defer the real completion banner (and
       // its browser URL) until that phase actually succeeds, so a manifest
@@ -4545,11 +4372,11 @@ export async function deploy(content: DeployContent, domainName: string | null =
         console.log(pickPostDeployBannerText(true));
         console.log("=".repeat(60) + "\n");
       } else {
-        printDeploymentCompleteBanner(`${name}.${envTld}`, browserUrl);
+        printDeploymentCompleteBanner(fullDomain, browserUrl);
       }
       return {
         domainName: name,
-        fullDomain: `${name}.${envTld}`,
+        fullDomain,
         cid: cid as string,
         ipfsCid,
         browserUrl,

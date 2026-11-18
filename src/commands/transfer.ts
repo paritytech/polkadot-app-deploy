@@ -2,11 +2,12 @@
 // deploy whose transfer step failed. Resolves the worker (current owner: Alice
 // or --mnemonic) and recipient (signed-in product H160 by default, else --to),
 // then calls the idempotent DotNS.transferName. A subname argument (e.g.
-// `app.foo.dot`) is routed to DotNS.transferSubname instead, since subnames are
-// reassigned by the parent owner via setSubnodeOwner rather than transferred as
-// ERC-721 tokens.
-import { DotNS, DEFAULT_MNEMONIC, DEFAULT_TLD, parseDomainName } from "../dotns.js";
-import { loadEnvironments, resolveEndpoints, getPopSelfServeConfig } from "../environments.js";
+// `app.foo.<tld>`, the auto-created subname polkadot-app-deploy deploys under a base
+// name) is routed to DotNS.transferSubname instead, since subnames are
+// reassigned by the parent owner via setSubnodeOwner rather than transferred
+// as ERC-721 tokens.
+import { DotNS, DEFAULT_MNEMONIC, parseDomainName } from "../dotns.js";
+import { stackSelectionOf, type Stack } from "../stacks.js";
 import { CLI_NAME } from "../cli-name.js";
 import { zeroAddress } from "viem";
 
@@ -36,57 +37,38 @@ export async function resolveTransferRecipient(
 }
 
 export async function runTransfer(
-  envId: string,
+  stack: Stack,
   opts: { label?: string; to?: string; mnemonic?: string },
 ): Promise<void> {
   const rawLabel = (opts.label ?? "").trim();
   if (!rawLabel) {
     throw new Error(`Usage: ${CLI_NAME} transfer <label> [--to <0xH160>] [--mnemonic <key>]`);
   }
-  // Resolved up front (independent of --to/session) so the label can be
-  // parsed against THIS environment's TLD, not a hardcoded ".dot" —
-  // paseo-next-v2 uses ".paseo" (see src/environments.ts's per-env `tld`
-  // field).
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, envId);
-  // Pre-connect display/parsing default — see the identical `tld` vs
-  // `envConfiguredTld` split in src/deploy.ts's deploy(). `resolved.tld`
-  // itself (undefined-preserving) is what reaches DotNS.connect() below, so
-  // an env that genuinely configures no tld still gets the on-chain read.
-  const tld = resolved.tld ?? DEFAULT_TLD;
-  // Detect a subname (e.g. `app.foo.<tld>`) vs a base name (`foo.<tld>`); each
-  // takes a different on-chain path (setSubnodeOwner vs ERC-721 transferFrom).
-  const parsed = parseDomainName(rawLabel, tld);
+  // Detect a subname (e.g. `app.foo.${tld}`) vs a base name (`foo.${tld}`);
+  // each takes a different on-chain path (setSubnodeOwner vs ERC-721
+  // transferFrom). Parsed against the stack's own tld so the right suffix is stripped.
+  const parsed = parseDomainName(rawLabel, stack.tld);
 
-  // Recipient from the signed-in session unless --to was given.
+  // Recipient from the signed-in session unless --to is set. The session's address is written on
+  // chain, so People must be the stack's chain with the NetworkSuffix its product id carries.
   let sessionH160: string | undefined;
   if (!opts.to) {
-    const { getAuthClient } = await import("../auth-config.js");
-    const authClient = await getAuthClient(envId);
+    const { getAuthClient, assertPeopleMatchesStack } = await import("../auth-config.js");
+    const authClient = await getAuthClient(stack);
     const handle = await authClient.getSessionSigner();
     if (handle) {
-      sessionH160 = handle.addresses.productH160;
-      handle.destroy();
+      try {
+        await assertPeopleMatchesStack(stack);
+        sessionH160 = handle.addresses.productH160;
+      } finally {
+        handle.destroy();
+      }
     }
   }
   const recipient = await resolveTransferRecipient(opts.to, { sessionH160 });
 
   const dotns = new DotNS();
-  await dotns.connect({
-    mnemonic: opts.mnemonic ?? DEFAULT_MNEMONIC,
-    rpc: resolved.assetHub[0],
-    assetHubEndpoints: resolved.assetHub,
-    autoAccountMapping: resolved.autoAccountMapping,
-    environmentId: envId,
-    contracts: Object.keys(resolved.contracts).length > 0 ? resolved.contracts : undefined,
-    nativeToEthRatio: resolved.nativeToEthRatio,
-    popSelfServe: getPopSelfServeConfig(doc, envId),
-    registerStorageDeposit: resolved.registerStorageDeposit,
-    recordStorageDeposit: resolved.recordStorageDeposit,
-    // resolved.tld, NOT the defaulted `tld` above — undefined-preserving so
-    // an env that configures none still gets connect()'s on-chain read.
-    tld: resolved.tld,
-  });
+  await dotns.connect({ ...stackSelectionOf(stack), mnemonic: opts.mnemonic ?? DEFAULT_MNEMONIC });
   try {
     const result = parsed.isSubdomain
       ? await dotns.transferSubname(parsed.sublabel!, parsed.parentLabel!, recipient, (s) => console.log(`   ${s}`))

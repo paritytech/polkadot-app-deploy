@@ -22,7 +22,16 @@ export class InsufficientFundsError extends NonRetryableError {
 
 export const EXIT_CODE_NO_RETRY = 78;
 
-/** How describeContractSources names an address that came from a config we
- *  ship. Shared so the classifier cannot drift from the wording it matches. */
-export const SHIPPED_CONFIG_ORIGIN = "assets/environments.json shipped with polkadot-app-deploy";
-export const FALLBACK_CONFIG_ORIGIN = "the built-in fallback for";
+/** How an address error refers to a built-in stack's descriptor as its origin. Shared so the
+ *  classifier cannot drift from the wording it matches. */
+export const BUILT_IN_STACK_ORIGIN = "the descriptor of built-in stack";
+
+/** Phrases of the genesis-check errors that the classifier matches; shared so it cannot drift
+ *  from them. They contain no regex metacharacters, so the classifier embeds them as is. */
+export const GENESIS_ERROR_PHRASES = {
+  mismatch: "has genesis hash",
+  timeout: "did not report its genesis hash within",
+  otherEndpoint: "is not one of the stack's",
+  customStack: "describes another chain",
+  passedDescriptor: "the descriptor passed with --stack",
+} as const;

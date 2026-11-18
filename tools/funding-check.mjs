@@ -2,9 +2,9 @@
 /**
  * tools/funding-check.mjs
  *
- * Daily E2E funding check (port of bulletin #1636 / #1628), run by
- * .github/workflows/e2e-funding-check.yml at 14:17 UTC, ahead of the 15:00 nightly. For every e2eEligible environment in
- * environments.json it reads the Asset Hub balance of each E2E signer (the
+   * Daily E2E funding check (port of bulletin #1636 / #1628), run by
+   * .github/workflows/e2e-funding-check.yml at 14:17 UTC, ahead of the 15:00 nightly. For every e2eEligible built-in stack
+   * it reads the Asset Hub balance of each E2E signer (the
  * tools/check-balances.mjs set) plus the refill source standard //Alice, and
  * judges them with tools/funding-verdict.mjs. READ-ONLY: it never sends a
  * transaction. Money movement stays a human step.
@@ -22,7 +22,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { loadEnvironments, resolveEndpoints } from "../dist/environments.js";
+import { loadStack, readShippedStack, BUILT_IN_STACK_IDS } from "../dist/stacks.js";
 import { DEFAULT_MNEMONIC } from "../dist/dotns.js";
 import { SIGNERS, deriveSigners, readAccounts } from "./check-balances.mjs";
 import { DEFAULTS, evaluateEnv, overallVerdict, renderTable, renderIssueBody } from "./funding-verdict.mjs";
@@ -56,15 +56,16 @@ export async function withTimeout(promise, ms, what) {
   }
 }
 
-export async function gatherEnv(doc, envId, signers) {
-  const env = doc.environments.find((e) => e.id === envId);
-  const base = { envId, registerStorageDeposit: env?.registerStorageDeposit === undefined ? undefined : BigInt(env.registerStorageDeposit) };
+export async function gatherEnv(envId, signers) {
+  let registerStorageDeposit;
   try {
-    const rpc = resolveEndpoints(doc, envId).assetHub[0];
-    return { ...base, rows: await withTimeout(readAccounts(rpc, signers), READ_TIMEOUT_MS, `${envId} balance read`) };
+    const stack = await loadStack({ env: envId });
+    registerStorageDeposit = stack.registerStorageDeposit;
+    const rpc = stack.chains.AssetHub.rpc[0];
+    return { envId, registerStorageDeposit, rows: await withTimeout(readAccounts(rpc, signers), READ_TIMEOUT_MS, `${envId} balance read`) };
   } catch (e) {
     const error = (e?.message ?? String(e)).slice(0, 120);
-    return { ...base, rows: signers.map((s) => ({ ...s, error })) };
+    return { envId, registerStorageDeposit, rows: signers.map((s) => ({ ...s, error })) };
   }
 }
 
@@ -76,14 +77,13 @@ async function main() {
     console.error(`>> FAIL: funding-check: ${e.message}`);
     process.exit(2);
   }
-  const { doc } = await loadEnvironments();
-  const envIds = args.envs.length ? args.envs : doc.environments.filter((e) => e.e2eEligible === true).map((e) => e.id);
+  const envIds = args.envs.length ? args.envs : BUILT_IN_STACK_IDS.filter((id) => readShippedStack(id).e2eEligible);
   if (envIds.length === 0) {
-    console.error(">> FAIL: funding-check: no e2eEligible environment found, so nothing would be checked");
+    console.error(">> FAIL: funding-check: no e2eEligible stack found, so nothing would be checked");
     process.exit(2);
   }
   const signers = await deriveSigners([...SIGNERS, REFILL_SIGNER], DEFAULT_MNEMONIC);
-  const gathered = await Promise.all(envIds.map((id) => gatherEnv(doc, id, signers)));
+  const gathered = await Promise.all(envIds.map((id) => gatherEnv(id, signers)));
   const envResults = gathered.map((g) => evaluateEnv(g, args.opts));
 
   const verdict = overallVerdict(envResults);

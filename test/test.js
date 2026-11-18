@@ -2,7 +2,7 @@ import { test, describe, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { collectUnitTestFiles } from "../scripts/run-unit-tests.mjs";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
-import { setupIsolatedHome } from "./helpers/isolated-home.js";
+import { createCliTestEnv, setupIsolatedHome, writeLocalStack } from "./helpers/isolated-home.js";
 // Personhood bootstrap imports (loaded after build)
 import { formatPersonhoodRemediation, formatPopShortfallReason, classifyAliasAccountRow, shortNamesClosedReason, soulboundTransferReason, reservedForOwnClaimReason } from "../dist/dotns.js";
 import { getAdapter, HIGHEST_VERIFIED_DOTNS_RELEASE } from "../dist/dotns-protocol.js";
@@ -25,10 +25,12 @@ import { createRequire } from "node:module";
 // `node`), so it's loaded here via createRequire rather than converted to
 // ESM just for this test file.
 const require = createRequire(import.meta.url);
-import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, InsufficientFundsError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, browserUrlFor, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, DEFAULT_BULLETIN_RPC, BULLETIN_ENDPOINTS, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
+import { deploy, chunk, createCID, computeStorageCid, encodeContenthash, deriveRootSigner, encryptContent, ENCRYPT_MAGIC, ENCRYPT_SALT_LEN, ENCRYPT_NONCE_LEN, ENCRYPT_TAG_LEN, isConnectionError, InsufficientFundsError, isBenignTeardownError, NonRetryableError, EXIT_CODE_NO_RETRY, friendlyChainError, estimateUploadBytes, CHUNK_MORTALITY_PERIOD, storeChunkedContent, resolveDotnsConnectOptions, checkDeploySize, resolveReproducibleTimestamp, __assignDenseNoncesForTest, assertSubdomainOwnerMatchesSigner, __selectStorageProviderModeForTest, interpretBitswapResult, probeP2pRetrieval, computePhoneSigningSteps, makeBulletinStatusHandler, reconcileTimedOutChunk, readBoundedChunkNonce, __waitForChainLivenessForTest, resolveBulletinEndpoints, setBulletinEndpoints, setBulletinStack, bulletinSelection, formatSubdomainParentError, partitionFinalityProbe } from "../dist/deploy.js";
 import { WsEvent } from "polkadot-api/ws";
 import { subnameNestingLevels } from "../dist/subname-depth.js";
-import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, RPC_ENDPOINTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
+import { validateDomainLabel, sanitizeDomainLabel, buildLabelAlternatives, stripTrailingDigits, countTrailingDigits, parseDomainName, fetchNonce, verifyNonceAdvanced, TX_TIMEOUT_MS, TX_CHAIN_TIME_BUDGET_MS, TX_WALL_CLOCK_CEILING_MS, DOTNS_TX_MAX_ATTEMPTS, classifyTxRetryDecision, dotnsRetryBackoffMs, shouldRetryTxAttempt, shouldRegateBeforeResign, VERIFY_EFFECT_CHAIN_SECONDS, CONNECTION_TIMEOUT_MS, DotNS, OPERATION_TIMEOUT_MS, ProofOfPersonhoodStatus, parseProofOfPersonhoodStatus, isCommitmentMature, isCommitmentTimingBarerevert, classifyDotnsLabel, canRegister, convertToHexString, __formatContractDryRunFailureForTest, formatDispatchError, makeRetryStatusFilter, WatcherSilentNoEventError, verifyEffectWithGrace, NONCE_ADVANCE_VERIFY_RETRIES, NONCE_ADVANCE_VERIFY_RETRY_INTERVAL_MS, classifyWatcherSilentFastFail, ReviveClientWrapper, TX_KIND_BEST_BLOCK, TX_KIND_HASH, withRetry, REVIVE_ADDRESS_ATTEMPTS, pickVerifyEndpoint, CONTENTHASH_VERIFY_ATTEMPTS, nonceContentionBackoffMs, isNonceContentionAmbiguous, reacquireNonceOnContention, DOTNS_NONCE_CONTENTION_MAX_ATTEMPTS, shouldSkipTextWrite, TX_KIND_SKIPPED, classifyRegistrability, formatUnregistrableReason, decideRegistrabilityOutcome, PHONE_APPROVAL_MS, PHONE_SILENCE_MAX_REARMS, TX_NO_PROGRESS_MS, PhoneSilenceNonRetryableError, DEFAULT_TLD } from "../dist/dotns.js";
+import { BUILT_IN_STACK_IDS, DEFAULT_STACK_ID, describeStackOrigin, readShippedStack, resolveStackSelection, stackSelectionOf } from "../dist/stacks.js";
+import { webUrl } from "@parity/trinity-stack";
 import { captureWarning, noteWarning, withSpan, withDeploySpan, resolveRepo, isExpectedError,
   classifyDeployError, classifySadReason, computeDeployOutcome,
   VERSION, resolveRunner, resolveRunnerType, getDeployAttributes,
@@ -39,7 +41,8 @@ import { captureWarning, noteWarning, withSpan, withDeploySpan, resolveRepo, isE
   classifyErrorKind, ERROR_KIND_CATEGORY, sanitizeErrorMessage, setDeployError,
   extractRepoSlug, resolveIssueRepoSlug } from "../dist/telemetry.js";
 import { derivePoolAccounts, selectAccount, isTestnetSpecName, detectTestnet, ensureAuthorized, formatPasBalance, isAuthorizationSufficient, accountsNeedingAuthorization, accountsNeedingReauthorization, isAutoReauthorizeAllowed, readAccountAuthorization, remainingRenewBytes, remainingStoreBytes, remainingTransactions, quotaHeadroomDimensions, DEFAULT_AUTHORIZATION_NEEDS, fetchPoolAuthorizations, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, _resetTestnetCacheForTests, resolvePoolMnemonic, describeIgnoredPoolMnemonicEnv } from "../dist/pool.js";
-import { stuckQueueMessage } from "../dist/pool.js";
+import { stuckQueueMessage, ensurePoolAccountsFundedOnAssetHub } from "../dist/pool.js";
+import { rejectAfterTimeout, startFakeChain } from "./helpers/fake-chain.js";
 // Mirrors of the anchor + slot parts of the two ChunkInclusionUnverifiedError messages in
 // src/deploy.ts; the source-pin test in the chunk-inclusion describe pins the anchors.
 const chunkUnverifiedMessage = (idxs, reason) =>
@@ -1172,20 +1175,6 @@ describe("DotNS eligibility — NoStatus names reject Lite signers per contract"
     assert.match(src, /personhoodStatus/);
   });
 
-  test.skip("PR179 paseo-next-v2 patch helper carries DotNS PR179 contract addresses", () => { // skipped in public snapshot: tool not shipped
-    const src = fs.readFileSync("tools/patch-dotns-pr179-contracts.mjs", "utf8");
-    assert.match(src, /github\.com\/paritytech\/dotns\/pull\/179/);
-    assert.match(src, /DOTNS_PROTOCOL_REGISTRY:\s*"0x8F28419f4E32Bb0aA02e156A0543Ff253f126D7D"/);
-    assert.match(src, /DOTNS_REGISTRAR:\s*"0xf7Ad3F44F316C73E4a2b46b1ed48d376bCc9E639"/);
-    assert.match(src, /ROOT_GATEWAY_DISPATCHER:\s*"0xd3F059FA65dA566B294b5d755a06054d4bE7ce7C"/);
-    assert.match(src, /POP_RULES:\s*"0x4909bFb3f4Fd86244abD6430fDfA0Ce5C91aD0c4"/);
-    assert.match(src, /TARGET_ENV_ID\s*=\s*"paseo-next-v2"/);
-    assert.match(src, /doc\.environments\.find\(e => e\.id === TARGET_ENV_ID\)/);
-    assert.doesNotMatch(src, /NATIVE_TO_ETH_RATIO/);
-    assert.doesNotMatch(src, /targetEnv\.nativeToEthRatio\s*=/);
-    assert.match(src, /--rollback/);
-  });
-
   test("src/dotns.ts does not import ws at runtime", () => {
     const src = fs.readFileSync("src/dotns.ts", "utf8");
     assert.doesNotMatch(src, /from ["']ws["']/);
@@ -1194,7 +1183,7 @@ describe("DotNS eligibility — NoStatus names reject Lite signers per contract"
   });
 
   test("environment config no longer tracks dotns-cli support or self-attestation", () => {
-    for (const file of ["src/environments.ts", "src/deploy.ts", "assets/environments.json", "bin/polkadot-app-deploy"]) {
+    for (const file of ["src/stacks.ts", "src/deploy.ts", "assets/stack-policy.json", "bin/polkadot-app-deploy"]) {
       const src = fs.readFileSync(file, "utf8");
       assert.doesNotMatch(src, /skipDotnsCli/);
       assert.doesNotMatch(src, /dotnsSelfAttest/);
@@ -2089,7 +2078,7 @@ describe("classifyErrorKind", () => {
   test("naming.contract_unavailable: 'No contract deployed at' wrapper message (hasCode=false)", () => {
     assert.strictEqual(
       classifyErrorKind(
-        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2).",
+        "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from the descriptor of built-in stack paseo-next-v2 (shipped with polkadot-app-deploy).",
       ),
       "naming.contract_unavailable",
     );
@@ -2702,30 +2691,42 @@ describe("withSpan error attribute propagation", () => {
 });
 
 // A wrong contract address is the operator's mistake only when it came from
-// their config. A stale address in the config we ship is a fleet-wide tool
-// failure and must stay on the health dashboards.
+// a stack they passed or their own contracts option. A stale address in a
+// built-in stack is a fleet-wide tool failure and must stay on the health
+// dashboards.
 describe("a missing contract is classified by WHOSE config is wrong", () => {
-  const body = (env) => `No contract deployed at 0xabc (POP_RULES) env=${env} — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code.`;
+  const body = (env) => `No contract deployed at 0xabc (POP_RULES) env=${env} \u2014 the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code.`;
   const from = (origin) => ` This address came from ${origin}.`;
+  const builtIn = readShippedStack(DEFAULT_STACK_ID);
+  const operatorFile = describeStackOrigin({ id: "gamingnet-1a4c2828", builtIn: false, source: "file" });
 
-  test("an address from the operator's own file is user error, not a sad deploy", () => {
-    const msg = body("gamingnet") + from("/home/ops/envs.json (environment gamingnet)");
-    assert.equal(classifyDeployError(msg), "user",
-      ">> FAIL: an operator's own wrong address counted against tool health");
+  test("an address from a stack the operator passed with --stack is user error, not a sad deploy", () => {
+    for (const source of ["file", "url", "link"]) {
+      const msg = body("gamingnet") + from(describeStackOrigin({ id: "gamingnet-1a4c2828", builtIn: false, source }));
+      assert.equal(classifyDeployError(msg), "user",
+        `>> FAIL: an operator's own wrong address (--stack ${source}) counted against tool health`);
+    }
   });
 
-  test("an address from the config we ship stays visible as a tool failure", () => {
-    const msg = body("paseo-next-v2") + from("assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2)");
+  test("an address from the contracts option of DotNS.connect() is user error", () => {
+    assert.equal(classifyDeployError(body("gamingnet") + from("the contracts option of DotNS.connect()")), "user",
+      ">> FAIL: an address the caller passed in the contracts option counted against tool health");
+  });
+
+  test("an address from a built-in stack's shipped copy stays visible as a tool failure", () => {
+    const msg = body(builtIn.id) + from(describeStackOrigin(builtIn));
     assert.equal(classifyDeployError(msg), "unknown",
-      ">> FAIL: a stale address in our own shipped config was blamed on the operator and filtered off the dashboards");
+      ">> FAIL: a stale address in a built-in stack was blamed on the operator and filtered off the dashboards");
     assert.equal(isExpectedError(msg), false,
-      ">> FAIL: a stale shipped address was marked expected, hiding it from every widget filtering NOT deploy.expected:true");
+      ">> FAIL: a stale built-in address was marked expected, hiding it from every widget filtering NOT deploy.expected:true");
   });
 
-  test("an address from the built-in fallback also stays visible", () => {
-    const msg = body("paseo-next-v2") + from("the built-in fallback for paseo-next-v2");
-    assert.equal(classifyDeployError(msg), "unknown",
-      ">> FAIL: a bad fallback address was blamed on the operator");
+  test("an address from a built-in stack's published descriptor, or passed with --stack, also stays visible", () => {
+    for (const source of ["published", "link", "url", "file"]) {
+      const msg = body(builtIn.id) + from(describeStackOrigin({ ...builtIn, source }));
+      assert.equal(classifyDeployError(msg), "unknown",
+        `>> FAIL: a bad address in built-in stack ${builtIn.id} (source ${source}) was blamed on the operator`);
+    }
   });
 
   test("no stated origin stays visible rather than assumed to be the operator's", () => {
@@ -2734,11 +2735,13 @@ describe("a missing contract is classified by WHOSE config is wrong", () => {
   });
 
   test("an unverifiable address follows the same rule", () => {
-    const unverifiable = "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.";
-    assert.equal(classifyDeployError(unverifiable + from("/home/ops/envs.json (environment paseo-next-v2)")), "user",
+    // The sibling branch at src/dotns.ts:3481 never appends an origin, so this
+    // uses the one that does.
+    const unverifiable = "Contract call returned empty data \u2014 contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address.";
+    assert.equal(classifyDeployError(unverifiable + from(operatorFile)), "user",
       ">> FAIL: unverifiable address: an operator's own wrong address counted against tool health");
-    assert.equal(classifyDeployError(unverifiable + from("assets/environments.json shipped with polkadot-app-deploy (environment paseo-next-v2)")), "unknown",
-      ">> FAIL: unverifiable address: an address from the config we ship was blamed on the operator");
+    assert.equal(classifyDeployError(unverifiable + from(describeStackOrigin(builtIn))), "unknown",
+      ">> FAIL: unverifiable address: an address from a built-in stack was blamed on the operator");
   });
 
   test("an unrecognised DotNS generation is environment, not unknown", () => {
@@ -2876,8 +2879,9 @@ describe("error classification corpus", () => {
 
   test("contract-address kinds attribute fault by whose config is wrong", () => {
     const base = "No contract deployed at 0xabc (POP_RULES) env=gamingnet.";
-    assert.strictEqual(classifyDeployError(`${base} This address came from /home/ops/envs.json (environment gamingnet).`), "user");
-    assert.strictEqual(classifyDeployError(`${base} This address came from assets/environments.json shipped with polkadot-app-deploy (environment gamingnet).`), "unknown");
+    const custom = describeStackOrigin({ id: "gamingnet-1a4c2828", builtIn: false, source: "file" });
+    assert.strictEqual(classifyDeployError(`${base} This address came from ${custom}.`), "user");
+    assert.strictEqual(classifyDeployError(`${base} This address came from ${describeStackOrigin(readShippedStack(DEFAULT_STACK_ID))}.`), "unknown");
     assert.strictEqual(classifyDeployError(base), "unknown");
   });
 });
@@ -4347,10 +4351,10 @@ describe("DotNS initial state", () => {
       // The record floor is resolved against the registration floor once, in DotNS.
       { label: "record (capped at a lower registration floor)", field: "_recordStorageDeposit", wrapperField: "_recordStorageDepositFloor", value: 2n ** 62n, expected: "register" },
     ]) {
-      test(`DotNS.recreateReviveClient applies the ${label} floor to the new wrapper`, () => {
+      test(`DotNS.recreateReviveClient applies the ${label} floor to the new wrapper`, async () => {
         const d = new DotNS();
         d[field] = value;
-        d["recreateReviveClient"]("wss://invalid.invalid.test"); // never awaited/connected — only the synchronous wiring is under test
+        await d["recreateReviveClient"]("wss://invalid.invalid.test"); // no stack, so no genesis check: resolves without a connection
         assert.strictEqual(d.clientWrapper[wrapperField], expected === "register" ? d["_registerStorageDeposit"] : expected,
           `>> FAIL: recreateReviveClient wiring (${label}): the freshly constructed wrapper must receive the configured floor immediately, not stay on the class default`);
         d.client?.destroy?.();
@@ -5085,8 +5089,8 @@ describe("DotNS initial state", () => {
         "ownerOf",
         [123n],
       ),
-      // This stub passes no contractSources, so the tail is the built-in default.
-      /No contract deployed at.*built-in default address/,
+      // This stub records no contract sources, so the tail reports that nothing supplied it.
+      /No contract deployed at.*No stack or contracts option supplied/,
     );
   });
 
@@ -5097,7 +5101,7 @@ describe("DotNS initial state", () => {
     d.evmAddress = "0x1111111111111111111111111111111111111111";
     d._environmentId = "gamingnet";
     d._contracts = { ...d._contracts, POP_RULES: "0x2222222222222222222222222222222222222222" };
-    d._contractSources = { POP_RULES: "/home/ops/envs.json (environment gamingnet)" };
+    d._contractSource = "the descriptor of stack gamingnet-1a4c2828 (passed with --stack as a file)";
     d.clientWrapper = {
       performDryRunCall: async () => ({
         result: { isOk: true, value: { data: "0x" } },
@@ -5110,7 +5114,7 @@ describe("DotNS initial state", () => {
     const abi = [{ type: "function", name: "ownerOf", stateMutability: "view", inputs: [{ name: "tokenId", type: "uint256" }], outputs: [{ name: "", type: "address" }] }];
     await assert.rejects(
       () => d.contractCall("0x2222222222222222222222222222222222222222", abi, "ownerOf", [123n]),
-      /No contract deployed at.*\(POP_RULES\).*This address came from \/home\/ops\/envs\.json \(environment gamingnet\)/,
+      /No contract deployed at.*\(POP_RULES\).*This address came from the descriptor of stack gamingnet-1a4c2828 \(passed with --stack as a file\)/,
     );
   });
 
@@ -5224,17 +5228,26 @@ describe("DotNS.resolveNativeToEthRatio", () => {
     }
   });
 
-  test("uses chain value without warning when no env override is provided", async () => {
-    // No options.nativeToEthRatio — helper uses NATIVE_TO_ETH_RATIO (1_000_000n) as baseline.
-    // Chain returns a different value → chain wins, warning fires naming both.
+  test("uses chain value without warning when no override is provided", async () => {
     const { d, warnings, restore } = makeHarness({ chainValue: 100000000n });
     try {
       await d.resolveNativeToEthRatio({});
-      assert.strictEqual(d._nativeToEthRatio, 100000000n, "chain value must be applied");
-      // 1_000_000n ≠ 100_000_000n so there WILL be a warning; both values must appear.
-      assert.strictEqual(warnings.length, 1, "warning fires when chain differs from default");
-      assert.match(warnings[0], /100000000/, "warning must name chain value");
-      assert.match(warnings[0], /1000000/, "warning must name baseline value");
+      assert.strictEqual(d._nativeToEthRatio, 100000000n, ">> FAIL: ratio: the chain value must be applied");
+      assert.strictEqual(warnings.length, 0, ">> FAIL: ratio: nothing was configured, so there is nothing to warn about");
+    } finally {
+      restore();
+    }
+  });
+
+  // The ratio is 1e6 on some chains and 1e8 on others; a guessed default makes register pay 100x off.
+  test("fails non-retryable naming the chain when the constant cannot be read and no override is provided", async () => {
+    const { d, restore } = makeHarness({ chainThrows: true });
+    d._stack = { id: "preview" };
+    d.rpc = "wss://ah.example.test";
+    try {
+      await assert.rejects(() => d.resolveNativeToEthRatio({}),
+        (error) => error instanceof NonRetryableError && /Revive\.NativeToEthRatio from the Asset Hub of stack preview at wss:\/\/ah\.example\.test/.test(error.message),
+        ">> FAIL: ratio: an unreadable constant must fail connect() naming the chain, not fall back to a default");
     } finally {
       restore();
     }
@@ -6103,6 +6116,7 @@ describe("getPriceAndValidate eligibility", () => {
     d.connected = true;
     d.evmAddress = "0xabcd000000000000000000000000000000000001";
     d.substrateAddress = "5".padEnd(48, "x");
+    d._contracts = { ...readShippedStack(DEFAULT_STACK_ID).contracts };
     d.getUserPopStatus = async () => NoStatus;
     d.clientWrapper = {
       performDryRunCall: async () => ({
@@ -9863,6 +9877,38 @@ describe("#1054 pool-leg DotNS-owner isolation", () => {
       ">> FAIL: #1054: empty account must top up the full target");
   });
 
+  // The pre-fund spends Alice funds, so only a stack whose own policy clears it may run it; the
+  // gate reads the stack itself, there is no separate policy argument to get out of step with it.
+  test("ensurePoolAccountsFundedOnAssetHub skips without connecting unless the stack's policy clears it", async () => {
+    const chain = await startFakeChain("0x" + "ab".repeat(32));
+    try {
+      for (const [label, stack] of [["without a stack", undefined], ["on polkadot", readShippedStack("polkadot")]]) {
+        const outcome = await rejectAfterTimeout(ensurePoolAccountsFundedOnAssetHub(chain.url, 1, undefined, { stack }), 10_000, "did not return within 10s")
+          .then(() => "returned", (error) => error.message);
+        assert.strictEqual(outcome, "returned", `>> FAIL: #1054: the Asset Hub pre-fund must return at once ${label}; got: ${outcome}`);
+      }
+      assert.strictEqual(chain.connections, 0, ">> FAIL: #1054: the Asset Hub pre-fund must not connect without a stack, or on a stack whose policy does not clear auto-reauthorize");
+    } finally {
+      await chain.close();
+    }
+  });
+
+  // The pre-fund sends Alice's funds, so it must stop on an Asset Hub of another chain.
+  test("ensurePoolAccountsFundedOnAssetHub checks the Asset Hub genesis hash before any transfer", async () => {
+    const other = await startFakeChain("0x" + "ab".repeat(32));
+    const stack = readShippedStack("paseo-next-v2");
+    assert.ok(stack.bulletinAutoAuthorize, ">> FAIL: #1054 pre-fund genesis: fixture assumption broken, paseo-next-v2's policy must clear the pre-fund");
+    try {
+      await assert.rejects(
+        () => rejectAfterTimeout(ensurePoolAccountsFundedOnAssetHub(other.url, 1, undefined, { stack }), 10_000, "the pre-fund did not stop at the genesis check"),
+        (error) => error.name === "GenesisMismatchError" && error.message.startsWith(`AssetHub at ${other.url} has genesis hash 0x${"ab".repeat(32)}`),
+        ">> FAIL: #1054 pre-fund genesis: an Asset Hub on another chain than the stack's must fail the genesis check before any transfer");
+      assert.strictEqual(other.genesisReads, 1, ">> FAIL: #1054 pre-fund genesis: the pre-fund client must read the genesis hash");
+    } finally {
+      await other.close();
+    }
+  });
+
   test("assetHubTopUpAmount matches ensurePoolAccountsFundedOnAssetHub's default 1 PAS / 2 PAS thresholds", () => {
     const PAS = 10_000_000_000n;
     const THRESHOLD = 1n * PAS;
@@ -10276,34 +10322,54 @@ describe("ensureAuthorized throws (does not self-authorize) when the account is 
 });
 
 // ---------------------------------------------------------------------------
-// bulletin #1362/#1095 port: deploy.ts must thread bulletinNetwork (derived
-// from the resolved env's environments.json `network` field) into every
-// ensureAuthorized call site and into the deploy.is_testnet detectTestnet
-// read, or a config-mistake network never reaches the money-movement gates.
+// bulletin #1362/#1095 port: deploy.ts must thread the selected stack's
+// declared network into every ensureAuthorized call site and into the
+// deploy.is_testnet detectTestnet read, or a config-mistake network never
+// reaches the money-movement gates.
 // ---------------------------------------------------------------------------
-describe("deploy.ts threads bulletinNetwork/envNetwork into every testnet-detection call site (#1362/#1095)", () => {
-  test("deploy.ts normalizes envNetwork = resolved.network ?? \"unknown\" and assigns bulletinNetwork from it", () => {
+describe("deploy.ts threads the stack's network into every testnet-detection call site (#1362/#1095)", () => {
+  // setBulletinStack also selects the stack every later Bulletin client is
+  // genesis-checked against, so it runs in a child process, not in this one.
+  function selectionAfterSetBulletinStack(id) {
+    const script = `import { setBulletinStack, bulletinSelection } from "./dist/deploy.js";
+import { readShippedStack } from "./dist/stacks.js";
+setBulletinStack(readShippedStack(${JSON.stringify(id)}));
+const { stack, endpoints } = bulletinSelection;
+process.stdout.write(JSON.stringify({ stackId: stack?.id, endpoints }));`;
+    return JSON.parse(execSync(`${JSON.stringify(process.execPath)} --input-type=module`, { input: script, encoding: "utf8" }));
+  }
+  // Every ensureAuthorized call in deploy.ts, whole, up to its closing `);`.
+  const deployEnsureAuthorizedCalls = (src) => src.match(/await ensureAuthorized\([\s\S]*?\);/g) ?? [];
+
+  test("setBulletinStack selects the stack, so its network applies to every ensureAuthorized call in deploy.ts (#1095)", () => {
+    for (const id of BUILT_IN_STACK_IDS) {
+      assert.ok(["testnet", "mainnet"].includes(readShippedStack(id).network),
+        `>> FAIL: #1095: built-in stack ${id} declares no network, so detectTestnet would fall through to a spec_name guess`);
+    }
+    const selection = selectionAfterSetBulletinStack("preview");
+    assert.strictEqual(selection.stackId, "preview", ">> FAIL: #1095: setBulletinStack must select the stack, or its network never applies to ensureAuthorized");
+    assert.deepStrictEqual(selection.endpoints, readShippedStack("preview").chains.Bulletin.rpc, ">> FAIL: setBulletinStack must select the stack's Bulletin endpoints with the stack");
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    assert.ok(/envNetwork\s*=\s*resolved\.network\s*\?\?\s*"unknown"/.test(src),
-      ">> FAIL: #1362/#1095: deploy.ts must normalize envNetwork = resolved.network ?? \"unknown\" once an env was resolved, so a config gap (field missing) fails closed instead of falling through to spec_name");
-    assert.ok(/bulletinNetwork\s*=\s*envNetwork/.test(src),
-      ">> FAIL: #1362/#1095: deploy.ts must assign bulletinNetwork from envNetwork, or the env's declared network never reaches ensureAuthorized/detectTestnet");
+    assert.match(src, /setBulletinStack\(stack, options\.rpc\);/,
+      ">> FAIL: #1095: deploy() must call setBulletinStack(stack, options.rpc), or the stack's network never replaces the previous run's");
+    assert.match(src, /return \{ network: bulletinSelection\.stack\?\.network \};/,
+      ">> FAIL: #1095: bulletinAuthorizationOptions must read the network from the selected stack");
+    const calls = deployEnsureAuthorizedCalls(src);
+    assert.ok(calls.length > 0, ">> FAIL: #1095: expected at least one ensureAuthorized call site in deploy.ts");
+    const missing = calls.filter((c) => !/bulletinAuthorizationOptions\(\)/.test(c));
+    assert.deepStrictEqual(missing, [],
+      `>> FAIL: #1095: every ensureAuthorized call site must pass bulletinAuthorizationOptions(); ${missing.length} of ${calls.length} do not. A missed site silently falls back to a live spec_name read instead of the stack's declared network. Offending: ${missing.join(" | ")}`);
   });
 
-  test("every ensureAuthorized call site in deploy.ts passes network: bulletinNetwork", () => {
-    const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // Window-based (not a single-paren regex): storeChunkedContent's call site
-    // spans multiple lines with nested object literals (needs/precheckedAuth),
-    // so a `[^)]*\)` match would stop at the first inner `)` rather than the
-    // call's real closing paren. Each call site's opts object is well within
-    // 400 chars of its opening paren in practice.
-    const callStarts = [...src.matchAll(/ensureAuthorized\(/g)].map((m) => m.index);
-    assert.ok(callStarts.length > 0, ">> FAIL: #1362/#1095: expected at least one ensureAuthorized call site in deploy.ts");
-    const missing = callStarts
-      .map((i) => src.slice(i, i + 400))
-      .filter((window) => !/network:\s*bulletinNetwork/.test(window));
-    assert.deepStrictEqual(missing, [],
-      `>> FAIL: #1362/#1095: every ensureAuthorized call site must pass network: bulletinNetwork; ${missing.length} of ${callStarts.length} do not. A missed site silently falls back to a live spec_name read instead of the declared env. Offending: ${missing.join(" | ")}`);
+  test("setBulletinEndpoints clears the stack, so no stale genesis check or policy remains", () => {
+    const script = `import { setBulletinStack, setBulletinEndpoints, bulletinSelection } from "./dist/deploy.js";
+import { readShippedStack } from "./dist/stacks.js";
+setBulletinStack(readShippedStack("preview"));
+setBulletinEndpoints(["ws://127.0.0.1:1"]);
+process.stdout.write(JSON.stringify({ hasStack: bulletinSelection.stack !== undefined, endpoints: bulletinSelection.endpoints }));`;
+    const selection = JSON.parse(execSync(`${JSON.stringify(process.execPath)} --input-type=module`, { input: script, encoding: "utf8" }));
+    assert.deepStrictEqual(selection, { hasStack: false, endpoints: ["ws://127.0.0.1:1"] },
+      ">> FAIL: setBulletinEndpoints must drop the previous stack, or clients to the new endpoints are checked against the wrong genesis hash");
   });
 
   test("deploy.ts threads envNetwork into the deploy.is_testnet telemetry detectTestnet call", () => {
@@ -10396,7 +10462,7 @@ describe("DotNS.isTestnet() (bulletin #1362/#1095: network field overrides spec_
   // this pins the wiring by source inspection rather than executing connect().
   test("connect() assigns options.network onto the instance before any chain call", () => {
     const src = fs.readFileSync("src/dotns.ts", "utf-8");
-    const connectIdx = src.indexOf("async connect(options: DotNSConnectOptions = {}): Promise<this> {");
+    const connectIdx = src.indexOf("async connect(connectOptions: DotNSConnectOptions = {}): Promise<this> {");
     const networkAssignIdx = src.indexOf("this._network = options.network;");
     assert.ok(connectIdx !== -1, ">> FAIL: DotNS.connect: could not locate the connect() method signature");
     assert.ok(networkAssignIdx !== -1,
@@ -10416,17 +10482,17 @@ describe("DotNS.isTestnet() (bulletin #1362/#1095: network field overrides spec_
 // constraint noted on the #1059 guard test above).
 // ---------------------------------------------------------------------------
 describe("bootstrapPool authorizer resolution (#1213 port) — no self-authorize regression", () => {
-  test("precedence is authorizerMnemonic > envAuthorizer > no blanket default, in that source order", () => {
+  test("precedence is authorizerMnemonic > the stack's bulletinAuthorizer > no blanket default, in that source order", () => {
     const src = fs.readFileSync("src/pool.ts", "utf-8");
     const mnemonicIdx = src.indexOf("if (opts.authorizerMnemonic) {");
-    const envAuthorizerIdx = src.indexOf("} else if (opts.envAuthorizer) {");
+    const envAuthorizerIdx = src.indexOf("} else if (opts.stack?.bulletinAuthorizer) {");
     const fallbackIdx = src.indexOf("No known authorizer");
     assert.ok(mnemonicIdx !== -1, ">> FAIL: #1213 precedence: bootstrapPool must still resolve opts.authorizerMnemonic first");
-    assert.ok(envAuthorizerIdx !== -1, ">> FAIL: #1213 precedence: bootstrapPool must resolve opts.envAuthorizer (environments.json bulletinAuthorizer) as the second precedence tier");
+    assert.ok(envAuthorizerIdx !== -1, ">> FAIL: #1213 precedence: bootstrapPool must resolve opts.stack?.bulletinAuthorizer (the stack policy's bulletinAuthorizer) as the second precedence tier");
     assert.ok(fallbackIdx !== -1, ">> FAIL: #1213 precedence: bootstrapPool must print a \"No known authorizer\" message as the final fallback");
     assert.ok(
       mnemonicIdx < envAuthorizerIdx && envAuthorizerIdx < fallbackIdx,
-      ">> FAIL: #1213 precedence: source order must be authorizerMnemonic, then envAuthorizer, then the no-default fallback — reordering silently changes which key wins",
+      ">> FAIL: #1213 precedence: source order must be authorizerMnemonic, then the stack's bulletinAuthorizer, then the no-default fallback — reordering silently changes which key wins",
     );
   });
 
@@ -10449,15 +10515,15 @@ describe("bootstrapPool authorizer resolution (#1213 port) — no self-authorize
     );
   });
 
-  test("the no-known-authorizer fallback names the environment when one was resolved", () => {
+  test("the no-known-authorizer fallback names the stack when one was loaded", () => {
     const src = fs.readFileSync("src/pool.ts", "utf-8");
     const fallbackIdx = src.indexOf("No known authorizer");
     assert.ok(fallbackIdx !== -1, ">> FAIL: #1213 fallback message: could not find the fallback branch");
     const fallbackBlock = src.slice(Math.max(0, fallbackIdx - 250), fallbackIdx + 400);
     assert.match(
       fallbackBlock,
-      /opts\.envLabel/,
-      ">> FAIL: #1213 fallback message: the fallback must reference opts.envLabel so the failure names which environment has no known authorizer, instead of a generic unattributed message",
+      /opts\.stack\.id/,
+      ">> FAIL: #1213 fallback message: the fallback must reference opts.stack.id so the failure names which stack has no known authorizer, instead of a generic unattributed message",
     );
   });
 
@@ -10499,17 +10565,12 @@ describe("bootstrapPool authorizer resolution (#1213 port) — no self-authorize
     );
   });
 
-  test("bin/polkadot-app-bootstrap threads the env's bulletinAuthorizer + envLabel into bootstrapOpts", () => {
+  test("bin/polkadot-app-bootstrap hands the loaded stack (its bulletinAuthorizer, network and id) to bootstrapPool (#1095)", () => {
     const src = fs.readFileSync("bin/polkadot-app-bootstrap", "utf-8");
     assert.match(
       src,
-      /bootstrapOpts\.envAuthorizer\s*=\s*envEntry\.bulletinAuthorizer/,
-      ">> FAIL: #1213 wiring: bin/polkadot-app-bootstrap must set bootstrapOpts.envAuthorizer from envEntry.bulletinAuthorizer, or --env alone can never resolve a known authorizer",
-    );
-    assert.match(
-      src,
-      /bootstrapOpts\.envLabel\s*=\s*flags\.env/,
-      ">> FAIL: #1213 wiring: bin/polkadot-app-bootstrap must set bootstrapOpts.envLabel so the \"no known authorizer\" failure names the environment",
+      /bootstrapOpts\.stack = stack;/,
+      ">> FAIL: #1213/#1095 wiring: bin/polkadot-app-bootstrap must pass the loaded stack to bootstrapPool, which reads its authorizer, network and id from it — or --env alone can never resolve a known authorizer",
     );
   });
 
@@ -10563,10 +10624,10 @@ describe("isTestnetSpecName", () => {
 });
 
 // ---------------------------------------------------------------------------
-// detectTestnet(api, network) — bulletin #1362/#1095: the environments.json
-// `network` field must be authoritative over the chain's spec_name for
+// detectTestnet(api, network) — bulletin #1362/#1095: the stack's declared
+// `network` must be authoritative over the chain's spec_name for
 // money-movement gates (isAutoReauthorizeAllowed, ensureAuthorized's error
-// branch). spec_name stays as the fallback ONLY when no env `network` is
+// branch). spec_name stays as the fallback ONLY when no `network` is
 // available (e.g. a raw library caller pointed at a custom RPC).
 // ---------------------------------------------------------------------------
 describe("detectTestnet (bulletin #1362/#1095: network field overrides spec_name)", () => {
@@ -10603,10 +10664,10 @@ describe("detectTestnet (bulletin #1362/#1095: network field overrides spec_name
       ">> FAIL: detectTestnet: with no network signal, a mainnet-looking spec_name must still resolve false");
   });
 
-  // An env WAS resolved (e.g. via --env) but its environments.json entry is
-  // missing the `network` field — deploy.ts normalizes this to the
-  // "unknown" sentinel (never leaves it undefined) specifically so it lands
-  // here, not in the spec_name-fallback branch above.
+  // A caller passing the "unknown" sentinel (a selected network with no
+  // declared value) must land here, not in the spec_name-fallback branch
+  // above: it must fail safe, i.e. resolve NOT-a-testnet, even against a
+  // testnet-looking spec_name.
   test("network:\"unknown\" (env resolved, field genuinely absent) fails safe: not-a-testnet, even against a testnet-looking spec_name", async () => {
     _resetTestnetCacheForTests();
     assert.strictEqual(
@@ -10743,29 +10804,21 @@ describe("estimateUploadBytes", () => {
 // MNEMONIC env-var fallback.
 // ---------------------------------------------------------------------------
 describe("resolveDotnsConnectOptions (#209)", () => {
-  // The seam between describeContractSources and the error messages. Each half is
-  // tested on its own; if contractSources stops being forwarded here the map
-  // arrives empty and every error silently reports "built-in default address"
-  // instead of the real origin, which is wrong rather than broken.
-  test("contractSources forwards on both the external-signer and mnemonic branches", () => {
-    const sources = { POP_RULES: "/home/ops/envs.json (environment gamingnet)" };
-    const ext = resolveDotnsConnectOptions(
-      { signer: {}, signerAddress: "5Foo" },
-      undefined, undefined, { POP_RULES: "0x" + "1".repeat(40) }, undefined, "gamingnet", undefined, undefined, undefined, sources,
-    );
-    assert.deepStrictEqual(ext.contractSources, sources,
-      ">> FAIL: the external-signer branch must forward contractSources, or a phone/session deploy loses every address origin");
-    const mnem = resolveDotnsConnectOptions(
-      { mnemonic: "bottom drive obey ..." },
-      undefined, undefined, { POP_RULES: "0x" + "1".repeat(40) }, undefined, "gamingnet", undefined, undefined, undefined, sources,
-    );
-    assert.deepStrictEqual(mnem.contractSources, sources,
-      ">> FAIL: the mnemonic branch must forward contractSources");
-  });
+  const STACK = readShippedStack(DEFAULT_STACK_ID);
 
-  test("contractSources is omitted when empty, like every other optional tail", () => {
-    const r = resolveDotnsConnectOptions({ mnemonic: "m" }, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, {});
-    assert.ok(!("contractSources" in r), ">> FAIL: an empty map must not be sent, so DotNS keeps its own default");
+  // DotNS.connect loads the Asset Hub endpoints, contracts (and the origin every
+  // address error reports), tld, network and deposit floors from the stack selection;
+  // a branch that dropped it would connect with none of them.
+  test("the stack selection forwards on both the external-signer and mnemonic branches", () => {
+    const selection = stackSelectionOf(STACK);
+    const fileSelection = stackSelectionOf({ ...STACK, location: ".trinity/paseo-next-v2.json" });
+    assert.deepStrictEqual(fileSelection, { stack: ".trinity/paseo-next-v2.json" }, ">> FAIL: a stack loaded from a file must be selected again by that file");
+    for (const [branch, options] of [["external-signer", { signer: {}, signerAddress: "5Foo" }], ["mnemonic", { mnemonic: "bottom drive obey ..." }], ["pool", {}]]) {
+      const r = resolveDotnsConnectOptions(options, STACK);
+      assert.deepStrictEqual({ env: r.env, stack: r.stack }, { env: selection.env, stack: selection.stack },
+        `>> FAIL: the ${branch} branch must forward the stack as its selection string, or DotNS.connect connects without its contracts and their origins`);
+      assert.strictEqual(typeof (r.stack ?? ""), "string", `>> FAIL: the ${branch} branch must not pass a Stack object, DotNS.connect accepts only a selection string`);
+    }
   });
 
   test("external signer wins; mnemonic + derivationPath are not forwarded", () => {
@@ -10775,7 +10828,7 @@ describe("resolveDotnsConnectOptions (#209)", () => {
       signerAddress: "5Foo",
       mnemonic: "should be ignored",
       derivationPath: "//ignored",
-    });
+    }, STACK);
     assert.strictEqual(r.signer, fakeSigner);
     assert.strictEqual(r.signerAddress, "5Foo");
     assert.strictEqual(r.mnemonic, undefined);
@@ -10786,7 +10839,7 @@ describe("resolveDotnsConnectOptions (#209)", () => {
     const r = resolveDotnsConnectOptions({
       mnemonic: "bottom drive obey ...",
       derivationPath: "//e2e-direct",
-    });
+    }, STACK);
     assert.strictEqual(r.mnemonic, "bottom drive obey ...");
     assert.strictEqual(r.derivationPath, "//e2e-direct");
   });
@@ -10794,7 +10847,7 @@ describe("resolveDotnsConnectOptions (#209)", () => {
   test("pool mode (no mnemonic flag): derivationPath STILL forwards — this is the #209 fix", () => {
     const r = resolveDotnsConnectOptions({
       derivationPath: "//e2e-fresh-pool",
-    });
+    }, STACK);
     assert.strictEqual(r.mnemonic, undefined);
     // Pre-#209 this was undefined (silent drop). Now it forwards so
     // DotNS.connect applies it to the MNEMONIC env-var fallback.
@@ -10802,7 +10855,7 @@ describe("resolveDotnsConnectOptions (#209)", () => {
   });
 
   test("pool mode without derivation: both undefined (DotNS uses MNEMONIC env, no derivation)", () => {
-    const r = resolveDotnsConnectOptions({});
+    const r = resolveDotnsConnectOptions({}, STACK);
     assert.strictEqual(r.mnemonic, undefined);
     assert.strictEqual(r.derivationPath, undefined);
   });
@@ -10811,7 +10864,7 @@ describe("resolveDotnsConnectOptions (#209)", () => {
     const r = resolveDotnsConnectOptions({
       signer: { kind: "incomplete" },
       derivationPath: "//foo",
-    });
+    }, STACK);
     // Without signerAddress the external-signer branch doesn't fire; we
     // fall through to forwarding mnemonic + derivationPath.
     assert.strictEqual(r.signer, undefined);
@@ -10819,47 +10872,34 @@ describe("resolveDotnsConnectOptions (#209)", () => {
     assert.strictEqual(r.derivationPath, "//foo");
   });
 
-  test("passes registerStorageDeposit when provided", () => {
-    const r = resolveDotnsConnectOptions({}, undefined, undefined, undefined, undefined, undefined, undefined, 5_000_000_000_000n);
-    assert.strictEqual(r.registerStorageDeposit, 5_000_000_000_000n);
+  // #paseo-tld / #1095 / #1518: tld, network and the deposit floors get to
+  // DotNS.connect through the stack. A resolver key of the same name would
+  // override the stack's value in connect()'s merge, so the resolver must not
+  // emit any of them.
+  test("registerStorageDeposit, tld and network come only from the stack", () => {
+    for (const options of [{ signer: {}, signerAddress: "5Foo" }, { mnemonic: "m" }, {}]) {
+      const r = resolveDotnsConnectOptions(options, STACK);
+      for (const key of ["registerStorageDeposit", "recordStorageDeposit", "tld", "network", "contracts", "assetHubEndpoints"]) {
+        assert.ok(!(key in r),
+          `>> FAIL: resolveDotnsConnectOptions: emits ${key}, which would override the stack's own value inside DotNS.connect`);
+      }
+    }
   });
 
-  test("omits registerStorageDeposit when not provided", () => {
-    const r = resolveDotnsConnectOptions({});
-    assert.strictEqual(r.registerStorageDeposit, undefined);
-  });
-
-  // bulletin #1362/#1095: the resolved env's `network` field must thread
-  // through to DotNS.connect — appended as the LAST positional param in this
-  // port (rather than inserted before contractSources, as bulletin-deploy
-  // does), so the manifest/publish.ts call site (a separate lane) doesn't
-  // need renumbering.
-  test("passes network when provided", () => {
-    const r = resolveDotnsConnectOptions({}, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, "mainnet");
-    assert.strictEqual(r.network, "mainnet",
-      ">> FAIL: resolveDotnsConnectOptions network: explicit network arg must forward verbatim");
-  });
-
-  test("omits network when not provided", () => {
-    const r = resolveDotnsConnectOptions({});
-    assert.strictEqual(r.network, undefined,
-      ">> FAIL: resolveDotnsConnectOptions network: omitted network must stay undefined (DotNS.isTestnet() then falls back to spec_name, not silently defaulting to testnet or mainnet)");
-  });
-
-  test("deploy.ts passes envNetwork into every deploy()-internal resolveDotnsConnectOptions call site (#1362/#1095)", () => {
+  test("deploy.ts passes the run's stack into every resolveDotnsConnectOptions call site (#1095)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
     const calls = src.match(/resolveDotnsConnectOptions\([^;]*?\)(?=[,)])/gs) ?? [];
-    assert.ok(calls.length > 0, ">> FAIL: #1362/#1095: expected at least one resolveDotnsConnectOptions call site in deploy.ts");
-    const missing = calls.filter((c) => !/,\s*envNetwork\)\s*$/.test(c.trim()));
+    assert.ok(calls.length > 0, ">> FAIL: #1095: expected at least one resolveDotnsConnectOptions call site in deploy.ts");
+    const missing = calls.filter((c) => !/,\s*stack\)\s*$/.test(c.trim()));
     assert.deepStrictEqual(missing, [],
-      `>> FAIL: #1362/#1095: every resolveDotnsConnectOptions call site in deploy.ts must end with envNetwork as the last argument, or DotNS.connect() never learns the declared env network and isTestnet() silently falls back to spec_name. Offending: ${missing.join(" | ")}`);
+      `>> FAIL: #1095: every resolveDotnsConnectOptions call site in deploy.ts must pass the run's stack, or DotNS.connect() never learns the stack's network and isTestnet() silently falls back to spec_name. Offending: ${missing.join(" | ")}`);
   });
 
   // bulletin #1221 Part 2: every deploy()-internal connect must size the
-  // first auto-map top-up via topUpTargetFor(..., envRegisterStorageDeposit,
+  // first auto-map top-up via topUpTargetFor(..., stack.registerStorageDeposit,
   // AUTO_MAP_RENT_HEADROOM), so a fresh signer mid-deploy (including the
   // owner-path reconnect) needs only one top-up instead of two.
-  test("deploy.ts sizes autoMapTopUpTarget via topUpTargetFor(..., envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM) on every deploy()-internal connect (#1221 Part 2)", () => {
+  test("deploy.ts sizes autoMapTopUpTarget via topUpTargetFor(..., stack.registerStorageDeposit, AUTO_MAP_RENT_HEADROOM) on every deploy()-internal connect (#1221 Part 2)", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
     const deployFnStart = src.indexOf("export async function deploy(");
     assert.ok(deployFnStart !== -1, ">> FAIL: #1221: could not locate deploy() to scope the call-site search");
@@ -10869,10 +10909,10 @@ describe("resolveDotnsConnectOptions (#209)", () => {
       `>> FAIL: #1221: expected at least 3 resolveDotnsConnectOptions call sites inside deploy(), found ${calls.length}`);
     const missing = calls.filter((m) => {
       const after = deployFnSrc.slice(m.index + m[0].length, m.index + m[0].length + 400);
-      return !/autoMapTopUpTarget:\s*topUpTargetFor\([^,]+,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/.test(after);
+      return !/autoMapTopUpTarget:\s*topUpTargetFor\([^,]+,\s*stack\.registerStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/.test(after);
     }).map((m) => m[0]);
     assert.deepStrictEqual(missing, [],
-      `>> FAIL: #1221: every deploy()-internal resolveDotnsConnectOptions call must be followed by an autoMapTopUpTarget: topUpTargetFor(<action>, envRegisterStorageDeposit, AUTO_MAP_RENT_HEADROOM) sibling key, or a fresh signer mid-deploy still does two top-ups. Offending: ${missing.join(" | ")}`);
+      `>> FAIL: #1221: every deploy()-internal resolveDotnsConnectOptions call must be followed by an autoMapTopUpTarget: topUpTargetFor(<action>, stack.registerStorageDeposit, AUTO_MAP_RENT_HEADROOM) sibling key, or a fresh signer mid-deploy still does two top-ups. Offending: ${missing.join(" | ")}`);
   });
 
   test("deploy.ts uses autoMapPlannedActionFor (not a hardcoded 'register') at every post-preflight connect (#1221)", () => {
@@ -10880,10 +10920,10 @@ describe("resolveDotnsConnectOptions (#209)", () => {
     const deployFnStart = src.indexOf("export async function deploy(");
     assert.ok(deployFnStart !== -1, ">> FAIL: #1221: could not locate deploy() to scope the call-site search");
     const deployFnSrc = src.slice(deployFnStart);
-    const realActionCalls = deployFnSrc.match(/topUpTargetFor\(\s*autoMapPlannedActionFor\(dotnsPreflight\)\s*,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
+    const realActionCalls = deployFnSrc.match(/topUpTargetFor\(\s*autoMapPlannedActionFor\(dotnsPreflight\)\s*,\s*stack\.registerStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
     assert.strictEqual(realActionCalls.length, 2,
       `>> FAIL: #1221: expected exactly 2 post-preflight connects (owner-path reconnect + main signer connect) to use autoMapPlannedActionFor(dotnsPreflight), found ${realActionCalls.length}`);
-    const hardcodedRegisterCalls = deployFnSrc.match(/topUpTargetFor\(\s*["']register["']\s*,\s*envRegisterStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
+    const hardcodedRegisterCalls = deployFnSrc.match(/topUpTargetFor\(\s*["']register["']\s*,\s*stack\.registerStorageDeposit\s*,\s*AUTO_MAP_RENT_HEADROOM\s*\)/g) ?? [];
     assert.strictEqual(hardcodedRegisterCalls.length, 1,
       `>> FAIL: #1221: expected exactly 1 connect (the preflight connect, which runs before plannedAction is known) to use a hardcoded "register", found ${hardcodedRegisterCalls.length}`);
   });
@@ -10925,9 +10965,9 @@ describe("DotNS external signer path (#158)", () => {
 // #1094: manifest publish uploaded the icon/executables to the DEFAULT
 // Bulletin RPC, ignoring --env/--rpc. deploy() itself resolves its Bulletin
 // endpoint via this exact override precedence before setting the
-// module-level BULLETIN_ENDPOINTS that storeFile/storeDirectory fall back to
+// module-level bulletinSelection that storeFile/storeDirectory fall back to
 // (getProvider(), no client of their own). resolveBulletinEndpoints/
-// setBulletinEndpoints are extracted so manifest/publish.ts can reuse the
+// setBulletinStack are extracted so manifest/publish.ts can reuse the
 // SAME mechanism instead of inventing a second one — see
 // test/product-manifest.test.js for the publishManifest-level regression
 // test that exercises the actual wiring.
@@ -10985,12 +11025,12 @@ describe("resolveBulletinEndpoints (#1094)", () => {
 });
 
 describe("setBulletinEndpoints (#1094)", () => {
-  test("updates the exported BULLETIN_ENDPOINTS binding read by getProvider()/storeFile/storeDirectory", () => {
-    const before = BULLETIN_ENDPOINTS;
+  test("updates the exported bulletinSelection binding read by getProvider()/storeFile/storeDirectory", () => {
+    const before = bulletinSelection.endpoints;
     try {
       setBulletinEndpoints(["wss://paseo-bulletin-next-rpc.polkadot.io"]);
-      assert.deepStrictEqual(BULLETIN_ENDPOINTS, ["wss://paseo-bulletin-next-rpc.polkadot.io"],
-        ">> FAIL: setBulletinEndpoints: exported BULLETIN_ENDPOINTS must reflect the setter's argument (live ESM binding) — this is the only way manifest/publish.ts (a different module) can update deploy.ts's module-level state");
+      assert.deepStrictEqual(bulletinSelection.endpoints, ["wss://paseo-bulletin-next-rpc.polkadot.io"],
+        ">> FAIL: setBulletinEndpoints: exported bulletinSelection must reflect the setter's argument (live ESM binding), which is how other modules read deploy.ts's selected endpoints");
     } finally {
       setBulletinEndpoints(before);
     }
@@ -11688,17 +11728,8 @@ function runBinIsolated(tmpdir, argv, { preseedState, extraEnv } = {}) {
   if (preseedState) {
     fs.writeFileSync(path.join(stateDir, "last-run.json"), typeof preseedState === "string" ? preseedState : JSON.stringify(preseedState));
   }
-  const env = {
-    ...process.env,
-    HOME: tmpdir,
-    USERPROFILE: tmpdir,
-    LOCALAPPDATA: path.join(tmpdir, "AppData", "Local"),
-    XDG_STATE_HOME: path.join(tmpdir, ".local", "state"),
-    // Keep telemetry disabled — the bin imports telemetry.js; we don't want
-    // to try to ship transactions to Sentry from the test.
-    PAD_TELEMETRY: "0",
-    ...extraEnv,
-  };
+  // createCliTestEnv also selects a local stack and blocks every non-local connection.
+  const env = createCliTestEnv(tmpdir, extraEnv);
   const result = spawnSync(process.execPath, [BIN_PATH, ...argv], { env, encoding: "utf-8", timeout: 15000 });
   return { ...result, stateDir };
 }
@@ -12251,8 +12282,8 @@ describe("verifyNonceAdvanced source structure (issue #153, AC#1)", () => {
       const src = fs.readFileSync(file, "utf-8");
       assert.doesNotMatch(
         src,
-        /(?:ensureAuthorized|withAliceApi|bootstrapPool)\([^;\n]*BULLETIN_ENDPOINTS\[0\]/,
-        `${file}: long-lived Bulletin client calls must receive the BULLETIN_ENDPOINTS array so S6 can fail over from a dead primary`,
+        /(?:ensureAuthorized|withAliceApi|bootstrapPool)\([^;\n]*endpoints\[0\]/,
+        `${file}: long-lived Bulletin client calls must receive the full endpoint array so S6 can fail over from a dead primary`,
       );
     });
   }
@@ -12275,10 +12306,10 @@ describe("verifyNonceAdvanced source structure (issue #153, AC#1)", () => {
   test("src/pool.ts: bootstrapPool throws before resolving an authorizer when reauth is needed but not allowed", () => {
     const src = fs.readFileSync("src/pool.ts", "utf-8");
     const needsAuthIdx = src.indexOf("const needsAuth = accountsNeedingReauthorization(");
-    const guardIdx = src.indexOf("reauthBufferBlocks > 0 && !opts.allowAutoReauthorize");
+    const guardIdx = src.indexOf("reauthBufferBlocks > 0 && !isAutoReauthorizeAllowed(opts.stack)");
     const authorizerIdx = src.indexOf("--- Step 3: resolve authorizer ---");
     assert.ok(needsAuthIdx !== -1, "bootstrapPool must compute needsAuth via accountsNeedingReauthorization");
-    assert.ok(guardIdx !== -1, "bootstrapPool must check reauthBufferBlocks > 0 && !opts.allowAutoReauthorize");
+    assert.ok(guardIdx !== -1, ">> FAIL: pre-check gate: bootstrapPool must check reauthBufferBlocks > 0 && !isAutoReauthorizeAllowed(opts.stack)");
     assert.ok(authorizerIdx !== -1, "bootstrapPool must still have a Step 3 authorizer-resolution block");
     assert.ok(
       needsAuthIdx < guardIdx && guardIdx < authorizerIdx,
@@ -12302,20 +12333,30 @@ describe("verifyNonceAdvanced source structure (issue #153, AC#1)", () => {
 });
 
 describe("getWsProvider multi-endpoint + heartbeat guard (issue #153, PR #92 regression guard)", () => {
-  // Check all production WebSocket clients for the heartbeat guard.
+  // Every production client opens through connectChainClient (src/genesis.ts), which hands its
+  // config to getWsProvider; each call must carry heartbeatTimeout, directly or via openBulletinClient.
   // We check source (not dist) because tsup chunks are not predictably named.
-  for (const file of ["src/deploy.ts", "src/dotns.ts", "src/pool.ts"]) {
-    test(`${file}: all getWsProvider calls include heartbeatTimeout`, () => {
+  test("src/genesis.ts: connectChainClient hands its config to getWsProvider", () => {
+    const src = fs.readFileSync("src/genesis.ts", "utf-8");
+    assert.match(src, /getWsProvider\(list, \{\s*\.\.\.providerConfig,/, ">> FAIL: heartbeat: connectChainClient must pass its config (heartbeatTimeout) to getWsProvider");
+  });
+
+  test("src/deploy.ts: openBulletinClient defaults heartbeatTimeout", () => {
+    const src = fs.readFileSync("src/deploy.ts", "utf-8");
+    assert.match(src, /connectChainClient\(stack, "Bulletin", endpoints, \{ heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, \.\.\.config \}\)/,
+      ">> FAIL: heartbeat: openBulletinClient must default heartbeatTimeout for every Bulletin client (would regress PR #92)");
+  });
+
+  for (const file of ["src/deploy.ts", "src/dotns.ts", "src/pool.ts", "src/storage-signer.ts", "src/personhood/people-client.ts", "src/personhood/bootstrap.ts", "src/auth-config.ts"]) {
+    test(`${file}: every connectChainClient call includes heartbeatTimeout`, () => {
       const src = fs.readFileSync(file, "utf-8");
-      const callSites = [...src.matchAll(/getWsProvider\s*\(/g)];
-      assert.ok(callSites.length > 0, `${file}: no getWsProvider calls found`);
-      for (const match of callSites) {
-        const snippet = src.slice(match.index, match.index + 400);
-        assert.ok(
-          /heartbeatTimeout\s*:/.test(snippet),
-          `${file}: getWsProvider at offset ${match.index} missing heartbeatTimeout (would regress PR #92)\n${snippet}`,
-        );
+      for (const match of src.matchAll(/connectChainClient\s*\(/g)) {
+        const snippet = src.slice(Math.max(0, match.index - 400), match.index + 400);
+        assert.ok(/heartbeatTimeout\s*:/.test(snippet),
+          `>> FAIL: heartbeat: ${file}: connectChainClient at offset ${match.index} missing heartbeatTimeout (would regress PR #92)\n${snippet}`);
       }
+      assert.ok(!/createClient\s*\(\s*getWsProvider/.test(src),
+        `>> FAIL: heartbeat: ${file} opens a client without connectChainClient, so it skips the genesis check`);
     });
 
     test(`${file}: no bare-string getWsProvider("wss://...") call (must use array form)`, () => {
@@ -18217,85 +18258,21 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
   }
 
-  test.skip("preview pins the current DotNS contract addresses", () => {
-    const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
-    const env = envDoc.environments.find((entry) => entry.id === "preview");
-    assert.ok(env, "assets/environments.json must define preview");
-    assert.strictEqual(env.nativeToEthRatio, 100000000);
-    assert.deepStrictEqual(env.contracts, {
-      DOTNS_PROTOCOL_REGISTRY: "0x984F17a9077808F4B7e127F76806A1D59546B5B6",
-      DOTNS_REGISTRAR: "0x061273AeF34e8ab9Ca08E199d7440E2639Fc2088",
-      DOTNS_REGISTRAR_CONTROLLER: "0xC0c21ca6302884572E61d69D5bf3E271Acf39B23",
-      DOTNS_REGISTRY: "0x5622CA75C75726Da13ae46C69127C07c87538633",
-      DOTNS_POP_CONTROLLER: "0xae2c63b921Bc9DC30C149A8FA462fd3efA53D1F4",
-      DOTNS_RESOLVER: "0x823f39E7a4126669be53211FFbCF27e55b3274C6",
-      DOTNS_CONTENT_RESOLVER: "0xBD003d5Dd04E68aC60d529a46AEfBdEf8941868C",
-      DOTNS_REVERSE_RESOLVER: "0xA347059298aA171b3E744538F7043e9AAaAa95E0",
-      DOTNS_POP_RESOLVER: "0xeD11Bb5064fAAcb0A91e52dac2272E89856F2F6a",
-      DOTNS_NAME_ESCROW: "0xb7E39199f13aCf7e90cCf67b980aC3ef0E2C4Fbe",
-      POP_RULES: "0xF209a15e8a10D208bb4d3e3c56D9EB73a5934C26",
-      STORE_FACTORY: "0x4BEFaB5de968183524b1eBd2FAec9C68Cdc696Fd",
-      LABEL_STORE_BEACON: "0x11f324597d850d626d6406713808Ed854dA00a6b",
-      USER_STORE_BEACON: "0xaC2209aFc366505d10Fd27d27030EB8C5E54874e",
-      PUBLISHER: "0xa616254fd98724c7a3d295c98ca393a486096b68",
-    });
-  });
-
-  test.skip("preview-pvm pins the current DotNS contract addresses", () => {
-    const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
-    const env = envDoc.environments.find((entry) => entry.id === "preview-pvm");
-    assert.ok(env, "assets/environments.json must define preview-pvm");
-    assert.strictEqual(env.nativeToEthRatio, 100000000);
-    assert.deepStrictEqual(env.contracts, {
-      DOTNS_PROTOCOL_REGISTRY: "0x84e7637427ba79550440146b7e51dc05230f3685",
-      DOTNS_REGISTRAR: "0x9554489ce26c1229cdbaa0fd1193ff5dcc9542ef",
-      DOTNS_REGISTRAR_CONTROLLER: "0x35f8594c8e68a0ad079bca5f72bf6c9560ac22b0",
-      DOTNS_REGISTRY: "0x64e619ea4d8a593c68533c0feaf3e36d3666495b",
-      DOTNS_POP_CONTROLLER: "0xb0dd60b3da4a563cdc8aa78ec9d5b169f81046f1",
-      DOTNS_RESOLVER: "0x5296344ed752c19cdee2bb3e5e5b015ba69982c7",
-      DOTNS_CONTENT_RESOLVER: "0xa27c323a30c7ee1f0a7a35f48983d98d18c53445",
-      DOTNS_REVERSE_RESOLVER: "0x099b539bf034c741404d393ab95946e4923bc7ab",
-      DOTNS_POP_RESOLVER: "0x43deee0a5800d6aefb62c44431bb1e8a64782b15",
-      DOTNS_NAME_ESCROW: "0xffa4bcd8d30eb08e154d9f5db6e21dd9cd02d6bd",
-      POP_RULES: "0xe12efef359226464a5672029cfce9c04ca89afcf",
-      STORE_FACTORY: "0xf594f6b5443ee915fddc24b201668e8d880e0fff",
-      MULTICALL3: "0x3388cf14bceb70d96fa242f9a31d525772f7dbf0",
-    });
-  });
-
-  test("paseo-next-v2 pins the current DotNS contract addresses", () => {
-    const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
-    const env = envDoc.environments.find((entry) => entry.id === "paseo-next-v2");
-    assert.ok(env, "assets/environments.json must define paseo-next-v2");
-    // DotNS was redeployed on paseo-next-v2 on 2026-08-12. Addresses come from the
-    // canonical registry (paritytech/dotns DEPLOYMENTS.md); DotNS deploys through a
-    // CREATE3 factory, so every network shares these addresses and only the TLD differs.
-    // A stale entry here does not fail the build — it fails at deploy time with
-    // "No contract deployed at 0x… (POP_RULES)", so this pin is the early-warning.
-    assert.deepStrictEqual(env.contracts, {
-      DOTNS_PROTOCOL_REGISTRY: "0xD19e3D0C97CF501125a04A97405e3e6592fa846E",
-      DOTNS_REGISTRAR: "0x4f06E818Ba3d987704fd91cf3d868E4b019106Ab",
-      DOTNS_REGISTRAR_CONTROLLER: "0xBdaA01bD1bA67d709F2b1fF286Da0d854977EA30",
-      DOTNS_REGISTRY: "0xf34054fd76BbF85f216cf9908226D5f0A72E50CA",
-      DOTNS_POP_CONTROLLER: "0xCC932348606cc1f3318cADeC5A5Cd2CA447f8a4b",
-      DOTNS_RESOLVER: "0xbd1165E549DF96F083c0A16f61590927bC187009",
-      DOTNS_CONTENT_RESOLVER: "0x7F74D7CD50f5a834270E2ad395a01b01891AB37d",
-      DOTNS_REVERSE_RESOLVER: "0xee3883d7eB60Ee9BCD7F3bcD8f2f05302A9Cc035",
-      DOTNS_POP_RESOLVER: "0xDaC984884EcA8Fc44011f1D6C49B27828390A72B",
-      DOTNS_NAME_ESCROW: "0x4881Afb78e7C908cAe818168B926229D93376520",
-      POP_RULES: "0x747B456bE03aec0b42bd85C51513730FBD45DA31",
-      // bulletin-deploy #1514: paseo-assethub's store set moved onto the v0.8.0
-      // proxy upstream; both old and new trios still have code on paseo-next-v2
-      // (verified on-chain), so this just follows the record.
-      STORE_FACTORY: "0x99605a926FcB40aB520F659c6505E5ff862771f6",
-      LABEL_STORE_BEACON: "0x2227d9807F5A71332Aaa0640643030f2A3bf84cD",
-      USER_STORE_BEACON: "0x3d1Ca165f7A5e387C2df02DB2FadD3149c1C72ad",
-      MULTICALL3: "0xB4468000abD87D3c56cbFBd153161223D7b109e5",
-    }, ">> FAIL: paseo-next-v2-contracts: assets/environments.json contract addresses drifted from the canonical DotNS deployment. Re-check paritytech/dotns DEPLOYMENTS.md — a stale address surfaces as \"No contract deployed at 0x… \" in preflight, not as a build error.");
-    assert.strictEqual(env.tld, "paseo",
-      `>> FAIL: paseo-next-v2-tld: paseo-next-v2 must set tld to "paseo"; got ${JSON.stringify(env.tld)}. The redeployed DotNS on this network roots names under .paseo, not .dot — a wrong or missing tld makes every registration target a non-existent TLD root.`);
-    assert.strictEqual(env.webGateway, "paseo.li",
-      `>> FAIL: paseo-next-v2-web-gateway: paseo-next-v2 must set webGateway to "paseo.li"; got ${JSON.stringify(env.webGateway)}. Without it browserUrlFor falls back to dot.li, so the post-deploy link points at the wrong gateway host.`);
+  // Each built-in stack's descriptor is the source of its DotNS addresses; a
+  // stack missing one src reads, or carrying a malformed one, fails every
+  // deploy on it at connect(). Pinned literals would break on each refresh of
+  // .trinity/, so this checks shape, not values.
+  test("every built-in stack carries a valid address for each DotNS contract src reads", async () => {
+    const { validateContractAddresses } = await import("../dist/dotns.js");
+    const { STACK_REQUIREMENTS } = await import("../dist/stacks.js");
+    for (const id of BUILT_IN_STACK_IDS) {
+      const { contracts } = readShippedStack(id);
+      const missing = STACK_REQUIREMENTS.contracts.filter((name) => !contracts[name]);
+      assert.deepStrictEqual(missing, [],
+        `>> FAIL: stack-contracts: built-in stack ${id} lacks ${missing.join(", ")}, which every deploy on it needs`);
+      assert.doesNotThrow(() => validateContractAddresses(contracts, id),
+        `>> FAIL: stack-contracts: built-in stack ${id} carries a malformed DotNS address`);
+    }
   });
 
   test.skip("paseo-next-v2 fixture bootstrap repairs funder-owned labels", () => { // skipped in public snapshot: tool not shipped
@@ -18318,27 +18295,27 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
   });
 
-  test.skip("derivation-signer setup resolves paseo-next-v2 endpoints from environments.json", () => { // skipped in public snapshot: tool not shipped
+  test.skip("derivation-signer setup resolves its endpoints from the selected stack", () => { // skipped in public snapshot: tool not shipped
     const helper = fs.readFileSync("tools/setup-e2e-derivation-signers.mjs", "utf-8");
     assert.ok(
-      /from "\.\.\/dist\/environments\.js"/.test(helper),
-      "setup helper must use the shared environments resolver instead of hard-coded RPC defaults",
+      /from "\.\.\/dist\/stacks\.js"/.test(helper),
+      "setup helper must use the shared stack loader instead of hard-coded RPC defaults",
     );
     assert.ok(
-      /--env/.test(helper) && /resolveEndpoints\(doc,\s*envId\)/.test(helper),
-      "setup helper must support --env and resolve endpoints from environments.json",
+      /--env/.test(helper) && /loadStack\(\{\s*env:\s*envId\s*\}\)/.test(helper),
+      "setup helper must support --env and load the selected stack",
     );
     assert.ok(
-      /rpc\s*=\s*resolved\.assetHub\[0\]/.test(helper),
-      "setup helper must derive the Asset Hub RPC from the selected environment",
+      /rpc\s*=\s*stack\.chains\.AssetHub\.rpc\[0\]/.test(helper),
+      "setup helper must derive the Asset Hub RPC from the selected stack",
     );
     assert.ok(
-      /bulletinRpc\s*=\s*resolved\.bulletin\[0\]/.test(helper),
-      "setup helper must derive the Bulletin RPC from the selected environment",
+      /bulletinRpc\s*=\s*stack\.chains\.Bulletin\.rpc\[0\]/.test(helper),
+      "setup helper must derive the Bulletin RPC from the selected stack",
     );
     assert.ok(
-      /ensureAuthorized\(bulletinApi,\s*s\.substrate,\s*s\.label\)/.test(helper),
-      "setup helper must call ensureAuthorized without a flag arg (v2 is now unconditional)",
+      /ensureAuthorized\(bulletinApi,\s*s\.substrate,\s*s\.label,\s*\{[^}]*authorizer:\s*stack\.bulletinAuthorizer/.test(helper),
+      "setup helper must call ensureAuthorized with the stack's own authorizer (bare call cannot grant on //Eve stacks; #1637), and no legacy v2 flag arg",
     );
   });
 
@@ -18358,20 +18335,20 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
   });
 
-  test("custom-env verification helper forwards nativeToEthRatio", () => {
+  test("custom-env verification helper connects DotNS with the selected stack", () => {
     const verifyHelper = fs.readFileSync("test/helpers/e2e-verify.js", "utf-8");
     assert.ok(
       /dotnsConnectOptions/.test(verifyHelper),
-      "test/helpers/e2e-verify.js must take its DotNS connect options from the shared env helper, which forwards nativeToEthRatio",
+      "test/helpers/e2e-verify.js must take its DotNS connect options from the shared env helper, which passes the selected stack",
     );
   });
 
-  test("custom-env E2E writer paths forward env-specific DotNS options in both connect sites", () => {
+  test("custom-env E2E writer paths forward the selected stack in both connect sites", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
     const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /dotnsConnectOptions:\s*\{[\s\S]{0,500}nativeToEthRatio:\s*resolved\.nativeToEthRatio/.test(envHelper),
-      "test/helpers/e2e-env.js must build the DotNS connect options and forward nativeToEthRatio",
+      /dotnsConnectOptions:\s*stackSelectionOf\(stack\)/.test(envHelper),
+      "test/helpers/e2e-env.js must build the DotNS connect options from the loaded stack's selection",
     );
     assert.ok(
       /async function resolveE2eTld\(\)\s*\{\s*return \(await resolveE2eEnv\(/.test(e2e),
@@ -18445,12 +18422,12 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
   });
 
-  test("custom-env roundtrip tests derive the gateway from environments.json", () => {
+  test("custom-env roundtrip tests derive the gateway from the selected stack", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
     const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /gateway:\s*resolved\.ipfs/.test(envHelper),
-      "test/helpers/e2e-env.js must derive the gateway from the resolved environment's ipfs endpoint",
+      /gateway:\s*stack\.ipfsGateway/.test(envHelper),
+      "test/helpers/e2e-env.js must derive the gateway from the selected stack's ipfs-gateway",
     );
     assert.ok(
       /const gateway = await resolveE2eGateway\(\)/.test(e2e),
@@ -18462,8 +18439,8 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     const e2e = fs.readFileSync("test/e2e.test.js", "utf-8");
     const envHelper = fs.readFileSync("test/helpers/e2e-env.js", "utf-8");
     assert.ok(
-      /bulletin:\s*resolved\.bulletin\[0\]/.test(envHelper),
-      "S8 must resolve the fault-proxy upstream from environments.json, not a hardcoded endpoint",
+      /bulletin:\s*stack\.chains\.Bulletin\.rpc\[0\]/.test(envHelper),
+      "S8 must resolve the fault-proxy upstream from the selected stack, not a hardcoded endpoint",
     );
     assert.ok(
       /startFaultProxy\(\{[\s\S]{0,220}mode: "once"[\s\S]{0,220}upstream: await resolveE2eBulletinRpc\(\)/.test(e2e),
@@ -18609,11 +18586,12 @@ describe("paseo-next-v2 E2E harness wiring", () => {
 
     const sExt = workflowJobBlock(workflow, "nightly-s-ext-signer");
     assert.match(sExt, /setContenthash\("e2epoolns01", expected\)/, "nightly S-ext-signer must write the v2 NoStatus pool label");
-    assert.match(sExt, /import \{ DotNS, loadEnvironments, resolveEndpoints \} from "@parity\/polkadot-app-deploy"/, "npm-installed S-ext must use the package's environment helpers");
-    assert.match(sExt, /const \{ doc \} = await loadEnvironments\(\)/, "npm-installed S-ext must load environments through actual bulletin-deploy code");
-    assert.match(sExt, /const resolved = resolveEndpoints\(doc, envId\)/, "npm-installed S-ext must resolve env options through actual bulletin-deploy code");
-    assert.doesNotMatch(sExt, /assets\/environments\.json/, "S-ext must not manually read the packaged environments asset");
-    assert.doesNotMatch(sExt, /require\.resolve\("bulletin-deploy"\)/, "S-ext must not use CJS require.resolve on the ESM/export-mapped package");
+    assert.match(sExt, /import \* as bulletinDeploy from "@parity\/polkadot-app-deploy"/, ">> FAIL: S-ext stack: npm-installed S-ext must use the package's own exports");
+    assert.match(sExt, /if \(!bulletinDeploy\.loadEnvironments\) return \{ env: envId \};/, ">> FAIL: npm-installed S-ext must pass the env id to DotNS.connect on a version that loads stacks itself");
+    assert.doesNotMatch(sExt, /\.trinity\//, ">> FAIL: S-ext must not read the shipped descriptors itself; DotNS.connect({ env }) loads and verifies them");
+    assert.match(sExt, /const resolved = bulletinDeploy\.resolveEndpoints\(doc, envId\)/, ">> FAIL: S-ext stack: npm-installed S-ext must still resolve env options through actual polkadot-app-deploy code on a version from before the stack cutover");
+    assert.doesNotMatch(sExt, /assets\/environments\.json/, ">> FAIL: S-ext stack: S-ext must not manually read the removed environments snapshot");
+    assert.doesNotMatch(sExt, /require\.resolve\("@parity\/polkadot-app-deploy"\)/, ">> FAIL: S-ext stack: S-ext must not use CJS require.resolve on the ESM/export-mapped package");
 
     const s7Script = fs.readFileSync("scripts/e2e-sigint-scenario.mjs", "utf-8");
     assert.match(s7Script, /const envFlag = \["--env", ENV_ID\]/, "S7 harness must forward the resolved env to both deploy invocations");
@@ -18984,8 +18962,8 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
     assert.match(
       helper,
-      /resolveEndpoints\(doc,\s*ENV_ID\)/,
-      "fixture builder must pass ENV_ID (not a hardcoded string) to resolveEndpoints",
+      /loadStack\(\{\s*env:\s*args\.envId/,
+      "fixture builder must pass the --env value (not a hardcoded string) to loadStack",
     );
   });
 
@@ -18993,8 +18971,8 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     // The old thin preview wrapper has been removed; its behaviour — "reach preview
     // via the unified builder with --env preview" — is now directly exercised through
     // register-test-fixture.mjs. This test guards that the builder still accepts
-    // --env and routes it through resolveEndpoints so --env preview targets the
-    // preview environment.
+    // --env and routes it through loadStack so --env preview targets the
+    // preview stack.
     const helper = fs.readFileSync("tools/register-test-fixture.mjs", "utf-8");
     assert.match(
       helper,
@@ -19003,8 +18981,8 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     );
     assert.match(
       helper,
-      /resolveEndpoints\(doc,\s*ENV_ID\)/,
-      "fixture builder must pass ENV_ID into resolveEndpoints so --env preview targets the preview environment",
+      /loadStack\(\{\s*env:\s*args\.envId/,
+      "fixture builder must pass the --env value into loadStack so --env preview targets the preview stack",
     );
     assert.match(
       helper,
@@ -19017,7 +18995,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
     // The generalized transfer tool (replaced the single-purpose transfer-e2eowned-to-bob.mjs).
     // It must accept label/recipient/env as flags, short-circuit when the label is already owned
     // by --to (so a re-run after a partial transfer is a no-op), and resolve the chain from
-    // environments.json rather than a hardcoded endpoint.
+    // the selected stack rather than a hardcoded endpoint.
     const tool = fs.readFileSync("tools/transfer-dotns-name.mjs", "utf-8");
     assert.match(tool, /"--label"/, "must parse --label");
     assert.match(tool, /"--to"/, "must parse --to");
@@ -19028,7 +19006,7 @@ describe("paseo-next-v2 E2E harness wiring", () => {
       /already owned by[\s\S]*?process\.exit\(0\)/,
       "must no-op (exit 0) when the label is already owned by --to",
     );
-    assert.match(tool, /resolveEndpoints\(/, "must resolve endpoints from environments.json");
+    assert.match(tool, /loadStack\(/, ">> FAIL: tool endpoints: must resolve endpoints from the selected stack");
     assert.doesNotMatch(tool, /wss:\/\//, "must not hardcode a wss:// endpoint (env-agnostic)");
   });
 });
@@ -20694,7 +20672,6 @@ describe("runBootstrap (mock — no chain)", () => {
 
     await runBootstrap({
       mnemonic: BOOTSTRAP_TEST_MNEMONIC,
-      environmentId: "paseo-next-v2",
       requireRecognized: false,
       _testApis: {
         ahUnsafeApi,
@@ -20720,7 +20697,6 @@ describe("runBootstrap (mock — no chain)", () => {
     await assert.rejects(
       runBootstrap({
         mnemonic: BOOTSTRAP_TEST_MNEMONIC,
-        environmentId: "paseo-next-v2",
         requireRecognized: false,
         _testApis: {
           ahUnsafeApi,
@@ -21254,7 +21230,7 @@ describe("ReviveClientWrapper: per-env storage-deposit floor reaches the submitt
 describe("DotNS: recreateReviveClient wires the connected instance's registerStorageDeposit into the wrapper (#1518)", () => {
   test("dotns.ts: recreateReviveClient calls setStorageDepositFloors with this._registerStorageDeposit right after construction", () => {
     const dotnsSrc = fs.readFileSync(new URL("../src/dotns.ts", import.meta.url), "utf-8");
-    const recreateFnMatch = dotnsSrc.match(/private recreateReviveClient\(endpoint: string\): void \{[\s\S]*?\n  \}/);
+    const recreateFnMatch = dotnsSrc.match(/private async recreateReviveClient\(endpoint: string\): Promise<void> \{[\s\S]*?\n  \}/);
     assert.ok(recreateFnMatch, ">> FAIL: recreateReviveClient not found — did the method get renamed/restructured?");
     assert.match(recreateFnMatch[0], /this\.clientWrapper\.setStorageDepositFloors\(\{\s*register: this\._registerStorageDeposit,/,
       ">> FAIL: recreateReviveClient must call setStorageDepositFloors({ register: this._registerStorageDeposit, ... }) — this is the ONLY place a " +
@@ -22445,83 +22421,63 @@ describe("manifest-fetch.ts: walkDagToManifest helper extracted", () => {
   });
 });
 
-describe("environments.ts: ipfs propagation through resolveEndpoints", () => {
-  test("ResolvedEndpoints interface declares ipfs?: string", () => {
-    const src = fs.readFileSync("src/environments.ts", "utf8");
-    assert.ok(
-      /ipfs\??\s*:\s*string\s*\|?\s*(undefined)?\s*;/.test(src),
-      "src/environments.ts: ResolvedEndpoints must include an 'ipfs' field"
-    );
+describe("ipfs gateway propagation from the stack", () => {
+  test("every built-in stack resolves a path-style ipfs gateway", () => {
+    for (const id of BUILT_IN_STACK_IDS) {
+      assert.match(readShippedStack(id).ipfsGateway, /^https:\/\/.+\/ipfs\/$/,
+        `>> FAIL: stack ${id}: ipfsGateway must be the descriptor's path-style ipfs-gateway (content at \${ipfsGateway}\${cid}), or deploys fall back to no network tier for the previous manifest`);
+    }
   });
 
-  test("resolveEndpoints returns env.ipfs", () => {
-    const src = fs.readFileSync("src/environments.ts", "utf8");
-    // The return object literal of resolveEndpoints must include `ipfs: env.ipfs`
-    assert.ok(
-      /ipfs\s*:\s*env\.ipfs/.test(src),
-      "src/environments.ts: resolveEndpoints() must return ipfs: env.ipfs"
-    );
-  });
-
-  test("deploy.ts plumbs env's ipfs into storeDirectoryV2's gateway option", () => {
+  test("deploy.ts plumbs the stack's ipfs gateway into storeDirectoryV2's gateway option", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    // envIpfs is assigned from resolved.ipfs near the top of the deploy function,
-    // then passed as `gateway: envIpfs` into storeDirectoryV2 so its
-    // `opts.gateway ?? DEFAULT_GATEWAY` falls back via the env-specific URL.
-    assert.ok(
-      /envIpfs\s*=\s*resolved\.ipfs/.test(src),
-      "deploy.ts: must assign env's ipfs URL from resolved.ipfs (envIpfs = resolved.ipfs)"
-    );
-    assert.ok(
-      /gateway:\s*envIpfs/.test(src),
-      "deploy.ts: must pass `gateway: envIpfs` into storeDirectoryV2 so the env-specific gateway URL flows through"
-    );
+    // Anchored on the storeFn call: the same text in a comment must not satisfy it.
+    const call = src.match(/await storeFn\(contentPath, \{\n([\s\S]*?)\n\s*\}\);/)?.[1];
+    assert.ok(call, ">> FAIL: ipfs gateway plumbing: could not locate deploy()'s `await storeFn(contentPath, { ... })` call");
+    assert.match(call, /^\s*gateway: stack\.ipfsGateway,$/m,
+      ">> FAIL: ipfs gateway plumbing: deploy() must pass `gateway: stack.ipfsGateway` to storeDirectoryV2, or the previous manifest and the pre-warm skip the stack's gateway");
   });
 });
 
 describe("recordStorageDeposit propagation (bulletin #1716)", () => {
-  test("deploy.ts, publish.ts and transfer.ts pass the env's recordStorageDeposit into DotNS.connect()", () => {
-    const deploySrc = fs.readFileSync("src/deploy.ts", "utf8");
-    assert.strictEqual((deploySrc.match(/recordStorageDeposit: envRecordStorageDeposit,/g) ?? []).length, 3,
-      ">> FAIL: deploy.ts: all three DotNS.connect() sites (preflight, owner, deploy) must pass recordStorageDeposit: envRecordStorageDeposit");
-    assert.match(fs.readFileSync("src/manifest/publish.ts", "utf8"),
-      /dotns\.connect\(\{\s*\.\.\.connectOpts,\s*recordStorageDeposit: resolved\.recordStorageDeposit\s*\}\)/,
-      ">> FAIL: manifest/publish.ts connectDotNS(): must pass resolved.recordStorageDeposit into connect, or an env's record floor is ignored on manifest publishes");
-    assert.match(fs.readFileSync("src/commands/transfer.ts", "utf8"), /recordStorageDeposit: resolved\.recordStorageDeposit,/,
-      ">> FAIL: commands/transfer.ts: must pass resolved.recordStorageDeposit into DotNS.connect()");
+  test("DotNS.connect() takes the stack's recordStorageDeposit, and transfer.ts connects with the stack", () => {
+    assert.match(fs.readFileSync("src/dotns.ts", "utf8"), /recordStorageDeposit: stack\.recordStorageDeposit,/,
+      ">> FAIL: dotns.ts: connect() must take recordStorageDeposit from the stack, or a stack's record floor is ignored on every deploy, manifest publish and transfer");
+    assert.match(fs.readFileSync("src/commands/transfer.ts", "utf8"), /await dotns\.connect\(\{\s*\.\.\.stackSelectionOf\(stack\),/,
+      ">> FAIL: commands/transfer.ts: must pass the stack's selection into DotNS.connect()");
   });
 });
 
-describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literals", () => {
-  // For every URL-shaped string value declared in assets/environments.json,
-  // assert that it does NOT also appear as a hardcoded string literal anywhere
-  // in src/ outside src/environments.ts (the loader, which is allowed to embed
-  // a bundled fallback snapshot).
-  //
-  // This catches the bug class that hid the manifest-fetch flakiness for
-  // multiple RCs: the IPFS gateway URL was declared per-environment in
-  // environments.json but src/manifest-fetch.ts had a hardcoded
-  // DEFAULT_GATEWAY pointing at the WRONG environment's gateway, and
-  // resolveEndpoints dropped the env.ipfs field so deploys silently fell back
-  // to the hardcoded default.
-  // DotNS v0.6.0 deleted ROOT_GATEWAY_DISPATCHER upstream and nothing on our
-  // side ever read it. Belt-and-suspenders beyond the per-env
-  // deepStrictEqual snapshots elsewhere in this file (which don't cover every
-  // environment): scan every environment's `contracts` for the removed keys.
-  test("no environment declares ROOT_GATEWAY_DISPATCHER, a role-manager, a popGateway, or PUBLISHER (#1410, #1310)", () => {
-    const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf-8"));
-    for (const env of envDoc.environments) {
-      const keys = Object.keys(env.contracts ?? {});
-      for (const removed of ["ROOT_GATEWAY_DISPATCHER", "DOTNS_ROLE_MANAGER", "DotnsRoleManager", "popGateway", "POP_GATEWAY", "PUBLISHER"]) {
-        assert.ok(!keys.includes(removed),
-          `>> FAIL: v060-config-cleanup: environment "${env.id}" still declares "${removed}", which upstream deleted — remove it from assets/environments.json.`);
-      }
+describe("DotNS v0.6.0 contract cleanup (#1410, #1310)", () => {
+  // #1410: DotNS v0.6.0 drops RootGatewayDispatcher (and the already-unused
+  // DotnsRoleManager / popGateway registry key) upstream, and nothing on our
+  // side reads any of the three.
+  test("no stack contract polkadot-app-deploy reads is RootGatewayDispatcher, a role-manager, a popGateway, or PUBLISHER (#1410, #1310)", async () => {
+    const { DOTNS_CONTRACT_KEYS } = await import("../dist/stacks.js");
+    const removed = ["rootgatewaydispatcher", "root_gateway_dispatcher", "dotnsrolemanager", "dotns_role_manager", "rolemanager", "popgateway", "pop_gateway", "publisher"];
+    const read = [...Object.keys(DOTNS_CONTRACT_KEYS), ...Object.values(DOTNS_CONTRACT_KEYS)].map((key) => key.toLowerCase());
+    const hits = read.filter((key) => removed.includes(key));
+    assert.deepStrictEqual(hits, [],
+      `>> FAIL: v060-config-cleanup: DOTNS_CONTRACT_KEYS still reads ${hits.join(", ")}, which upstream deleted (#1410, #1310)`);
+    for (const id of BUILT_IN_STACK_IDS) {
+      const keys = Object.keys(readShippedStack(id).contracts).map((key) => key.toLowerCase());
+      assert.deepStrictEqual(keys.filter((key) => removed.includes(key)), [],
+        `>> FAIL: v060-config-cleanup: built-in stack ${id} exposes a contract DotNS v0.6.0 deleted upstream (#1410)`);
     }
   });
+});
 
-  test("no environments.json URL appears as a hardcoded string literal in src/ outside environments.ts", () => {
-    const envDoc = JSON.parse(fs.readFileSync("assets/environments.json", "utf8"));
-
+describe("INVARIANT: stack URLs never leak into src/ as hardcoded literals", () => {
+  // For every URL-shaped string value in a built-in stack's descriptor,
+  // assert that it does NOT also appear as a hardcoded string literal anywhere
+  // in src/.
+  //
+  // This catches the bug class that hid the manifest-fetch flakiness for
+  // multiple RCs: the IPFS gateway URL was declared per-environment in the
+  // network config but src/manifest-fetch.ts had a hardcoded DEFAULT_GATEWAY
+  // pointing at the WRONG environment's gateway, and the loader dropped the
+  // ipfs field so deploys silently fell back to the hardcoded default.
+  test("no built-in stack URL appears as a hardcoded string literal in src/", () => {
     const urls = new Set();
     function walk(node) {
       if (node === null || node === undefined) return;
@@ -22532,7 +22488,8 @@ describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literal
       if (Array.isArray(node)) { for (const item of node) walk(item); return; }
       if (typeof node === "object") { for (const v of Object.values(node)) walk(v); return; }
     }
-    walk(envDoc);
+    for (const id of BUILT_IN_STACK_IDS) walk(readShippedStack(id).descriptor);
+    assert.ok(urls.size > 0, ">> FAIL: stack URL invariant: collected no URLs from the built-in stacks, so this check would pass vacuously");
 
     const srcFiles = [];
     function collectTsFiles(dir) {
@@ -22544,21 +22501,10 @@ describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literal
     }
     collectTsFiles("src");
 
-    const ALLOWED_FILES = new Set([
-      "src/environments.ts", // loader; embeds the bundled fallback (only legitimate place to repeat env URLs)
-    ]);
-
-    // Per-URL exemptions for documented last-resort fallbacks that intentionally
-    // duplicate environments.json values. New entries here need a comment
-    // explaining why they're not in environments.ts.
-    const EXEMPT_URLS = new Set([
-      // src/deploy.ts: DEFAULT_BULLETIN_RPC — bottom-fallback used to seed the
-      // module-level BULLETIN_ENDPOINTS variable BEFORE the env loader runs.
-      // The let var gets overwritten with env-resolved endpoints; this seed
-      // matters only on the pre-env-load read path. Migrating to a deferred
-      // init is a separate cleanup.
-      "wss://paseo-bulletin-rpc.polkadot.io",
-    ]);
+    const ALLOWED_FILES = new Set();
+    // Per-URL exemptions for documented last-resort fallbacks. New entries
+    // here need a comment explaining why the stack cannot supply the value.
+    const EXEMPT_URLS = new Set();
 
     // Strip comments so docstrings / JSDoc / inline notes that reference these
     // URLs by name don't trigger false positives.
@@ -22610,9 +22556,8 @@ describe("INVARIANT: env-specific URLs never leak into src/ as hardcoded literal
         .join("\n");
       assert.fail(
         `\nFound ${violations.length} hardcoded URL(s) in src/ that duplicate values from ` +
-        `assets/environments.json. These should be looked up via resolveEndpoints() or another ` +
-        `env-aware accessor instead of hardcoded literals. Move them to environments.json (per-env) ` +
-        `and read via env config:\n${formatted}\n`
+        `a built-in stack descriptor. These should be read from the selected Stack instead ` +
+        `of hardcoded literals:\n${formatted}\n`
       );
     }
   });
@@ -25691,9 +25636,10 @@ describe("DotNS read-back client refresh (sticky-client stale read, #1131-follow
   });
 
   test("pickVerifyEndpoint: falls back to assetHubEndpoints when rpc is null (never connected)", () => {
-    assert.equal(pickVerifyEndpoint(1, null, RPC_ENDPOINTS), RPC_ENDPOINTS[0],
+    const endpoints = ["wss://asset-hub-a.example", "wss://asset-hub-b.example"];
+    assert.equal(pickVerifyEndpoint(1, null, endpoints), endpoints[0],
       ">> FAIL: pickVerifyEndpoint-nullrpc: with no rpc set yet, attempt 1 must fall back to the first configured asset-hub endpoint");
-    assert.equal(pickVerifyEndpoint(2, null, RPC_ENDPOINTS), RPC_ENDPOINTS[1],
+    assert.equal(pickVerifyEndpoint(2, null, endpoints), endpoints[1],
       ">> FAIL: pickVerifyEndpoint-nullrpc: attempt 2 must still rotate through assetHubEndpoints when rpc is null");
   });
 
@@ -25712,151 +25658,134 @@ describe("DotNS read-back client refresh (sticky-client stale read, #1131-follow
 
   test("wiring: connect() and the read-back share ONE recreateReviveClient helper — no inline duplicate left behind (/simplify)", () => {
     const src = fs.readFileSync("src/dotns.ts", "utf-8");
-    assert.match(src, /private recreateReviveClient\(endpoint: string\): void/,
-      ">> FAIL: recreate-dedup: expected a private recreateReviveClient(endpoint) helper — connect()'s destroy+createClient+wrapper sequence must be extracted, not copy-pasted into the read-back");
-    const createClientCallSites = (src.match(/createClient\(getWsProvider\(/g) || []).length;
-    assert.equal(createClientCallSites, 1,
-      `>> FAIL: recreate-dedup: expected exactly 1 createClient(getWsProvider(...)) call site (inside recreateReviveClient), found ${createClientCallSites} — connect() or the read-back kept an inline copy instead of calling the shared helper`);
-    assert.match(src, /this\.recreateReviveClient\(rpc\)/,
-      ">> FAIL: recreate-dedup: connect()'s ReviveApi.address retry must call the shared this.recreateReviveClient(rpc), not its own inline destroy+createClient");
+    assert.match(src, /private async recreateReviveClient\(endpoint: string\): Promise<void>/,
+      ">> FAIL: recreate-dedup: expected a private recreateReviveClient(endpoint) helper — connect()'s destroy+connect+wrapper sequence must be extracted, not copy-pasted into the read-back");
+    const clientCallSites = (src.match(/createClient\(|connectChainClient\(/g) || []).length;
+    assert.equal(clientCallSites, 1,
+      `>> FAIL: recreate-dedup: expected exactly 1 Asset Hub client call site (connectChainClient inside recreateReviveClient), found ${clientCallSites} — connect() or the read-back kept an inline copy, or skipped the genesis check`);
+    assert.match(src, /await this\.recreateReviveClient\(rpc\)/,
+      ">> FAIL: recreate-dedup: connect()'s ReviveApi.address retry must await the shared this.recreateReviveClient(rpc), not its own inline destroy+createClient");
   });
 });
 
 // ---------------------------------------------------------------------------
-// browserUrlFor — dot.li link generation (#696)
-// When --env preview is used, the dot.li SPA defaults to paseo-next-v2 and
-// shows "no content" for previewnet deployments. Appending ?network=previewnet
-// tells the SPA which chain to query.
+// Post-deploy link: deploy() calls webUrl(stack.descriptor, fullDomain) (#696, #142)
+// The link comes from the stack descriptor's `web-gateway` service: its host
+// (devnet domains resolve on dev-dot.li, not dot.li, #142) and its query
+// (previewnet's ?network=previewnet, without which the SPA shows "no content"
+// for a preview deploy, #696).
 // ---------------------------------------------------------------------------
 
-describe("browserUrlFor", () => {
-  test("default env (paseo-next-v2) produces plain dot.li URL", () => {
-    assert.strictEqual(
-      browserUrlFor("myapp", "paseo-next-v2"),
-      "https://myapp.dot.li",
-      ">> FAIL: browserUrlFor: paseo-next-v2 must not append a network param"
-    );
+describe("post-deploy web link", () => {
+  const gatewayOf = (stack) => new URL(stack.descriptor.services.find((s) => s.kind === "web-gateway").urls[0]);
+  const linkOf = (stack, label) => webUrl(stack.descriptor, `${label}.${stack.tld}`);
+
+  test("every built-in stack serves <label>.<web-gateway host>, keeping the gateway's query", () => {
+    for (const id of BUILT_IN_STACK_IDS) {
+      const stack = readShippedStack(id);
+      const gateway = gatewayOf(stack);
+      const url = new URL(linkOf(stack, "myapp"));
+      assert.strictEqual(url.host, `myapp.${gateway.host}`,
+        `>> FAIL: web link: ${id} must link to myapp.${gateway.host}, the descriptor's web-gateway host, not a hardcoded one`);
+      assert.strictEqual(url.search, gateway.search,
+        `>> FAIL: web link: ${id} must carry the web-gateway's query (${gateway.search || "none"}), or the SPA opens the wrong network`);
+    }
   });
 
-  test("preview env appends ?network=previewnet to dot.li URL", () => {
-    assert.strictEqual(
-      browserUrlFor("myapp", "preview"),
-      "https://myapp.dot.li?network=previewnet",
-      ">> FAIL: browserUrlFor: preview env must append ?network=previewnet"
-    );
-  });
-
-  test("custom env produces plain dot.li URL", () => {
-    assert.strictEqual(
-      browserUrlFor("myapp", "custom"),
-      "https://myapp.dot.li",
-      ">> FAIL: browserUrlFor: custom env must not append a network param"
-    );
-  });
-
-  test("undefined envId produces plain dot.li URL", () => {
-    assert.strictEqual(
-      browserUrlFor("myapp", undefined),
-      "https://myapp.dot.li",
-      ">> FAIL: browserUrlFor: undefined envId must not append a network param"
-    );
+  test("preview's link tells the SPA to open previewnet", () => {
+    assert.match(linkOf(readShippedStack("preview"), "myapp"), /[?&]network=previewnet\b/,
+      ">> FAIL: web link: preview must append ?network=previewnet, or the SPA shows no content for a preview deploy");
   });
 
   test("domain name is preserved verbatim in URL", () => {
-    assert.strictEqual(
-      browserUrlFor("my-cool-app", "preview"),
-      "https://my-cool-app.dot.li?network=previewnet",
-      ">> FAIL: browserUrlFor: domain name must be preserved verbatim"
-    );
+    const stack = readShippedStack(DEFAULT_STACK_ID);
+    assert.strictEqual(new URL(linkOf(stack, "my-cool-app")).host, `my-cool-app.${gatewayOf(stack).host}`,
+      ">> FAIL: web link: domain name must be preserved verbatim");
   });
 
-  // #142: devnet-family deploys printed https://<name>.dot.li, but devnet
-  // names resolve on a different gateway host (dev-dot.li). The page loaded
-  // (HTTP 200) but resolved the name against the wrong network, so the
-  // just-deployed app never showed up. Fix: browserUrlFor takes an optional
-  // webGateway host, defaulting to "dot.li" when the env doesn't specify one.
-  test("webGateway arg uses the given gateway host", () => {
-    assert.strictEqual(
-      browserUrlFor("myapp", "devnet", "dev-dot.li"),
-      "https://myapp.dev-dot.li",
-      ">> FAIL: browserUrlFor: a webGateway arg must produce https://<name>.<gateway>, not the hardcoded dot.li host"
-    );
-  });
-
-  test("no webGateway arg falls back to dot.li", () => {
-    assert.strictEqual(
-      browserUrlFor("myapp", "paseo-next-v2", undefined),
-      "https://myapp.dot.li",
-      ">> FAIL: browserUrlFor: omitting webGateway must still default to dot.li"
-    );
-  });
-
-  test("preview env keeps ?network=previewnet even with a webGateway arg passed as undefined", () => {
-    assert.strictEqual(
-      browserUrlFor("myapp", "preview", undefined),
-      "https://myapp.dot.li?network=previewnet",
-      ">> FAIL: browserUrlFor: adding the webGateway param must not break the existing preview suffix behavior"
-    );
+  test("a stack without a web-gateway has no link", () => {
+    const stack = readShippedStack(DEFAULT_STACK_ID);
+    const services = stack.descriptor.services.filter((s) => s.kind !== "web-gateway");
+    assert.strictEqual(webUrl({ ...stack.descriptor, services }, `myapp.${stack.tld}`), undefined,
+      ">> FAIL: web link: with no web-gateway the link must be undefined, not a guessed dot.li host");
   });
 });
 
 // ---------------------------------------------------------------------------
 // DeployResult.browserUrl + its plumbing (#1157)
-// browserUrlFor() already resolved the env's real webGateway (and the
-// previewnet suffix) for the CLI's "Check it out here" console line — this
-// section pins that the SAME resolution reaches DeployResult, bin/polkadot-
-// app-deploy's GITHUB_OUTPUT, and the reusable workflow's PR-comment/summary
-// URL, instead of a second, out-of-sync mechanism recomputing a gateway URL
-// from a hardcoded default.
+// webUrl(stack.descriptor, fullDomain) resolves the stack's web gateway for the CLI's "Check it out
+// here" console line — this section pins that the SAME resolution gets to
+// DeployResult, bin/polkadot-app-deploy's GITHUB_OUTPUT, and the reusable
+// workflow's PR-comment/summary URL, instead of a second, out-of-sync
+// mechanism recomputing a gateway URL from a hardcoded default.
 // ---------------------------------------------------------------------------
 
 describe("DeployResult.browserUrl (#1157)", () => {
-  test("DeployResult interface declares browserUrl: string", () => {
+  test("DeployResult interface declares an optional browserUrl", () => {
     const src = fs.readFileSync("src/deploy.ts", "utf-8");
     const ifaceMatch = src.match(/export interface DeployResult \{[\s\S]*?\n\}/);
     assert.ok(ifaceMatch, ">> FAIL: DeployResult.browserUrl: could not locate the DeployResult interface in src/deploy.ts");
     assert.match(
       ifaceMatch[0],
-      /browserUrl:\s*string;/,
-      ">> FAIL: DeployResult.browserUrl: DeployResult must declare `browserUrl: string` so library callers (and the CLI's GITHUB_OUTPUT write) can reuse the env-resolved URL instead of recomputing one"
+      /browserUrl\?:\s*string;/,
+      ">> FAIL: DeployResult.browserUrl: DeployResult must declare `browserUrl?: string` (undefined when the stack lists no web-gateway) so library callers (and the CLI's GITHUB_OUTPUT write) can reuse the stack-resolved URL instead of recomputing one"
     );
   });
 
-  test("deploy()'s return site reuses ONE browserUrlFor(...) call — no second URL mechanism", () => {
+  test("deploy()'s return site reuses ONE webUrl(...) call — no second URL mechanism", () => {
+    // Guards the "reuse the one resolution" invariant structurally: the
+    // console.log line and the returned `browserUrl` field must come from
+    // the SAME computed value, not two separate webUrl(...) calls
+    // (which could drift, e.g. if only one call site is updated later).
+    //
+    // Checked directly rather than via a fixed-size preceding-text window:
+    // a byte-distance window is brittle to unrelated edits between the
+    // `const browserUrl = ...` assignment and the return statement (e.g. a
+    // new console.log line) shifting the assignment out of the window and
+    // failing the test for a reason unrelated to the invariant.
+    const src = fs.readFileSync("src/deploy.ts", "utf-8");
+    // Located by shape, not as one exact literal: the return object legitimately
+    // grows new fields (DeployResult.storageSigner, #1494 follow-up), and pinning
+    // the whole statement made an additive change fail a test about browserUrl.
+    // What must hold is unchanged: the returned browserUrl is the variable, and
+    // webUrl is not called a second time in that statement.
+    const returnMatch = src.match(/return \{\s*domainName: name,[\s\S]*?\n?\s*\};/);
+    assert.ok(returnMatch, ">> FAIL: browserUrl-single-resolution: could not locate deploy()'s DeployResult return statement (expected `return { domainName: name, ... };`)");
+    assert.match(
+      returnMatch[0],
+      /(?:^|[\s{,])browserUrl\s*(?:,|\}|$)/m,
+      ">> FAIL: browserUrl-single-resolution: deploy()'s DeployResult return must include a `browserUrl` field, shorthand for the one resolved value"
+    );
+    assert.doesNotMatch(
+      returnMatch[0],
+      /webUrl\(/,
+      ">> FAIL: browserUrl-single-resolution: the return statement must reuse the `browserUrl` variable, not call webUrl(...) again"
+    );
     // #1164: the "Check it out here" console lines moved out of this call
     // site and into printDeploymentCompleteBanner (deferred until after a
     // pending manifest publish succeeds, so a manifest failure never leaves
     // a false completion banner on screen) — they no longer appear
     // immediately after this assignment. The invariant this test protects
-    // (one resolution, reused everywhere) still holds and is asserted
-    // directly: browserUrlFor is called exactly once in this file, and the
+    // (one resolution, reused everywhere) still holds and is re-asserted
+    // directly: webUrl is called exactly once in this file, and the
     // banner call passes the SAME `browserUrl` variable rather than
     // resolving a second time.
-    const src = fs.readFileSync("src/deploy.ts", "utf-8");
-    const returnStatement = "domainName: name,\n        fullDomain: `${name}.${envTld}`,\n        cid: cid as string,\n        ipfsCid,\n        browserUrl,";
-    assert.ok(src.includes(returnStatement), ">> FAIL: browserUrl-single-resolution: deploy()'s DeployResult return must include a `browserUrl` field");
-    assert.ok(
-      !returnStatement.includes("browserUrlFor("),
-      ">> FAIL: browserUrl-single-resolution: the return statement must reuse the `browserUrl` variable, not call browserUrlFor(...) again"
-    );
     assert.match(
       src,
-      /const browserUrl = browserUrlFor\(name, envId, envWebGateway\);/,
-      ">> FAIL: browserUrl-single-resolution: expected `const browserUrl = browserUrlFor(name, envId, envWebGateway)` assigned once in deploy()"
+      /const \{ fullDomain, browserUrl \} = domainUrlsFor\(stack, name\);/,
+      ">> FAIL: browserUrl-single-resolution: expected `const { fullDomain, browserUrl } = domainUrlsFor(stack, name)` in deploy()"
     );
-    // Matches only the CALL shape (name, envId, envWebGateway args) — not the
-    // `export function browserUrlFor(...)` definition or its doc-comment
-    // mention, either of which would false-positive a naive `browserUrlFor(`
-    // occurrence count.
-    const browserUrlForCallCount = (src.match(/browserUrlFor\(name, envId, envWebGateway\)/g) || []).length;
+    assert.equal((src.match(/\bdomainUrlsFor\(/g) || []).length, 2,
+      ">> FAIL: browserUrl-single-resolution: deploy.ts must define domainUrlsFor and call it exactly once, or deploy() resolves the link twice");
+    const webUrlCallCount = (src.match(/webUrl\(/g) || []).length;
     assert.equal(
-      browserUrlForCallCount,
+      webUrlCallCount,
       1,
-      ">> FAIL: browserUrl-single-resolution: browserUrlFor(name, envId, envWebGateway) must be called exactly once in src/deploy.ts — a second call site would be the exact drift this test guards against"
+      ">> FAIL: browserUrl-single-resolution: webUrl(...) must be called exactly once in src/deploy.ts — a second call site would be the exact drift this test guards against"
     );
     assert.match(
       src,
-      /printDeploymentCompleteBanner\(`\$\{name\}\.\$\{envTld\}`, browserUrl\)/,
+      /printDeploymentCompleteBanner\(fullDomain, browserUrl\)/,
       ">> FAIL: browserUrl-single-resolution: the completion banner must reuse the SAME browserUrl variable via printDeploymentCompleteBanner(..., browserUrl), not a second resolution"
     );
   });
@@ -25865,8 +25794,18 @@ describe("DeployResult.browserUrl (#1157)", () => {
     const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
     assert.match(
       bin,
-      /appendFileSync\(output, `browserUrl=\$\{result\.browserUrl\}\\n`\)/,
-      ">> FAIL: bin-browserUrl-output: bin/polkadot-app-deploy must append `browserUrl=${result.browserUrl}` to GITHUB_OUTPUT alongside cid/domain, so a consumer's reusable-workflow step can read the env-resolved URL"
+      /appendFileSync\(output, `browserUrl=\$\{result\.browserUrl \?\? ""\}\\n`\)/,
+      ">> FAIL: bin-browserUrl-output: bin/polkadot-app-deploy must append `browserUrl=${result.browserUrl ?? \"\"}` to GITHUB_OUTPUT alongside cid/domain, so a consumer's reusable-workflow step can read the stack-resolved URL"
+    );
+  });
+
+  // deploy.yml reads fullDomain for its summary, PR comment and full-domain output.
+  test("bin/polkadot-app-deploy writes fullDomain to GITHUB_OUTPUT", () => {
+    const bin = fs.readFileSync("bin/polkadot-app-deploy", "utf-8");
+    assert.match(
+      bin,
+      /appendFileSync\(output, `fullDomain=\$\{result\.fullDomain\}\\n`\)/,
+      ">> FAIL: bin-fullDomain-output: bin/polkadot-app-deploy must append `fullDomain=${result.fullDomain}` to GITHUB_OUTPUT, or deploy.yml shows only the bare label"
     );
   });
 
@@ -25882,26 +25821,24 @@ describe("DeployResult.browserUrl (#1157)", () => {
     );
     assert.match(
       step,
-      /if \[ -n "\$RESOLVED_URL" \]; then\s*\n\s*URL="\$RESOLVED_URL"/,
-      ">> FAIL: workflow-browser-url: a non-empty RESOLVED_URL must win over the inputs.gateway-based fallback construction"
+      /if \[ -n "\$RESOLVED_URL" \] \|\| \[ -n "\$FULL_DOMAIN" \]; then\s*\n\s*URL="\$RESOLVED_URL"/,
+      ">> FAIL: workflow-browser-url: a non-empty RESOLVED_URL (or a fullDomain from a CLI that resolved none) must win over the inputs.gateway-based fallback construction"
     );
   });
 
+  // A cache hit runs no deploy step, so the URL the original deploy resolved is read back from .deploy-cache.
   test(".github/workflows/deploy.yml: 'Set deployment outputs' propagates browserUrl on both the cache-hit and fresh-deploy branches", () => {
     const wf = fs.readFileSync(".github/workflows/deploy.yml", "utf-8");
+    const save = wf.match(/- name: Save deployment to cache[\s\S]*?(?=\n {6}- name:|\Z)/);
+    assert.ok(save, ">> FAIL: workflow-final-outputs: could not locate the 'Save deployment to cache' step");
+    assert.match(save[0], /BROWSER_URL:\s*\$\{\{ steps\.deploy\.outputs\.browserUrl \}\}/,
+      ">> FAIL: workflow-final-outputs: the fresh deploy's browserUrl must be saved to the cache");
+    assert.match(save[0], /"\$BROWSER_URL" > \.deploy-cache\/browserUrl/,
+      ">> FAIL: workflow-final-outputs: the saved browserUrl must land in .deploy-cache/browserUrl");
     const stepMatch = wf.match(/- name: Set deployment outputs[\s\S]*?(?=\n {6}- name:|\Z)/);
     assert.ok(stepMatch, ">> FAIL: workflow-final-outputs: could not locate the 'Set deployment outputs' step");
-    const step = stepMatch[0];
-    assert.match(
-      step,
-      /echo "browserUrl=\$\{\{ steps\.deploy\.outputs\.browserUrl \}\}" >> "\$GITHUB_OUTPUT"/,
-      ">> FAIL: workflow-final-outputs: fresh-deploy branch must propagate steps.deploy.outputs.browserUrl"
-    );
-    assert.match(
-      step,
-      /echo "browserUrl=" >> "\$GITHUB_OUTPUT"/,
-      ">> FAIL: workflow-final-outputs: cache-hit branch must emit an explicit empty browserUrl (deploy step never ran, so no env-resolved URL exists) rather than omitting the key"
-    );
+    assert.match(stepMatch[0], /echo "browserUrl=\$\(read_cached browserUrl\)"/,
+      ">> FAIL: workflow-final-outputs: both branches must report browserUrl from the cache, empty only when the deploy resolved none");
   });
 
   test(".github/workflows/deploy.yml: gateway input is documented as a fallback, not the primary mechanism", () => {
@@ -27023,7 +26960,7 @@ describe("GRANDPA finality re-upload loop has connection-error recovery (#946)",
 //   chooseSignerInput Layer-3 isolation   → no session + no --suri → "pool" (no adapter)
 // ---------------------------------------------------------------------------
 import { resolveStorageSigner } from "../dist/deploy-actors.js";
-import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, resolveEnvId, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText, resolveProductSigner, isPoolFallbackAllowed, assertPoolFallbackAllowed, setBulletinNetworkContext, __getBulletinNetworkContextForTest } from "../dist/deploy.js";
+import { chooseSignerInput, formatStorageSignerLine, formatTransferModeDotnsLine, formatTransferModeStorageSignerLine, describeSlotFallbackReason, resolveEffectiveMnemonic, mnemonicConflictNotice, shouldPublishManifest, nonInteractivePhoneConfirmationError, pickPostDeployBannerText, resolveProductSigner, isPoolFallbackAllowed, assertPoolFallbackAllowed } from "../dist/deploy.js";
 import { deriveProductSigner } from "../dist/product-account.js";
 import { BulletinSlotAuthError as BulletinSlotAuthErrorForReasonTest } from "../dist/storage-signer.js";
 
@@ -27501,17 +27438,20 @@ describe("DotNS.connect() shares resolveEffectiveMnemonic's precedence (bulletin
     // closed. A child process can be killed outright via spawnSync's timeout
     // once the value we need (substrateAddress, set synchronously before any
     // network call) has been captured and printed.
+    // A temp home, a local stack and no live network, so only the signer derivation is observed.
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pad-1461-home-"));
+    const stackFile = writeLocalStack(home);
     const script = [
       `import { DotNS } from ${JSON.stringify(dotnsUrl)};`,
       `const dotns = new DotNS();`,
-      `dotns.connect({ rpc: "ws://127.0.0.1:1" }).catch(() => {});`,
+      `dotns.connect({ stack: ${JSON.stringify(stackFile)}, rpc: "ws://127.0.0.1:1" }).catch(() => {});`,
       `setTimeout(() => { process.stdout.write(JSON.stringify({ address: dotns.substrateAddress ?? null })); process.exit(0); }, 1200);`,
     ].join("\n");
     const result = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
       encoding: "utf8",
       timeout: 6000,
       killSignal: "SIGKILL",
-      env: { ...process.env, MNEMONIC: MN1553_A, DOTNS_MNEMONIC: MN1553_B },
+      env: createCliTestEnv(home, { MNEMONIC: MN1553_A, DOTNS_MNEMONIC: MN1553_B }),
     });
     assert.ok(result.stdout, `>> FAIL: dotns-connect-precedence: child process produced no stdout (status ${result.status}, signal ${result.signal}, stderr: ${result.stderr})`);
     // dotns.ts's own connect() prints "   SS58 Address: ..." to stdout
@@ -27538,16 +27478,14 @@ describe("CLI end-to-end: bin/polkadot-app-deploy's mnemonic collapse doesn't de
         encoding: "utf8",
         timeout: 8000,
         killSignal: "SIGKILL",
-        env: {
-          ...process.env,
+        env: createCliTestEnv(fs.mkdtempSync(path.join(os.tmpdir(), "mn1461-home-")), {
           MNEMONIC: MN1553_A,
           DOTNS_MNEMONIC: MN1553_B,
           // Unreachable on purpose — this test only needs the signer to be
           // derived and printed, which happens before any network call; the
           // deploy is expected (and allowed) to fail after.
           DOTNS_RPC: "ws://127.0.0.1:1",
-          PAD_UPDATE_CHECK: "0",
-        },
+        }),
       });
     } finally {
       fs.rmSync(buildDir, { recursive: true, force: true });
@@ -27560,32 +27498,32 @@ describe("CLI end-to-end: bin/polkadot-app-deploy's mnemonic collapse doesn't de
   });
 });
 
-describe("resolveEnvId env/flag precedence (#1165)", () => {
+describe("resolveStackSelection env/flag precedence (#1165)", () => {
   const FLAG_ENV = "preview";
   const VAR_ENV = "summit";
 
   test("--env flag present, no PAD_ENV → returns the flag value", () => {
-    const resolved = resolveEnvId({ flagEnv: FLAG_ENV, envVar: undefined });
-    assert.strictEqual(resolved, FLAG_ENV,
-      ">> FAIL: resolveEnvId: an explicit --env flag with no env var set must resolve to the flag value");
+    const resolved = resolveStackSelection({ flagEnv: FLAG_ENV, envVarEnv: undefined });
+    assert.deepStrictEqual(resolved, { env: FLAG_ENV },
+      ">> FAIL: resolveStackSelection: an explicit --env flag with no env var set must resolve to the flag value");
   });
 
   test("--env flag present AND PAD_ENV set → flag wins", () => {
-    const resolved = resolveEnvId({ flagEnv: FLAG_ENV, envVar: VAR_ENV });
-    assert.strictEqual(resolved, FLAG_ENV,
-      ">> FAIL: resolveEnvId: --env flag must take precedence over PAD_ENV when both are set");
+    const resolved = resolveStackSelection({ flagEnv: FLAG_ENV, envVarEnv: VAR_ENV });
+    assert.deepStrictEqual(resolved, { env: FLAG_ENV },
+      ">> FAIL: resolveStackSelection: --env flag must take precedence over PAD_ENV when both are set");
   });
 
   test("only PAD_ENV set, no --env flag → returns the env var value", () => {
-    const resolved = resolveEnvId({ flagEnv: undefined, envVar: VAR_ENV });
-    assert.strictEqual(resolved, VAR_ENV,
-      ">> FAIL: resolveEnvId: PAD_ENV must be honored as the session default when no --env flag is given");
+    const resolved = resolveStackSelection({ flagEnv: undefined, envVarEnv: VAR_ENV });
+    assert.deepStrictEqual(resolved, { env: VAR_ENV },
+      ">> FAIL: resolveStackSelection: PAD_ENV must be honored as the session default when no --env flag is set");
   });
 
-  test("neither --env flag nor PAD_ENV set → returns undefined (caller applies DEFAULT_ENV_ID)", () => {
-    const resolved = resolveEnvId({ flagEnv: undefined, envVar: undefined });
-    assert.strictEqual(resolved, undefined,
-      ">> FAIL: resolveEnvId: with no flag and no env var the result must stay undefined so callers fall through to DEFAULT_ENV_ID (paseo-next-v2) themselves");
+  test("neither --env flag nor PAD_ENV set → selects nothing (loadStack applies DEFAULT_STACK_ID)", () => {
+    const resolved = resolveStackSelection({ flagEnv: undefined, envVarEnv: undefined });
+    assert.deepStrictEqual(resolved, {},
+      ">> FAIL: resolveStackSelection: with no flag and no env var the selection must stay empty so loadStack falls through to DEFAULT_STACK_ID itself");
   });
 });
 
@@ -27722,21 +27660,32 @@ describe("product config discovery in the reusable-workflow layout (#1418)", () 
 // import-order timing gap that the prior in-isolation test missed.
 // ---------------------------------------------------------------------------
 describe("localStorage warning suppression (real bin)", () => {
-  // Use --list-environments, not --version. --version calls process.exit(0) synchronously
-  // before the nextTick-queued warning can flush; --list-environments does an await
-  // (loadEnvironments) before exit, which drains the nextTick and surfaces the warning
-  // if the suppressor was not installed before the SDK module-init code ran.
-  test("polkadot-app-deploy --list-environments emits no localStorage warning on stderr", () => {
+  // A missing --stack file, not --version or --list-environments: both of those
+  // call process.exit(0) synchronously before the nextTick-queued warning can
+  // flush. Loading the stack file awaits a read before the bin exits, which
+  // drains the nextTick and surfaces the warning if the suppressor was not
+  // installed before the SDK module-init code ran. No network is involved.
+  test("polkadot-app-deploy emits no localStorage warning on stderr", () => {
     const binPath = path.resolve(fileURLToPath(import.meta.url), "../../bin/polkadot-app-deploy");
-    const result = spawnSync(process.execPath, [binPath, "--list-environments"], {
-      encoding: "utf8",
-      env: { ...process.env, PAD_TELEMETRY: "0", PAD_UPDATE_CHECK: "0" },
-      timeout: 15000,
-    });
-    assert.ok(
-      !/local ?storage/i.test(result.stderr ?? ""),
-      `>> FAIL: localStorage warning suppression: polkadot-app-deploy --list-environments must not emit a localStorage warning on stderr.\nActual stderr: ${result.stderr}`,
-    );
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "pad-warn-suppress-"));
+    const buildDir = path.join(home, "site");
+    fs.mkdirSync(buildDir);
+    fs.writeFileSync(path.join(buildDir, "index.html"), "<html></html>");
+    try {
+      const result = spawnSync(process.execPath, [binPath, buildDir, "myapp", "--stack", path.join(home, "missing-stack.json")], {
+        encoding: "utf8",
+        env: { ...process.env, HOME: home, PAD_TELEMETRY: "0", PAD_UPDATE_CHECK: "0" },
+        timeout: 15000,
+      });
+      assert.match(result.stderr ?? "", /failed to read stack/,
+        `>> FAIL: localStorage warning suppression: the bin must get to the async stack read before exiting, or this check proves nothing.\nActual stderr: ${result.stderr}`);
+      assert.ok(
+        !/local ?storage/i.test(result.stderr ?? ""),
+        `>> FAIL: localStorage warning suppression: polkadot-app-deploy must not emit a localStorage warning on stderr.\nActual stderr: ${result.stderr}`,
+      );
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 
@@ -28017,12 +27966,12 @@ describe("e2e-ensure-authorized: environment guards (testnet-only, no-guess auth
   });
 
   // devnet-shaped: testnet network, but NO declared bulletinAuthorizer (see
-  // environments.json — devnet is community-operated, the field is
+  // assets/stack-policy.json — pcf-devnet is community-operated, the field is
   // deliberately left unset). Must refuse, never guess //Alice.
-  test("requireBulletinAuthorizer refuses a devnet-shaped environment (no declared authorizer) with an actionable message, never guessing", () => {
+  test("requireBulletinAuthorizer refuses a devnet-shaped stack (no declared authorizer) with an actionable message, never guessing", () => {
     const devnetLike = { network: "testnet", bulletinAuthorizer: undefined };
-    assert.throws(() => requireBulletinAuthorizer(devnetLike, "devnet"),
-      /environment 'devnet' does not declare a bulletinAuthorizer.*community-operated.*Refusing to guess/s,
+    assert.throws(() => requireBulletinAuthorizer(devnetLike, "pcf-devnet"),
+      /stack 'pcf-devnet' does not declare a bulletinAuthorizer.*community-operated.*Refusing to guess/s,
       ">> FAIL: env-guards: an environment with no declared bulletinAuthorizer must refuse with an actionable message, and must NEVER fall back to guessing //Alice — that reproduces the exact bug #1213/env-authorizer-read fixed.");
   });
 
@@ -28385,25 +28334,24 @@ describe("slot storage failure falls back to the pool only off mainnet (#1496)",
 
 // #1494-equivalent for the twin (auto-authorize itself excluded per the port brief — the twin
 // never self-authorizes Bulletin storage): publishManifest opens its own Bulletin provider and
-// can run without a preceding in-process deploy() (it is a public export). The mainnet
-// pool-fallback gate above reads module-level state that only deploy() used to write, so a
-// publishManifest() call with no preceding deploy() would resolve bulletinNetwork=undefined —
-// the historical testnet-shaped fallback, not a hard failure on a real mainnet env.
-// publish.ts now sets it from the same env it already resolves; this pins the setter both
-// paths depend on.
-describe("Bulletin network context is settable from outside deploy() (#1496, minus auto-authorize)", () => {
-  test("round-trips the env's declared network", () => {
-    const saved = __getBulletinNetworkContextForTest();
-    try {
-      setBulletinNetworkContext("mainnet");
-      assert.equal(__getBulletinNetworkContextForTest(), "mainnet",
-        ">> FAIL: without this, a publishManifest() call that does not follow deploy() in-process resolves bulletinNetwork=undefined even on a real mainnet env, and a failed slot silently falls back to the pool instead of refusing.");
-      setBulletinNetworkContext(undefined);
-      assert.equal(__getBulletinNetworkContextForTest(), undefined,
-        ">> FAIL: an env that declares no network must CLEAR the previous one, not inherit it from an earlier deploy in the same process.");
-    } finally {
-      setBulletinNetworkContext(saved);
-    }
+// can run without a preceding in-process deploy() (it is a public export), so it selects its
+// stack with setBulletinStack too. The mainnet pool-fallback gate above reads the selected
+// stack's network, so a later selection must replace the earlier stack whole, never inherit
+// its network.
+describe("setBulletinStack replaces the previous selection", () => {
+  test("a second stack's network replaces the first's", () => {
+    const script = `import { setBulletinStack, bulletinSelection } from "./dist/deploy.js";
+import { readShippedStack } from "./dist/stacks.js";
+setBulletinStack(readShippedStack("preview"));
+const first = { stackId: bulletinSelection.stack.id, network: bulletinSelection.stack.network };
+setBulletinStack(readShippedStack("polkadot"));
+const second = { stackId: bulletinSelection.stack.id, network: bulletinSelection.stack.network };
+process.stdout.write(JSON.stringify({ first, second }));`;
+    const { first, second } = JSON.parse(execSync(`${JSON.stringify(process.execPath)} --input-type=module`, { input: script, encoding: "utf8" }));
+    assert.deepEqual(first, { stackId: "preview", network: "testnet" },
+      ">> FAIL: without this, a publishManifest() call that does not follow deploy() in-process has no stack network, and a failed slot silently falls back to the pool even on a mainnet stack.");
+    assert.deepEqual(second, { stackId: "polkadot", network: "mainnet" },
+      ">> FAIL: a later stack must REPLACE the previous one's network, not inherit it from an earlier deploy in the same process.");
   });
 });
 
@@ -28450,7 +28398,7 @@ describe("e2e.yml: per-leg e2e-result files (#1625)", () => {
   const RESULT_PATH = "${{ github.workspace }}/e2e-result/e2e-result.json";
   const REUSABLE = ["nightly-s1-pool", "nightly-s1-direct", "nightly-s2-fresh"];
   // Every nightly scenario job: the S-numbered and S- named scenarios plus the HEAD coverage matrix.
-  // The harness-smoke, telemetry, pool-distribution, drift, chain-identity and code-path jobs are META verdicts.
+  // The harness-smoke, telemetry, pool-distribution and code-path jobs are META verdicts.
   const scenarioJobs = [...e2e.matchAll(/^ {2}(nightly-(?:s\d+[\w-]*|s-[\w-]+|pr-coverage)):\s*$/gm)]
     .map((m) => m[1])
     .filter((j) => j !== "nightly-s-v060-unblock");

@@ -5,10 +5,12 @@ import * as os from "os";
 import * as path from "path";
 import { mutateFixture } from "./e2e-fixture.js";
 import { runBulletinDeploy } from "./e2e-cli.js";
+import { createCliTestEnv } from "./isolated-home.js";
 import { classifyFixtureState, assertFixtureOwnership, fixtureRemedy, assertFixtureNotDrifted } from "./e2e-failure.js";
 import { buildManifestSidecar, buildPvmAppManifest } from "./e2e-manifest-fixture.js";
 import { resolveE2eEnv, resolveE2eEnvId } from "./e2e-env.js";
-import { preflightProductConfig, DEFAULT_ENV_ID } from "@parity/polkadot-app-deploy";
+import { preflightProductConfig } from "@parity/polkadot-app-deploy";
+import { DEFAULT_STACK_ID, readShippedStack } from "../../dist/stacks.js";
 
 describe("mutateFixture", () => {
   test("copies fixture to a fresh tempdir and injects runTag into index.html", async () => {
@@ -54,8 +56,15 @@ describe("mutateFixture", () => {
 });
 
 describe("runBulletinDeploy", () => {
+  // runBulletinDeploy spreads process.env first, so the isolated env blanks what it leaves out:
+  // the CLI then runs with a temp home, a local stack on an unreachable port and no live network.
+  const createTestEnv = (extra = {}) => ({
+    PAD_ENV: "", PAD_ENV_FILE: "", BULLETIN_RPC: "", DOTNS_RPC: "", MNEMONIC: "", DOTNS_MNEMONIC: "",
+    ...createCliTestEnv(fs.mkdtempSync(path.join(os.tmpdir(), "bd-e2e-cli-home-")), extra),
+  });
+
   test("returns exit code, stdout, stderr, durationMs for --version", async () => {
-    const result = await runBulletinDeploy({ args: ["--version"], timeoutMs: 10_000 });
+    const result = await runBulletinDeploy({ args: ["--version"], env: createTestEnv(), timeoutMs: 10_000 });
     assert.strictEqual(result.code, 0);
     assert.match(result.stdout, /polkadot-app-deploy v\d+\.\d+\.\d+/);
     assert.ok(typeof result.durationMs === "number" && result.durationMs >= 0);
@@ -63,18 +72,21 @@ describe("runBulletinDeploy", () => {
 
   test("exits with non-zero for missing args", async () => {
     // Passing only a build-dir without a domain — CLI requires both
-    const result = await runBulletinDeploy({ args: ["somedir"], env: { CI: "" }, timeoutMs: 10_000 });
+    const result = await runBulletinDeploy({ args: ["somedir"], env: createTestEnv({ CI: "" }), timeoutMs: 10_000 });
     assert.notStrictEqual(result.code, 0);
   });
 
+  // Every chain of the local stack is unreachable, so the deploy waits on its connections until
+  // the timeout kills it.
   test("enforces timeout with SIGTERM", async () => {
     const result = await runBulletinDeploy({
-      args: ["./test/fixtures/e2e-spa", "thiswillhang.dot"],
-      env: { BULLETIN_RPC: "ws://192.0.2.1:9944" },
+      args: ["./test/fixtures/e2e-spa", "thiswillhang"],
+      env: createTestEnv(),
       timeoutMs: 2_000,
     });
-    assert.notStrictEqual(result.code, 0);
-    assert.ok(result.durationMs < 10_000);
+    assert.notStrictEqual(result.code, 0, ">> FAIL: runBulletinDeploy timeout: a killed run must not report success");
+    assert.ok(result.durationMs >= 2_000 && result.durationMs < 10_000,
+      `>> FAIL: runBulletinDeploy timeout: the run must be killed at the 2s timeout, not end on its own; took ${result.durationMs}ms: ${result.stderr.trim().split("\n").pop()}`);
   });
 });
 
@@ -707,14 +719,17 @@ describe("buildManifestSidecar: App v2 PolkaVM executable", () => {
   });
 });
 
-// A run with no PAD_ENV is a DEFAULT_ENV_ID run: deploy() resolves
-// `options.env ?? DEFAULT_ENV_ID`, so the TLD, gateway, Bulletin endpoint and
-// DotNS contracts the harness reads must come from that same env.
+// A run with no PAD_ENV is a DEFAULT_STACK_ID run: deploy() loads
+// `options.env ?? DEFAULT_STACK_ID`, so the TLD, gateway, Bulletin endpoint and
+// DotNS stack the harness reads must come from that same stack.
 describe("resolveE2eEnv", () => {
+  // The published descriptor is unreachable, so loadStack uses the shipped copy.
+  const offline = { fetch: async () => new Response(null, { status: 503 }), warn: () => {} };
+
   test("no PAD_ENV resolves the env the CLI itself would pick", () => {
     for (const unset of [null, undefined, ""]) {
-      assert.equal(resolveE2eEnvId(unset), DEFAULT_ENV_ID,
-        `>> FAIL: resolveE2eEnv: ${JSON.stringify(unset)} must resolve to DEFAULT_ENV_ID, the env deploy() falls back to`);
+      assert.equal(resolveE2eEnvId(unset), DEFAULT_STACK_ID,
+        `>> FAIL: resolveE2eEnv: ${JSON.stringify(unset)} must resolve to DEFAULT_STACK_ID, the stack deploy() falls back to`);
     }
   });
 
@@ -724,24 +739,25 @@ describe("resolveE2eEnv", () => {
   });
 
   test("the unset path and the explicit default path describe the same chain", async () => {
-    const implicit = await resolveE2eEnv(null);
-    const explicit = await resolveE2eEnv(DEFAULT_ENV_ID);
+    const implicit = await resolveE2eEnv(null, offline);
+    const explicit = await resolveE2eEnv(DEFAULT_STACK_ID, offline);
     assert.deepEqual(implicit, explicit,
-      ">> FAIL: resolveE2eEnv: the no-env path diverged from DEFAULT_ENV_ID, so the harness reads a different chain than the deploy writes");
+      ">> FAIL: resolveE2eEnv: the no-env path diverged from DEFAULT_STACK_ID, so the harness reads a different chain than the deploy writes");
   });
 
-  test("resolves per-environment values rather than a fixed literal", async () => {
-    const dflt = await resolveE2eEnv(null);
-    const devnet = await resolveE2eEnv("devnet");
+  test("resolves per-stack values rather than a fixed literal", async () => {
+    const dflt = await resolveE2eEnv(null, offline);
+    const preview = await resolveE2eEnv("preview", offline);
     for (const key of ["tld", "bulletin", "gateway"]) {
-      assert.notEqual(dflt[key], devnet[key],
-        `>> FAIL: resolveE2eEnv: ${key} is identical across two environments, so it is not being read from environments.json`);
+      assert.notEqual(dflt[key], preview[key],
+        `>> FAIL: resolveE2eEnv: ${key} is identical across two stacks, so it is not being read from the stack descriptor`);
     }
-    assert.equal(dflt.dotnsConnectOptions.rpc, dflt.dotnsConnectOptions.assetHubEndpoints[0],
-      ">> FAIL: resolveE2eEnv: the DotNS rpc must be the resolved env's own Asset Hub, not a legacy default");
-    assert.ok(dflt.dotnsConnectOptions.nativeToEthRatio,
-      ">> FAIL: resolveE2eEnv: nativeToEthRatio must be forwarded; DotNS prices the register deposit with it");
-    assert.ok(dflt.dotnsConnectOptions.contracts,
-      ">> FAIL: resolveE2eEnv: the default env configures contracts; dropping them falls back to DotNS's hardcoded pre-redeploy addresses");
+    const shipped = readShippedStack(DEFAULT_STACK_ID);
+    assert.deepEqual(
+      { tld: dflt.tld, bulletin: dflt.bulletin, gateway: dflt.gateway },
+      { tld: shipped.tld, bulletin: shipped.chains.Bulletin.rpc[0], gateway: shipped.ipfsGateway },
+      ">> FAIL: resolveE2eEnv: the harness values differ from the default stack's descriptor, so it reads a different chain than the deploy writes");
+    assert.deepEqual(dflt.dotnsConnectOptions, { env: DEFAULT_STACK_ID },
+      ">> FAIL: resolveE2eEnv: DotNS.connect must get the resolved stack's selection, which supplies its Asset Hub endpoints, contracts and tld");
   });
 });

@@ -526,7 +526,7 @@ test("storageDepositLimitFor: an estimate above the floor wins, with a 20% buffe
 });
 
 test("storageDepositLimitFor: the floor is per environment, not the built-in default", () => {
-  // registerStorageDeposit in environments.json is what makes this reachable;
+  // registerStorageDeposit in assets/stack-policy.json is what makes this reachable;
   // both call sites previously hardcoded 200 PAS and ignored it.
   assert.equal(storageDepositLimitFor(0n, 5n * PAS), 5n * PAS,
     ">> FAIL: storageDepositLimitFor ignored the per-environment floor");

@@ -5,12 +5,8 @@
 //   2. IPFS gateway tier ladder (range-request, falls through to full-body if needed).
 //   3. Heuristic fallback: caller proceeds with lossier file classification.
 //
-// Root cause of the manifest-fetch flakiness: assets/environments.json correctly declares
-// env.ipfs per environment (e.g. paseo-bulletin-next-ipfs.polkadot.io for paseo-next-v2),
-// but resolveEndpoints() in src/environments.ts was silently dropping the field. Every
-// deploy fell back to the hardcoded DEFAULT_GATEWAY pointing at the wrong gateway.
-// Fixing the propagation (Task 2 of 2026-05-21 gateway-pivot plan) is the real fix.
-// The gateway tier ladder + patience-pattern timeouts here provide the reliability layer.
+// The gateway comes from the stack's `ipfs-gateway` service; the tier ladder +
+// patience-pattern timeouts here provide the reliability layer.
 
 import * as fs from "fs";
 import * as path from "path";
@@ -23,7 +19,7 @@ import { parseManifest, type EmbeddedManifest, MANIFEST_DIR, MANIFEST_FILENAME }
 import { discardBody } from "./http.js";
 
 // No DEFAULT_GATEWAY constant — caller must provide a gateway URL (typically
-// from environments.ts's resolveEndpoints().ipfs, threaded through
+// the stack's ipfsGateway, threaded through
 // storeDirectoryV2's opts.gateway). Without a gateway, fetchPreviousManifest
 // short-circuits to heuristic_fallback rather than silently hitting a
 // hardcoded URL pointing at the wrong environment. That short-circuit is
@@ -605,9 +601,8 @@ export async function fetchPreviousManifest(
   let bytesDownloaded = 0;
 
   for (const gatewayRaw of gatewayList) {
-    // Normalise: gateway URLs in environments.json sometimes include a
-    // trailing /ipfs or /ipfs/ (paseo-next, preview); other envs don't
-    // (paseo-next-v2). Strip it so we always produce `<base>/ipfs/<cid>`
+    // Normalise: stack ipfs-gateway URLs end in /ipfs/ (path style); a caller's
+    // gateway may not. Strip it so we always produce `<base>/ipfs/<cid>`
     // exactly once, matching dotli/desktop's convention.
     const gateway = gatewayRaw.replace(/\/ipfs\/?$/, "");
     const url = `${gateway}/ipfs/${prevContenthash}`;

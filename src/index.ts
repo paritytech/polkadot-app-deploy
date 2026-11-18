@@ -1,8 +1,7 @@
 export { deploy } from "./deploy.js";
 export type { DeployResult, DeployContent, DeployOptions } from "./deploy.js";
-export { derivePoolAccounts, selectAccount, fetchPoolAuthorizations, ensureAuthorized, bootstrapPool, accountsNeedingReauthorization, isAutoReauthorizeAllowed, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount, ensurePoolAccountsFundedOnAssetHub } from "./pool.js";
-export type { EnsurePoolFundedOptions } from "./pool.js";
-export type { PoolAccount, PoolAuthorization, BootstrapPoolOptions, AutoReauthorizeEnv } from "./pool.js";
+export { derivePoolAccounts, selectAccount, fetchPoolAuthorizations, ensureAuthorized, accountsNeedingReauthorization, BULLETIN_BLOCKS_PER_DAY, DEPLOY_PATH_PREFIX, poolAccountDerivationPath, assetHubTopUpAmount } from "./pool.js";
+export type { PoolAccount, PoolAuthorization } from "./pool.js";
 export { DotNS, parseDomainName, DEFAULT_MNEMONIC, sanitizeDomainLabel } from "./dotns.js";
 export type { DotNSConnectOptions, OwnershipResult, PriceValidationResult, ParsedDomainName } from "./dotns.js";
 export { merkleizeJS, merkleizeWithStableOrder } from "./merkle.js";
@@ -16,28 +15,8 @@ export { fetchPreviousManifest } from "./manifest-fetch.js";
 export type { FetchOutcome, FetchOptions } from "./manifest-fetch.js";
 export { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
 export type { IncrementalStats, ComputeStatsInput } from "./incremental-stats.js";
-export {
-  DEFAULT_ENV_ID,
-  deepMergeEnvironments,
-  defaultBundledPath,
-  formatEnvironmentTable,
-  isValidContractAddress,
-  listEnvironments,
-  loadEnvironments,
-  resolveEndpoints,
-  validateContractAddresses,
-} from "./environments.js";
-export type {
-  Chain,
-  ChainEndpoint,
-  Environment,
-  EnvironmentListing,
-  EnvironmentsDoc,
-  EnvironmentsSource,
-  LoadOptions,
-  LoadResult,
-  ResolvedEndpoints,
-} from "./environments.js";
+export { GenesisMismatchError } from "./genesis.js";
+export { isValidContractAddress, validateContractAddresses } from "./dotns.js";
 export * from "./run-state.js";
 export { defineConfig } from "./manifest/types.js";
 export type {

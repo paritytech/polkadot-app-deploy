@@ -186,14 +186,13 @@ export interface DotnsProtocolProbe {
    *   - `false` — the function reverted (or no data came back): the same
    *     "a probe not answering means this generation lacks it" posture
    *     already used for pricingVersion/startingPrice above.
-   *   - `null`/`undefined` — the probe was never attempted, typically
-   *     because DOTNS_POP_CONTROLLER has no configured address for this
-   *     environment (a `--contract` override that supplies only POP_RULES,
-   *     say). Falls back to v0.5.8-rc1 rather than erroring: v0.5.8-rc1 and
-   *     v0.6.0 share an IDENTICAL registration tuple/ABI adapter (see the
-   *     module doc comment), so this field only ever changes
-   *     classifyLabelStatus's LOCAL advisory label semantics, never the
-   *     on-chain transaction shape — misclassifying that is a
+   *   - `null`/`undefined` — the probe was never attempted, e.g. a caller
+   *     that classifies without DotNS.connect(), which requires a
+   *     DOTNS_POP_CONTROLLER address. Falls back to v0.5.8-rc1 rather than
+   *     erroring: v0.5.8-rc1 and v0.6.0 share an IDENTICAL registration
+   *     tuple/ABI adapter (see the module doc comment), so this field only
+   *     ever changes classifyLabelStatus's LOCAL advisory label semantics,
+   *     never the on-chain transaction shape — misclassifying that is a
    *     preflight-message inaccuracy, not a broken deploy. Optional so
    *     every existing caller/test built before this field existed (which
    *     never needed to disambiguate v0.6.0) keeps compiling and keeps its

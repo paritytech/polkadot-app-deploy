@@ -144,6 +144,19 @@ jobs:
         run: ipfs init
       - run: npm run typecheck
       - run: npm test
+      # A copy expires with the date, not with the PR, so here an expired copy is a warning;
+      # publish.yml fails on it.
+      - name: Check the shipped stack copies are current
+        shell: bash
+        run: |
+          if message=$(node scripts/check-stacks-current.mjs 2>&1); then
+            [ -z "$message" ] || echo "$message"
+          else
+            message=${message//'%'/'%25'}
+            message=${message//$'\r'/'%0D'}
+            message=${message//$'\n'/'%0A'}
+            echo "::warning title=Shipped stack copy expired::${message}"
+          fi
 
       # Static-check the workflows themselves. `yaml.safe_load` only proves a
       # file is well-formed YAML — it cannot see an invalid *expression*. That

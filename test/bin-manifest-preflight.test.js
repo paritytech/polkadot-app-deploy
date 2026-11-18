@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { createCliTestEnv } from "./helpers/isolated-home.js";
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const BIN_SOURCE_PATH = path.join(repoRoot, "bin/polkadot-app-deploy");
@@ -43,7 +44,12 @@ async function makeFixture({ configDomain }) {
 // broke the pre-deploy wiring without touching the exact source strings the
 // sibling wiring-test greps for, this test could not fall through into a real
 // deploy() connecting to paseo-next-v2 — it would hit ERR_ACCESS_DENIED
-// instead.
+// instead. This is the guard called for after this file's own earlier draft
+// twice caused a real Bulletin upload from the shared dev pool (see the
+// describe-level comment below) before the fix existed.
+// It also runs with a temp home (the run-state file) and PAD_STACK set to a copy of
+// paseo-next-v2 on an unreachable local port, so a regression fails here and leaves the user's
+// state alone.
 function runCli(args) {
   return execFileSync(
     process.execPath,
@@ -52,6 +58,7 @@ function runCli(args) {
       cwd: repoRoot,
       encoding: "utf8",
       timeout: 15_000,
+      env: createCliTestEnv(fsSync.mkdtempSync(path.join(os.tmpdir(), "bd-preflight-home-"))),
     },
   );
 }
@@ -80,8 +87,6 @@ describe("bin/polkadot-app-deploy: #1572 pre-deploy manifest domain reconciliati
         DEPLOY_LABEL,
         "--config",
         path.join(dir, "polkadot-app-deploy.config.mjs"),
-        "--env",
-        "paseo-next-v2",
       ]);
       assert.fail(
         ">> FAIL: bin-manifest-preflight mismatched-label-exits-before-deploy: expected the CLI to exit non-zero, it exited 0",
@@ -117,10 +122,10 @@ describe("bin/polkadot-app-deploy: #1572 wiring (source-level, no subprocess/net
       importIdx >= 0,
       ">> FAIL: bin-wiring reconcile-call-present: bin/polkadot-app-deploy no longer dynamically imports from ../dist/index.js in the preflight block",
     );
-    const reconcileCallIdx = src.indexOf("reconcileManifestDomain(loadedConfig.config.domain, domain, envTld, loadedConfig.sourcePath)");
+    const reconcileCallIdx = src.indexOf("reconcileManifestDomain(loadedConfig.config.domain, domain, stack.tld, loadedConfig.sourcePath)");
     assert.ok(
       reconcileCallIdx > importIdx,
-      ">> FAIL: bin-wiring reconcile-call-present: expected a reconcileManifestDomain(loadedConfig.config.domain, domain, envTld, loadedConfig.sourcePath) call after the preflightProductConfig import — got none, or the exact argument shape changed. If the shape genuinely changed, update this string alongside it.",
+      ">> FAIL: bin-wiring reconcile-call-present: expected a reconcileManifestDomain(loadedConfig.config.domain, domain, stack.tld, loadedConfig.sourcePath) call after the preflightProductConfig import — got none, or the exact argument shape changed. If the shape genuinely changed, update this string alongside it.",
     );
     const deployCallIdx = src.indexOf("await deploy(buildDir, domain,");
     assert.ok(

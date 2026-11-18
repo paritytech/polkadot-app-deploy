@@ -2,18 +2,20 @@
  * Auth configuration builder for the sign-in integration.
  *
  * DOT_DAPP_ID scopes the session files on disk. The product id is
- * `polkadot-app-deploy.<network suffix>` (RFC-0022): the wallet derives the
- * signing account `//product//{productId}/{index}` from it, funds PGAS there,
- * and keys the Bulletin / statement-store allowances by it. Android only
- * answers for a product id whose suffix matches its People chain's
- * `NetworkSuffix`.
+ * `polkadot-app-deploy.<tld>` (RFC-0022), with the stack descriptor's `tld`:
+ * the wallet derives the signing account `//product//{productId}/{index}` from
+ * it, funds PGAS there, and keys the Bulletin / statement-store allowances by
+ * it. Android only answers for a product id whose suffix matches its People
+ * chain's `NetworkSuffix`.
  */
 
 import { existsSync, readdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
-import { loadEnvironments } from "./environments.js";
-import type { EnvironmentsDoc } from "./environments.js";
+import type { Stack } from "./stacks.js";
+import { Storage, str } from "@polkadot-api/substrate-bindings";
+import { connectChainClient } from "./genesis.js";
+import { NonRetryableError } from "./errors.js";
 import type { AuthConfig } from "./auth/index.js";
 import { VERSION } from "./telemetry.js";
 import { CLI_NAME } from "./cli-name.js";
@@ -66,107 +68,51 @@ export function hasPersistedSession(): boolean {
 }
 
 /**
- * Build an `AuthConfig` from the bundled environments document.
- *
- * Reads the People-parachain endpoint for `envId` and assembles the config that
- * `createAuthClient` needs. Throws with a clear message if the people chain or
- * its endpoint for `envId` is absent.
+ * The `AuthConfig` `createAuthClient` needs for `stack`: its People endpoints, and the
+ * product id `polkadot-app-deploy.<tld>` the wallet derives the signing account from.
  */
-export function buildAuthConfig(
-    doc: EnvironmentsDoc,
-    envId: string,
-    networkSuffix?: string | null,
-): AuthConfig {
-    const peopleChain = doc.chains.find((c) => c.id === "people");
-    if (!peopleChain) {
-        throw new Error(
-            `No "people" chain found in environments doc. ` +
-            `Add a "people" entry under "chains" in environments.json.`,
-        );
-    }
-    const endpoint = peopleChain.endpoints[envId];
-    if (!endpoint) {
-        throw new Error(
-            `No people-chain endpoint for environment "${envId}". ` +
-            `Available envs: ${Object.keys(peopleChain.endpoints).join(", ")}.`,
-        );
-    }
-    // Normalize string | string[] to string[]
-    const peopleEndpoints = Array.isArray(endpoint.wss) ? endpoint.wss : [endpoint.wss];
-
-    // Envs without a `tld` use the People chain's suffix if the caller read it,
-    // else "dot", the same default as DEFAULT_TLD in src/dotns.ts.
-    const tld = doc.environments.find((e) => e.id === envId)?.tld ?? networkSuffix ?? "dot";
-
+export function buildAuthConfig(stack: Pick<Stack, "chains" | "tld">): AuthConfig {
     return {
         dappId: DOT_DAPP_ID,
-        productId: `${DOT_DAPP_ID}.${tld}`,
+        productId: `${DOT_DAPP_ID}.${stack.tld}`,
         derivationIndex: DOT_DERIVATION_INDEX,
         hostName: DOT_HOST_NAME,
         hostVersion: VERSION,
-        peopleEndpoints,
+        peopleEndpoints: stack.chains.People.rpc,
     };
 }
 
 /**
- * Resolve the Bulletin chain WS endpoint(s) for an environment from the
- * environments doc. Mirrors buildAuthConfig's people-chain resolution.
- *
- * Login needs this because src/deploy.ts only reassigns its module-level
- * BULLETIN_ENDPOINTS (initialized to DEFAULT_BULLETIN_RPC = the paseo-next
- * chain) to the selected env's endpoint inside the deploy flow. The login path
- * never runs that, so without resolving here it would poll the default chain
- * instead of the selected env's (e.g. paseo-next-v2 on paseo-bulletin-next-rpc)
- * and never observe an authorization that lives on the selected chain.
- *
- * Returns null if the bulletin chain or its endpoint for envId is absent.
+ * Lazily create an auth client for `stack` without reading any chain. Imports the facade only
+ * when called so the SSO deps don't load in headless/mnemonic paths.
  */
-export function resolveBulletinEndpoints(
-    doc: EnvironmentsDoc,
-    envId: string,
-): string[] | null {
-    const bulletinChain = doc.chains.find((c) => c.id === "bulletin");
-    const endpoint = bulletinChain?.endpoints[envId];
-    if (!endpoint) return null;
-    return Array.isArray(endpoint.wss) ? endpoint.wss : [endpoint.wss];
-}
-
-/**
- * Return the People chain WSS endpoints for the given environment.
- * Used by the SSS allowance preflight check — no SSO deps loaded.
- */
-export async function getPeopleChainEndpoints(envId: string): Promise<string[]> {
-    const { doc } = await loadEnvironments();
-    const config = buildAuthConfig(doc, envId);
-    return config.peopleEndpoints;
-}
-
-/**
- * The People chain's `NetworkSuffix`, which the phone checks the product id
- * against. Null when the chain has none or the read fails.
- */
-export async function readNetworkSuffix(peopleEndpoints: string[]): Promise<string | null> {
-    const { Storage, str } = await import("@polkadot-api/substrate-bindings");
-    const { readStorageValue } = await import("./sss-allowance.js");
-    const value = await readStorageValue(Storage("NetworkSuffix")("NetworkSuffix").enc(), peopleEndpoints);
-    if (!value) return null;
-    try {
-        return str.dec(value) || null;
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Lazily create an auth client for the given environment. Imports the facade
- * only when called so the SSO deps don't load in headless/mnemonic paths.
- */
-export async function getAuthClient(envId: string) {
+export async function getAuthClient(stack: Stack) {
     const { createAuthClient } = await import("./auth/index.js");
-    const { doc } = await loadEnvironments();
-    const config = buildAuthConfig(doc, envId);
-    // Bundled tlds match their chain's suffix (test/auth-config.test.js), so only
-    // envs without one, like devnet, pay for the chain read.
-    if (doc.environments.find((e) => e.id === envId)?.tld) return createAuthClient(config);
-    return createAuthClient(buildAuthConfig(doc, envId, await readNetworkSuffix(config.peopleEndpoints)));
+    return createAuthClient(buildAuthConfig(stack));
+}
+
+/**
+ * Fails when `stack`'s People chain has another genesis hash, or a `NetworkSuffix` other than
+ * `stack.tld`: the wallet rejects a product id with another suffix.
+ */
+export async function assertPeopleMatchesStack(stack: Stack): Promise<void> {
+    // Lazy: dotns.js loads the DotNS deps, which logout and whoami don't use.
+    const { WS_HEARTBEAT_TIMEOUT_MS } = await import("./dotns.js");
+    const client = await connectChainClient(stack, "People", undefined, {
+        heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS,
+    });
+    let suffix: string | null;
+    try {
+        const value: string | null = await client._request("state_getStorage", [
+            Storage("NetworkSuffix")("NetworkSuffix").enc(),
+        ]);
+        suffix = value && value !== "0x" ? str.dec(value) || null : null;
+    } finally {
+        client.destroy();
+    }
+    if (suffix !== null && suffix !== stack.tld) {
+        throw new NonRetryableError(
+            `stack '${stack.id}' has tld '${stack.tld}', but its People chain's NetworkSuffix is '${suffix}'`,
+        );
+    }
 }

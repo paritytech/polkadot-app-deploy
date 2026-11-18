@@ -10,9 +10,7 @@
 // Each step is gated on the chain state being "still needs doing". Re-running
 // after a partial success resumes from the first incomplete step.
 
-import { createClient } from "polkadot-api";
 import { getTxCreator } from "polkadot-api/tx-creator";
-import { getWsProvider } from "../ws.js";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import type { SS58String } from "polkadot-api";
@@ -20,7 +18,8 @@ import type { SS58String } from "polkadot-api";
 // @ts-ignore — verifiablejs/nodejs DTS path differs from the types field
 import * as verifiable from "verifiablejs/nodejs";
 
-import { loadEnvironments } from "../environments.js";
+import type { Stack } from "../stacks.js";
+import { connectChainClient } from "../genesis.js";
 import { WS_HEARTBEAT_TIMEOUT_MS } from "../dotns.js";
 import { bytesToHex } from "./encoding.js";
 import { DOTNS_CONTEXT_BYTES, PGAS_ASSET_ID, PEOPLE_MEMBER_IDENTIFIER_HEX } from "./constants.js";
@@ -243,16 +242,16 @@ export interface RunBootstrapTestApis {
 
 export async function runBootstrap({
   mnemonic,
-  environmentId,
+  stack,
   requireRecognized = true,
   _testApis,
 }: {
   mnemonic: string;
-  environmentId: string;
+  stack: Stack;
   requireRecognized?: boolean;
   /**
    * Test-only: inject pre-built API objects and function overrides.
-   * When set the real WS connections and environment lookup are skipped.
+   * When set the real WS connections and the genesis checks are skipped.
    */
   _testApis?: RunBootstrapTestApis;
 }): Promise<BootstrapResult> {
@@ -269,32 +268,20 @@ export async function runBootstrap({
     ahUnsafeApiResolved = _testApis.ahUnsafeApi;
     peopleUnsafeApiResolved = _testApis.peopleUnsafeApi;
   } else {
-    const { doc } = await loadEnvironments();
-    const ahChain = doc.chains.find((c) => c.id === "asset-hub");
-    const peopleChain = doc.chains.find((c) => c.id === "people");
-    if (!ahChain || !peopleChain) {
-      throw new Error("environments.json missing asset-hub or people chain");
+    const config = { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS };
+    const [ah, people] = await Promise.allSettled([
+      connectChainClient(stack, "AssetHub", undefined, config),
+      connectChainClient(stack, "People", undefined, config),
+    ]);
+    if (ah.status === "rejected" || people.status === "rejected") {
+      if (ah.status === "fulfilled") ah.value.destroy();
+      if (people.status === "fulfilled") people.value.destroy();
+      throw ah.status === "rejected" ? ah.reason : (people as PromiseRejectedResult).reason;
     }
-    const ahEntry = ahChain.endpoints[environmentId];
-    const peopleEntry = peopleChain.endpoints[environmentId];
-    if (!ahEntry || !peopleEntry) {
-      throw new Error(
-        `No endpoints for environment '${environmentId}'. Bootstrap is only available on paseo-next-v2.`,
-      );
-    }
-    const ahWss = Array.isArray(ahEntry.wss) ? ahEntry.wss[0] : ahEntry.wss;
-    const peopleWss = Array.isArray(peopleEntry.wss) ? peopleEntry.wss[0] : peopleEntry.wss;
-
-    const realAhClient = createClient(
-      getWsProvider(ahWss, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }),
-    );
-    const realPeopleClient = createClient(
-      getWsProvider(peopleWss, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }),
-    );
-    ahClient = realAhClient;
-    peopleClient = realPeopleClient;
-    ahUnsafeApiResolved = realAhClient.getUnsafeApi();
-    peopleUnsafeApiResolved = realPeopleClient.getUnsafeApi();
+    ahClient = ah.value;
+    peopleClient = people.value;
+    ahUnsafeApiResolved = ah.value.getUnsafeApi();
+    peopleUnsafeApiResolved = people.value.getUnsafeApi();
   }
 
   try {

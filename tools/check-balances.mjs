@@ -3,7 +3,7 @@
  * tools/check-balances.mjs
  *
  * Diagnostic: dump per-signer status for every signer the E2E pipeline uses,
- * on whichever environment you target with --env (default: paseo-next-v2).
+ * on whichever built-in stack you target with --env (default: DEFAULT_STACK_ID).
  * Both chains are inspected in one run:
  *
  *   - The env's Asset Hub: free / reserved / usable PAS + nonce. PAS funds the
@@ -14,7 +14,7 @@
  *     + nonce. Bulletin has no fee model; chunk uploads need an unexpired
  *     authorization, not a balance.
  *
- * Both endpoints are resolved from environments.json via --env; nothing is
+ * Both endpoints are resolved from the stack descriptor via --env; nothing is
  * hardcoded. Read-only and idempotent — safe to re-run anytime.
  *
  * Default signer set (substrate URIs):
@@ -47,7 +47,7 @@ import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { createClient } from "polkadot-api";
 import { getWsProvider } from "polkadot-api/ws";
-import { loadEnvironments, resolveEndpoints, DEFAULT_ENV_ID } from "../dist/environments.js";
+import { loadStack, DEFAULT_STACK_ID } from "../dist/stacks.js";
 import { DEFAULT_MNEMONIC } from "../dist/dotns.js";
 import { readAccountAuthorization, remainingRenewBytes, remainingTransactions } from "../dist/pool.js";
 
@@ -155,7 +155,7 @@ async function dumpBulletinAuth(label, ws, signers) {
 
 async function main() {
   const args = process.argv.slice(2);
-  let envId = DEFAULT_ENV_ID;
+  let envId = DEFAULT_STACK_ID;
   let mnemonic = DEFAULT_MNEMONIC;
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--env") envId = args[++i];
@@ -169,10 +169,9 @@ async function main() {
     }
   }
 
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, envId);
-  const rpc = resolved.assetHub[0];
-  const bulletinRpc = resolved.bulletin[0];
+  const stack = await loadStack({ env: envId });
+  const rpc = stack.chains.AssetHub.rpc[0];
+  const bulletinRpc = stack.chains.Bulletin.rpc[0];
 
   console.log(`Environment:   ${envId}`);
   console.log(`Asset Hub RPC: ${rpc}`);

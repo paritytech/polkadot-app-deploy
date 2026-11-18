@@ -140,11 +140,11 @@ describe("collectJobs: counted job set and unknown state (#1652, #1651)", () => 
   test("excludeRe drops jobs outside nightly-report's needs before anything is read", async () => {
     const seen = [];
     const base = stubFetch([
-      ["/attempts/1/jobs?", json({ jobs: [{ id: 1, name: "Nightly S1 pool (preview)", conclusion: "failure" }, { id: 2, name: "Nightly · DotNS address drift", conclusion: null, status: "queued" }] })],
+      ["/attempts/1/jobs?", json({ jobs: [{ id: 1, name: "Nightly S1 pool (preview)", conclusion: "failure" }, { id: 2, name: "Chain-call arg encoding (all extrinsics)", conclusion: null, status: "queued" }] })],
       ["/check-runs/1/annotations", json(LOST)],
     ]);
     const fetchImpl = (url, o) => { seen.push(url); return base(url, o); };
-    const jobs = await collectJobs({ apiUrl: "https://x", repo: "o/r", runId: 9, attempt: 1, token: "t", excludeRe: /^Nightly · DotNS address drift/, fetchImpl });
+    const jobs = await collectJobs({ apiUrl: "https://x", repo: "o/r", runId: 9, attempt: 1, token: "t", excludeRe: /^Chain-call arg encoding/, fetchImpl });
     assert.equal(classifyRunnerLoss(jobs).verdict, "all-runner-loss", ">> FAIL: classifier: the excluded queued job must not block or change the verdict");
     assert.ok(!seen.some((u) => u.includes("/check-runs/2/")), ">> FAIL: classifier: an excluded job must not be read");
   });

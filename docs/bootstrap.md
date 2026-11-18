@@ -13,7 +13,7 @@ The Bulletin chain has **no fee model**. Storage access is gated by the `Transac
 
 ### The authorizer is declared per environment, not guessed from network type
 
-When `--env <id>` is given and `--authorizer` is omitted, bootstrap falls back to that environment's declared `bulletinAuthorizer` field in `environments.json` (e.g. `//Alice` on `paseo-next-v2`). There is **no other default** — in particular, no "if this looks like a testnet, use `//Alice`" heuristic. An environment operated by someone else — for example the community `devnet` preset, run by the Polkadot Community Foundation — declares no `bulletinAuthorizer` at all, because the actual authorizer key isn't known here. Omitting `--authorizer` there prints a clear "no known authorizer" message and does nothing, rather than guessing and having the grant silently rejected on-chain. Always pass the key that holds `TransactionStorage` authorization authority on that chain explicitly:
+When `--env <id>` is given and `--authorizer` is omitted, bootstrap falls back to that stack's declared `bulletinAuthorizer` field in `assets/stack-policy.json` (e.g. `//Alice` on `paseo-next-v2`). There is **no other default** — in particular, no "if this looks like a testnet, use `//Alice`" heuristic. A stack operated by someone else — for example the community `pcf-devnet` stack, run by the Polkadot Community Foundation — declares no `bulletinAuthorizer` at all, because the actual authorizer key isn't known here. Omitting `--authorizer` there prints a clear "no known authorizer" message and does nothing, rather than guessing and having the grant silently rejected on-chain. Always pass the key that holds `TransactionStorage` authorization authority on that chain explicitly:
 
 ```bash
 polkadot-app-bootstrap --env devnet --authorizer "<your authorizer seed or mnemonic>"
@@ -36,7 +36,8 @@ Options:
 | `--mnemonic "..."` | Pool root mnemonic used to derive the pool accounts. Also readable from `BULLETIN_POOL_MNEMONIC`. Defaults to the well-known dev phrase — the same key, read the same way, as the deploy path (`resolvePoolMnemonic` in `src/pool.ts` is the one resolver both use). `MNEMONIC` is deliberately **not** consulted: it names the DotNS signing account, and honouring it here authorized a set of `//deploy/N` accounts no deploy ever uploads from. Bootstrap warns when `MNEMONIC` is set and `BULLETIN_POOL_MNEMONIC` is not, and prints the derived `//deploy/0` so you can compare it against the deploy's own "Using pool account 0: <ss58>" line. |
 | `--authorizer "..."` | Seed/mnemonic of the key that holds authorization authority on this chain (e.g. `//Alice`, a full mnemonic, or a hex seed). If omitted, falls back to the `--env`'s declared `bulletinAuthorizer` (e.g. `//Alice` on `paseo-next-v2`); if the env declares none (or `--env` isn't given), the run is status-only. |
 | `--rpc wss://...` | Override the Bulletin RPC endpoint. Also readable from `BULLETIN_RPC`. |
-| `--env <id>` | Load environment by id from `environments.json` (sets the default RPC). |
+| `--env <id>` | Built-in stack id or alias (sets the default RPC). |
+| `--stack <link\|url\|file>` | Stack that is not built in: `polkadotapp://stack` link, descriptor URL or descriptor file. Cannot be combined with `--env`. |
 | `--pool-size N` | Number of pool accounts to check/initialize. Default: `10`. |
 | `--version` | Print the CLI version. |
 | `--help` | Show help. |
@@ -83,6 +84,12 @@ polkadot-app-bootstrap --rpc wss://custom-bulletin.example.com --pool-size 20
 
 # Explicit pool mnemonic and authorizer
 polkadot-app-bootstrap --mnemonic "word word word ..." --authorizer "//Alice"
+
+# Use a built-in stack
+polkadot-app-bootstrap --env paseo-next-v2
+
+# Use a stack that is not built in
+polkadot-app-bootstrap --stack ./my-stack.json
 ```
 
 ## Related Docs

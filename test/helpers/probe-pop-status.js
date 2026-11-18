@@ -14,7 +14,7 @@
  * @param {() => object} opts.dotnsFactory      — returns a fresh DotNS-like instance
  * @param {string|null}  opts.bulletinDeployEnv  — PAD_ENV value (or null)
  * @param {() => Promise<object>} opts.resolveEnvConnectOptions — resolves extra connect
- *   options from environments.json when bulletinDeployEnv is set
+ *   options (the selected stack) when bulletinDeployEnv is set
  * @param {string}       opts.defaultMnemonic    — DEFAULT_MNEMONIC constant from the module
  * @param {string|null}  [opts.derivationPath]   — explicit derivation path for the actual
  *   per-scenario signer (see COUPLING NOTE above); omit/null = bare ROOT
@@ -31,9 +31,8 @@ export async function probeSignerPopStatus(opts) {
 
   const dotns = dotnsFactory();
   try {
-    // Build connect options. When bulletinDeployEnv is set, use env-resolved
-    // options (unchanged from the original hook); otherwise use the default
-    // paseo-next environment. In both cases, layer the resolved derivation
+    // Build connect options. When bulletinDeployEnv is set, use the stack-resolved
+    // options; otherwise the mnemonic alone. In both cases, layer the resolved derivation
     // path on top so the probed H160 matches the actual per-scenario signer
     // (see COUPLING NOTE above).
     const connectOptions = bulletinDeployEnv

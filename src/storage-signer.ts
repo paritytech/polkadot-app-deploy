@@ -4,11 +4,12 @@ import { join, dirname } from "node:path";
 import { fromHex, toHex } from "@polkadot-api/utils";
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { sr25519, ss58Address } from "@polkadot-labs/hdkd-helpers";
-import { createClient as createPolkadotClient } from "polkadot-api";
 import { getTxCreator } from "polkadot-api/tx-creator";
-import { getWsProvider } from "./ws.js";
 import type { SignerTxCreator } from "polkadot-api/tx-creator";
-import { BULLETIN_ENDPOINTS, WS_HEARTBEAT_TIMEOUT_MS, makeBulletinStatusHandler } from "./deploy.js";
+import { bulletinSelection, WS_HEARTBEAT_TIMEOUT_MS, makeBulletinStatusHandler, openBulletinClient } from "./deploy.js";
+import { connectChainClient } from "./genesis.js";
+import { NonRetryableError } from "./errors.js";
+import type { Stack } from "./stacks.js";
 import { readAccountAuthorization, type BulletinAuthorization } from "./pool.js";
 import { setDeployAttribute, truncateAddress } from "./telemetry.js";
 
@@ -242,6 +243,7 @@ export async function pollUntilBulletinAuthorized(
  * race where deploy checks immediately after phone approval but before the
  * on-chain tx is included).
  *
+ * Polls `stack`'s Bulletin chain, checked against its genesis hash.
  * Does NOT print any progress — the caller (login.ts) owns the output via a
  * spinner. Pass `quiet: true` to suppress connection status chatter so the
  * caller's spinner owns the line.
@@ -251,20 +253,13 @@ export async function pollUntilBulletinAuthorized(
  */
 export async function waitForBulletinAuthorization(
   ss58: string,
-  opts: { timeoutMs?: number; pollMs?: number; quiet?: boolean; endpoints?: string[] } = {},
+  opts: { timeoutMs?: number; pollMs?: number; quiet?: boolean; stack: Stack },
 ): Promise<{ authorized: true; expiration: number } | { authorized: false; reason: "timeout" }> {
-  const { quiet, endpoints, ...pollOpts } = opts;
-  // Callers in the login path MUST pass the selected env's bulletin endpoint(s).
-  // BULLETIN_ENDPOINTS defaults to the deploy-only DEFAULT_BULLETIN_RPC (the
-  // paseo-next chain) and is the wrong chain for any other env — we only fall
-  // back to it when no endpoints are supplied (preserves the deploy-path default).
-  const eps = endpoints && endpoints.length > 0 ? endpoints : BULLETIN_ENDPOINTS;
-  const primary = eps[0];
-  const onStatusChanged = quiet ? () => {} : makeBulletinStatusHandler(primary);
-  const client = createPolkadotClient(getWsProvider(
-    eps,
-    { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, onStatusChanged },
-  ));
+  const { quiet, stack, ...pollOpts } = opts;
+  const client = await connectChainClient(stack, "Bulletin", undefined, {
+    heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS,
+    onStatusChanged: quiet ? () => {} : makeBulletinStatusHandler(stack.chains.Bulletin.rpc[0]),
+  });
   const unsafeApi: any = client.getUnsafeApi();
   try {
     return await pollUntilBulletinAuthorized(
@@ -284,8 +279,9 @@ export async function waitForBulletinAuthorization(
 
 /**
  * Generic retry wrapper for a single flaky step. Retries any thrown error
- * EXCEPT `BulletinSlotAuthError` up to `retries` times (default 2, i.e. 3
- * total attempts) with `delayMs` between attempts (default 1000ms).
+ * EXCEPT `BulletinSlotAuthError` and `NonRetryableError` (which includes
+ * `GenesisMismatchError`) up to `retries` times (default 2, i.e. 3 total
+ * attempts) with `delayMs` between attempts (default 1000ms).
  *
  * `BulletinSlotAuthError` ("missing" | "expired") is a definitive on-chain
  * fact, not a network blip — retrying it would just re-read the same state
@@ -311,7 +307,7 @@ export async function withTransientRetry<T>(
     try {
       return await attempt();
     } catch (e) {
-      if (e instanceof BulletinSlotAuthError) throw e;
+      if (e instanceof BulletinSlotAuthError || e instanceof NonRetryableError) throw e;
       lastErr = e;
       if (i < retries) {
         if (debug) {
@@ -340,12 +336,9 @@ export async function getSlotSignerProvider(
   ss58: string,
 ): Promise<{ client: any; unsafeApi: any; signer: SignerTxCreator; ss58: string }> {
   return withTransientRetry(async () => {
-    const primary = BULLETIN_ENDPOINTS[0];
+    const primary = bulletinSelection.endpoints[0];
     console.log(`   Connecting to Bulletin (slot signer): ${primary}`);
-    const client = createPolkadotClient(getWsProvider(
-      BULLETIN_ENDPOINTS,
-      { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS, onStatusChanged: makeBulletinStatusHandler(primary) },
-    ));
+    const client = await openBulletinClient({ onStatusChanged: makeBulletinStatusHandler(primary) });
     const unsafeApi: any = client.getUnsafeApi();
 
     let auth: BulletinAuthorization | null = null;

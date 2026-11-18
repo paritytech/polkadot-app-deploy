@@ -99,8 +99,8 @@ on:
       # alone is safe — a filtered-out prerequisite (s5) skips and consumes no
       # nonces, and the jobs' `if: always()` lets the selected job still run;
       # when both are selected the existing `needs:` ordering still serializes.
-      # Aggregate verifiers (telemetry / pool-distribution / code-path coverage /
-      # address-drift) deliberately keep no filter — a subset cannot satisfy them.
+      # Aggregate verifiers (telemetry / pool-distribution / code-path coverage)
+      # deliberately have no filter — a subset cannot satisfy them.
       # nightly-pr-coverage and nightly-s-inc are also unfiltered: their scenario
       # id comes from the matrix, and the `matrix` context is NOT available in a
       # job-level `if:` (only github / needs / vars / inputs are). Referencing it
@@ -315,9 +315,9 @@ jobs:
   #
   # Probes the primary E2E env (paseo-next-v2 by default, override via
   # workflow_dispatch.primary-env input). If unhealthy, iterates every
-  # entry in assets/environments.json with e2eEligible:true in declaration
-  # order and picks the first healthy one. Falls back through all of them
-  # before failing the job.
+  # built-in stack with e2eEligible:true in assets/stack-policy.json, in
+  # policy order, and picks the first healthy one. Falls back through all of
+  # them before failing the job.
   #
   # In PR 2 (this PR), select-env drives both per-PR and nightly jobs.
   # See docs-internal/superpowers/specs/2026-05-29-e2e-env-fallback-design.md.
@@ -357,6 +357,11 @@ jobs:
       canary_envs: ${{ steps.select.outputs.canary_envs }}
       primary_healthy: ${{ steps.select.outputs.primary_healthy }}
       fallback_used: ${{ steps.select.outputs.fallback_used }}
+      # selected_tld: the DotNS TLD (e.g. "dot", "paseo") in the shipped
+      # descriptor of selected_env (.trinity/). Per-stack since #1240 — never
+      # assume ".dot"; jobs that build artifact filenames/URLs from a domain
+      # outside the CLI (which resolves its own TLD) need this.
+      selected_tld: ${{ steps.select.outputs.selected_tld }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -389,9 +394,14 @@ jobs:
         run: |
           set -uo pipefail
           # Build ordered probe list: primary first, then the other eligible envs.
-          ALL_ELIGIBLE=$(node -e '
-            const doc = JSON.parse(require("fs").readFileSync("assets/environments.json"));
-            doc.environments.filter(e => e.e2eEligible).forEach(e => console.log(e.id));
+          # Read build-free: PR/push runs skip npm ci.
+          PRIMARY_ENV=$(PRIMARY_ENV="$PRIMARY_ENV" node --input-type=module -e '
+            import { findBuiltInStackId } from "./tools/lib/stack-copies.mjs";
+            console.log(findBuiltInStackId(process.env.PRIMARY_ENV) ?? process.env.PRIMARY_ENV);
+          ')
+          ALL_ELIGIBLE=$(node --input-type=module -e '
+            import { listShippedStacks } from "./tools/lib/stack-copies.mjs";
+            for (const { id, policy } of listShippedStacks()) if (policy.e2eEligible) console.log(id);
           ')
           PROBE_ORDER=("$PRIMARY_ENV")
           for env in $ALL_ELIGIBLE; do
@@ -471,6 +481,12 @@ jobs:
             FAN_OUT_ENVS="[\"$SELECTED\"]"
             CANARY_ENVS="$FAN_OUT_ENVS"
           fi
+          # Per-stack DotNS TLD (#1240) for callers that build a filename/URL
+          # from a domain outside the CLI (which resolves its own TLD).
+          SELECTED_TLD=$(SELECTED_ENV_ID="$SELECTED" node --input-type=module -e '
+            import { findBuiltInStackId, readShippedDescriptor } from "./tools/lib/stack-copies.mjs";
+            console.log(readShippedDescriptor(findBuiltInStackId(process.env.SELECTED_ENV_ID)).tld);
+          ')
           {
             echo "selected_env=$SELECTED"
             echo "healthy_envs=$FAN_OUT_ENVS"
@@ -1937,7 +1953,8 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: ./.github/actions/npm-retry
         with:
-          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          run: |
+            npm ci
       - name: Use the test harness from the tag under test (#1621)
         if: env.BULLETIN_DEPLOY_REF == ''
         env:
@@ -2041,7 +2058,8 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: ./.github/actions/npm-retry
         with:
-          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          run: |
+            npm ci
       - name: Use the test harness from the tag under test (#1621)
         if: env.BULLETIN_DEPLOY_REF == ''
         env:
@@ -2136,7 +2154,8 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: ./.github/actions/npm-retry
         with:
-          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          run: |
+            npm ci
       - name: Use the test harness from the tag under test (#1621)
         if: env.BULLETIN_DEPLOY_REF == ''
         env:
@@ -2232,7 +2251,8 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: ./.github/actions/npm-retry
         with:
-          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          run: |
+            npm ci
       - name: Use the test harness from the tag under test (#1621)
         if: env.BULLETIN_DEPLOY_REF == ''
         env:
@@ -2330,7 +2350,8 @@ jobs:
       - name: Build polkadot-app-deploy from source
         uses: ./.github/actions/npm-retry
         with:
-          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          run: |
+            npm ci
       - name: Run S-REPROVE auto-reprove scenario (one retry on transient testnet failures)
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         env:
@@ -2780,7 +2801,7 @@ jobs:
           # 'polkadot-api' from /tmp/bd-s-ext/node_modules (script location = module root).
           # Using a file rather than piped inline code avoids shell-escape hazards (!=, etc).
           cat > /tmp/bd-s-ext/run-s-ext.mjs << 'SCRIPT'
-          import { DotNS, loadEnvironments, resolveEndpoints } from "@parity/polkadot-app-deploy";
+          import * as bulletinDeploy from "@parity/polkadot-app-deploy";
           import { Keyring } from "@polkadot/keyring";
           import { cryptoWaitReady } from "@polkadot/util-crypto";
           import { readFileSync } from "node:fs";
@@ -2799,9 +2820,12 @@ jobs:
             return Buffer.from(bytes).toString("hex");
           }
 
+          // This job installs a published version (nightly @latest, or the release RC). Versions
+          // before the stack cutover export loadEnvironments; later ones load the stack from `env`.
           async function resolveDotnsConnectOptions(envId) {
-            const { doc } = await loadEnvironments();
-            const resolved = resolveEndpoints(doc, envId);
+            if (!bulletinDeploy.loadEnvironments) return { env: envId };
+            const { doc } = await bulletinDeploy.loadEnvironments();
+            const resolved = bulletinDeploy.resolveEndpoints(doc, envId);
             return {
               rpc: resolved.assetHub[0],
               assetHubEndpoints: resolved.assetHub,
@@ -2832,7 +2856,7 @@ jobs:
           );
 
           console.log(`[S-ext-signer] Connecting as ${account.address} via external signer...`);
-          const dotns = new DotNS();
+          const dotns = new bulletinDeploy.DotNS();
           try {
             await dotns.connect({ signer: polkadotSigner, signerAddress: account.address, ...await resolveDotnsConnectOptions(PAD_ENV) });
             await dotns.setContenthash("e2epoolns01", expected);
@@ -2916,7 +2940,8 @@ jobs:
         if: env.BULLETIN_DEPLOY_REF != ''
         uses: ./.github/actions/npm-retry
         with:
-          run: SKIP_ENVIRONMENTS_PREFETCH=1 npm ci
+          run: |
+            npm ci
       - name: Use the test harness from the tag under test (#1621)
         if: env.BULLETIN_DEPLOY_REF == ''
         env:
@@ -3085,7 +3110,7 @@ jobs:
             {
               name = $1; conclusion = $2
               meta = (index(name,"telemetry assertions")>0) || (index(name,"pool selection")>0) || \
-                     (index(name,"code-path")>0) || (index(name,"harness-import smoke")>0) || (index(name,"E2E Report")>0) || (index(name,"DotNS address drift")>0)
+                     (index(name,"code-path")>0) || (index(name,"harness-import smoke")>0) || (index(name,"E2E Report")>0)
               env_tag = "META"
               if (!meta) {
                 env_tag = selected
@@ -3258,7 +3283,7 @@ jobs:
             # the "(<env>)" name suffix, $SELECTED_ENV for the env-fixed
             # scenarios (S-INC, PR-coverage), or META for jobs that aren't
             # scoped to a single env (telemetry, pool distribution, code-path,
-            # DotNS drift, this report job itself). That classification is
+            # this report job itself). That classification is
             # computed once, upstream in the Fetch step; here we only filter
             # and count — no re-parsing of job names, so it can't drift out of
             # sync with the failing-legs table below (which reads the same
@@ -3484,7 +3509,7 @@ jobs:
           GITHUB_API_URL: ${{ github.api_url }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
-          EXCLUDE_JOBS: ^(Detect signature-only push|Classify package\.json/lock diff|PR · |PR E2E Report|Dispatch · |Chain-call arg encoding|Nightly · DotNS address drift|Nightly · Chain identity)
+          EXCLUDE_JOBS: ^(Detect signature-only push|Classify package\.json/lock diff|PR · |PR E2E Report|Dispatch · |Chain-call arg encoding)
         run: |
           node .github/scripts/classify-runner-loss.cjs
 
@@ -3927,91 +3952,6 @@ jobs:
           PAD_ENV: ${{ needs.select-env.outputs.selected_env }}
         run: E2E=1 node --test --test-timeout=60000 test/e2e-chain-calls.test.js
 
-  # Authoritative daily drift detector: are the DotNS contract addresses in
-  # assets/environments.json still in sync with paritytech/dotns DEPLOYMENTS.md?
-  # Stale addresses cause bare-revert (flags=1 data=0x) deploy failures. Runs in
-  # the nightly so a drift directly explains a red nightly. (PR-time check lives
-  # in .github/workflows/dotns-address-drift.yml.)
-  nightly-dotns-address-drift:
-    name: Nightly · DotNS address drift
-    # Schedule-only (NOT release): drift is an env-config signal orthogonal to the
-    # released bytes. Running it on release events could red an RC gating run for
-    # an unrelated reason (dotns redeploy mid-cut, expired PAT) → needless rc.N+1.
-    if: false  # disabled in public snapshot: address-drift not tracked publicly
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-      # Node 22 bundles npm 10, which cannot install this repo's npm 11
-      # lockfile (see #1216). Keep in sync with packageManager in package.json.
-      - name: npm install -g npm@11.17.0
-        uses: ./.github/actions/npm-retry
-        with:
-          run: npm install -g npm@11.17.0
-      # paritytech/dotns is a private repo — GITHUB_TOKEN can't read it. With the
-      # DOTNS_REPO_READ_TOKEN PAT this is the real drift check; without it the
-      # tool soft-skips on the fetch failure rather than false-failing.
-      # Exit codes: 0 match or soft-skip, 1 a real divergence, 2 the check could
-      # not run and nothing was compared. steps.*.outcome collapses 1 and 2, so
-      # the filer below gates on the captured code.
-      - name: Check DotNS contract addresses against DEPLOYMENTS.md
-        id: check-addresses
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.DOTNS_REPO_READ_TOKEN || secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          node tools/check-dotns-contract-addresses.mjs
-          code=$?
-          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          exit $code
-      - name: Open issue on address drift
-        if: steps.check-addresses.outcome == 'failure' && steps.check-addresses.outputs.exit_code == '1'
-        uses: actions/github-script@v8
-        continue-on-error: true
-        with:
-          script: |
-            const title = 'DotNS contract address drift detected';
-            const body = [
-              'The nightly DotNS address drift check measured a real divergence.',
-              '',
-              `Run: https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              '',
-              'Addresses in `assets/environments.json` diverge from `DEPLOYMENTS.md` in',
-              'paritytech/dotns, or its format changed and the parser needs updating.',
-              'Refresh from https://github.com/paritytech/dotns/blob/master/DEPLOYMENTS.md',
-            ].join('\n');
-            const q = `repo:${context.repo.owner}/${context.repo.repo} is:issue is:open "${title}"`;
-            const existing = await github.rest.search.issuesAndPullRequests({ q, per_page: 1 });
-            if (existing.data.items.length > 0) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner, repo: context.repo.repo,
-                issue_number: existing.data.items[0].number,
-                body: `Still drifting.\n\nRun: https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-              });
-              return;
-            }
-            await github.rest.issues.create({ owner: context.repo.owner, repo: context.repo.repo, title, body });
-      - name: Fail the job when the drift check did not pass
-        if: steps.check-addresses.outcome == 'failure'
-        env:
-          EXIT_CODE: ${{ steps.check-addresses.outputs.exit_code }}
-        run: |
-          if [ "$EXIT_CODE" = "1" ]; then
-            echo ">> FAIL: DotNS address drift: a real divergence was measured."
-            echo "::error::DotNS address drift: a real divergence was measured."
-          else
-            echo ">> FAIL: DotNS address drift: check could not run (exit $EXIT_CODE); nothing was compared."
-            echo "::error::DotNS address drift: check could not run (exit $EXIT_CODE); nothing was compared."
-          fi
-          exit 1
-
   nightly-code-path-coverage:
     name: Nightly · Code-path coverage
     if: false  # disabled in public snapshot: code-path coverage needs Parity Sentry
@@ -4025,7 +3965,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      # Exit codes as in nightly-dotns-address-drift: 1 = dead path, 2 = could not run.
+      # The check exits 1 for a real dead path and 2 when it could not run and
+      # nothing was measured (#1367); continue-on-error + the captured exit code
+      # let the steps below tell those apart, and the last step fails the job.
       - name: Check dead-branch coverage in Sentry
         id: check-coverage
         continue-on-error: true

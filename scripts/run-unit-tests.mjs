@@ -67,7 +67,9 @@ if (isMain) {
     console.error(">> FAIL: run-unit-tests: no unit test files discovered under test/");
     process.exit(1);
   }
-  const result = spawnSync(process.execPath, ["--test", ...files], {
+  // --test-force-exit: a test that failed on a hung chain client still has its socket open; the
+  // file ends when its tests end instead of waiting on that handle.
+  const result = spawnSync(process.execPath, ["--test", "--test-force-exit", ...files], {
     stdio: "inherit",
     cwd: repoRoot,
   });

@@ -25,8 +25,8 @@ This repo's `tools/` ships one read-only diagnostic, `probe-env-health.mjs --env
 2. **Asset Hub funding (DotNS fees).** The accounts that register or transfer names need a balance on the target Asset Hub.
    - Grant: on Paseo, use the public faucet at [https://faucet.polkadot.io/](https://faucet.polkadot.io/). `paseo-next-v2` has no public faucet — the operator funds the accounts out of band.
 
-3. **Bulletin storage authorization (upload allowance).** Every account that uploads chunks must carry a `TransactionStorage` authorization; `polkadot-app-deploy` never self-authorizes. The authorizer is declared per environment (`bulletinAuthorizer` in `environments.json`) — e.g. `//Alice` on `paseo-next-v2`.
-   - Grant: **pool accounts** via `polkadot-app-bootstrap --env <id>` (authorizes them using the env's declared authorizer — see [`docs/bootstrap.md`](bootstrap.md)); **direct-mode signers** (the per-shard `//e2e-*` derivation paths) are authorized by the same operator out of band. Alice is the authorizer itself, and Bob only owns the S3 fixture name (never uploads), so neither needs its own storage grant.
+3. **Bulletin storage authorization (upload allowance).** Every account that uploads chunks must carry a `TransactionStorage` authorization; `polkadot-app-deploy` never self-authorizes. The authorizer is **per stack** — read `bulletinAuthorizer` from `assets/stack-policy.json` rather than assuming. It is `//Alice` on `paseo-next-v2` and `//Eve` on `preview`; signing as the wrong key is rejected with `Invalid / BadSigner` (see #1209, fixed in v0.14.2).
+   - Grant: **pool accounts** via `polkadot-app-bootstrap --env <id>` (authorizes them using the stack's declared authorizer — see [`docs/bootstrap.md`](bootstrap.md)); **direct-mode signers** (the per-shard `//e2e-*` derivation paths) are authorized by the same operator out of band. Alice is the authorizer itself, and Bob only owns the S3 fixture name (never uploads), so neither needs its own storage grant.
 
 The per-environment sections below are the step-by-step procedures that satisfy these.
 

@@ -35,12 +35,12 @@ const PNG_1X1 = Buffer.from(
  * @param {object} opts
  * @param {string} opts.buildDir  Absolute path to the deploy's build directory (the `app` executable bytes).
  * @param {string} opts.label     Domain label as passed to the CLI (bare, or already suffixed with `.<tld>`).
- * @param {string} [opts.tld]     The environment's DotNS TLD (per-env: "paseo" on paseo-next-v2, "dot"
- *                                elsewhere). Defaults to "dot". Hardcoding ".dot" here produced a
- *                                double-suffixed config domain ("e2epoolns01.paseo.dot") once callers
- *                                began passing a label that already carried the env's TLD, which the
- *                                CLI rejected as a config/deploy domain mismatch (#1244).
- * @param {object} [opts.appManifest] An App v2 manifest; emits an App v2 executable instead of App v1.
+ * @param {string} [opts.tld]     The stack's DotNS TLD (its descriptor's `tld`, per stack since
+ *                                #1240). Defaults to "dot".
+ *                                Hardcoding ".dot" here produced a double-suffixed config domain
+ *                                ("e2epoolns01.paseo.dot") once callers began passing a label that
+ *                                already carried the env's TLD, which the CLI rejected as a
+ *                                config/deploy domain mismatch.
  * @param {Record<string, string[]>} [opts.trustedProducts] Passed straight through to
  *                                `ProductConfig.trustedProducts` (#1484). Optional — omitted
  *                                entirely from the written config when not given, matching every

@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       dotns-domain:
-        description: 'DotNS domain name (with .dot extension)'
+        description: 'DotNS label, BARE — no TLD suffix (e.g. "myapp", not "myapp.dot"). Since #1240 the TLD is per-stack and resolved at deploy time from the stack descriptor, so a caller-supplied suffix either conflicts with the stack''s real TLD or targets the wrong on-chain node. See docs-internal/adopt-shared-workflow.md. PR-preview labels must zero-pad the PR number ("myapp-pr07", not "myapp-pr7") — DotNS requires a trailing digit run of exactly 0 or 2 digits, so PRs 1-9 are otherwise always rejected; see the PR-preview subsection of docs-internal/adopt-shared-workflow.md for the workflow-caller form.'
         required: false
         type: string
         default: ''
@@ -42,11 +42,15 @@ on:
         type: string
         default: ''
       rpc:
-        description: 'Override the Bulletin chain RPC endpoint within the chosen env (default: derived from --env). Precedence: rpc > BULLETIN_RPC > env bulletin endpoint.'
+        description: 'Override the Bulletin chain RPC endpoint within the chosen stack (default: from the stack descriptor). Precedence: rpc > BULLETIN_RPC > descriptor Bulletin endpoint.'
         type: string
         default: ''
       env:
-        description: 'Target environment id from environments.json (e.g. paseo-next-v2, paseo-next, paseo-review). Default: paseo-next-v2. Drives both the bulletin RPC and the asset-hub RPC.'
+        description: 'Built-in stack id or alias: preview (aliases previewnet, ppn), paseo-next-v2, pcf-devnet (alias PCF-devnet), polkadot. Empty: the CLI default (paseo-next-v2). Do not combine with stack.'
+        type: string
+        default: ''
+      stack:
+        description: 'Custom stack: a polkadotapp://stack link, a descriptor URL, or a descriptor file path in the caller''s checkout. Passed as --stack. Do not combine with env.'
         type: string
         default: ''
       pool-size:
@@ -70,11 +74,11 @@ on:
         type: string
         default: ''
       gateway:
-        description: 'FALLBACK ONLY (issue #1157): gateway host used to construct the browser URL in the deployment summary and PR comment (e.g. "dot.li", "paseo.li") when polkadot-app-deploy could not supply one itself — a cache-hit run (deploy step skipped) or a polkadot-app-deploy version older than the browserUrl output. On a normal run this is ignored in favor of the env-resolved URL polkadot-app-deploy already computed (correct gateway + previewnet query suffix). Does not affect the deploy itself — only the URL displayed.'
+        description: 'FALLBACK ONLY (issue #1157): gateway host used to construct the browser URL in the deployment summary and PR comment (e.g. "dot.li", "paseo.li") when polkadot-app-deploy reported no full domain, which happens with a polkadot-app-deploy version older than the fullDomain/browserUrl outputs. When polkadot-app-deploy reports a full domain this is ignored: its browserUrl is used, and a stack that lists no web-gateway gets no browser URL. Does not affect the deploy itself, only the URL displayed.'
         type: string
         default: 'dot.li'
       gateway-path-style:
-        description: 'Applies only to the FALLBACK URL (see `gateway`). If true, build it as https://{gateway}/{domain}.dot (e.g. paseo.li/my-app.dot). If false (default), use subdomain form https://{domain}.{gateway} (e.g. my-app.paseo.li).'
+        description: 'Applies only to the FALLBACK URL (see `gateway`). If true, build it as https://{gateway}/{label} (e.g. paseo.li/my-app). If false (default), use subdomain form https://{label}.{gateway} (e.g. my-app.paseo.li).'
         type: boolean
         default: false
       comment-header:
@@ -101,12 +105,15 @@ on:
         description: 'Content CID'
         value: ${{ jobs.deploy.outputs.cid }}
       domain:
-        description: 'Full domain name (with .dot)'
+        description: 'Bare DotNS label as polkadot-app-deploy reported it (e.g. "myapp"); the stack TLD is not included'
         value: ${{ jobs.deploy.outputs.domain }}
+      full-domain:
+        description: 'DotNS name with the stack TLD as polkadot-app-deploy reported it (e.g. "myapp.paseo"); empty with a polkadot-app-deploy version older than this output'
+        value: ${{ jobs.deploy.outputs.full-domain }}
 
 jobs:
   deploy:
-    name: Deploy on ${{ inputs.env }}
+    name: Deploy on ${{ inputs.env || (inputs.stack != '' && 'custom stack') || 'default stack' }}
     runs-on: ${{ inputs.runner }}
     # Workflow-level safety net so a runaway hang (dead RPC, broken setup
     # action, etc.) cannot consume the GitHub default 6h ceiling. The deploy
@@ -116,6 +123,7 @@ jobs:
     outputs:
       cid: ${{ steps.final.outputs.cid }}
       domain: ${{ steps.final.outputs.domain }}
+      full-domain: ${{ steps.final.outputs.fullDomain }}
     steps:
       - name: Setup Node.js
         uses: actions/setup-node@v6
@@ -148,6 +156,9 @@ jobs:
         id: hash
         env:
           BUILD_DIR: ${{ inputs.build-dir }}
+          DEPLOY_ENV: ${{ inputs.env }}
+          STACK: ${{ inputs.stack }}
+          DOTNS_DOMAIN: ${{ inputs.dotns-domain }}
         run: |
           # polkadot-app-deploy.config.* drives the manifest publish and the CLI
           # finds it by walking up from BUILD_DIR, so it usually sits outside the
@@ -165,14 +176,25 @@ jobs:
             dir="$parent"
           done
           echo "hash=$( { find "$BUILD_DIR" -type f -exec sha256sum {} \; ; [ -n "$configs" ] && sha256sum $configs; } | sort | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # The deploy target goes into the cache key too, so a hit belongs to this target: the env,
+          # the stack (a descriptor file by its content) and the label. A stack link or URL is
+          # fetched at deploy time and can change behind the same string, so it is never cached.
+          stack_content=""
+          if printf '%s' "$STACK" | grep -Eq '^[A-Za-z][A-Za-z0-9+.-]*://'; then
+            echo "cacheable=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "cacheable=true" >> "$GITHUB_OUTPUT"
+            if [ -f "$STACK" ]; then stack_content=$(sha256sum < "$STACK" | cut -d' ' -f1); fi
+          fi
+          echo "target=$(printf '%s\n' "$DEPLOY_ENV" "$STACK" "$stack_content" "$DOTNS_DOMAIN" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Check deployment cache
         id: cache
-        if: inputs.skip-cache != true
+        if: inputs.skip-cache != true && steps.hash.outputs.cacheable == 'true'
         uses: actions/cache@v5
         with:
           path: .deploy-cache
-          key: deploy-${{ steps.hash.outputs.hash }}
+          key: deploy-${{ steps.hash.outputs.hash }}-${{ steps.hash.outputs.target }}
 
       - name: Load cached CID
         id: cached-deploy
@@ -368,10 +390,12 @@ jobs:
         id: deploy
         if: steps.cache.outputs.cache-hit != 'true'
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
-        # build-dir reaches the script as an environment variable: interpolated into
-        # the script text, a quote in it would run as shell in this job.
+        # Inputs arrive in the script as environment variables: interpolated into
+        # the script text, a quote in one would run as shell in this job.
         env:
           BUILD_DIR: ${{ inputs.build-dir }}
+          DEPLOY_ENV: ${{ inputs.env }}
+          STACK: ${{ inputs.stack }}
         with:
           timeout_minutes: 15
           max_attempts: ${{ inputs.max-retries }}
@@ -420,7 +444,8 @@ jobs:
             if [ "${{ inputs.direct-signer }}" = "true" ]; then FLAGS+=(--mnemonic "${{ secrets.mnemonic }}"); fi
             if [ -n "${{ inputs.derivation-path }}" ]; then FLAGS+=(--derivation-path "${{ inputs.derivation-path }}"); fi
             if [ -n "${{ inputs.rpc }}" ]; then FLAGS+=(--rpc "${{ inputs.rpc }}"); fi
-            if [ -n "${{ inputs.env }}" ]; then FLAGS+=(--env "${{ inputs.env }}"); fi
+            if [ -n "$DEPLOY_ENV" ]; then FLAGS+=(--env "$DEPLOY_ENV"); fi
+            if [ -n "$STACK" ]; then FLAGS+=(--stack "$STACK"); fi
             if [ "${{ inputs.pool-size }}" != "0" ]; then FLAGS+=(--pool-size "${{ inputs.pool-size }}"); fi
             # Only use the wrapper when retry is actually configured (max-retries > 1).
             # Default callers (max-retries: 1) run the deploy directly so there
@@ -441,52 +466,49 @@ jobs:
 
       - name: Save deployment to cache
         if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          CID: ${{ steps.deploy.outputs.cid }}
+          DOMAIN: ${{ steps.deploy.outputs.domain }}
+          FULL_DOMAIN: ${{ steps.deploy.outputs.fullDomain }}
+          BROWSER_URL: ${{ steps.deploy.outputs.browserUrl }}
         run: |
           mkdir -p .deploy-cache
-          echo "${{ steps.deploy.outputs.cid }}" > .deploy-cache/cid
+          printf '%s\n' "$CID" > .deploy-cache/cid
+          printf '%s\n' "$DOMAIN" > .deploy-cache/domain
+          printf '%s\n' "$FULL_DOMAIN" > .deploy-cache/fullDomain
+          printf '%s\n' "$BROWSER_URL" > .deploy-cache/browserUrl
 
+      # Reads .deploy-cache on both paths: restored on a cache hit, written by the step above
+      # otherwise.
       - name: Set deployment outputs
         id: final
         run: |
-          if [ "${{ steps.cache.outputs.cache-hit }}" == "true" ]; then
-            DOMAIN="${{ inputs.dotns-domain }}"
-            DOMAIN="${DOMAIN%.dot}"
-            echo "cid=${{ steps.cached-deploy.outputs.cid }}" >> "$GITHUB_OUTPUT"
-            echo "domain=${DOMAIN}" >> "$GITHUB_OUTPUT"
-            # Cache hit: the deploy step (and polkadot-app-deploy itself) never ran,
-            # so there's no env-resolved browser URL. Explicit empty value (not
-            # an omitted key) — see the "Compute browser URL" step for why.
-            echo "browserUrl=" >> "$GITHUB_OUTPUT"
-          else
-            echo "cid=${{ steps.deploy.outputs.cid }}" >> "$GITHUB_OUTPUT"
-            echo "domain=${{ steps.deploy.outputs.domain }}" >> "$GITHUB_OUTPUT"
-            # #1157: env-resolved URL polkadot-app-deploy already computed — see
-            # the "Compute browser URL" step for how it's used and why it can
-            # be empty (older polkadot-app-deploy versions predate this output).
-            echo "browserUrl=${{ steps.deploy.outputs.browserUrl }}" >> "$GITHUB_OUTPUT"
-          fi
+          read_cached() { cat ".deploy-cache/$1" 2>/dev/null || true; }
+          {
+            echo "cid=$(read_cached cid)"
+            echo "domain=$(read_cached domain)"
+            echo "fullDomain=$(read_cached fullDomain)"
+            echo "browserUrl=$(read_cached browserUrl)"
+          } >> "$GITHUB_OUTPUT"
 
+      # polkadot-app-deploy resolves the stack's web gateway and previewnet query suffix into
+      # browserUrl (#1157). It reports an empty browserUrl with a fullDomain when the stack
+      # lists no web-gateway, and neither with a version older than these outputs; only the
+      # last case falls back to the gateway inputs.
       - name: Compute browser URL
         id: browser
         if: steps.final.outputs.domain != ''
         env:
           DOMAIN: ${{ steps.final.outputs.domain }}
-          # #1157: polkadot-app-deploy already resolves the env's real webGateway
-          # (assets/environments.json) plus the previewnet query suffix — reuse
-          # that ONE resolution rather than recomputing a second, out-of-sync
-          # URL here. RESOLVED_URL is only empty on a cache-hit run (the
-          # deploy step, and polkadot-app-deploy itself, never ran) or with a
-          # polkadot-app-deploy version older than the browserUrl output; the
-          # gateway/gateway-path-style inputs are the fallback for that case
-          # only and do NOT get the previewnet suffix.
+          FULL_DOMAIN: ${{ steps.final.outputs.fullDomain }}
           RESOLVED_URL: ${{ steps.final.outputs.browserUrl }}
           GATEWAY: ${{ inputs.gateway }}
           PATH_STYLE: ${{ inputs.gateway-path-style }}
         run: |
-          if [ -n "$RESOLVED_URL" ]; then
+          if [ -n "$RESOLVED_URL" ] || [ -n "$FULL_DOMAIN" ]; then
             URL="$RESOLVED_URL"
           elif [ "$PATH_STYLE" = "true" ]; then
-            URL="https://${GATEWAY}/${DOMAIN}.dot"
+            URL="https://${GATEWAY}/${DOMAIN}"
           else
             URL="https://${DOMAIN}.${GATEWAY}"
           fi
@@ -495,6 +517,7 @@ jobs:
       - name: Deployment summary
         env:
           DOMAIN: ${{ steps.final.outputs.domain }}
+          FULL_DOMAIN: ${{ steps.final.outputs.fullDomain || steps.final.outputs.domain }}
           CID: ${{ steps.final.outputs.cid }}
           BROWSER_URL: ${{ steps.browser.outputs.url }}
         run: |
@@ -506,10 +529,10 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           else
             {
-              echo "### ${DOMAIN}.dot"
+              echo "### ${FULL_DOMAIN}"
               echo ""
-              echo "Browser &nbsp; ${BROWSER_URL}"
-              echo "Desktop &nbsp; \`${DOMAIN}.dot\`"
+              if [ -n "$BROWSER_URL" ]; then echo "Browser &nbsp; ${BROWSER_URL}"; fi
+              echo "Desktop &nbsp; \`${FULL_DOMAIN}\`"
               echo "CID &nbsp; \`${CID}\`"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -520,7 +543,7 @@ jobs:
         with:
           header: ${{ inputs.comment-header }}
           message: |
-            **${{ steps.final.outputs.domain }}.dot** · [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            **${{ steps.final.outputs.fullDomain || steps.final.outputs.domain }}** · [logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
 
             ${{ steps.browser.outputs.url }}
 

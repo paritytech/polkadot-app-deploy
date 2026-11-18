@@ -240,15 +240,13 @@ describe("formal-ci replay: FV-B-2 / #1651 an unreadable run fails closed (Every
 });
 
 describe("formal-ci replay: FV-B-3 / #1652 the in-run verdict counts only nightly-report's needs (EveryRedNightAccounted)", () => {
-  test("a still-queued DotNS-drift job is outside needs: excluded at report time and after, so the verdict cannot flip", () => {
+  test("a still-queued chain-call-encoding job is outside needs: excluded at report time and after, so the verdict cannot flip", () => {
     const needs = jobNeeds(E2E, "nightly-report");
-    for (const j of ["nightly-dotns-address-drift", "nightly-chain-identity"]) {
-      assert.equal(needs.includes(j), false, `>> FAIL: #1652 replay: ${j} is now in nightly-report needs; re-derive this replay`);
-    }
+    assert.equal(needs.includes("chain-call-encoding"), false, ">> FAIL: #1652 replay: chain-call-encoding is now in nightly-report needs; re-derive this replay");
     assert.ok(reportClassify.env.EXCLUDE_JOBS, ">> FAIL: #1652: nightly-report must pass EXCLUDE_JOBS (the jobs outside its needs)");
-    const DRIFT = "Nightly · DotNS address drift";
-    const atReport = [job(101, SUBDOMAIN, "completed", "failure"), job(105, DRIFT, "queued", null), job(104, "Nightly E2E Report", "in_progress", null)];
-    const afterRun = [job(101, SUBDOMAIN, "completed", "failure"), job(105, DRIFT, "completed", "failure"), job(104, "Nightly E2E Report", "completed", "success")];
+    const OUTSIDE_NEEDS = "Chain-call arg encoding (all extrinsics)";
+    const atReport = [job(101, SUBDOMAIN, "completed", "failure"), job(105, OUTSIDE_NEEDS, "queued", null), job(104, "Nightly E2E Report", "in_progress", null)];
+    const afterRun = [job(101, SUBDOMAIN, "completed", "failure"), job(105, OUTSIDE_NEEDS, "completed", "failure"), job(104, "Nightly E2E Report", "completed", "success")];
     const routesFor = (jobs) => [
       attemptJobs(1, jobs),
       ...lostAnnotations([101]),

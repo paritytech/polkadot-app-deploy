@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { createReadStream } from "fs";
-import { createClient, Enum } from "polkadot-api";
+import { Enum } from "polkadot-api";
 import { getTxCreator } from "polkadot-api/tx-creator";
 import { getWsProvider } from "./ws.js";
 import { PGAS_ASSET_LOCATION, PGAS_FEE_OPTIONS } from "./personhood/constants.js";
@@ -26,8 +26,9 @@ import { CID } from "multiformats/cid";
 import { withSpan, captureWarning, setDeployAttribute, setDeploySentryTag, truncateAddress, markCodePath, classifyErrorKind } from "./telemetry.js";
 import { CODE_PATHS } from "./code-paths.js";
 import { isTestnetSpecName, testnetFromNetworkField } from "./pool.js";
-import { validateContractAddresses } from "./environments.js";
-import type { PopSelfServeConfig } from "./environments.js";
+import { describeStackOrigin, loadStack, STACK_REQUIREMENTS } from "./stacks.js";
+import type { PopSelfServeConfig, Stack } from "./stacks.js";
+import { connectChainClient } from "./genesis.js";
 import { InsufficientFundsError, NonRetryableError } from "./errors.js";
 import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { classifyProtocolVersion, classifyDeclaredProtocolVersion, HIGHEST_VERIFIED_DOTNS_RELEASE, getAdapter, withTenPercentBuffer, POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL } from "./dotns-protocol.js";
@@ -56,14 +57,18 @@ export function assertTxCreator(signer: unknown, option: string): void {
   throw new NonRetryableError(`${option} must be a callable polkadot-api v3 TxCreator.${hint}`);
 }
 
-export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?: string; derivationPath?: string; signer?: SignerTxCreator; signerAddress?: string; /**
-   * Optional override for the Asset Hub RPC failover list. When provided, the
-   * primary RPC (this.rpc) is followed by these endpoints for retries. When
-   * omitted, the legacy hardcoded RPC_ENDPOINTS list (paseo) is used —
-   * preserves backwards-compatibility for external library consumers. The
-   * bulletin-deploy CLI passes the list resolved from environments.json so
-   * `--env <id>` drives both bulletin and asset-hub endpoints.
-  */
+export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?: string; derivationPath?: string; signer?: SignerTxCreator; signerAddress?: string;
+  /** A built-in stack by id or alias. connect() checks the Asset Hub genesis hash against the loaded stack. */
+  env?: string;
+  /**
+   * A stack descriptor file, URL or link. With `env` or `stack` set, the stack
+   * is the only source of contracts, tld, network, Asset Hub endpoints,
+   * deposit floors, popSelfServe, environmentId and autoAccountMapping:
+   * passing any of those as well throws. Without either, `contracts` and
+   * `assetHubEndpoints` (or `rpc`) are required.
+   */
+  stack?: string;
+  /** Asset Hub RPC failover list; the primary RPC (this.rpc) is followed by these endpoints for retries. */
   assetHubEndpoints?: string[];
   autoAccountMapping?: boolean;
   /**
@@ -83,29 +88,24 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
   /** Optional environment ID (e.g. "paseo-next-v2"). Used in shell command examples in error messages. */
   environmentId?: string;
   /**
-   * bulletin #1362/#1095: the resolved env's environments.json `network`
-   * field ("testnet" | "mainnet"). When set, this is AUTHORITATIVE for
-   * isTestnet() (and everything it gates — attemptTestnetTopUp's Alice/Bob
-   * dev-phrase spend) and is never overridden by a chain spec_name read.
-   * Omit (or pass an env-less/custom RPC) to fall back to the spec_name-based
-   * detection, unchanged from before this issue.
+   * "testnet" or "mainnet". When set, this decides isTestnet() (and
+   * everything it gates: attemptTestnetTopUp's Alice/Bob dev-phrase spend,
+   * the NoStatus self-grant path) over the chain's spec_name. Omit it to
+   * detect from spec_name.
    */
   network?: string;
-  /** Per-contract origin phrases from describeContractSources, named in address errors. */
-  contractSources?: Record<string, string>;
-  /** Optional PoP self-serve config resolved from environments.json. Gates state-aware and generic testnet guidance blocks. */
+  /** Optional PoP self-serve config. Gates state-aware and generic testnet guidance blocks. */
   popSelfServe?: PopSelfServeConfig | null;
-  /** Optional override for the storage deposit required for a fresh TLD register(). Loaded from environments.json per-env. */
+  /** Optional override for the storage deposit required for a fresh TLD register(). */
   registerStorageDeposit?: bigint;
-  /** Optional record-write storage-deposit floor (default MINIMUM_RECORD_STORAGE_DEPOSIT, capped at the registration floor), from environments.json. */
+  /** Optional record-write storage-deposit floor (default MINIMUM_RECORD_STORAGE_DEPOSIT, capped at the registration floor). */
   recordStorageDeposit?: bigint;
   /**
-   * Optional per-environment DotNS TLD (e.g. "paseo" on paseo-next-v2; "dot"
-   * on every other env). See environments.json's per-env `tld` field. When
-   * omitted, connect() reads DotnsProtocolRegistry.tld() on-chain instead of
-   * silently assuming a default (dotns PR #218); that read itself falls back
-   * to DEFAULT_TLD ("dot") only when it COMPLETES but reverts or returns
-   * empty data (pre-#218 deployment). See resolveTldFromRegistryResult.
+   * Optional DotNS TLD (e.g. "paseo" on paseo-next-v2; "testnet" on
+   * previewnet). When omitted, connect() reads DotnsProtocolRegistry.tld()
+   * on-chain; that read falls back to DEFAULT_TLD ("dot") only when it
+   * completes but reverts or returns empty data (pre-#218 deployment). See
+   * resolveTldFromRegistryResult.
    */
   tld?: string;
   /**
@@ -141,18 +141,16 @@ export interface DotNSConnectOptions { rpc?: string; keyUri?: string; mnemonic?:
    */
   phoneSigner?: boolean;
   /**
-   * Optional per-environment pin for the DotNS protocol generation (e.g. from
-   * environments.json's per-env `dotnsProtocol` field). ASSERTED against the
-   * live connect()-time probe, never used to override it — connect() throws
-   * naming both values when they disagree. A pin that silently overrode the
-   * probe would recreate exactly the "addresses are identical across
-   * generations so nothing flags a drift" failure this detection exists to
-   * prevent (2026-09-01 outage). Not wired from environments.json yet — that
-   * plumbing is a follow-up; this option exists so connect() can already
-   * honour it once it is.
+   * Optional pin for the DotNS ABI profile; polkadot-app-deploy never sets it.
+   * connect() checks it against the live probe and throws naming both values
+   * when they differ; it never overrides the probe.
    */
   dotnsProtocol?: DotnsAbiProfile;
 }
+const STACK_NETWORK_OPTIONS = [
+  "contracts", "tld", "network", "assetHubEndpoints", "registerStorageDeposit", "recordStorageDeposit",
+  "popSelfServe", "environmentId", "autoAccountMapping",
+] as const satisfies readonly (keyof DotNSConnectOptions)[];
 export interface OwnershipResult { owned: boolean; owner: string | null; }
 // Verdict from DotNS.checkNodeAuthorization: `authorised` is the actual
 // write-permission verdict (registry isAuthorised(node, account), or a
@@ -364,22 +362,27 @@ export function topUpTargetFor(plannedAction: DotnsSuccessAction, storageDeposit
   return TOP_UP_TARGET + storageDeposit + rentPriceNative + transferFeeNative;
 }
 
-export const RPC_ENDPOINTS: string[] = [
-  "wss://asset-hub-paseo.dotters.network",
-  "wss://sys.ibp.network/asset-hub-paseo",
-  "wss://pas-rpc.stakeworld.io/assethub",
-];
+const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
+const ZERO_ADDRESS = "0x" + "0".repeat(40);
 
-export const CONTRACTS = {
-  DOTNS_REGISTRAR: "0x329aAA5b6bEa94E750b2dacBa74Bf41291E6c2BD",
-  DOTNS_REGISTRAR_CONTROLLER: "0xd09e0F1c1E6CE8Cf40df929ef4FC778629573651",
-  DOTNS_REGISTRY: "0x4Da0d37aBe96C06ab19963F31ca2DC0412057a6f",
-  DOTNS_RESOLVER: "0x95645C7fD0fF38790647FE13F87Eb11c1DCc8514",
-  DOTNS_CONTENT_RESOLVER: "0x7756DF72CBc7f062e7403cD59e45fBc78bed1cD7",
-  DOTNS_REVERSE_RESOLVER: "0x95D57363B491CF743970c640fe419541386ac8BF",
-  STORE_FACTORY: "0x030296782F4d3046B080BcB017f01837561D9702",
-  POP_RULES: "0x4e8920B1E69d0cEA9b23CBFC87A17Ee6fE02d2d3",
-} as const;
+/** Whether `addr` is a 0x-prefixed 20-byte EVM address other than the zero address, in any casing. */
+export function isValidContractAddress(addr: unknown): boolean {
+  return typeof addr === "string" && EVM_ADDRESS_RE.test(addr) && addr.toLowerCase() !== ZERO_ADDRESS;
+}
+
+/** Fails naming the first malformed address in `contracts` and, when `sources` lists it, where it came from. */
+export function validateContractAddresses(
+  contracts: Record<string, string>,
+  envId: string,
+  sources?: Record<string, string>,
+): void {
+  for (const [name, addr] of Object.entries(contracts)) {
+    if (!isValidContractAddress(addr)) {
+      const origin = sources?.[name] ? ` This address came from ${sources[name]}.` : "";
+      throw new Error(`Invalid contract address for ${name} in environment ${envId}: ${addr}.${origin}`);
+    }
+  }
+}
 
 const PERSONHOOD_PRECOMPILE_ADDRESS = "0x000000000000000000000000000000000a010000";
 const PERSONHOOD_CONTEXT = "0x646f746e73000000000000000000000000000000000000000000000000000000";
@@ -637,7 +640,8 @@ export function dotnsRetryBackoffMs(attempt: number, rand: () => number = Math.r
 
 /**
  * Run `fn` up to `attempts` times, backing off between failures. Returns the
- * first success; rethrows the LAST error if every attempt fails. `sleep` and
+ * first success; rethrows a NonRetryableError at once, and otherwise the LAST
+ * error if every attempt fails. `sleep` and
  * `backoffMs` are injectable so the retry policy is unit-testable without real
  * timers. Used for the ReviveApi.address resolution in connect() (#1131) — a
  * generic seam so the "retry N times with backoff" behaviour is tested once,
@@ -659,6 +663,7 @@ export async function withRetry<T>(
     try {
       return await fn(attempt);
     } catch (e) {
+      if (e instanceof NonRetryableError) throw e;
       lastErr = e;
       if (attempt < opts.attempts) {
         const b = backoffMs(attempt);
@@ -739,9 +744,8 @@ export function makeRetryStatusFilter(sink: (status: string) => void): {
 
 export const DEFAULT_MNEMONIC: string = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
 
-// DotNS's per-network TLD (issue: paseo-next-v2 redeploy). Most envs keep
-// ".dot"; paseo-next-v2 now uses ".paseo" — see assets/environments.json's
-// per-env `tld` field and src/environments.ts's ResolvedEndpoints.tld.
+// DotNS's per-network TLD, the stack descriptor's `tld` (previewnet: ".testnet",
+// paseo-next-v2: ".paseo").
 // DEFAULT_TLD is the fallback for every existing call site / library consumer
 // that never passes a tld — NOT a module-level mutable global (deploy() is
 // consumed as a library by playground-cli, so per-instance/per-call state is
@@ -782,7 +786,7 @@ export const KNOWN_TLDS: readonly string[] = ["dot", "paseo"];
 // On-chain TLD resolution (dotns PR #218 — DotnsProtocolRegistry.tld()/tldNode()).
 //
 // Resolution order, exactly:
-//   1. environments.json's per-env `tld` field, when set — no chain read.
+//   1. The stack descriptor's `tld`, when connect() gets one — no chain read.
 //   2. Absent — read DotnsProtocolRegistry.tld() at connect() time.
 //   3. That read completes but reverts / returns empty `0x` — pre-#218
 //      deployment — fall back to DEFAULT_TLD.
@@ -1218,9 +1222,10 @@ function extractStorageDepositCharge(rawStorageDeposit: unknown): bigint {
   return 0n;
 }
 
-function dotnsContractName(address: string, contracts: Record<string, string> = CONTRACTS): string {
+
+function dotnsContractName(address: string, contracts: Record<string, string>): string {
   const normalized = address.toLowerCase();
-  for (const [name, contractAddress] of Object.entries({ ...CONTRACTS, ...contracts })) {
+  for (const [name, contractAddress] of Object.entries(contracts)) {
     if (contractAddress.toLowerCase() === normalized) return name;
   }
   return "unknown";
@@ -1282,7 +1287,7 @@ function formatContractDryRunFailure(
   },
 ): string {
   const functionName = context.functionName ?? "unknown";
-  const contractName = dotnsContractName(context.contractAddress, context.contracts);
+  const contractName = dotnsContractName(context.contractAddress, context.contracts ?? {});
   const lines = [
     `Contract execution would revert during ${functionName} on ${contractName}`,
     `  contract: ${context.contractAddress}`,
@@ -1935,6 +1940,14 @@ function exampleNoStatusLabel(label: string, tld: string = DEFAULT_TLD): string 
 // Preflight's chain reads rethrow on these rather than falling back to a
 // default: network noise is not evidence about the chain's state.
 const READ_NEVER_COMPLETED_RE = /timed out after \d+ms|heartbeat timeout|WS halt|Unable to connect|ChainHead disjointed|websocket.*closed|socket closed|disconnect/i;
+
+// Why a signer cannot publicly register a base name it holds the live
+// reservation for. Up to DotNS 1.0.0 PopRules lets the reservation's owner
+// register it; from 1.1.0 a live reservation keeps the name off public
+// registration for every account, so it is taken only through a gateway claim.
+export function reservedForOwnClaimReason(baseName: string): string {
+  return `Base name ${baseName} is reserved for your own personhood claim, and PopRules keeps a reserved name off public registration for every account, its owner included. Claim it through the gateway, or deploy to another name.`;
+}
 
 // PopRules closes every base length below nine unless shortNamesEnabled is on.
 // Below six is already Reserved and refused earlier, so six to eight is the only
@@ -2851,6 +2864,22 @@ export function formatPopShortfallReason(opts: {
   return leadIn + testnetBlock + alternativesBlock;
 }
 
+/** The connect options a loaded stack supplies: every network value DotNS.connect takes from it. */
+export function connectOptionsFromStack(stack: Stack): Required<Pick<DotNSConnectOptions, "assetHubEndpoints" | "environmentId" | "network" | "tld" | "autoAccountMapping" | "contracts">>
+  & Pick<DotNSConnectOptions, "popSelfServe" | "registerStorageDeposit" | "recordStorageDeposit"> {
+  return {
+    assetHubEndpoints: stack.chains.AssetHub.rpc,
+    contracts: stack.contracts,
+    environmentId: stack.id,
+    network: stack.network,
+    popSelfServe: stack.popSelfServe,
+    registerStorageDeposit: stack.registerStorageDeposit,
+    recordStorageDeposit: stack.recordStorageDeposit,
+    tld: stack.tld,
+    autoAccountMapping: stack.autoAccountMapping,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // DotNS class
 // ---------------------------------------------------------------------------
@@ -2863,17 +2892,17 @@ export class DotNS {
   evmAddress: string | null;
   signer: SignerTxCreator | null;
   connected: boolean;
-  // Per-instance failover list. Populated from options.assetHubEndpoints when
-  // bulletin-deploy resolves the asset-hub list via environments.json; falls
-  // back to the legacy paseo-only RPC_ENDPOINTS for direct library callers.
+  // Per-instance failover list, from options.assetHubEndpoints or the stack.
   assetHubEndpoints: string[];
 
   private _usesExternalSigner = false;
   /** True only when the signer is a real phone/session signer that needs `_awaitPhoneReady`. */
   private _isPhoneSigner = false;
   private _localMnemonic: string | null = null;
-  private _contracts: typeof CONTRACTS & { DOTNS_PROTOCOL_REGISTRY?: string; DOTNS_POP_CONTROLLER?: string } = CONTRACTS;
-  private _contractSources: Record<string, string> = {};
+  private _contracts: Record<string, string> = {};
+  // Where every address in _contracts came from: the stack's origin or the contracts option.
+  private _contractSource: string | null = null;
+  private _stack: Stack | null = null;
   private _nativeToEthRatio: bigint = NATIVE_TO_ETH_RATIO;
   private _environmentId: string | null = null;
   // bulletin #1362/#1095: the resolved env's declared `network`, when
@@ -2954,7 +2983,7 @@ export class DotNS {
     this._reproveFallbackForTest = result;
   }
 
-  constructor() { this.client = null; this.clientWrapper = null; this.rpc = null; this.substrateAddress = null; this.evmAddress = null; this.signer = null; this.connected = false; this.assetHubEndpoints = RPC_ENDPOINTS; }
+  constructor() { this.client = null; this.clientWrapper = null; this.rpc = null; this.substrateAddress = null; this.evmAddress = null; this.signer = null; this.connected = false; this.assetHubEndpoints = []; }
 
   /**
    * The authoritative, post-connect resolved TLD: `options.tld` when the env
@@ -3044,15 +3073,22 @@ export class DotNS {
 
   /**
    * Tear down the current papi client (if any) and stand up a fresh WS
-   * connection + ReviveClientWrapper against `endpoint`. Escapes a
+   * connection + ReviveClientWrapper against `endpoint`, checked against the
+   * stack's Asset Hub genesis hash when connected with a stack. Escapes a
    * wedged/slow/stale connection — used by connect()'s ReviveApi.address
    * retry (#1131) and by setContenthash's post-deploy read-back retry
-   * (#1131-follow-up), which is the single reason this is a shared helper
-   * rather than two copies of the same three lines.
+   * (#1131-follow-up), which is the single reason this is a shared helper.
    */
-  private recreateReviveClient(endpoint: string): void {
+  private async recreateReviveClient(endpoint: string): Promise<void> {
     if (this.client) { try { this.client.destroy(); } catch { /* ignore teardown errors */ } }
-    this.client = createClient(getWsProvider(endpoint, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }));
+    this.client = null;
+    this.clientWrapper = null;
+    this.client = await connectChainClient(
+      this._stack ?? undefined,
+      "AssetHub",
+      endpoint,
+      { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS },
+    );
     this.clientWrapper = new ReviveClientWrapper(this.client.getUnsafeApi());
     // bulletin-deploy #1518: this is the ONLY place a ReviveClientWrapper is
     // ever constructed (grep confirms), so it is the one place that cannot
@@ -3070,18 +3106,47 @@ export class DotNS {
       this.ensureSubmissionFunding(operation, storageDepositLimit, value));
   }
 
-  async connect(options: DotNSConnectOptions = {}): Promise<this> {
-    assertTxCreator(options.signer, "DotNSConnectOptions.signer");
+  async connect(connectOptions: DotNSConnectOptions = {}): Promise<this> {
+    assertTxCreator(connectOptions.signer, "DotNSConnectOptions.signer");
+    const { env, stack: stackSource } = connectOptions;
+    let options: DotNSConnectOptions;
+    let stack: Stack | null = null;
+    if (env !== undefined || stackSource !== undefined) {
+      const conflicting = STACK_NETWORK_OPTIONS.find((name) => connectOptions[name] !== undefined);
+      if (conflicting) {
+        throw new NonRetryableError(
+          `DotNS.connect takes ${conflicting} from the stack selected by env/stack; pass either env/stack or ${conflicting}, not both`,
+        );
+      }
+      stack = await loadStack({ env, stack: stackSource });
+      options = { ...connectOptions, ...connectOptionsFromStack(stack) };
+    } else {
+      options = connectOptions;
+    }
+    const contracts: Record<string, string> = { ...options.contracts };
+    this._stack = stack;
     if (options.assetHubEndpoints && options.assetHubEndpoints.length > 0) {
       this.assetHubEndpoints = options.assetHubEndpoints;
     }
-    if (options.contracts && Object.keys(options.contracts).length > 0) {
-      // Validate early — before any chain calls — so a stale environments.json
-      // surfaces a clear error rather than a confusing RPC revert.
-      validateContractAddresses(options.contracts, options.environmentId ?? "unknown", options.contractSources);
-      this._contracts = { ...CONTRACTS, ...options.contracts } as typeof CONTRACTS & { DOTNS_PROTOCOL_REGISTRY?: string };
+    const missingContracts = STACK_REQUIREMENTS.contracts.filter((name) => !contracts[name]);
+    if (missingContracts.length > 0) {
+      throw new NonRetryableError(
+        `DotNS.connect needs env, stack (a descriptor file, URL or link), or a contracts option with ${missingContracts.join(", ")} plus assetHubEndpoints or rpc`,
+      );
     }
-    this._contractSources = options.contractSources ?? {};
+    if (!options.rpc && !process.env.DOTNS_RPC && this.assetHubEndpoints.length === 0) {
+      throw new NonRetryableError(
+        "DotNS.connect needs env, stack (a descriptor file, URL or link), or assetHubEndpoints or rpc next to the contracts option",
+      );
+    }
+    const contractSource = stack ? describeStackOrigin(stack) : "the contracts option of DotNS.connect()";
+    // Validated before any chain call, so a malformed address fails with its origin instead of an RPC revert.
+    if (!stack) {
+      const sources = Object.fromEntries(Object.keys(contracts).map((name) => [name, contractSource]));
+      validateContractAddresses(contracts, options.environmentId ?? "unknown", sources);
+    }
+    this._contractSource = contractSource;
+    this._contracts = contracts;
     if (options.environmentId) {
       this._environmentId = options.environmentId;
     }
@@ -3170,7 +3235,7 @@ export class DotNS {
       // rather than failing the whole deploy on one bad ~30s window.
       try {
         this.evmAddress = await withRetry(async (attempt) => {
-          this.recreateReviveClient(rpc);
+          await this.recreateReviveClient(rpc);
           const addr = await withTimeout(
             this.clientWrapper!.getEvmAddress(this.substrateAddress!),
             CONNECTION_TIMEOUT_MS,
@@ -3186,6 +3251,7 @@ export class DotNS {
           },
         });
       } catch (e: any) {
+        if (e instanceof NonRetryableError) throw e;
         const inner = e?.message?.slice(0, 200) ?? String(e).slice(0, 200);
         const rpcHint = inner.includes("timed out") ? `; RPC: ${rpc} — retry or set DOTNS_RPC to another endpoint` : "";
         throw new Error(
@@ -3216,22 +3282,22 @@ export class DotNS {
       // reused.
       this._subnodeOwnerShape = null;
       this._shortNamesEnabled = null;
-      // Optional pin (e.g. environments.json's per-env `dotnsProtocol`):
+      // Optional pin (a `dotnsProtocol` option):
       // ASSERTED against the live probe, never obeyed over it. A pin that
       // silently overrode the probe would recreate exactly the failure this
       // detection exists to prevent.
       if (options.dotnsProtocol && options.dotnsProtocol !== this._protocolVersion) {
         this.connected = false;
         throw new Error(
-          `DotNS protocol mismatch on ${this._environmentId ?? "unknown"}: environments.json pins dotnsProtocol="${options.dotnsProtocol}" but the live probe detected "${this._protocolVersion}". The pin and the chain disagree — update the pin or investigate why the chain doesn't match it.`,
+          `DotNS protocol mismatch on ${this._environmentId ?? "unknown"}: the dotnsProtocol pin is "${options.dotnsProtocol}" but the live probe detected "${this._protocolVersion}". The pin and the chain disagree — update the pin or investigate why the chain doesn't match it.`,
         );
       }
 
       // Ensure the account is mapped before any dry-run that requires a mapped
       // origin. Auto-map chains may reject explicit map_account; fall back to
       // the Revive.call trigger when that path is unavailable.
-      await this.resolveNativeToEthRatio(options);
       try {
+        await this.resolveNativeToEthRatio(options);
         await this.ensureMappedAccountReady(options.autoAccountMapping ?? false, options.autoMapTopUpTarget);
       } catch (e) {
         this.connected = false;
@@ -3352,44 +3418,48 @@ export class DotNS {
   /**
    * Resolve the authoritative nativeToEthRatio for this session.
    *
-   * Priority: chain constant (Revive.NativeToEthRatio) > options.nativeToEthRatio > default.
-   * On mismatch between the env-configured value and the chain value, logs a WARNING naming
+   * Priority: chain constant (Revive.NativeToEthRatio) > options.nativeToEthRatio.
+   * On mismatch between the configured value and the chain value, logs a WARNING naming
    * both values and proceeds with the chain value (it is the source of truth).
-   * On query failure, falls back to the configured/default value without throwing.
+   * When the constant cannot be read, uses options.nativeToEthRatio, and without it fails
+   * with a NonRetryableError naming the chain: the ratio differs per chain, so no default fits.
    *
    * Must be called after clientWrapper is established (i.e. inside connect()).
    */
   async resolveNativeToEthRatio(options: DotNSConnectOptions): Promise<void> {
-    // Apply env/default baseline first so it always wins over the class default on its own.
-    const configuredRatio: bigint = options.nativeToEthRatio ?? NATIVE_TO_ETH_RATIO;
-    this._nativeToEthRatio = configuredRatio;
+    const configuredRatio = options.nativeToEthRatio;
+    if (configuredRatio !== undefined) this._nativeToEthRatio = configuredRatio;
     if (!this.clientWrapper) return;
+    let chainRatio: bigint;
     try {
-      const chainValue = await this.clientWrapper.client.constants.Revive.NativeToEthRatio();
-      const chainRatio = BigInt(chainValue as bigint | number);
-      if (chainRatio !== configuredRatio) {
-        const msg = `DotNS: Revive.NativeToEthRatio from chain (${chainRatio}) differs from configured value (${configuredRatio}); using chain value`;
-        console.warn(msg);
-        captureWarning("nativeToEthRatio mismatch: chain value overrides env config", {
-          chain_value: String(chainRatio),
-          configured_value: String(configuredRatio),
-        });
-      }
-      this._nativeToEthRatio = chainRatio;
-    } catch {
-      // Chain query failed — keep the configured/default baseline. Do not break connect.
+      chainRatio = BigInt(await this.clientWrapper.client.constants.Revive.NativeToEthRatio() as bigint | number);
+    } catch (error) {
+      if (configuredRatio !== undefined) return;
+      const chain = this._stack ? `the Asset Hub of stack ${this._stack.id}` : "Asset Hub";
+      throw new NonRetryableError(
+        `DotNS connect: could not read Revive.NativeToEthRatio from ${chain} at ${this.rpc} (${(error as Error)?.message ?? String(error)}); fees cannot be converted to native units without it`,
+      );
     }
+    if (configuredRatio !== undefined && chainRatio !== configuredRatio) {
+      const msg = `DotNS: Revive.NativeToEthRatio from chain (${chainRatio}) differs from configured value (${configuredRatio}); using chain value`;
+      console.warn(msg);
+      captureWarning("nativeToEthRatio mismatch: chain value overrides env config", {
+        chain_value: String(chainRatio),
+        configured_value: String(configuredRatio),
+      });
+    }
+    this._nativeToEthRatio = chainRatio;
   }
 
   // Returns true when this is a testnet — used to gate test-only/money-moving
   // behaviors like attemptTestnetTopUp's Alice/Bob dev-phrase transfer and
   // self-granting Full PoP on a Lite signer for a NoStatus label.
   //
-  // bulletin #1362/#1095: `this._network` (from connect()'s `network` option,
-  // sourced from environments.json) takes precedence over the spec_name read
-  // below via testnetFromNetworkField() (pool.ts) — see its doc comment for
-  // the full three-state rationale. Mirrors detectTestnet()'s use of the same
-  // helper exactly, so the two stay in lockstep by construction.
+  // #1095: `this._network` (from connect()'s `network` option, normally the
+  // stack's policy) takes precedence over the spec_name read below via
+  // testnetFromNetworkField() (pool.ts) — see its doc comment for the full
+  // three-state rationale. Mirrors detectTestnet()'s use of the same helper
+  // exactly, so the two stay in lockstep by construction.
   private _testnetCache: boolean | null = null;
   async isTestnet(): Promise<boolean> {
     const override = testnetFromNetworkField(this._network);
@@ -3406,8 +3476,8 @@ export class DotNS {
         return this._testnetCache;
       } catch {}
     }
-    // Fallback: infer from RPC endpoint string. The default RPC_ENDPOINTS are
-    // all Paseo (testnet); an explicit mainnet RPC would not contain "paseo".
+    // Fallback: infer from the RPC endpoint string; an explicit mainnet RPC
+    // would not contain "paseo".
     const rpc = this.rpc ?? "";
     this._testnetCache = isTestnetSpecName(rpc) || rpc.includes("paseo") || rpc.includes("westend") || rpc.includes("rococo");
     return this._testnetCache;
@@ -3758,11 +3828,11 @@ export class DotNS {
     }
   }
 
-  // Ends an address error with where that address came from. A key with no
-  // recorded source fell through to the defaults compiled into this module.
+  // Ends an address error with where that address came from.
   private contractSourceHint(name: string): string {
-    const src = this._contractSources[name];
-    return src ? ` This address came from ${src}.` : ` No environment or --contract supplied ${name}, so this is the built-in default address.`;
+    return this._contracts[name] && this._contractSource
+      ? ` This address came from ${this._contractSource}.`
+      : ` No stack or contracts option supplied ${name}.`;
   }
 
   async contractCall(contractAddress: string, contractAbi: readonly any[], functionName: string, args: any[] = []): Promise<any> {
@@ -4803,7 +4873,7 @@ export class DotNS {
         await withRetry(async (attempt) => {
           if (attempt > 1) {
             const endpoint = pickVerifyEndpoint(attempt, this.rpc, this.assetHubEndpoints);
-            this.recreateReviveClient(endpoint);
+            await this.recreateReviveClient(endpoint);
           }
           finalOnChain = ((await this.getContenthash(domainName)) || "0x").toLowerCase();
           if (finalOnChain !== expected) throw new Error(`contenthash still ${finalOnChain}, awaiting ${expected}`);
@@ -4815,7 +4885,10 @@ export class DotNS {
             console.log(`      Read-back attempt ${attempt}/${CONTENTHASH_VERIFY_ATTEMPTS} saw a mismatch (${inner}) — retrying against a fresh connection in ${Math.round(backoff / 1000)}s…`);
           },
         });
-      } catch { /* keep last finalOnChain for the error message below */ }
+      } catch (e) {
+        // retain the last finalOnChain for the error message below; a rotated endpoint on another chain is not a mismatch
+        if (e instanceof NonRetryableError) throw e;
+      }
       if (finalOnChain !== expected) {
         throw new Error(
           `Post-deploy verification failed for ${domainName}.${this._tld}: on-chain contenthash is ${finalOnChain}, ` +
@@ -5205,6 +5278,22 @@ export class DotNS {
     return { requiredStatus, message };
   }
 
+  // Whether PopRules refuses `owner` the name `label` because its base name is
+  // under a live reservation. Read from PopRules' own quote, which applies the
+  // connected release's rule (see reservedForOwnClaimReason). Null when the
+  // quote could not be read (a revert or empty data); a read that never
+  // completed throws, as for isBaseNameReserved in preflight.
+  private async reservationBlocksOwner(label: string, owner: string): Promise<boolean | null> {
+    try {
+      const quote = await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "priceWithoutCheck", [label, owner]), 30000, "priceWithoutCheck");
+      const status = (quote as any)?.status;
+      return status == null ? null : Number(status) === ProofOfPersonhoodStatus.Reserved;
+    } catch (e: any) {
+      if (READ_NEVER_COMPLETED_RE.test(e?.message ?? String(e))) throw e;
+      return null;
+    }
+  }
+
   async ensureNotRegistered(label: string): Promise<void> {
     this.ensureConnected();
     console.log(`\n   Checking availability of ${label}.${this._tld}...`);
@@ -5313,6 +5402,7 @@ export class DotNS {
     const reservationInfo = await withTimeout(this.contractCall(this._contracts.POP_RULES, POP_RULES_ABI, "isBaseNameReserved", [baseName]), 30000, "isBaseNameReserved");
     const [isReserved, reservationOwner] = reservationInfo;
     if (isReserved && reservationOwner.toLowerCase() !== this.evmAddress!.toLowerCase()) throw new Error("Base name reserved for original Lite registrant");
+    if (isReserved && (await this.reservationBlocksOwner(label, this.evmAddress!)) === true) throw new Error(reservedForOwnClaimReason(baseName));
     const { requiredStatus, message } = await this.classifyName(label);
     const userStatus = await this.getUserPopStatus();
     if (requiredStatus === ProofOfPersonhoodStatus.Reserved) throw new Error(message);
@@ -6039,6 +6129,18 @@ export class DotNS {
         };
       }
 
+      // Base name reserved for this signer: whether that still lets it register
+      // the name publicly depends on the DotNS release, so PopRules decides.
+      if (isReserved && (await this.reservationBlocksOwner(validated, selfAddress)) === true) {
+        return {
+          label: validated, classification, userStatus, trailingDigits, baselength,
+          isAvailable: true, existingOwner: null, isBaseNameReserved: true, reservationOwner,
+          isTestnet, canProceed: false,
+          reason: reservedForOwnClaimReason(baseName),
+          plannedAction: "abort", needsPopUpgrade: false, signerFreeBalance,
+        };
+      }
+
       const targetPopStatus = userStatus;
 
       // Before the personhood check: a shut band is not a personhood problem, and
@@ -6311,7 +6413,7 @@ export class DotNS {
     if (!this.substrateAddress || !this.signer) {
       throw new Error("reprove: DotNS must be connected with a signer");
     }
-    const envId = this._environmentId ?? "paseo-next-v2";
+    const stack = this.requireStack("reprove");
 
     // Import lazily to avoid pulling verifiablejs into the main bundle for
     // callers who never use the bootstrap/reprove path.
@@ -6326,7 +6428,7 @@ export class DotNS {
     const memberEntropy = deriveMemberEntropy(mnemonic);
     const memberKey = deriveMemberKey(mnemonic);
 
-    const peopleConn = await connectPeopleClient(envId);
+    const peopleConn = await connectPeopleClient(stack);
     try {
       const result = await reproveAliasToAccount({
         peopleUnsafeApi: peopleConn.unsafeApi,
@@ -6372,8 +6474,12 @@ export class DotNS {
    */
   async bootstrap(mnemonic: string): Promise<import("./personhood/bootstrap.js").BootstrapResult> {
     const { runBootstrap } = await import("./personhood/bootstrap.js");
-    const envId = this._environmentId ?? "paseo-next-v2";
-    return runBootstrap({ mnemonic, environmentId: envId });
+    return runBootstrap({ mnemonic, stack: this.requireStack("bootstrap") });
+  }
+
+  private requireStack(operation: string): Stack {
+    if (!this._stack) throw new NonRetryableError(`${operation}: DotNS must be connected with env or stack`);
+    return this._stack;
   }
 
   /**

@@ -47,7 +47,7 @@
     "tools/release-retry-wrapper.mjs"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "trinity-stack generate && tsup && node scripts/check-stacks.mjs",
     "typecheck": "tsc --noEmit -p .",
     "postinstall": "patch-package || true",
     "prepare": "npm run build",
@@ -67,6 +67,7 @@
     "@parity/product-sdk-keys": "^0.5.4",
     "@parity/product-sdk-terminal": "^0.13.4",
     "@parity/product-sdk-tx": "^0.5.4",
+    "@parity/trinity-stack": "^0.2.1",
     "@polkadot-api/metadata-builders": "^0.14.2",
     "@polkadot-api/signers-common": "^0.4.0",
     "@polkadot-api/substrate-bindings": "^0.20.2",
@@ -101,7 +102,7 @@
   },
   "minimumVersion": "0.5.6",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.3"
   },
   "packageManager": "npm@11.17.0",
   "license": "GPL-3.0-or-later"

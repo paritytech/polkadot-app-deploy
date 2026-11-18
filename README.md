@@ -17,7 +17,7 @@ It targets Polkadot **testnets** (default: `paseo-next-v2`). This is reference t
 - **Zero-signature testnet deploys** — a local worker registers the name and uploads the content, then transfers ownership to your signed-in account — no wallet taps in the default testnet flow.
 - **Incremental uploads** — re-deploys only push the content chunks that changed, so updates are fast and cheap.
 - **No native dependency required** — `--js-merkle` does content addressing in pure JavaScript; the IPFS Kubo binary is optional, not required.
-- **Built-in environments** — target presets (RPC endpoints + contract addresses) selectable with `--env`, overridable per field.
+- **Built-in networks** — Trinity stack presets selectable with `--env`; any other stack with `--stack`.
 - **Telemetry off by default** — opt-in only, and honors the `DO_NOT_TRACK` convention.
 
 ## Install
@@ -76,7 +76,8 @@ Key options:
 
 | Option | Description |
 |--------|-------------|
-| `--env <id>` | Target environment (default: `paseo-next-v2`). Also settable session-wide via the `PAD_ENV` env var; `--env` wins if both are given. Run `--list-environments` to see available IDs. |
+| `--env <id>` | Built-in stack id or alias (default: `paseo-next-v2`). Run `--list-environments` to see available IDs. |
+| `--stack <link\|url\|file>` | Deploy to a stack that is not built in: a `polkadotapp://stack` link, a descriptor URL or a descriptor file. Cannot be combined with `--env`. |
 | `--mnemonic "..."` | DotNS owner mnemonic (or set `MNEMONIC`, then `DOTNS_MNEMONIC`). Alternative to session signing. |
 | `--no-transfer-to-signedin-user` | When signed in, sign every DotNS tx with your mobile session instead of the default register-as-worker-then-hand-over flow. |
 | `--to <0xH160>` | Recipient address for the `transfer` subcommand. Defaults to the signed-in account; the zero address is refused. |
@@ -90,7 +91,7 @@ Subcommands: `login`, `logout`, `whoami` (session management, above) and `transf
 
 ## Environments
 
-polkadot-app-deploy ships with built-in environment presets (RPC endpoints, contract addresses, DotNS TLD). The default is `paseo-next-v2`, a Polkadot testnet. Use `--list-environments` to print the table; override individual fields with `--environment-file <path>` or `--contract KEY=0x...`. For what a starting account needs on a given network — funding, a DotNS name, authorization — see **[DEPLOYMENT.md](DEPLOYMENT.md)**.
+polkadot-app-deploy ships with built-in Trinity stacks: `preview` (aliases `previewnet`, `ppn`), `paseo-next-v2` (default, a Polkadot testnet), `pcf-devnet` (alias `PCF-devnet`) and `polkadot` (mainnet: no auto-authorize, no top-ups, no dev defaults). Each run fetches the selected stack's published descriptor and falls back to the shipped copy with a warning. Use `--list-environments` to print the table. To deploy to any other stack, such as a fork or a local stack, pass `--stack ./my-stack.json` (or a descriptor URL or `polkadotapp://stack` link, or set `PAD_STACK`). For what a starting account needs on a given network — funding, a `.dot` name, authorization — see **[DEPLOYMENT.md](DEPLOYMENT.md)**.
 
 ## Build from source
 

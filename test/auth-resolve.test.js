@@ -2,11 +2,13 @@
 // and stale-session message emit path in deploy.ts.
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 import { setupStaleSessionHome } from "./helpers/stale-session-home.js";
+import { startFakeChain } from "./helpers/fake-chain.js";
+import { createCliTestEnv, writeLocalStack } from "./helpers/isolated-home.js";
 
 describe("chooseSignerInput", async () => {
     const { chooseSignerInput } = await import("../dist/deploy.js");
@@ -332,39 +334,57 @@ describe("deploy CLI: unreadable persisted session must fail fast, not fall back
   const { DOT_DAPP_ID } = await import("../dist/auth-config.js");
   const { EXIT_CODE_NO_RETRY } = await import("../dist/deploy.js");
   const repoRoot = path.resolve(import.meta.dirname, "..");
+  const { readShippedStack } = await import("../dist/stacks.js");
 
   // Shared scaffold for both tests below: a fresh corrupt-session HOME + a
-  // throwaway build dir, spawn the built CLI against them, clean up either way.
+  // throwaway build dir, run the built CLI against them, clean up either way.
+  // Asynchronous, so a fake chain served from this process can answer meanwhile.
   async function runDeployAgainstCorruptSession(domainLabel, extraArgs, extraEnv) {
     const fakeHome = await setupStaleSessionHome(DOT_DAPP_ID, "pad-234-");
     const buildDir = fs.mkdtempSync(path.join(os.tmpdir(), "pad-234-build-"));
     fs.writeFileSync(path.join(buildDir, "index.html"), "<html></html>");
     try {
-      return spawnSync(process.execPath, [path.join(repoRoot, "bin/polkadot-app-deploy"), buildDir, domainLabel, "--no-manifest", ...extraArgs], {
+      const child = spawn(process.execPath, [path.join(repoRoot, "bin/polkadot-app-deploy"), buildDir, domainLabel, "--no-manifest", ...extraArgs], {
         cwd: repoRoot,
-        encoding: "utf8",
-        timeout: 8000,
-        killSignal: "SIGKILL",
-        env: {
-          ...process.env,
-          HOME: fakeHome,
-          USERPROFILE: fakeHome,
-          // Unreachable on purpose — should never be dialled in the no-mnemonic
-          // case (abort happens first); in the --mnemonic case the deploy is
-          // expected to fail here, AFTER signer selection is what's under test.
-          DOTNS_RPC: "ws://127.0.0.1:1",
-          PAD_UPDATE_CHECK: "0",
-          ...extraEnv,
-        },
+        // A temp home with the stale session, a local stack, no live network; DOTNS_RPC is
+        // unreachable too, so the --mnemonic case fails at DotNS after signer selection.
+        env: createCliTestEnv(fakeHome, { DOTNS_RPC: "ws://127.0.0.1:1", ...extraEnv }),
       });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const timer = setTimeout(() => child.kill("SIGKILL"), 8000);
+      const status = await new Promise((resolve) => child.on("close", (code) => resolve(code)));
+      clearTimeout(timer);
+      return { status, stdout, stderr };
     } finally {
       fs.rmSync(buildDir, { recursive: true, force: true });
       fs.rmSync(fakeHome, { recursive: true, force: true });
     }
   }
 
+  // The stack comes from a file (no descriptor fetch) whose People endpoint counts connections and
+  // whose other chains are unreachable, so the run is offline and any People read shows up.
+  function writeStackFile(peopleUrl) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bd-234-stack-"));
+    return { dir, file: writeLocalStack(dir, { urlFor: (role) => (role === "People" ? peopleUrl : "ws://127.0.0.1:1") }) };
+  }
+
   test("no --mnemonic + unreadable session on disk: deploy exits non-zero (NonRetryableError) BEFORE any signer plan or phone gate is printed", async () => {
-    const result = await runDeployAgainstCorruptSession("authfailfast234x", [], { MNEMONIC: "", DOTNS_MNEMONIC: "" });
+    const people = await startFakeChain(readShippedStack("paseo-next-v2").chains.People.genesisHash);
+    const { dir, file } = writeStackFile(people.url);
+    let result;
+    try {
+      result = await runDeployAgainstCorruptSession("authfailfast234x", ["--stack", file], { MNEMONIC: "", DOTNS_MNEMONIC: "" });
+    } finally {
+      await people.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+    // The session read itself opens the SSO adapter's People connection (statement store), so the
+    // signal is the genesis read: the People check runs only for a session about to be used.
+    assert.equal(people.genesisReads, 0,
+      `>> FAIL: #234: an unreadable session must fail before the People genesis/NetworkSuffix check; got ${people.genesisReads} genesis read(s)`);
 
     assert.equal(
       result.status, EXIT_CODE_NO_RETRY,

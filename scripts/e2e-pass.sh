@@ -163,6 +163,7 @@ case "$MODE" in
     # S8: WS fault injection — drop-once reconnect + rapid-storm bail.
     # wsHaltCallback fix (#287) prevents the activeBroadcasts.forEach OOM.
     run s8 direct js
+    run s-store-blocks pool js
     ;;
 
   *)

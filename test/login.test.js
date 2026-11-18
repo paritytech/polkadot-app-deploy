@@ -1,6 +1,7 @@
 // test/login.test.js — unit tests for src/commands/login.ts
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 // Top-level import — consistent with auth-config.test.js pattern.
 const { bulletinAuthSummary, formatAllocationSummary, withTimeout } = await import("../dist/commands/login.js");
@@ -256,5 +257,32 @@ describe("allocationFailedMessage", async () => {
             /personhood|alias/i.test(msg),
             ">> FAIL: login/allocationFailedMessage: must mention personhood or alias as likely cause hint",
         );
+    });
+});
+
+describe("People check placement", () => {
+    const readSource = (name) => readFileSync(`src/commands/${name}.ts`, "utf8");
+
+    // login pairs against People, and transfer writes the session's address on chain, so both
+    // check the chain; logout must clear local storage while People is down, and whoami only
+    // reads the local session.
+    test("login and transfer check the People chain; logout and whoami do not", () => {
+        assert.match(readSource("login"), /await assertPeopleMatchesStack\(stack\);\s*const client = await getAuthClient\(stack\);/,
+            ">> FAIL: login: runLogin must check People (genesis and NetworkSuffix) before pairing");
+        assert.match(readSource("transfer"), /await assertPeopleMatchesStack\(stack\);\s*sessionH160 = handle\.addresses\.productH160;/,
+            ">> FAIL: transfer: a session recipient must be checked against People before its address is written on chain");
+        assert.match(readSource("transfer"), /if \(!opts\.to\) \{[\s\S]*assertPeopleMatchesStack[\s\S]*\}\s*const recipient/,
+            ">> FAIL: transfer: with --to the transfer must stay off the People chain");
+        for (const name of ["logout", "whoami"]) {
+            assert.doesNotMatch(readSource(name), /assertPeopleMatchesStack/,
+                `>> FAIL: ${name}: must not read the People chain for the stack check`);
+        }
+    });
+
+    // A Bulletin genesis mismatch in the authorization poll means the stack is wrong; reporting
+    // it as a personhood pre-warm failure would hide it and exit 0.
+    test("a NonRetryableError in the post-sign-in pre-warm is rethrown, not reported as an allocation failure", () => {
+        assert.match(readSource("login"), /\} catch \(err\) \{\s*(\/\/[^\n]*\n\s*)*if \(err instanceof NonRetryableError\) throw err;\s*(\/\/[^\n]*\n\s*)*await Promise\.resolve\(handle\.userSession\.abortPendingRequests\(\)\)/,
+            ">> FAIL: login: the pre-warm catch must rethrow NonRetryableError (e.g. GenesisMismatchError) before reporting allocationFailedMessage");
     });
 });

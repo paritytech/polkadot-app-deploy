@@ -6,6 +6,7 @@
 
 import type { LogoutStatus } from "../auth/index.js";
 import { getAuthClient } from "../auth-config.js";
+import type { Stack } from "../stacks.js";
 import { renderLogoutStatus } from "../auth/index.js";
 import { clearSssAllowanceCache } from "../sss-allowance-cache.js";
 
@@ -19,8 +20,8 @@ export function formatLogout(status: LogoutStatus): string {
 /**
  * Run the logout command. Finds the current session and signs out.
  */
-export async function runLogout(envId: string): Promise<void> {
-    const client = await getAuthClient(envId);
+export async function runLogout(stack: Stack): Promise<void> {
+    const client = await getAuthClient(stack);
     try {
         const handle = await client.findSession();
         if (!handle) {

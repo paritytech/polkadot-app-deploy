@@ -27,7 +27,7 @@ import { fileURLToPath } from "url";
 import * as path from "path";
 import { createClient, Binary, Enum } from "polkadot-api";
 import { getWsProvider } from "polkadot-api/ws";
-import { loadEnvironments } from "../dist/environments.js";
+import { BUILT_IN_STACK_IDS, loadStack, readShippedStack } from "../dist/stacks.js";
 import { ACCOUNT_AUTHORIZATION_FIELDS } from "../dist/pool.js";
 import { withTimeout } from "../dist/commands/login.js";
 
@@ -40,14 +40,15 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ENABLED = process.env.E2E === "1";
 
 // ---------------------------------------------------------------------------
-// Endpoints — resolved from environments.json for the selected/default env.
+// Endpoints — from the stack descriptor of the selected/default env.
 // PAD_ENV is set by CI's select-env job (which probes + falls back);
 // default to paseo-next-v2 locally. Never hardcode wss URLs — they must track
-// environments.json so an endpoint change can't silently desync the test.
+// the stack descriptors so an endpoint change can't silently desync the test.
 // ---------------------------------------------------------------------------
 
 const ENV_ID = process.env.PAD_ENV ?? "paseo-next-v2";
-let ENV_DOC; // the loaded environments.json doc, populated in before()
+let STACKS; // every built-in stack, the selected one as loaded this run; populated in before()
+let SELECTED_ID; // ENV_ID's stack id (ENV_ID may be an alias)
 
 // ---------------------------------------------------------------------------
 // Timeouts (#1595) — every client connect, metadata/runtime fetch, and
@@ -99,11 +100,11 @@ function isChainCallTimeout(err) {
 }
 
 /**
- * Build the ordered fallback candidate list for `chainId`: the selected
- * env's own endpoint first, then the same chain's endpoints from the OTHER
- * e2eEligible envs (in environments.json order), then any other env that
- * declares this chain at all (also in file order). Read entirely from the
- * loaded environments doc — never a hardcoded wss literal.
+ * Build the ordered fallback candidate list for chain `role`: the selected
+ * stack's own endpoint first, then the same chain's endpoints from the OTHER
+ * e2eEligible stacks (in `stacks` order), then any other stack that
+ * declares this chain at all (also in order). Read entirely from the
+ * stacks — never a hardcoded wss literal.
  *
  * #1595 follow-up: People going down on the selected env must not fail
  * chains that don't need it, and select-env itself no longer gates on
@@ -115,33 +116,26 @@ function isChainCallTimeout(err) {
  * This repo has only one e2eEligible env (paseo-next-v2), so the only
  * fallback candidate is "devnet" (not e2eEligible, last-resort). Its People
  * chain runtime was verified compatible by actually running this suite
- * against it (`PAD_ENV=devnet E2E=1 node --test test/e2e-chain-calls.test.js`)
+ * against it (`PAD_ENV=pcf-devnet E2E=1 node --test test/e2e-chain-calls.test.js`)
  * — People.set_personal_id_account encodes cleanly there, so it's a
  * meaningful fallback target, not a different-runtime false pass.
  */
-function candidateEndpoints(doc, chainId, selectedEnvId) {
-  const chain = doc.chains.find((c) => c.id === chainId);
-  if (!chain) {
-    throw new Error(`>> FAIL: chain-call-encoding: no '${chainId}' chain declared in environments.json`);
+function candidateEndpoints(stacks, role, selectedEnvId) {
+  if (!stacks.some((stack) => stack.chains[role])) {
+    throw new Error(`>> FAIL: chain-call-encoding: no stack declares a '${role}' chain`);
   }
-  const pickWss = (envId) => {
-    const wss = chain.endpoints?.[envId]?.wss;
-    return Array.isArray(wss) ? wss[0] : wss;
-  };
-  const eligibleIds = doc.environments.filter((e) => e.e2eEligible).map((e) => e.id);
-  const allIds = doc.environments.map((e) => e.id);
   const seen = new Set();
   const candidates = [];
-  const add = (envId) => {
-    if (seen.has(envId)) return;
-    const url = pickWss(envId);
+  const add = (stack) => {
+    if (!stack || seen.has(stack.id)) return;
+    const url = stack.chains[role]?.rpc[0];
     if (!url) return;
-    seen.add(envId);
-    candidates.push({ envId, url });
+    seen.add(stack.id);
+    candidates.push({ envId: stack.id, url });
   };
-  add(selectedEnvId);
-  for (const envId of eligibleIds) add(envId);
-  for (const envId of allIds) add(envId);
+  add(stacks.find((stack) => stack.id === selectedEnvId));
+  for (const stack of stacks.filter((s) => s.e2eEligible)) add(stack);
+  for (const stack of stacks) add(stack);
   return candidates;
 }
 
@@ -166,10 +160,10 @@ function defaultConnect(url) {
 async function connectChainWithFallback(
   chainId,
   selectedEnvId,
-  doc,
+  stacks,
   { connect = defaultConnect, log = console.log, timeoutMs = CONNECT_TIMEOUT_MS } = {},
 ) {
-  const candidates = candidateEndpoints(doc, chainId, selectedEnvId);
+  const candidates = candidateEndpoints(stacks, chainId, selectedEnvId);
   if (candidates.length === 0) {
     throw new Error(`>> FAIL: chain-call ${chainId}: no reachable endpoint (tried: no candidate endpoints configured for this chain)`);
   }
@@ -245,7 +239,9 @@ async function tryEncode(api, pallet, call, args, { chain, endpoint, timeoutMs =
 
 describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !ENABLED }, () => {
   before(async () => {
-    ({ doc: ENV_DOC } = await loadEnvironments());
+    const selected = await loadStack({ env: ENV_ID });
+    SELECTED_ID = selected.id;
+    STACKS = BUILT_IN_STACK_IDS.map((id) => (id === selected.id ? selected : readShippedStack(id)));
   });
 
   // ------------------------------------------------------------------
@@ -263,9 +259,9 @@ describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !E
     // below (#1595).
     before(async () => {
       ({ client: ahClient, api: ahApi, url: resolvedEndpoint["asset-hub"] } = await connectChainWithFallback(
-        "asset-hub",
-        ENV_ID,
-        ENV_DOC,
+        "AssetHub",
+        SELECTED_ID,
+        STACKS,
       ));
     });
 
@@ -399,9 +395,9 @@ describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !E
 
     before(async () => {
       ({ client: peopleClient, api: peopleApi, url: resolvedEndpoint["people"] } = await connectChainWithFallback(
-        "people",
-        ENV_ID,
-        ENV_DOC,
+        "People",
+        SELECTED_ID,
+        STACKS,
       ));
     });
 
@@ -434,9 +430,9 @@ describe("chain-call encoding — all 10 extrinsics + 1 runtime API", { skip: !E
 
     before(async () => {
       ({ client: bulletinClient, api: bulletinApi, url: resolvedEndpoint["bulletin"] } = await connectChainWithFallback(
-        "bulletin",
-        ENV_ID,
-        ENV_DOC,
+        "Bulletin",
+        SELECTED_ID,
+        STACKS,
       ));
     });
 
@@ -597,33 +593,22 @@ describe("chain-call timeout guard — unit (no chain)", () => {
 // ---------------------------------------------------------------------------
 
 describe("chain fallback — unit (no chain)", () => {
-  // Fixture doc: "primary-env" and "fallback-env" are the two e2eEligible
-  // envs (in that file order); "other-env" is NOT e2eEligible but still
+  // Fixture stacks: "primary-env" and "fallback-env" are the two e2eEligible
+  // stacks (in that order); "other-env" is NOT e2eEligible but still
   // declares the chain, so it's only ever reached as a last resort;
-  // "no-chain-env" declares no endpoint for "test-chain" at all and must
+  // "no-chain-env" declares no "test-chain" chain at all and must
   // never appear in the candidate list.
-  const FIXTURE_DOC = {
-    environments: [
-      { id: "primary-env", e2eEligible: true },
-      { id: "fallback-env", e2eEligible: true },
-      { id: "other-env" },
-      { id: "no-chain-env" },
-    ],
-    chains: [
-      {
-        id: "test-chain",
-        endpoints: {
-          "primary-env": { wss: "wss://primary.example" },
-          "fallback-env": { wss: "wss://fallback.example" },
-          "other-env": { wss: "wss://other.example" },
-        },
-      },
-    ],
-  };
+  const testChain = (url) => ({ "test-chain": { rpc: [url], genesisHash: "0x00" } });
+  const FIXTURE_STACKS = [
+    { id: "primary-env", e2eEligible: true, chains: testChain("wss://primary.example") },
+    { id: "fallback-env", e2eEligible: true, chains: testChain("wss://fallback.example") },
+    { id: "other-env", e2eEligible: false, chains: testChain("wss://other.example") },
+    { id: "no-chain-env", e2eEligible: false, chains: {} },
+  ];
 
   describe("candidateEndpoints() ordering", () => {
-    test("selected env first, then other e2eEligible envs (file order), then any other env declaring the chain", () => {
-      const candidates = candidateEndpoints(FIXTURE_DOC, "test-chain", "fallback-env");
+    test("selected env first, then other e2eEligible envs (stack order), then any other env declaring the chain", () => {
+      const candidates = candidateEndpoints(FIXTURE_STACKS, "test-chain", "fallback-env");
       assert.deepEqual(
         candidates.map((c) => c.envId),
         ["fallback-env", "primary-env", "other-env"],
@@ -636,7 +621,7 @@ describe("chain fallback — unit (no chain)", () => {
     });
 
     test("an env declaring no endpoint for the chain is never a candidate", () => {
-      const candidates = candidateEndpoints(FIXTURE_DOC, "test-chain", "primary-env");
+      const candidates = candidateEndpoints(FIXTURE_STACKS, "test-chain", "primary-env");
       assert.ok(
         !candidates.some((c) => c.envId === "no-chain-env"),
         ">> FAIL: candidate-ordering: no-chain-env has no 'test-chain' endpoint and must never be offered as a candidate",
@@ -669,7 +654,7 @@ describe("chain fallback — unit (no chain)", () => {
         "wss://fallback.example": "ok",
       });
       const logs = [];
-      const result = await connectChainWithFallback("test-chain", "primary-env", FIXTURE_DOC, {
+      const result = await connectChainWithFallback("test-chain", "primary-env", FIXTURE_STACKS, {
         connect,
         log: (msg) => logs.push(msg),
         timeoutMs: 50,
@@ -694,7 +679,7 @@ describe("chain fallback — unit (no chain)", () => {
       });
       await assert.rejects(
         () =>
-          connectChainWithFallback("test-chain", "primary-env", FIXTURE_DOC, {
+          connectChainWithFallback("test-chain", "primary-env", FIXTURE_STACKS, {
             connect,
             log: () => {},
             timeoutMs: 50,
@@ -712,7 +697,7 @@ describe("chain fallback — unit (no chain)", () => {
     test("primary ok → no fallback attempted, plain 'using' log with no fallback clause", async () => {
       const { connect } = stubConnect({ "wss://primary.example": "ok" });
       const logs = [];
-      const result = await connectChainWithFallback("test-chain", "primary-env", FIXTURE_DOC, {
+      const result = await connectChainWithFallback("test-chain", "primary-env", FIXTURE_STACKS, {
         connect,
         log: (msg) => logs.push(msg),
         timeoutMs: 50,

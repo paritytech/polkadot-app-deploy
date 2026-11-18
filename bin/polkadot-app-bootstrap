@@ -1,9 +1,7 @@
 #!/usr/bin/env node
 
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-import { DEFAULT_BULLETIN_RPC, DEFAULT_POOL_SIZE } from "../dist/deploy.js";
+import { DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY } from "../dist/deploy.js";
+import { loadStack, resolveStackSelection } from "../dist/stacks.js";
 import { bootstrapPool, resolvePoolMnemonic, describeIgnoredPoolMnemonicEnv } from "../dist/pool.js";
 import { VERSION } from "../dist/telemetry.js";
 
@@ -16,6 +14,7 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i] === "--authorizer") { flags.authorizer = args[++i]; }
   else if (args[i] === "--rpc") { flags.rpc = args[++i]; }
   else if (args[i] === "--env") { flags.env = args[++i]; }
+  else if (args[i] === "--stack") { flags.stack = args[++i]; }
   else if (args[i] === "--version" || args[i] === "-V") { flags.version = true; }
   else if (args[i] === "--help" || args[i] === "-h") { flags.help = true; }
   else {
@@ -49,73 +48,56 @@ Options:
                       Default: the well-known dev phrase (same key the deploy path uses).
   --authorizer "..."  Seed/mnemonic of the key that holds authorization authority
                       on this chain (e.g. "//Alice", a full mnemonic, or a hex seed).
-                      When --env is given and omitted, falls back to that
-                      environment's configured authorizer (environments.json
-                      bulletinAuthorizer field, e.g. //Alice on paseo-next-v2).
-                      There is no other default: some environments (e.g.
-                      devnet) are community-operated and their authorizer is
-                      unknown, so omitting both fails with a clear message
-                      instead of guessing — omit to get status only.
-  --rpc wss://...     Bulletin RPC endpoint (or set BULLETIN_RPC env var)
-  --env <id>          Load environment by id from environments.json
+                      When --env or --stack is given and omitted, falls back to that
+                      stack's configured authorizer (the bulletinAuthorizer field of
+                      its policy, e.g. //Alice on paseo-next-v2).
+                      There is no other default: some stacks (e.g. pcf-devnet) are
+                      community-operated and their authorizer is unknown, so omitting
+                      both fails with a clear message instead of guessing — omit to
+                      get status only.
+  --rpc wss://...     Bulletin RPC endpoint (or set BULLETIN_RPC env var). With
+                      --env/--stack its genesis hash must match the stack's
+                      Bulletin chain; alone, no stack policy applies.
+  --env <id>          Built-in stack id or alias (default: paseo-next-v2 when
+                      neither --rpc nor --stack is set)
+  --stack <link|URL|file>
+                      Any other stack descriptor (cannot be combined with --env)
   --pool-size N       Number of pool accounts to check/initialize (default: 10)
   --version           Show version
   --help              Show this help`);
   process.exit(0);
 }
 
-let rpc = flags.rpc ?? process.env.BULLETIN_RPC ?? DEFAULT_BULLETIN_RPC;
-const poolSize = flags.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
-// Same resolver the deploy path uses (src/pool.ts), so the accounts this tool authorizes are
-// exactly the accounts a deploy will upload from. It deliberately ignores MNEMONIC — that names
-// the DotNS signing account, and honouring it here authorized a set of //deploy/N accounts no
-// deploy ever touches, with no visible symptom until storage failed on a bootstrapped env.
-const mnemonic = resolvePoolMnemonic(flags.mnemonic);
-const ignoredMnemonicWarning = describeIgnoredPoolMnemonicEnv(process.env, flags.mnemonic);
-if (ignoredMnemonicWarning) console.warn(`⚠  ${ignoredMnemonicWarning}`);
+try {
+  const selection = resolveStackSelection({ flagEnv: flags.env, flagStack: flags.stack });
+  const hasSelection = selection.env !== undefined || selection.stack !== undefined;
+  const rpcOverride = flags.rpc ?? process.env.BULLETIN_RPC;
+  const poolSize = flags.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
+  // Same resolver the deploy path uses (src/pool.ts), so the accounts this tool authorizes are
+  // exactly the accounts a deploy will upload from. It deliberately ignores MNEMONIC — that selects
+  // the DotNS signing account, and honouring it here authorized a set of //deploy/N accounts no
+  // deploy ever touches, with no visible symptom until storage failed on a bootstrapped env.
+  const mnemonic = resolvePoolMnemonic(flags.mnemonic);
+  const ignoredMnemonicWarning = describeIgnoredPoolMnemonicEnv(process.env, flags.mnemonic);
+  if (ignoredMnemonicWarning) console.warn(`⚠  ${ignoredMnemonicWarning}`);
 
-const bootstrapOpts = {};
+  const bootstrapOpts = {};
+  if (flags.authorizer) {
+    bootstrapOpts.authorizerMnemonic = flags.authorizer;
+  }
 
-if (flags.authorizer) {
-  bootstrapOpts.authorizerMnemonic = flags.authorizer;
+  // A bare --rpc / BULLETIN_RPC targets that chain without a stack: no genesis check and no stack policy.
+  let stack;
+  let rpc = rpcOverride;
+  if (hasSelection || !rpcOverride) {
+    stack = await loadStack(selection);
+    rpc = rpcOverride ?? stack.chains.Bulletin.rpc[0];
+    bootstrapOpts.stack = stack;
+  }
+
+  await bootstrapPool(rpc, poolSize, mnemonic, bootstrapOpts);
+
+} catch (e) {
+  console.error(`Error: ${e.message}`);
+  process.exit(e instanceof NonRetryableError ? EXIT_CODE_NO_RETRY : 1);
 }
-
-if (flags.env) {
-  const envJsonPath = fileURLToPath(new URL("../assets/environments.json", import.meta.url));
-  let envDoc;
-  try {
-    const raw = await fs.readFile(envJsonPath, "utf8");
-    envDoc = JSON.parse(raw);
-  } catch (e) {
-    console.error(`Error: could not load environments.json: ${e.message}`);
-    process.exit(1);
-  }
-
-  const envEntry = envDoc.environments.find(e => e.id === flags.env);
-  if (!envEntry) {
-    const valid = envDoc.environments.map(e => e.id).join(", ");
-    console.error(`Error: unknown environment '${flags.env}'. Valid: ${valid}.`);
-    process.exit(1);
-  }
-
-  if (!flags.rpc) {
-    const bulletinChain = envDoc.chains.find(c => c.id === "bulletin");
-    const ep = bulletinChain?.endpoints?.[flags.env];
-    if (ep?.wss) {
-      rpc = Array.isArray(ep.wss) ? ep.wss[0] : ep.wss;
-    }
-  }
-
-  bootstrapOpts.bulletinAuthorizeV2 = envEntry.bulletinAuthorizeV2 ?? false;
-
-  // Which key holds TransactionStorage authorizer rights on this env's
-  // Bulletin chain (environments.json `bulletinAuthorizer`). Not always
-  // //Alice — e.g. devnet is community-operated and deliberately omits it,
-  // so bootstrapPool refuses to guess and reports a clear message instead.
-  bootstrapOpts.envLabel = flags.env;
-  if (envEntry.bulletinAuthorizer) {
-    bootstrapOpts.envAuthorizer = envEntry.bulletinAuthorizer;
-  }
-}
-
-await bootstrapPool(rpc, poolSize, mnemonic, bootstrapOpts);

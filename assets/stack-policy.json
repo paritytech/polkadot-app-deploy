@@ -1,0 +1,48 @@
+{
+  "default": "paseo-next-v2",
+  "stacks": {
+    "preview": {
+      "aliases": ["previewnet", "ppn"],
+      "description": "Product Preview net, used by Product Teams",
+      "bulletinAutoAuthorize": true,
+      "bulletinAuthorizer": "//Eve",
+      "e2eEligible": true,
+      "autoAccountMapping": true,
+      "registerStorageDeposit": 50000000000,
+      "popSelfServe": {
+        "sudoEnvLabel": "Preview",
+        "personhoodFaucetUrl": "https://sudo.personhood.dev/personhood-faucet",
+        "dotnsBootstrapUrl": "https://sudo.personhood.dev/dotns-bootstrap",
+        "stateAwareGuidance": true
+      }
+    },
+    "paseo-next-v2": {
+      "aliases": [],
+      "description": "Next iteration of the Paseo Next testnet",
+      "bulletinAutoAuthorize": true,
+      "bulletinAuthorizer": "//Alice",
+      "e2eEligible": true,
+      "autoAccountMapping": true,
+      "registerStorageDeposit": 50000000000,
+      "popSelfServe": {
+        "sudoEnvLabel": "Next V2",
+        "personhoodFaucetUrl": "https://sudo.personhood.dev/personhood-faucet",
+        "dotnsBootstrapUrl": "https://sudo.personhood.dev/dotns-bootstrap",
+        "stateAwareGuidance": true
+      }
+    },
+    "pcf-devnet": {
+      "aliases": ["PCF-devnet"],
+      "description": "Polkadot Community Foundation products devnet on the Paseo system chains",
+      "e2eEligible": false,
+      "autoAccountMapping": true,
+      "registerStorageDeposit": 50000000000
+    },
+    "polkadot": {
+      "aliases": [],
+      "description": "Polkadot mainnet",
+      "e2eEligible": false,
+      "autoAccountMapping": true
+    }
+  }
+}

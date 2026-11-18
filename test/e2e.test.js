@@ -13,10 +13,13 @@ import { installE2eResultHook } from "./helpers/e2e-result.js";
 import { resolveContenthashOnChain, resolveTextRecordOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
 import { S3_OWNED_LABEL, tieredFixtureLabel, smokeLabel, digitsToLetters } from "../tools/lib/e2e-fixtures.mjs";
-import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
+import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, deploy, poolAccountDerivationPath, probeChunks } from "@parity/polkadot-app-deploy";
+import { storeBlocksCar } from "./helpers/e2e-store-blocks.js";
+import { createClient } from "polkadot-api";
+import { getWsProvider } from "polkadot-api/ws";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 import { resolveE2eEnv, resolveE2eEnvId } from "./helpers/e2e-env.js";
-import { encodeContenthash, DEFAULT_BULLETIN_RPC } from "@parity/polkadot-app-deploy/deploy";
+import { encodeContenthash } from "@parity/polkadot-app-deploy/deploy";
 import { fetchManifestRoundtrip } from "@parity/polkadot-app-deploy/manifest-roundtrip";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
@@ -490,11 +493,11 @@ async function resolveDotnsEnvConnectOptions() {
   return (await resolveE2eEnv(E2E_ENV_ID)).dotnsConnectOptions;
 }
 
-// #paseo-tld: DotNS's TLD is per-environment (paseo-next-v2 following its
-// redeploy: "paseo" — see src/environments.ts's per-env `tld` field). Every
+// #paseo-tld: DotNS's TLD is per-stack (previewnet: "testnet",
+// paseo-next-v2: "paseo" — the stack descriptor's `tld`). Every
 // `.dot`-suffixed label/target in this file below must resolve through this
-// helper instead of hardcoding the old suffix, or deploys/assertions
-// silently target the wrong on-chain node.
+// helper instead of hardcoding a suffix, or deploys/assertions silently
+// target the wrong on-chain node.
 async function resolveE2eTld() {
   return (await resolveE2eEnv(E2E_ENV_ID)).tld;
 }
@@ -582,8 +585,8 @@ export function buildOneTrailingDigitLabel(tag) {
 
 // Detect the live DotNS ABI profile via a short-lived, read-only connection —
 // the SAME detection connect() itself runs (detectProtocolVersion, src/dotns.ts),
-// never inferred from E2E_ENV_ID's name or environments.json config (a
-// configured `dotnsProtocol` pin is asserted against the live probe, never
+// never inferred from PAD_ENV's name or the stack's policy
+// (a configured `dotnsProtocol` pin is asserted against the live probe, never
 // obeyed over it — see connect()'s own comment). Reads the profile via the
 // public `protocolVersion` getter, not by scraping connect()'s own log line.
 // Used by S-V060-UNBLOCK to decide whether the chain has the v0.6.0 redeploy
@@ -1085,8 +1088,8 @@ describe("e2e", { skip: !ENABLED }, () => {
   });
 
   // S6 forces transport-level failover by pointing BULLETIN_RPC at an
-  // unroutable address (RFC 3330). src/deploy.ts:811-813 prepends user-rpc
-  // to BULLETIN_ENDPOINTS, leaving the public Bulletin endpoint as the
+  // unroutable address (RFC 3330). resolveBulletinEndpoints prepends user-rpc
+  // to the selected Bulletin endpoints, leaving the public Bulletin endpoint as the
   // backup; papi rotates after the first endpoint fails fast. The
   // captureWarning("Bulletin RPC failover", …) is Sentry-only — we don't
   // assert against stdout here. Sentry-side assertion lives in
@@ -2331,16 +2334,12 @@ describe("e2e", { skip: !ENABLED }, () => {
   });
 
   // #1094: publishManifest must resolve ITS OWN Bulletin endpoint from the
-  // deploy's --env/--rpc (via resolveBulletinEndpoints/setBulletinEndpoints —
-  // the same precedence deploy() itself uses) before uploading the icon,
-  // otherwise the icon lands on the module's hardcoded DEFAULT_BULLETIN_RPC
-  // regardless of which chain the rest of the deploy targeted.
+  // deploy's --env/--stack/--rpc (via setBulletinStack — the same precedence
+  // deploy() itself uses) before uploading the icon, otherwise the icon lands
+  // on whatever Bulletin chain the module was last pointed at.
   //
-  // This exercises that resolution against a REAL non-default env end-to-end.
-  // Every e2eEligible env in environments.json (paseo-next-v2, devnet) has a
-  // Bulletin endpoint that differs from DEFAULT_BULLETIN_RPC, and
-  // nightly-pr-coverage always sets PAD_ENV via select-env, so this
-  // scenario is "non-default" by construction in CI.
+  // This exercises that resolution end-to-end on every healthy env:
+  // nightly-pr-coverage always sets PAD_ENV via select-env.
   //
   // Note: the exact standalone-call regression #1094 fixed (publishManifest()
   // invoked without a preceding in-process deploy() in the same process) can't
@@ -2486,12 +2485,8 @@ describe("e2e", { skip: !ENABLED }, () => {
   describe("S-MANIFEST-ENV — manifest publish honors --env for icon Bulletin storage on a non-default env (#1094)", { skip: SCENARIO !== "s-manifest-env" }, () => {
     test(`deploy ${SIGNER}/${MERKLE} with a manifest lands the icon on the resolved env's Bulletin chain`, { timeout: DEPLOY_TIMEOUT_MS + 5 * 60 * 1000 + 30_000 }, async () => {
       // The regression this guards is publishManifest ignoring --env and
-      // uploading to the built-in endpoint, so the run's own Bulletin endpoint
-      // has to differ from it for the scenario to prove anything.
-      const envBulletinRpc = await resolveE2eBulletinRpc();
-      assert.notEqual(envBulletinRpc, DEFAULT_BULLETIN_RPC,
-        `>> FAIL: S-MANIFEST-ENV: ${E2E_ENV_ID} resolves to the built-in Bulletin endpoint ${envBulletinRpc}, so an icon uploaded to the wrong chain would be indistinguishable from a correct one. Run this scenario against an env with its own Bulletin chain.`);
-
+      // uploading to another Bulletin chain; the icon must then be missing
+      // from the selected env's own gateway.
       const label = perLegPoolLabel() ?? pickFreshRunLabel("e2emanenv");
       const tld = await resolveE2eTld();
       const { fixtureDir } = await mutateFixture(RUN_TAG);
@@ -2549,7 +2544,7 @@ describe("e2e", { skip: !ENABLED }, () => {
           failWith({
             scenario: "S-MANIFEST-ENV",
             message: `icon CID ${iconCid} not retrievable (byte-identical) from ${E2E_ENV_ID}'s own gateway (${iconUrl}) within 5 min (last HTTP status ${lastStatus})`,
-            hint: "publishManifest may have uploaded the icon to the wrong Bulletin chain (DEFAULT_BULLETIN_RPC instead of the resolved env) — the #1094 regression this scenario guards against.",
+            hint: "publishManifest may have uploaded the icon to the wrong Bulletin chain (not the selected stack's) — the #1094 regression this scenario guards against.",
           });
         }
       } finally {
@@ -2656,7 +2651,7 @@ describe("e2e", { skip: !ENABLED }, () => {
             scenario: "S-V060-UNBLOCK",
             message: `E2E_REQUIRE_PROFILE=v0.6.0 was set but there is NO CONTRACT CODE at the configured DotNS address — v0.6.0 validation did not run`,
             context: detectedProfile.error,
-            hint: "this is NOT \"the wrong profile\" — environments.json's configured POP_RULES address currently has nothing deployed (e.g. a redeploy in flight). Wait for the redeploy to land and re-run, or fix environments.json/--contract if the configured address is simply stale.",
+            hint: "this is NOT \"the wrong profile\" — the stack's configured POP_RULES address currently has nothing deployed (e.g. a redeploy in flight). Wait for the redeploy to land and re-run, or pass a corrected descriptor with --stack if the published address is simply stale.",
           });
         }
         console.log("=".repeat(60));
@@ -2853,7 +2848,7 @@ describe("e2e", { skip: !ENABLED }, () => {
         // submit — a real transaction. Cover both ensureMappedAccountReady
         // code paths (src/dotns.ts): the manual-mapping branch logs "Mapping
         // account on Asset Hub Revive..." right before ensureAccountMapped();
-        // the auto-mapping branch (every env in assets/environments.json
+        // the auto-mapping branch (every built-in stack in assets/stack-policy.json
         // today) logs "is NOT mapped on Revive" as soon as it finds the
         // account unmapped, then "Mapping requires submitting a
         // transaction..." and "Topped up ... for auto-map" if it has to
@@ -2880,6 +2875,77 @@ describe("e2e", { skip: !ENABLED }, () => {
         }
       } finally {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("S-STORE-BLOCKS: --store-blocks and --force-store against the live pallet", { skip: SCENARIO !== "s-store-blocks", concurrency: false }, () => {
+    const STORE_TIMEOUT_MS = 5 * 60 * 1000;
+    const PROBE_ATTEMPTS = 10;
+    const PROBE_WAIT_MS = 6_000;
+
+    test(`${SIGNER} signer: new blocks stored, found on the second run, stored again with --force-store`, { timeout: 3 * STORE_TIMEOUT_MS + 5 * 60_000 }, async () => {
+      const carDir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-store-blocks-"));
+      const carFile = path.join(carDir, "blocks.car");
+      const cids = await storeBlocksCar(carFile, `${RUN_TAG}-${Date.now()}`);
+      const signerArgs = SIGNER === "direct" ? directSignerArgs() : poolOwnerArgs();
+      const args = ["--store-blocks", carFile, "--tag", process.env.DEPLOY_TAG, "--env", E2E_ENV_ID, ...signerArgs];
+      const client = createClient(getWsProvider(await resolveE2eBulletinRpc()));
+
+      async function blockNumbers(step, condition, expectation) {
+        let seen = "";
+        for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+          const entries = await probeChunks(cids, { client, atFinalized: true });
+          const numbers = entries.map((entry) => (entry.present === true ? entry.block : null));
+          if (numbers.every((number) => number !== null) && condition(numbers)) return numbers;
+          seen = entries.map((entry) => `${entry.cid}: ${entry.present === true ? `block ${entry.block}` : entry.present === false ? "absent" : entry.failureReason}`).join("; ");
+          await new Promise((resolve) => setTimeout(resolve, PROBE_WAIT_MS));
+        }
+        failWith({
+          scenario: "S-STORE-BLOCKS",
+          message: `${step}: ${expectation}. Finalized TransactionByContentHash after ${PROBE_ATTEMPTS} reads: ${seen}`,
+          hint: "the CLI reported success for this step, so a difference here is a change in the pallet or in the presence probe, not a failed upload.",
+        });
+      }
+
+      try {
+        const first = await runBulletinDeploy({ args, timeoutMs: STORE_TIMEOUT_MS });
+        assertDeploySucceeded(first, { scenario: "S-STORE-BLOCKS", step: "first run" });
+        assertStdoutMatches(first.stdout, /^Stored blocks: 3, already on chain: 0$/m, {
+          scenario: "S-STORE-BLOCKS",
+          what: "the first run must store all three blocks",
+          hint: "the block content is new in every run, so a block that the chain already has means the CAR content repeated.",
+        });
+        const firstBlocks = await blockNumbers("first run", () => true, "every block must be on chain under its own CID");
+
+        const second = await runBulletinDeploy({ args, timeoutMs: STORE_TIMEOUT_MS });
+        assertDeploySucceeded(second, { scenario: "S-STORE-BLOCKS", step: "second run" });
+        assertStdoutMatches(second.stdout, /^Stored blocks: 0, already on chain: 3$/m, {
+          scenario: "S-STORE-BLOCKS",
+          what: "the second run must find every block on chain and store none",
+          hint: "a store here means the presence probe no longer finds an entry that the first run finalised.",
+        });
+        await blockNumbers("second run", (numbers) => numbers.every((number, index) => number === firstBlocks[index]),
+          `the entries must stay at blocks ${firstBlocks.join(", ")}, because the run stored nothing`);
+
+        const forced = await runBulletinDeploy({ args: [...args, "--force-store"], timeoutMs: STORE_TIMEOUT_MS });
+        assertDeploySucceeded(forced, { scenario: "S-STORE-BLOCKS", step: "--force-store run" });
+        assertStdoutMatches(forced.stdout, /^Stored blocks: 3, already on chain: 0$/m, {
+          scenario: "S-STORE-BLOCKS",
+          what: "the --force-store run must store all three blocks again",
+          hint: "a block counted as already on chain means an entry from before the run confirmed the store.",
+        });
+        const floor = 1 + Number(parseLineOrExplain(forced.stdout, {
+          pattern: /Force store: entries up to block (\d+) do not count as stored/,
+          scenario: "S-STORE-BLOCKS",
+          what: "the --force-store run must print the block up to which entries do not count as stored",
+          hint: "the floor is the value this scenario compares the chain entries with; a changed log line needs a changed pattern here.",
+        })[1]);
+        await blockNumbers("--force-store run", (numbers) => numbers.every((number) => number >= floor),
+          `every entry must point at block ${floor} or later, because the chain must move the entry of identical bytes to the new store`);
+      } finally {
+        client.destroy();
+        fs.rmSync(carDir, { recursive: true, force: true });
       }
     });
   });

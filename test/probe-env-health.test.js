@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { readShippedDescriptor } from "../tools/lib/stack-copies.mjs";
 
 const PROBE_SCRIPT = path.resolve("tools/probe-env-health.mjs");
 
@@ -11,18 +12,13 @@ const PROBE_SCRIPT = path.resolve("tools/probe-env-health.mjs");
 // preload file. We can't trivially inject mocks into an ESM script invoked
 // as a child process, so we drive the probe through a Node --import preload
 // that replaces globalThis.WebSocket before the probe runs.
-// `cwd` defaults to the repo root; a test that needs a synthetic
-// assets/environments.json (e.g. an env with no contracts block, which no
-// real fixture in this repo has — both paseo-next-v2 and devnet declare
-// DotNS contracts) overrides it to a temp dir and PROBE_SCRIPT's absolute
-// path keeps the probe itself resolvable regardless of cwd.
-function runProbe({ env, scenario, timeoutMs = 5000, cwd }) {
+function runProbe({ env, scenario, timeoutMs = 5000, cwd = process.cwd() }) {
   return new Promise((resolve) => {
     const preload = path.join(os.tmpdir(), `ws-mock-${scenario}-${Date.now()}.mjs`);
     fs.writeFileSync(preload, MOCKS[scenario]);
     const child = spawn(
       process.execPath,
-      ["--import", preload, PROBE_SCRIPT, "--env", env, "--timeout-ms", String(timeoutMs)],
+      ["--import", preload, "tools/probe-env-health.mjs", "--env", env, "--timeout-ms", String(timeoutMs)],
       { cwd, env: { ...process.env, GITHUB_OUTPUT: "" }, stdio: ["ignore", "pipe", "pipe"] },
     );
     let stdout = "", stderr = "";
@@ -35,30 +31,21 @@ function runProbe({ env, scenario, timeoutMs = 5000, cwd }) {
   });
 }
 
-// Builds a throwaway repo root (assets/environments.json only — that's all
-// loadEnv() reads) with one env, `no-contracts`, that has valid chain
-// endpoints but declares no `contracts` block at all. Used only by the
-// "no contracts block" test below; every real env in this repo has one.
-function makeNoContractsFixtureDir() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "probe-env-health-fixture-"));
-  fs.mkdirSync(path.join(dir, "assets"));
-  fs.writeFileSync(
-    path.join(dir, "assets", "environments.json"),
-    JSON.stringify({
-      environments: [{ id: "no-contracts", name: "No Contracts", network: "paseo", ipfs: "http://gateway.example" }],
-      chains: [
-        { id: "asset-hub", endpoints: { "no-contracts": { wss: "wss://asset-hub.example" } } },
-        { id: "bulletin", endpoints: { "no-contracts": { wss: "wss://bulletin.example" } } },
-        // #1595 follow-up: loadEnv() now requires a people RPC too (see
-        // probe-env-health.mjs), so this synthetic fixture must declare one
-        // or every test using it would fail on a missing-people-RPC
-        // config_error before ever reaching the dotns_not_configured check
-        // this fixture exists to exercise.
-        { id: "people", endpoints: { "no-contracts": { wss: "wss://people.example" } } },
-      ],
-    }),
-  );
-  return dir;
+// A copy of the probe beside a .trinity/ whose preview descriptor lacks `dropKeys` from its
+// `dotns` map. Every real built-in stack carries the checked contracts, so this is the only way
+// to get to the probe's not-configured branch.
+function probeCopyWithout(dropKeys) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "probe-env-"));
+  fs.mkdirSync(path.join(root, "tools/lib"), { recursive: true });
+  fs.mkdirSync(path.join(root, "assets"));
+  fs.mkdirSync(path.join(root, ".trinity"));
+  fs.copyFileSync("tools/probe-env-health.mjs", path.join(root, "tools/probe-env-health.mjs"));
+  fs.copyFileSync("tools/lib/stack-copies.mjs", path.join(root, "tools/lib/stack-copies.mjs"));
+  fs.copyFileSync("assets/stack-policy.json", path.join(root, "assets/stack-policy.json"));
+  const descriptor = readShippedDescriptor("preview");
+  for (const key of dropKeys) delete descriptor.dotns[key];
+  fs.writeFileSync(path.join(root, ".trinity/preview.json"), JSON.stringify(descriptor));
+  return root;
 }
 
 // Every mock stubs BOTH globalThis.WebSocket (for the chain probes) AND
@@ -124,17 +111,14 @@ const DOTNS_HANGS = `
   };
 `;
 
-// People probe (#1595 follow-up, port of bulletin PR #1596-follow-up):
-// distinguishes behavior by connection URL, since a real env's
-// asset-hub/bulletin/people endpoints differ (see assets/environments.json's
-// paseo-next-v2 entry — e.g. "paseo-asset-hub-next-rpc" vs
-// "paseo-people-next-system-rpc"). Asset Hub + Bulletin stay healthy; only
-// the People connection errors or hangs, proving the probe attributes the
-// failure to the right chain rather than needing all three down to notice.
-// One factory (same pattern as wsWithStorage() above) instead of two
-// hand-copied mock classes that would otherwise repeat the
-// system_chain/state_call/state_getStorage response ternary a second and
-// third time.
+// since a stack's asset-hub/bulletin/people endpoints differ (see
+// the preview descriptor, e.g. ".../asset-hub" vs
+// ".../people"). Asset Hub + Bulletin stay healthy; only the People
+// connection errors or hangs, proving the probe attributes the failure to
+// the right chain rather than needing all three down to notice. One factory
+// (same pattern as wsWithStorage() above) instead of two hand-copied mock
+// classes that would otherwise repeat the system_chain/state_call/
+// state_getStorage response ternary a second and third time.
 function wsPeopleFails(mode) {
   // NOTE: no trailing "//" comment on these single-line guards — the
   // generated code is a single template line, and a line comment there would
@@ -297,24 +281,22 @@ describe("probe-env-health", () => {
     assert.match(stderr, /gateway /);
   });
 
-  // bulletin-deploy issue #1329: DotNS deploys through a CREATE3 factory, so
-  // contract addresses are IDENTICAL across every env and stable across a
-  // chain reset — a healthy RPC + a configured address proves nothing about
-  // whether the contracts actually exist on that chain. The probe must check
-  // code presence, not just address configuration. (port of bulletin #1353)
-  describe("DotNS contract-presence check (bulletin-deploy issue #1329)", () => {
-    test("env with no contracts block at all is unhealthy", async () => {
-      // No real env in this repo's assets/environments.json omits
-      // `contracts` (both paseo-next-v2 and devnet declare it), so this test
-      // builds a throwaway repo root with a synthetic env that has valid
-      // chain endpoints but no contracts block at all.
-      const fixtureDir = makeNoContractsFixtureDir();
+  // Issue #1329: DotNS deploys through a CREATE3 factory, so contract
+  // addresses are IDENTICAL across every env and stable across a chain
+  // reset — a healthy RPC + a configured address proves nothing about
+  // whether the contracts actually exist on that chain. The probe must
+  // check code presence, not just address configuration.
+  describe("DotNS contract-presence check (issue #1329)", () => {
+    test("stack whose descriptor lacks the checked DotNS contracts is unhealthy", async () => {
+      // Chain probes still need mocking so the probe gets to the DotNS check at all.
+      const root = probeCopyWithout(["popRules", "controller"]);
       try {
-        const { code, stderr } = await runProbe({ env: "no-contracts", scenario: "healthy", cwd: fixtureDir });
-        assert.notStrictEqual(code, 0, ">> FAIL: no-contracts-block: expected non-zero exit for an env with no contracts configured");
-        assert.match(stderr, /dotns_not_configured/, `>> FAIL: no-contracts-block: expected dotns_not_configured, got: ${stderr}`);
+        const { code, stderr } = await runProbe({ env: "preview", scenario: "healthy", cwd: root });
+        assert.notStrictEqual(code, 0, ">> FAIL: no-contracts: expected non-zero exit for a stack whose descriptor lists neither checked contract");
+        assert.match(stderr, /dotns_not_configured/, `>> FAIL: no-contracts: expected dotns_not_configured, got: ${stderr}`);
+        assert.match(stderr, /dotns\.popRules, dotns\.controller/, `>> FAIL: no-contracts: the message must list every missing dotns key, got: ${stderr}`);
       } finally {
-        fs.rmSync(fixtureDir, { recursive: true, force: true });
+        fs.rmSync(root, { recursive: true, force: true });
       }
     });
 
@@ -322,7 +304,7 @@ describe("probe-env-health", () => {
       const { code, stderr } = await runProbe({ env: "paseo-next-v2", scenario: "dotns_contract_missing" });
       assert.notStrictEqual(code, 0, ">> FAIL: contract-missing: expected non-zero exit when the AccountInfoOf read returns null (no code)");
       assert.match(stderr, /dotns_contract_missing/, `>> FAIL: contract-missing: expected dotns_contract_missing, got: ${stderr}`);
-      assert.match(stderr, /POP_RULES/, ">> FAIL: contract-missing: message should name the address/contract key that failed");
+      assert.match(stderr, /dotns\.popRules/, ">> FAIL: contract-missing: message should name the descriptor key of the contract that failed");
     });
 
     test("a hanging storage read times out rather than hanging or false-passing", async () => {
@@ -360,36 +342,37 @@ describe("probe-env-health", () => {
 // loadEnv() drift guard (port of bulletin #1538, probe-env-health half only —
 // the twin has no chunk-sharing-report.mjs, so that half of #1538 doesn't apply)
 // ---------------------------------------------------------------------------
-// Why loadEnv() stays a hand-parse: see the comment above loadEnv() in
-// tools/probe-env-health.mjs. This test runs under `npm test`, where dist/ IS
-// built (unlike the CI job that constraint is about), and compares loadEnv()
-// against src/environments.ts's resolveEndpoints() for every e2eEligible env
-// — the set select-env actually probes — so a future edit to either side that
-// silently diverges fails loudly here instead of in a 3am CI run.
-describe("loadEnv() drift guard against the real resolver", () => {
-  test("loadEnv() agrees with resolveEndpoints() for every e2eEligible env", async () => {
-    const distPath = new URL("../dist/environments.js", import.meta.url);
-    if (!fs.existsSync(distPath)) {
-      throw new Error(">> FAIL: loadEnv-drift-guard: dist/environments.js not found — run `npm run build` first");
-    }
+// loadEnv() reads the shipped copies without dist/ (see the comment above it in
+// tools/probe-env-health.mjs). This compares it against dist/stacks.js's
+// readShippedStack() for every e2eEligible stack, the set select-env probes, so a
+// divergence on either side fails here instead of in a CI run.
+describe("loadEnv() drift guard against the real resolver (#1535)", () => {
+  test("loadEnv() agrees with readShippedStack() for every e2eEligible stack", async () => {
     const { loadEnv } = await import("../tools/probe-env-health.mjs");
-    const { loadEnvironments, resolveEndpoints } = await import("../dist/environments.js");
-
-    const { doc } = await loadEnvironments();
-    const e2eEligibleIds = doc.environments.filter((e) => e.e2eEligible).map((e) => e.id);
-    assert.ok(e2eEligibleIds.length > 0, ">> FAIL: loadEnv-drift-guard: fixture assumption broken — no e2eEligible envs found in assets/environments.json");
+    const { readShippedStack, BUILT_IN_STACK_IDS } = await import("../dist/stacks.js");
+    const e2eEligibleIds = BUILT_IN_STACK_IDS.filter((id) => readShippedStack(id).e2eEligible);
+    assert.ok(e2eEligibleIds.length > 0, ">> FAIL: loadEnv-drift-guard: no e2eEligible stack in assets/stack-policy.json");
 
     for (const envId of e2eEligibleIds) {
-      const fromHandParse = loadEnv(envId);
-      assert.ok(!fromHandParse.error, `>> FAIL: loadEnv-drift-guard ${envId}: loadEnv() itself errored: ${fromHandParse.error?.message}`);
-
-      const resolved = resolveEndpoints(doc, envId);
-      assert.strictEqual(fromHandParse.assetHubRpc, resolved.assetHub[0],
-        `>> FAIL: loadEnv-drift-guard ${envId}: asset-hub RPC diverges from resolveEndpoints() — hand-parse=${fromHandParse.assetHubRpc}, resolver=${resolved.assetHub[0]}`);
-      assert.strictEqual(fromHandParse.bulletinRpc, resolved.bulletin[0],
-        `>> FAIL: loadEnv-drift-guard ${envId}: bulletin RPC diverges from resolveEndpoints() — hand-parse=${fromHandParse.bulletinRpc}, resolver=${resolved.bulletin[0]}`);
-      assert.strictEqual(fromHandParse.gatewayUrl, resolved.ipfs,
-        `>> FAIL: loadEnv-drift-guard ${envId}: gateway URL diverges from resolveEndpoints() — hand-parse=${fromHandParse.gatewayUrl}, resolver=${resolved.ipfs}`);
+      const fromCopies = loadEnv(envId);
+      assert.ok(!fromCopies.error, `>> FAIL: loadEnv-drift-guard ${envId}: loadEnv() itself errored: ${fromCopies.error?.message}`);
+      const stack = readShippedStack(envId);
+      assert.strictEqual(fromCopies.assetHubRpc, stack.chains.AssetHub.rpc[0],
+        `>> FAIL: loadEnv-drift-guard ${envId}: asset-hub RPC diverges from readShippedStack(): tool=${fromCopies.assetHubRpc}, resolver=${stack.chains.AssetHub.rpc[0]}`);
+      assert.strictEqual(fromCopies.bulletinRpc, stack.chains.Bulletin.rpc[0],
+        `>> FAIL: loadEnv-drift-guard ${envId}: bulletin RPC diverges from readShippedStack(): tool=${fromCopies.bulletinRpc}, resolver=${stack.chains.Bulletin.rpc[0]}`);
+      assert.strictEqual(fromCopies.peopleRpc, stack.chains.People.rpc[0],
+        `>> FAIL: loadEnv-drift-guard ${envId}: people RPC diverges from readShippedStack(): tool=${fromCopies.peopleRpc}, resolver=${stack.chains.People.rpc[0]}`);
+      assert.strictEqual(fromCopies.gatewayUrl, stack.ipfsGateway,
+        `>> FAIL: loadEnv-drift-guard ${envId}: gateway URL diverges from readShippedStack(): tool=${fromCopies.gatewayUrl}, resolver=${stack.ipfsGateway}`);
+      assert.deepStrictEqual(Object.entries(fromCopies.dotns).sort(), Object.entries(stack.descriptor.dotns ?? {}).sort(),
+        `>> FAIL: loadEnv-drift-guard ${envId}: dotns diverges from readShippedStack(): tool=${JSON.stringify(fromCopies.dotns)}, resolver=${JSON.stringify(stack.descriptor.dotns)}`);
     }
+  });
+
+  test("loadEnv() resolves an alias to its built-in stack", async () => {
+    const { loadEnv } = await import("../tools/probe-env-health.mjs");
+    assert.strictEqual(loadEnv("previewnet").id, "preview",
+      ">> FAIL: loadEnv alias: select-env passes ids and aliases alike, so 'previewnet' must probe the preview stack");
   });
 });

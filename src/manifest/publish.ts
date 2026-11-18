@@ -18,28 +18,23 @@ import {
   encodeContenthash,
   storeDirectory,
   storeFile,
+  startPresenceFloor,
+  assertNoRemovedSelections,
   resolveDotnsConnectOptions,
   resolveProductSigner,
-  resolveBulletinEndpoints,
-  setBulletinEndpoints,
-  setBulletinNetworkContext,
   selectStorageReconnect,
+  setBulletinStack,
   type DeployOptions,
 } from "../deploy.js";
-import { DotNS, assertTxCreator, DEFAULT_TLD, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
+import { DotNS, assertTxCreator, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
-import {
-  loadEnvironments,
-  resolveEndpoints,
-  getPopSelfServeConfig,
-  DEFAULT_ENV_ID,
-  type ResolvedEndpoints,
-  type PopSelfServeConfig,
-} from "../environments.js";
+import { setPresenceFloor } from "../chunk-probe.js";
+import { loadStack, type Stack } from "../stacks.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
 import { composeExecutable, composeRoot, selfListedKeys } from "./compose.js";
 import type { LoadedProductConfig } from "./config-load.js";
 import { verifyEmbeddedAppManifests } from "./product-preflight.js";
+import type { ProductConfig } from "./types.js";
 
 export interface PublishManifestOptions {
   /** Loaded + validated product config (call loadProductConfig first). */
@@ -53,11 +48,12 @@ export interface PublishManifestOptions {
    */
   buildDirCid?: { absPath: string; cid: string };
   /**
-   * Env id (e.g. "paseo-next-v2"). Drives DotNS RPC + contract resolution
-   * AND the Bulletin endpoint the icon/executable uploads target — both use
-   * the same resolved env, matching the legacy deploy.
+   * Built-in stack id or alias (e.g. "paseo-next-v2"). The stack drives DotNS and the
+   * Bulletin endpoint the icon/executable uploads target, as in deploy(). Exclusive with `stack`.
    */
   env?: string;
+  /** A stack link, descriptor URL or descriptor file path. Exclusive with `env`. */
+  stack?: string;
   /** Optional bulletin RPC override — same precedence as the legacy deploy's `--rpc`. */
   rpc?: string;
   /** Required: signer mnemonic. */
@@ -66,6 +62,7 @@ export interface PublishManifestOptions {
   derivationPath?: string;
   /** Sign as the RFC-0022 product account, the same key deploy() registers the name with. */
   productName?: string;
+  forceStore?: boolean;
   /**
    * The Bulletin allowance-slot signer deploy() resolved for the content upload, handed over
    * in-process via DeployResult. Set when the deploy ran on a login session's own slot rather
@@ -84,6 +81,51 @@ export interface PublishManifestResult {
   textRecordsWritten: number;
 }
 
+
+export async function manifestAssetUpload(
+  reconnect: ReturnType<typeof selectStorageReconnect>,
+  assets: {
+    iconBytes: Uint8Array;
+    executables: ProductConfig["executables"];
+    configDir: string;
+    buildDirCid?: PublishManifestOptions["buildDirCid"];
+    forceStore?: boolean;
+  },
+): Promise<{ iconCid: string; executableCids: Record<string, string> }> {
+  const storage = await reconnect();
+  const executableCids: Record<string, string> = {};
+  try {
+    if (assets.forceStore) await startPresenceFloor(storage.client);
+    const iconCid = await storeFile(assets.iconBytes, { ...storage, hashCode: BLAKE2B_256_MULTIHASH_CODE });
+    console.log(`  Icon CID: ${iconCid}`);
+
+    for (const exec of assets.executables) {
+      const execAbs = path.resolve(assets.configDir, exec.path);
+      if (
+        assets.buildDirCid &&
+        path.resolve(assets.buildDirCid.absPath) === execAbs
+      ) {
+        console.log(
+          `  Executable [${exec.kind}] reused build-dir CID: ${assets.buildDirCid.cid}`,
+        );
+        executableCids[exec.kind] = assets.buildDirCid.cid;
+        continue;
+      }
+      console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
+      const { storageCid } = await storeDirectory(execAbs, storage, undefined, true);
+      console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
+      executableCids[exec.kind] = storageCid;
+    }
+    return { iconCid, executableCids };
+  } finally {
+    setPresenceFloor(null);
+    // Best-effort: a reconnect inside storeDirectory may already have
+    // destroyed and replaced this client (same guard every other destroy
+    // call site in deploy.ts uses).
+    try { storage.client.destroy(); } catch { /* already destroyed */ }
+  }
+}
+
 /**
  * Publish a product manifest on top of an already-completed legacy deploy.
  *
@@ -93,6 +135,7 @@ export interface PublishManifestResult {
  * content resolver before any `setText`.
  */
 export async function publishManifest(opts: PublishManifestOptions): Promise<PublishManifestResult> {
+  assertNoRemovedSelections(opts);
   assertTxCreator(opts.storageSigner, "PublishManifestOptions.storageSigner");
   const { config, sourcePath } = opts.loaded;
   // #1156/#1572: domain reconciliation happens below, once envTld is known —
@@ -115,38 +158,20 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
 
   const configDir = path.dirname(sourcePath);
 
-  // Resolve the env's Bulletin endpoint(s) up front — same env/--rpc
-  // precedence deploy() uses (resolveBulletinEndpoints is the exact function
-  // deploy() itself calls) — and point the module-level storage endpoint at
-  // it BEFORE any storeFile/storeDirectory call below. Without this,
-  // storeFile/storeDirectory connect with no client of their own, falling
-  // back to getProvider()'s module-default endpoint (DEFAULT_BULLETIN_RPC)
-  // regardless of opts.env/opts.rpc, while the DotNS text-record writes
-  // further down correctly use the resolved env — so the manifest content
-  // could land on the wrong Bulletin chain. Resolve once here and reuse the
-  // result in connectDotNS below (no second load).
-  const envId = opts.env ?? DEFAULT_ENV_ID;
-  const { doc } = await loadEnvironments();
-  const resolved = resolveEndpoints(doc, envId);
-  // DotNS helpers append `.<tld>` internally (this env's resolved TLD — see
-  // DotNS._tld / connectDotNS below), so callers of those helpers further
-  // down pass the bare label, not this full domain.
-  const envTld = resolved.tld ?? DEFAULT_TLD;
+  // Point Bulletin uploads at this stack before any storeFile/storeDirectory call: they use the
+  // module-level endpoint and authorization policy, which an earlier deploy() may have set for
+  // another chain.
+  const stack = await loadStack({ env: opts.env, stack: opts.stack });
+  // DotNS helpers append `.<tld>` internally, so callers of those helpers further down
+  // pass the bare label, not this full domain.
+  const envTld = stack.tld;
 
   // #1156/#1572: reconcile config.domain against the ACTUAL deploy target
   // (opts.domain) — not a config-derived copy of itself. Hoisted here, right
   // after envTld is known and before any upload below: this makes
   // publishManifest() itself block the icon/executable upload on a mismatch.
   reconcileManifestDomain(config.domain, opts.domain, envTld, sourcePath);
-  const popSelfServe = getPopSelfServeConfig(doc, envId);
-  setBulletinEndpoints(resolveBulletinEndpoints(resolved.bulletin, opts.rpc));
-  // Same reasoning as the endpoints above, for the OTHER piece of env state
-  // selectStorageReconnect's mainnet pool-fallback gate reads: `bulletinNetwork` is
-  // module-level in deploy.ts and is set per-deploy inside deploy(). A library caller
-  // invoking publishManifest() on its own (no preceding in-process deploy()) would
-  // otherwise leave it undefined — the historical testnet-shaped fallback, not a hard
-  // failure on mainnet. Resolve it from the same env this function already resolved.
-  setBulletinNetworkContext(resolved.network);
+  setBulletinStack(stack, opts.rpc);
 
   const iconAbs = path.resolve(configDir, config.icon.path);
   const iconBytes = await readFileOrThrow(iconAbs, "icon");
@@ -177,34 +202,16 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   // logs "Product deployer: …", and resolving twice would print the line
   // twice under --product-name.
   const signerOpts = manifestSignerOptions(opts);
-  const reconnect = selectStorageReconnect(signerOpts);
-  const storage = await reconnect();
-  let iconCid!: string;
-  const executableCids: Record<string, string> = {};
-  try {
-    iconCid = await storeFile(iconBytes, { ...storage, hashCode: BLAKE2B_256_MULTIHASH_CODE });
-    console.log(`  Icon CID: ${iconCid}`);
+  const { iconCid, executableCids } = await manifestAssetUpload(selectStorageReconnect(signerOpts), {
+    iconBytes,
+    executables: config.executables,
+    configDir,
+    buildDirCid: opts.buildDirCid,
+    forceStore: opts.forceStore,
+  });
 
-    for (const exec of config.executables) {
-      const execAbs = path.resolve(configDir, exec.path);
-      if (opts.buildDirCid && path.resolve(opts.buildDirCid.absPath) === execAbs) {
-        console.log(`  Executable [${exec.kind}] reused build-dir CID: ${opts.buildDirCid.cid}`);
-        executableCids[exec.kind] = opts.buildDirCid.cid;
-        continue;
-      }
-      console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
-      const { storageCid } = await storeDirectory(execAbs, storage, undefined, true);
-      console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
-      executableCids[exec.kind] = storageCid;
-    }
-  } finally {
-    // Best-effort: a reconnect inside storeDirectory may already have
-    // destroyed and replaced this client (same guard every other destroy
-    // call site in deploy.ts uses).
-    try { storage.client.destroy(); } catch { /* already destroyed */ }
-  }
-
-  const dotns = await connectDotNS(signerOpts, resolved, popSelfServe, envId);
+  const dotns = new DotNS();
+  await dotns.connect(resolveDotnsConnectOptions(signerOpts, stack));
 
   try {
     const baseLabel = stripDotSuffix(config.domain, envTld);
@@ -321,35 +328,8 @@ export function manifestSignerOptions(
     : base;
 }
 
-// Takes the ALREADY-RESOLVED signer options rather than the raw PublishManifestOptions: the
-// storage selection above needs the same resolution, and resolveProductSigner logs a line per
-// call, so the single caller resolves once and passes the result to both.
-async function connectDotNS(
-  deployOptsShim: ReturnType<typeof manifestSignerOptions>,
-  resolved: ResolvedEndpoints,
-  popSelfServe: PopSelfServeConfig | null,
-  envId: string,
-): Promise<DotNS> {
-  const connectOpts = resolveDotnsConnectOptions(
-    deployOptsShim,
-    resolved.assetHub,
-    resolved.autoAccountMapping,
-    resolved.contracts,
-    resolved.nativeToEthRatio,
-    envId,
-    popSelfServe,
-    resolved.registerStorageDeposit,
-    resolved.tld,
-  );
-
-  const dotns = new DotNS();
-  await dotns.connect({ ...connectOpts, recordStorageDeposit: resolved.recordStorageDeposit });
-  return dotns;
-}
-
 // tld is a required param: this function's single caller (below) always
-// passes a resolved value (`resolved.tld ?? DEFAULT_TLD`), so a default here
-// was dead code.
+// passes the stack's tld, so a default here would be dead code.
 function stripDotSuffix(domain: string, tld: string): string {
   return stripTldSuffix(domain, tld);
 }

@@ -151,18 +151,22 @@ async function main() {
   }
   if (!envId) { console.error("usage: check-env-readiness.mjs --env <id> [--timeout-ms N]"); process.exit(2); }
 
-  const { loadEnvironments, resolveEndpoints } = await import("../dist/environments.js");
+  const { loadStack, stackSelectionOf } = await import("../dist/stacks.js");
   const { DotNS, DEFAULT_MNEMONIC, fmtPas: fmt, computeDomainTokenId } = await import("../dist/dotns.js");
   const { DOTNS_ABI_PROFILES } = await import("../dist/dotns-protocol.js");
   const { SIGNERS, deriveSigners } = await import("./check-balances.mjs");
   const { gatherEnv } = await import("./funding-check.mjs");
 
-  const { doc } = await loadEnvironments();
-  if (!doc.environments.some((e) => e.id === envId)) {
-    console.error(`Unknown env "${envId}"`);
+  let stack;
+  try {
+    stack = await loadStack({ env: envId });
+  } catch (e) {
+    console.error(e.message);
     process.exit(2);
   }
-  const resolved = resolveEndpoints(doc, envId);
+  // The stricter of the two testnet gates: a write needs the stack to say both
+  // "testnet" and bulletinAutoAuthorize, never just one.
+  const refillable = isAutoReauthorizeAllowed(stack);
 
   // One DotNS connection serves the profile probe and the S3 read; a failed
   // connect is the profile verdict and leaves the S3 read unknown.
@@ -171,16 +175,7 @@ async function main() {
   const connected = (async () => {
     try {
       const d = new DotNS();
-      await d.connect({
-        mnemonic: DEFAULT_MNEMONIC,
-        rpc: resolved.assetHub[0],
-        assetHubEndpoints: resolved.assetHub,
-        autoAccountMapping: resolved.autoAccountMapping,
-        contracts: Object.keys(resolved.contracts).length > 0 ? resolved.contracts : undefined,
-        nativeToEthRatio: resolved.nativeToEthRatio,
-        tld: resolved.tld,
-        environmentId: envId,
-      });
+      await d.connect({ ...stackSelectionOf(stack), mnemonic: DEFAULT_MNEMONIC });
       dotns = d;
     } catch (e) {
       connectError = e;
@@ -194,18 +189,18 @@ async function main() {
     },
     funding: async () => {
       const signers = await deriveSigners(SIGNERS, DEFAULT_MNEMONIC);
-      return evaluateEnv(await gatherEnv(doc, envId, signers), DEFAULTS);
+      return evaluateEnv(await gatherEnv(envId, signers), DEFAULTS);
     },
     s3owner: async () => {
       await connected;
       if (connectError) throw new Error(`DotNS connect failed: ${msgOf(connectError)}`);
-      return dotns.contractCallNullable(resolved.contracts.DOTNS_REGISTRAR, REGISTRAR_OWNER_OF_ABI, "ownerOf", [computeDomainTokenId(S3_OWNED_LABEL, resolved.tld)]);
+      return dotns.contractCallNullable(stack.contracts.DOTNS_REGISTRAR, REGISTRAR_OWNER_OF_ABI, "ownerOf", [computeDomainTokenId(S3_OWNED_LABEL, stack.tld)]);
     },
   };
 
   const summary = await checkReadiness({
     envId,
-    tld: resolved.tld,
+    tld: stack.tld,
     knownProfiles: Object.keys(DOTNS_ABI_PROFILES),
     readers,
     timeoutMs,

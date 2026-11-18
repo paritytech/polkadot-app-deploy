@@ -16,7 +16,7 @@
 //      fallback for the chains that DO need People now lives at the test
 //      level instead (test/e2e-chain-calls.test.js's candidateEndpoints()/
 //      connectChainWithFallback()).
-//   4. Bulletin gateway (HTTP) — fetch the env's `ipfs` URL; any HTTP status
+//   4. Bulletin gateway (HTTP) — fetch the stack's `ipfs-gateway` URL; any HTTP status
 //      means the gateway server is up (404 at "/" is fine — the gateway
 //      doesn't serve a root index but proves it's reachable).
 //   5. DotNS contract presence (issue #1329 in bulletin-deploy) — a chain can
@@ -45,12 +45,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { findBuiltInStackId, findChain, readShippedDescriptor, readStackPolicy } from "./lib/stack-copies.mjs";
 
-// The two DotNS contracts a deploy cannot proceed without: POP_RULES gates
-// name classification/pricing, DOTNS_REGISTRAR_CONTROLLER handles
-// commit/register. Both must have code on chain, not just a configured
-// address (see the CREATE3 note above).
-const DOTNS_CHECK_KEYS = ["POP_RULES", "DOTNS_REGISTRAR_CONTROLLER"];
+// The two DotNS contracts a deploy cannot proceed without, by their key in the
+// descriptor's `dotns` map: popRules gates name classification/pricing,
+// controller handles commit/register. Both must have code on chain, not just a
+// configured address (see the CREATE3 note above).
+const DOTNS_CHECK_KEYS = ["popRules", "controller"];
 
 // Alice (//Alice derivation) — 32-byte SS58 pubkey hex.
 // Substrate address: 5GrwvaEF5zXb26Fz9rcQpDWS57CtERHpNehXCPcNoHGKutQY
@@ -78,59 +79,36 @@ function fail(kind, message, durationMs) {
   process.exit(1);
 }
 
-// #1538 (bulletin-deploy) looked at replacing this hand-parse with the real
-// src/environments.ts resolveEndpoints()/loadEnvironments() (which the
-// comment below used to say it was manually matching). Deliberately NOT
-// done: this function is invoked directly by .github/workflows/e2e.yml's
-// `select-env` job (`node tools/probe-env-health.mjs --env "$env"`), which
-// runs no `npm ci` and no `npm run build` before that call — a hard
-// "zero npm deps, no build step" constraint documented in this file's own
-// header. `dist/` (where resolveEndpoints lives once built) is gitignored
-// and does not exist in that job's checkout. Importing it here would make
-// `select-env` crash with "dist/environments.js not found" — no env would
-// get selected, and the whole E2E pipeline goes dark. Do NOT "fix" this
-// hand-parse without first adding a build step to `select-env` or otherwise
-// removing the zero-build constraint.
-// A drift-guard test (test/probe-env-health.test.js) runs under `npm test`,
-// where `dist/` does exist, and will catch this hand-parse silently
-// diverging from resolveEndpoints() for any e2eEligible env.
-export function loadEnv(envId) {
-  let doc;
+// Reads the shipped stack copies through tools/lib/stack-copies.mjs instead of
+// dist/stacks.js: e2e.yml's `select-env` job runs this without `npm ci` or
+// `npm run build`, so dist/ and node_modules do not exist there.
+export function loadEnv(envValue) {
+  let policy;
   try {
-    doc = JSON.parse(fs.readFileSync(path.resolve("assets/environments.json"), "utf-8"));
+    policy = readStackPolicy();
   } catch (e) {
-    return { error: { kind: "config_error", message: `assets/environments.json: ${e.message}` } };
+    return { error: { kind: "config_error", message: `assets/stack-policy.json: ${e.message}` } };
   }
-  const entry = (doc.environments || []).find((e) => e.id === envId);
-  if (!entry) {
-    const available = (doc.environments || []).map((e) => e.id).join(", ");
+  const envId = findBuiltInStackId(envValue, policy);
+  if (!envId) {
     return {
       error: {
         kind: "unknown_env",
-        message: `env "${envId}" not in environments.json. Available envs: ${available}`,
+        message: `env "${envValue}" is not a built-in stack. Available envs: ${Object.keys(policy.stacks).join(", ")}`,
       },
     };
   }
-  // Resolve every chain endpoint this probe touches. Asset Hub hosts the
-  // Revive pallet (and therefore ReviveApi.address) and Bulletin hosts
-  // content storage — both GATE env health below. People is resolved too
-  // (advisory reporting only, see the module comment above) but is
-  // deliberately NOT required here: an env with no people entry at all is
-  // just "people not configured", reported the same as a live People probe
-  // failure, not a config_error that would gate health. Match how
-  // src/environments.ts::resolveEndpoints reads it (chains is an array of
-  // chain objects, each with an `id` and an `endpoints` map keyed by env id)
-  // — see the module-level comment above for why this stays a hand-parse
-  // instead of importing resolveEndpoints itself.
-  const pickWss = (chainId) => {
-    const chain = (doc.chains || []).find((c) => c.id === chainId);
-    const wss = chain?.endpoints?.[envId]?.wss;
-    return Array.isArray(wss) ? wss[0] : wss;
-  };
-  const assetHubRpc = pickWss("asset-hub");
-  const bulletinRpc = pickWss("bulletin");
-  const peopleRpc = pickWss("people"); // advisory only — may be undefined
-  const gatewayUrl = entry.ipfs;
+  let descriptor;
+  try {
+    descriptor = readShippedDescriptor(envId);
+  } catch (e) {
+    return { error: { kind: "config_error", message: `.trinity/${envId}.json: ${e.message}` } };
+  }
+  // Asset Hub and Bulletin gate env health below; People is advisory only and may be missing.
+  const assetHubRpc = findChain(descriptor, "AssetHub")?.rpc?.[0];
+  const bulletinRpc = findChain(descriptor, "Bulletin")?.rpc?.[0];
+  const peopleRpc = findChain(descriptor, "People")?.rpc?.[0];
+  const gatewayUrl = descriptor.services?.find((service) => service.kind === "ipfs-gateway")?.urls?.[0];
   if (!assetHubRpc) {
     return { error: { kind: "config_error", message: `no asset-hub RPC for env "${envId}"` } };
   }
@@ -138,9 +116,9 @@ export function loadEnv(envId) {
     return { error: { kind: "config_error", message: `no bulletin RPC for env "${envId}"` } };
   }
   if (!gatewayUrl) {
-    return { error: { kind: "config_error", message: `no gateway (ipfs) URL for env "${envId}"` } };
+    return { error: { kind: "config_error", message: `no ipfs-gateway service for env "${envId}"` } };
   }
-  return { entry, assetHubRpc, bulletinRpc, peopleRpc, gatewayUrl };
+  return { id: envId, assetHubRpc, bulletinRpc, peopleRpc, gatewayUrl, dotns: descriptor.dotns ?? {} };
 }
 
 // Probe a single chain over WebSocket. Returns { ok: true, result } on success
@@ -221,17 +199,14 @@ async function probeChain({ url, calls, timeoutMs }) {
   });
 }
 
-// Config half of the DotNS readiness check (bulletin-deploy issue #1329): the
-// env must declare the contracts a deploy needs. The on-chain half runs as
-// extra `state_call`s on the SAME Asset Hub probe below (dotnsStorageCalls) —
-// same connection, same timeout, no extra dependency.
-function checkDotnsConfigured(contracts) {
-  if (!contracts || Object.keys(contracts).length === 0) {
-    return { ok: false, kind: "dotns_not_configured", message: "env has no contracts block — cannot support a DotNS deploy" };
-  }
-  const missingKeys = DOTNS_CHECK_KEYS.filter((k) => !contracts[k]);
+// Config half of the DotNS readiness check (issue #1329): the env must declare
+// the contracts a deploy needs. The on-chain half runs as extra `state_call`s
+// on the SAME Asset Hub probe below (dotnsStorageCalls) — same connection, same
+// timeout, no extra dependency.
+function checkDotnsConfigured(dotns) {
+  const missingKeys = DOTNS_CHECK_KEYS.filter((key) => !dotns[key]).map((key) => `dotns.${key}`);
   if (missingKeys.length > 0) {
-    return { ok: false, kind: "dotns_not_configured", message: `env contracts block missing ${missingKeys.join(", ")}` };
+    return { ok: false, kind: "dotns_not_configured", message: `env descriptor missing ${missingKeys.join(", ")}` };
   }
   return { ok: true };
 }
@@ -241,16 +216,16 @@ function checkDotnsConfigured(contracts) {
 // are identical across chains and stable across resets — a configured
 // address can point at empty space on a freshly reset chain. `null` means no
 // code at that address.
-function dotnsStorageCalls(contracts, startId) {
+function dotnsStorageCalls(dotns, startId) {
   return DOTNS_CHECK_KEYS.map((key, i) => ({
     id: startId + i,
     method: "state_getStorage",
-    params: [reviveAccountInfoKey(contracts[key])],
+    params: [reviveAccountInfoKey(dotns[key])],
     errorKind: "dotns_probe_error",
     validateKind: "dotns_contract_missing",
     validate: (r) =>
       r === null || r === undefined
-        ? `no contract code at ${contracts[key]} (${key}) — chain may have been reset`
+        ? `no contract code at ${dotns[key]} (dotns.${key}) — chain may have been reset`
         : null,
   }));
 }
@@ -265,7 +240,7 @@ async function probe({ env, timeoutMs }) {
 
   // DotNS config check first — it needs no network, so a misconfigured env
   // fails before we open a socket.
-  const dotnsConfig = checkDotnsConfigured(loaded.entry.contracts);
+  const dotnsConfig = checkDotnsConfigured(loaded.dotns);
   if (!dotnsConfig.ok) fail(dotnsConfig.kind, dotnsConfig.message, Date.now() - t0);
 
   // 1. Asset Hub: WS + system_chain + ReviveApi.address (Revive lives here),
@@ -285,7 +260,7 @@ async function probe({ env, timeoutMs }) {
             ? `unexpected response: ${r}`
             : null,
       },
-      ...dotnsStorageCalls(loaded.entry.contracts, 3),
+      ...dotnsStorageCalls(loaded.dotns, 3),
     ],
   });
   if (!ah.ok) fail(ah.kind, `asset-hub ${ah.message}`, Date.now() - t0);

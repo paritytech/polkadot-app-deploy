@@ -5,7 +5,7 @@
  * Usage:
  *   node tools/probe-dotns-v060.mjs [--env <id>]
  *
- *   --env    Environment id from assets/environments.json (default: paseo-next-v2)
+ *   --env    Built-in stack id or alias (default: DEFAULT_STACK_ID)
  *
  * This is a read-only reconnaissance tool, not a test. It exists because three
  * facts about the live v0.6.0 PopRules/DotnsPopController deployment are
@@ -50,7 +50,7 @@
  *      different remedy — see this env's own OUTCOME line below.
  *
  * Every query is a read-only dry-run (ReviveApi.call). No transactions, no
- * state writes. Reads contract addresses from assets/environments.json via
+ * state writes. Reads contract addresses from the stack descriptor via
  * --env — never a hardcoded address (a testnet redeploy keeps every CREATE3
  * address identical, so a stale hardcoded address would look like "no code"
  * rather than "wrong env").
@@ -60,6 +60,7 @@ import { getWsProvider } from "polkadot-api/ws";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { DotNS } from "../dist/dotns.js";
+import { loadStack, stackSelectionOf, DEFAULT_STACK_ID } from "../dist/stacks.js";
 import { POP_CONTROLLER_PROBE_ABI, PROTOCOL_PROBE_LABEL, DOTNS_ABI_PROFILES } from "../dist/dotns-protocol.js";
 import { dryRun } from "./_revive-dry-run.mjs";
 
@@ -96,7 +97,7 @@ async function probeAndReport(fn, { onOk, onRevert, onError }) {
 }
 
 const rawArgv = process.argv.slice(2);
-let ENV_ID = "paseo-next-v2";
+let ENV_ID = DEFAULT_STACK_ID;
 for (let i = 0; i < rawArgv.length; i++) {
   if (rawArgv[i] === "--env") { ENV_ID = rawArgv[++i]; continue; }
   if (["--help", "-h"].includes(rawArgv[i])) {
@@ -112,34 +113,25 @@ for (let i = 0; i < rawArgv.length; i++) {
   process.exit(2);
 }
 
-const { loadEnvironments, resolveEndpoints } = await import("../dist/environments.js");
-// loadEnvironments() returns { doc, source } — this tool's whole job is
-// reporting ground truth about what's live, so which environments.json
-// source won (local file vs. a remote prefetch/refresh) belongs in the
-// report too, not just the addresses it produced.
-const { doc, source } = await loadEnvironments();
-const envEntry = doc.environments.find((e) => e.id === ENV_ID);
-if (!envEntry) {
-  console.error(`Unknown env "${ENV_ID}". Known: ${doc.environments.map((e) => e.id).join(", ")}`);
+// The report includes which descriptor won (the published one or the shipped
+// fallback): this tool reports ground truth about what's live.
+let stack;
+try {
+  stack = await loadStack({ env: ENV_ID });
+} catch (e) {
+  console.error(e.message);
   process.exit(2);
 }
-const resolved = resolveEndpoints(doc, ENV_ID);
-const RPC = resolved.assetHub[0];
-const POP_RULES = envEntry.contracts?.POP_RULES;
-const DOTNS_POP_CONTROLLER = envEntry.contracts?.DOTNS_POP_CONTROLLER;
-const DOTNS_REGISTRAR = envEntry.contracts?.DOTNS_REGISTRAR;
-if (!RPC || !POP_RULES) {
-  console.error(`env "${ENV_ID}" is missing an asset-hub endpoint or POP_RULES address`);
-  process.exit(2);
-}
+const RPC = stack.chains.AssetHub.rpc[0];
+const { POP_RULES, DOTNS_POP_CONTROLLER, DOTNS_REGISTRAR } = stack.contracts;
 
 const ALICE_DEV = "bottom drive obey lake curtain smoke basket hold race lonely fit walk";
 await cryptoWaitReady();
 const keyring = new Keyring({ type: "sr25519" });
 const alice = keyring.addFromUri(ALICE_DEV);
 
-console.log(`env:                  ${ENV_ID}`);
-console.log(`environments.json:    ${source}`);
+console.log(`env:                  ${stack.id}`);
+console.log(`descriptor:           ${stack.source}`);
 console.log(`RPC (asset-hub):      ${RPC}`);
 console.log(`POP_RULES:            ${POP_RULES}`);
 console.log(`DOTNS_POP_CONTROLLER: ${DOTNS_POP_CONTROLLER ?? "(not configured for this env)"}`);
@@ -153,25 +145,16 @@ console.log("");
 //   1. a profile answered — report which, via the public `protocolVersion`
 //      getter (not by scraping connect()'s own log line).
 //   2. NO CONTRACT CODE at the configured POP_RULES address — this is NOT
-//      "wrong profile", it means environments.json's configured address
+//      "wrong profile", it means the descriptor's configured address
 //      currently has nothing deployed (e.g. a redeploy in flight, or a
-//      stale/wrong address). Remedy: wait, or fix environments.json.
+//      stale/wrong address). Remedy: wait, or get the descriptor fixed.
 //   3. code is present (or its presence could not be verified) but neither
 //      known discriminator answered — a genuinely unrecognized ABI, or a
 //      transient RPC issue. Remedy: investigate; do NOT assume "not v0.6.0".
 console.log("=== 1. Detected DotNS ABI profile (DotNS.connect()'s own probe) ===");
 try {
   const dotns = new DotNS();
-  await dotns.connect({
-    mnemonic: ALICE_DEV,
-    rpc: resolved.assetHub[0],
-    assetHubEndpoints: resolved.assetHub,
-    autoAccountMapping: resolved.autoAccountMapping,
-    contracts: Object.keys(resolved.contracts).length > 0 ? resolved.contracts : undefined,
-    nativeToEthRatio: resolved.nativeToEthRatio,
-    tld: resolved.tld,
-    environmentId: ENV_ID,
-  });
+  await dotns.connect({ ...stackSelectionOf(stack), mnemonic: ALICE_DEV });
   const profile = dotns.protocolVersion; // public getter — read directly, never scraped from a log line
   const info = DOTNS_ABI_PROFILES[profile];
   console.log(`OUTCOME: PROFILE DETECTED`);
@@ -182,7 +165,7 @@ try {
   const msg = e.message ?? String(e);
   if (/No contract deployed at this address/.test(msg)) {
     console.log(`OUTCOME: NO CONTRACT CODE at ${POP_RULES} — cannot determine the ABI profile at all.`);
-    console.log(`   This is NOT "not v0.6.0" — environments.json's configured address currently has nothing`);
+    console.log(`   This is NOT "not v0.6.0" — the descriptor's configured address currently has nothing`);
     console.log(`   deployed here (e.g. a redeploy in flight). Remedy: wait and re-probe, or fix the configured`);
     console.log(`   address if it is simply stale/wrong.`);
     console.log(`   raw: ${msg}`);

@@ -5,7 +5,9 @@
 
 import type { SessionAddresses } from "../auth/index.js";
 import { getAuthClient, hasPersistedSession, STALE_SESSION_MESSAGE } from "../auth-config.js";
+import type { Stack } from "../stacks.js";
 import { CLI_NAME } from "../cli-name.js";
+import { NonRetryableError } from "../errors.js";
 
 /**
  * Format session address info for display. Pass `null` when no session exists.
@@ -25,16 +27,17 @@ export function formatWhoami(addresses: SessionAddresses | null): string {
 
 /**
  * Run the whoami command. Gets the session signer (if any) and prints the
- * formatted output. Never throws — "no session" prints the not-logged-in message.
+ * formatted output. Without a session file it prints the not-logged-in message
+ * without calling `loadStack`; otherwise it fails only when the stack does not load.
  */
-export async function runWhoami(envId: string): Promise<void> {
-    // Cheap probe: if no session file exists, skip the People-chain WebSocket entirely.
+export async function runWhoami(loadStack: () => Promise<Stack>): Promise<void> {
     if (!hasPersistedSession()) {
         console.log(formatWhoami(null));
         return;
     }
+    const stack = await loadStack();
     try {
-        const client = await getAuthClient(envId);
+        const client = await getAuthClient(stack);
         const handle = await client.getSessionSigner();
         if (handle) {
             console.log(formatWhoami(handle.addresses));
@@ -50,9 +53,9 @@ export async function runWhoami(envId: string): Promise<void> {
         if (e?.name === "SignerNotAvailableError") {
             // Expected: session file exists but no usable signer — treat as stale.
             console.error(STALE_SESSION_MESSAGE);
-        } else if (e?.name === "NonRetryableError") {
-            // Signed in, but the phone did not return this env's account key.
-            console.error(e.message);
+        } else if (err instanceof NonRetryableError) {
+            // The phone did not return this stack's account key.
+            console.error(err.message);
         } else {
             // Unexpected error (WS failure, People chain unavailable, etc.).
             console.log(`Could not reach login service: ${e?.message ?? String(err)}`);

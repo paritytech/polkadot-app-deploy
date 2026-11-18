@@ -49,6 +49,8 @@ jobs:
       # NO Sentry DSN: telemetry is strictly opt-in and inert by default. Do NOT
       # add a SENTRY_DSN secret to this repo — leaving it unset is the design.
       - run: npm test
+      - name: Check the shipped stack copies are current
+        run: node scripts/check-stacks-current.mjs
 
       # The package is published to the @parity scope through Parity's
       # `npm_publish_automation` — this repo never holds an npm token. We build

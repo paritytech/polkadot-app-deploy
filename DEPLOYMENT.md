@@ -26,29 +26,39 @@ Setup is: tell `polkadot-app-deploy` where those are, authorize the accounts tha
 
 ## 1. Define the environment
 
-`polkadot-app-deploy` resolves environments from `environments.json`. The built-in presets ship in `assets/environments.json`:
+`polkadot-app-deploy` reads network values from Trinity stack descriptors. The built-in stacks (`preview`, `paseo-next-v2` (default), `pcf-devnet`, `polkadot`) ship signed copies under `.trinity/`; each run fetches the selected stack's published descriptor and falls back to the shipped copy with a warning.
 
 ```sh
-polkadot-app-deploy --list-environments      # list the built-in environment IDs
+polkadot-app-deploy --list-environments      # list the built-in stacks and their aliases
 ```
 
-Add your network either by adding an entry to `assets/environments.json`, or by supplying one at runtime:
+Any other network (a fork, a local stack) is selected at runtime, without a release:
 
 ```sh
-polkadot-app-deploy ./dist myapp.dot --environment-file ./my-env.json
-polkadot-app-deploy ./dist myapp.dot --env <id> --contract DOTNS_REGISTRAR=0x...   # override single fields
+polkadot-app-deploy ./dist myapp.dot --stack ./my-stack.json                      # descriptor file
+polkadot-app-deploy ./dist myapp.dot --stack https://example.com/stack.json      # descriptor URL
+polkadot-app-deploy ./dist myapp.dot --stack 'polkadotapp://stack?...'           # signed stack link
 ```
 
-An environment entry provides:
+`PAD_STACK` does the same as `--stack`. Passing `--stack` together with `--env` is an error. A custom stack is treated as a testnet unless one of its Relay, AssetHub, People or Bulletin genesis hashes is a Polkadot or Kusama chain's, in which case the mainnet gates apply (no auto-authorize, no top-ups, no dev defaults).
 
-- **Chain endpoints** — the `wss://` RPCs for at least the **bulletin** and **asset-hub** chains.
-- **DotNS contract addresses** — the contract set deployed on your Asset Hub (`DOTNS_REGISTRAR`, `POP_RULES`, the resolvers, `STORE_FACTORY`, …).
-- **`nativeToEthRatio`** — `10^(18 − native_decimals)`; e.g. a 10-decimal native token → `100000000`.
-- **`registerStorageDeposit`** — the DotNS registration deposit on your chain.
-- **`autoAccountMapping`** — whether the chain maps accounts to H160 automatically on first tx.
-- **`ipfs`** — the gateway that serves deployed content.
+To get a descriptor file, save a published stack with the `trinity-stack` CLI. It fetches the descriptor the link points to, checks it against the link's key and writes `./stacks/my-stack.json`:
 
-Use the `paseo-next-v2` and `devnet` entries in `assets/environments.json` as worked examples to copy.
+```sh
+npx -p @parity/trinity-stack trinity-stack add my-stack 'polkadotapp://stack?key=0x...&url=https%3A%2F%2F...' --dir ./stacks
+polkadot-app-deploy ./dist myapp --stack ./stacks/my-stack.json
+```
+
+A hand-written unsigned descriptor JSON file is accepted too; the files in `.trinity/` hold signed copies whose base64 `payload` is such a descriptor.
+
+A descriptor provides:
+
+- **Chains**: `wss://` RPCs and genesis hash for at least the **Bulletin**, **AssetHub**, **People** and **Relay** roles. After connecting, `polkadot-app-deploy` checks the genesis hash of Bulletin, Asset Hub and People (including a `--rpc` / `BULLETIN_RPC` override) and fails naming the chain that does not match.
+- **DotNS contract addresses** (`dotns`): the contract set deployed on your Asset Hub (`registrar`, `popRules`, the resolvers, `storeFactory`, ...).
+- **`tld`**: the DotNS top-level domain. Sign-in fails when it differs from the People chain's `NetworkSuffix`.
+- **Services**: an `ipfs-gateway` that serves deployed content.
+
+The format is defined by the [Trinity stack descriptor RFC](https://github.com/paritytech/trinity-user-agents/blob/main/docs/rfcs/trinity-stack-descriptor.md).
 
 ## 2. Authorize Bulletin storage
 

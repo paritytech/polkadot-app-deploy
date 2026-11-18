@@ -1,13 +1,19 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { deploy, isPhoneSignerActive, shouldHandoverName } from "../dist/deploy.js";
 import { parseDomainName } from "../dist/dotns.js";
+import { setupIsolatedHome, writeLocalStack } from "./helpers/isolated-home.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, "..");
+// A temp home and a stack on an unreachable local port: if the label check regresses, the deploy
+// fails here instead of connecting to paseo-next-v2.
+const isolation = setupIsolatedHome();
+after(() => isolation.restore());
+const LOCAL_STACK = writeLocalStack(isolation.tmp);
 
 // Behavioral guard (#890): a syntactically invalid label must be rejected
 // up-front — BEFORE the signer-resolution block prints the worker/storage plan.
@@ -34,9 +40,9 @@ test("deploy rejects a syntactically invalid label before printing any signer pl
   try {
     await assert.rejects(
       // suri → forces the "resolve" signer path (the one that prints the plan).
-      // bulletinEndpoints → bypasses the env loader, so the test is hermetic
-      // (no network, no env file, no session load — the throw fires first).
-      () => deploy(new Uint8Array([0]), "ab", { suri: "//Alice", bulletinEndpoints: ["wss://example.invalid"] }),
+      // stack → a local descriptor file loads without a fetch, so the test is
+      // hermetic (no network, no session load — the throw fires first).
+      () => deploy(new Uint8Array([0]), "ab", { suri: "//Alice", stack: LOCAL_STACK }),
       /3-63 chars/,
       ">> FAIL: deploy label ordering: a too-short label should be rejected up-front, before any signer plan",
     );

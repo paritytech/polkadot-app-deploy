@@ -2194,7 +2194,7 @@
   }
  },
  {
-  "message": "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address. This address came from /home/ops/envs.json (environment paseo-next-v2).",
+  "message": "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address. This address came from the descriptor of stack paseo-next-v2-1a4c2828 (passed with --stack as a file).",
   "sources": [
    "test"
   ],
@@ -2205,7 +2205,7 @@
   }
  },
  {
-  "message": "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address. This address came from assets/environments.json shipped with bulletin-deploy (environment paseo-next-v2).",
+  "message": "Contract call returned empty data — contract=POP_RULES (0xabc) env=paseo-next-v2 functionName=startingPrice. Could not verify whether contract code exists at this address (runtime code-presence query failed); investigate the contract/ABI or the configured address. This address came from the descriptor of built-in stack paseo-next-v2 (shipped with polkadot-app-deploy).",
   "sources": [
    "test"
   ],
@@ -3494,7 +3494,7 @@
   }
  },
  {
-  "message": "No contract deployed at 0xabc (DOTNS_REGISTRAR) env=paseo-next-v2. This address came from assets/environments.json shipped with bulletin-deploy (environment paseo-next-v2).",
+  "message": "No contract deployed at 0xabc (DOTNS_REGISTRAR) env=paseo-next-v2. This address came from the descriptor of built-in stack paseo-next-v2 (shipped with polkadot-app-deploy).",
   "sources": [
    "test"
   ],
@@ -3505,7 +3505,7 @@
   }
  },
  {
-  "message": "No contract deployed at 0xabc (POP_RULES) env=(unset) — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. No environment or --contract supplied POP_RULES, so this is the built-in default address.",
+  "message": "No contract deployed at 0xabc (POP_RULES) env=(unset) — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. No stack or contracts option supplied POP_RULES.",
   "sources": [
    "test"
   ],
@@ -3527,7 +3527,7 @@
   }
  },
  {
-  "message": "No contract deployed at 0xabc (POP_RULES) env=gamingnet — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from /home/ops/envs.json (environment gamingnet).",
+  "message": "No contract deployed at 0xabc (POP_RULES) env=gamingnet — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from the descriptor of stack gamingnet-1a4c2828 (passed with --stack as a file).",
   "sources": [
    "test"
   ],
@@ -3538,7 +3538,7 @@
   }
  },
  {
-  "message": "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from assets/environments.json shipped with bulletin-deploy (environment paseo-next-v2).",
+  "message": "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from the descriptor of built-in stack paseo-next-v2 (shipped with polkadot-app-deploy).",
   "sources": [
    "test"
   ],
@@ -3549,7 +3549,7 @@
   }
  },
  {
-  "message": "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from the built-in fallback for paseo-next-v2.",
+  "message": "No contract deployed at 0xabc (POP_RULES) env=paseo-next-v2 — the dry-run call to isBaseNameReserved returned empty success data, which on pallet-revive means the target address has no contract code. This address came from the descriptor of built-in stack paseo-next-v2 (as published by its operator).",
   "sources": [
    "test"
   ],
@@ -6299,7 +6299,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-6F1a2f/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-e222fbd3 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6311,7 +6311,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-9C2Ywr/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-8c9f9015 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6323,7 +6323,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-C1yLnx/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-2cabdb4a (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6335,7 +6335,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-D7Buvo/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-d0d9ca61 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6347,7 +6347,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-DYyv1S/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-0af64ad8 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6359,7 +6359,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-J3Q6Ha/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-519d5193 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6371,7 +6371,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-KuKcSA/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-b26ecddf (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6383,7 +6383,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-M2Z66l/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-4b977b77 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6395,7 +6395,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-NucDTf/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-be9f6832 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6407,7 +6407,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-OU0jKh/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-70fb5ab5 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6419,7 +6419,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-S3RWuw/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-b27028fe (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6431,7 +6431,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-T0Wv83/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-d77ca494 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6443,7 +6443,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-TNIZ8t/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-e67af6bd (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6455,7 +6455,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-TqZQbT/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-a0234508 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6467,7 +6467,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-ZDsnDp/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-59804dcb (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6479,7 +6479,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-bkgBtS/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-2bbc4acb (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6491,7 +6491,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-eYph1q/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-a20cf52f (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6503,7 +6503,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-gmrsuj/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-c7da6b9a (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6515,7 +6515,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-gq7B6t/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-2078dfae (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6527,7 +6527,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-kCkrb4/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-f9ebf403 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6539,7 +6539,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-kl2FAt/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-338a6340 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6551,7 +6551,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-qI2VRD/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-70ce11bf (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6563,7 +6563,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-rjlPGn/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-3a175154 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6575,7 +6575,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-rwzU1L/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-d30eba08 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6587,7 +6587,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-uLVX9P/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-e549e9b6 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6599,7 +6599,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-ucrFF4/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-6c1805e2 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6611,7 +6611,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-wQMAYM/environments.json (environment paseo-next-v2).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack paseo-next-v2-bc76a9b2 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6623,7 +6623,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the --contract flag or contracts option (POP_RULES=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa).",
+  "message": "paseo-next-v2 (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the contracts option of DotNS.connect().",
   "sources": [
    "sentry",
    "test"
@@ -6647,7 +6647,7 @@
   }
  },
  {
-  "message": "paseo-next-v2 (POP_RULES 0xabc): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the --contract flag or contracts option (POP_RULES=0xabc).",
+  "message": "paseo-next-v2 (POP_RULES 0xabc): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the contracts option of DotNS.connect().",
   "sources": [
    "test"
   ],
@@ -6777,7 +6777,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-0b8d8V/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-4f8a9574 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6789,7 +6789,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-CCvWtv/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-a9a35985 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6801,7 +6801,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-DBAtUC/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-65051f6a (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6813,7 +6813,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-MSyN8r/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-ae73c1f3 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6825,7 +6825,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-N5SJD4/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-deabd25e (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6837,7 +6837,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-NNgBpU/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-4020e9f3 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6849,7 +6849,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-Ptkbdo/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-e3d36d89 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6861,7 +6861,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-RxhbY3/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-1dd944ee (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6873,7 +6873,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-TXKNAV/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-618403e6 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6885,7 +6885,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-Y7Q1na/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-c350646d (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6897,7 +6897,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-YMNeAK/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-36e00df0 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6909,7 +6909,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-YkVN8k/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-9fa22f66 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6921,7 +6921,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-btVflC/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-b567a8fd (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6933,7 +6933,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-dWSxHq/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-d1201976 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6945,7 +6945,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-gNFIB5/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-a40161b1 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6957,7 +6957,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-iMF0fe/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-bc4a71a4 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6969,7 +6969,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-kgQrDQ/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-b28fc3ac (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6981,7 +6981,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from /tmp/e2e-custom-env-zFjxRV/environments.json (environment preview).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the descriptor of stack preview-662605a0 (passed with --stack as a file).",
   "sources": [
    "sentry"
   ],
@@ -6993,7 +6993,7 @@
   }
  },
  {
-  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the --contract flag or contracts option (POP_RULES=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa).",
+  "message": "preview (POP_RULES 0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa): No contract deployed at this address: could not detect the DotNS ABI profile because no contract code was found here. This address came from the contracts option of DotNS.connect().",
   "sources": [
    "sentry"
   ],
@@ -7394,6 +7394,72 @@
   ],
   "snapshot": {
    "kind": "nonce-stale",
+   "category": "environment",
+   "expected": false
+  }
+ },
+ {
+  "message": "Bulletin at wss://bulletin.example.test has genesis hash 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee, but stack paseo-next-v2 expects 0x1212121212121212121212121212121212121212121212121212121212121212: the chain restarted and the published descriptor of stack paseo-next-v2 (sequence 1762128000) does not describe the new chain yet; pass --stack with a descriptor of the restarted chain, or wait for its operator to publish one.",
+  "sources": [
+   "test"
+  ],
+  "snapshot": {
+   "kind": "chain.genesis_mismatch",
+   "category": "environment",
+   "expected": false
+  }
+ },
+ {
+  "message": "Bulletin at wss://bulletin.example.test has genesis hash 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee, but stack paseo-next-v2 expects 0x1212121212121212121212121212121212121212121212121212121212121212: the chain restarted, and this run used the copy of stack paseo-next-v2 shipped with polkadot-app-deploy (sequence 1762128000) because the published descriptor could not be used (see the warning above); retry when it can be fetched, or pass --stack with a descriptor of the restarted chain.",
+  "sources": [
+   "test"
+  ],
+  "snapshot": {
+   "kind": "chain.genesis_mismatch",
+   "category": "environment",
+   "expected": false
+  }
+ },
+ {
+  "message": "AssetHub at wss://asset-hub.example.test has genesis hash 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee, but stack preview expects 0x1212121212121212121212121212121212121212121212121212121212121212: the chain restarted and the descriptor passed with --stack (sequence 1762128000) does not describe the new chain; pass a newer one.",
+  "sources": [
+   "test"
+  ],
+  "snapshot": {
+   "kind": "chain.genesis_mismatch",
+   "category": "user",
+   "expected": true
+  }
+ },
+ {
+  "message": "People at wss://people.example.test has genesis hash 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee, but stack my-stack-0011aabb expects 0x1212121212121212121212121212121212121212121212121212121212121212: the descriptor of stack my-stack-0011aabb describes another chain.",
+  "sources": [
+   "test"
+  ],
+  "snapshot": {
+   "kind": "chain.genesis_mismatch",
+   "category": "user",
+   "expected": true
+  }
+ },
+ {
+  "message": "Bulletin at ws://127.0.0.1:9944 has genesis hash 0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee, but stack preview expects 0x1212121212121212121212121212121212121212121212121212121212121212: ws://127.0.0.1:9944 is not one of the stack's Bulletin endpoints, so it points at another chain.",
+  "sources": [
+   "test"
+  ],
+  "snapshot": {
+   "kind": "chain.genesis_mismatch",
+   "category": "user",
+   "expected": true
+  }
+ },
+ {
+  "message": "AssetHub at wss://asset-hub.example.test did not report its genesis hash within 15000ms",
+  "sources": [
+   "test"
+  ],
+  "snapshot": {
+   "kind": "chain.genesis_timeout",
    "category": "environment",
    "expected": false
   }

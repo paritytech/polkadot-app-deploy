@@ -1,10 +1,8 @@
-// Opens an untyped polkadot-api client against the People-chain wss endpoint
-// for a given environment. Mirrors the AH-client setup pattern in dotns.ts.
+// Opens an untyped polkadot-api client against a stack's People chain.
 
-import { createClient } from "polkadot-api";
-import { getWsProvider } from "../ws.js";
 import type { PolkadotClient } from "polkadot-api";
-import { loadEnvironments } from "../environments.js";
+import type { Stack } from "../stacks.js";
+import { connectChainClient } from "../genesis.js";
 import { WS_HEARTBEAT_TIMEOUT_MS } from "../dotns.js";
 
 export interface PeopleClientResult {
@@ -15,32 +13,12 @@ export interface PeopleClientResult {
 }
 
 /**
- * Open a People-chain polkadot-api client for the given environment.
- * The caller must call `disconnect()` when done to release the WS connection.
+ * Open a People-chain polkadot-api client for `stack`, failing when the chain's genesis hash
+ * differs from the stack's. The caller must call `disconnect()` when done to release the WS
+ * connection.
  */
-export async function connectPeopleClient(
-  environmentId: string,
-): Promise<PeopleClientResult> {
-  const { doc } = await loadEnvironments();
-  const peopleChain = doc.chains.find((c) => c.id === "people");
-  if (!peopleChain) {
-    throw new Error(
-      `environments.json has no 'people' chain entry for env '${environmentId}'`,
-    );
-  }
-  const entry = peopleChain.endpoints[environmentId];
-  if (!entry) {
-    throw new Error(
-      `No People-chain endpoint for environment '${environmentId}'. ` +
-        `Bootstrap is only available on paseo-next-v2.`,
-    );
-  }
-  const rawWss = entry.wss;
-  const wss = Array.isArray(rawWss) ? rawWss[0] : rawWss;
-
-  const client = createClient(
-    getWsProvider(wss, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS }),
-  );
+export async function connectPeopleClient(stack: Stack): Promise<PeopleClientResult> {
+  const client = await connectChainClient(stack, "People", undefined, { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS });
   const unsafeApi = client.getUnsafeApi();
 
   return {

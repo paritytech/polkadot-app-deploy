@@ -13,11 +13,9 @@ interface VersionInfo {
 }
 
 export function checkNodeVersion(enginesNode: string, currentVersion: string): string | null {
-  const match = enginesNode.match(/(\d+)/);
+  const match = enginesNode.match(/\d+(?:\.\d+){0,2}/);
   if (!match) return null;
-  const required = parseInt(match[1], 10);
-  const actual = parseInt(currentVersion.replace(/^v/, "").split(".")[0], 10);
-  if (actual < required) {
+  if (compareSemver(currentVersion.replace(/^v/, ""), match[0]) < 0) {
     return `polkadot-app-deploy requires Node.js ${enginesNode} (running ${currentVersion}).\n       Download a supported version at https://nodejs.org/`;
   }
   return null;

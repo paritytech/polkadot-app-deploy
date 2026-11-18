@@ -128,16 +128,15 @@ export async function clearSssAllowanceCache(storageDir?: string): Promise<void>
  *             surface the "run logout/login" guidance
  *   `null`  — no statement account, or People chain unreachable → don't block
  *
- * On a cache hit it skips BOTH the chain read and the endpoint resolution, so
- * `getPeopleEndpoints` is a thunk evaluated only on a miss.
+ * On a cache hit it skips the chain read.
  */
 export async function preflightSssAllowance(
     account: Uint8Array | null,
-    getPeopleEndpoints: () => Promise<string[]>,
+    peopleEndpoints: string[],
 ): Promise<boolean | null> {
     if (!account) return null;
     if (await isSssAllowanceCacheValid(account)) return true;
-    const allowed = await checkSSSAllowance(account, await getPeopleEndpoints());
+    const allowed = await checkSSSAllowance(account, peopleEndpoints);
     if (allowed === true) await writeSssAllowanceCache(account);
     else if (allowed === false) await clearSssAllowanceCache();
     return allowed;

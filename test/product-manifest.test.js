@@ -23,7 +23,8 @@ import {
 import { registerOrEnsureResolver, domainMatchesEnvTld, manifestSignerOptions } from "../dist/manifest/publish.js";
 import { composeExecutable, composeRoot, selfListedKeys } from "../dist/manifest/compose.js";
 import { NonRetryableError } from "../dist/errors.js";
-import { BULLETIN_ENDPOINTS, DEFAULT_BULLETIN_RPC, setBulletinEndpoints, __selectStorageProviderModeForTest, resolveProductSigner } from "../dist/deploy.js";
+import { bulletinSelection, setBulletinEndpoints, __selectStorageProviderModeForTest, resolveProductSigner } from "../dist/deploy.js";
+import { DEFAULT_STACK_ID, readShippedStack } from "../dist/stacks.js";
 import { deriveProductSigner } from "../dist/product-account.js";
 
 describe("validateRootManifest", () => {
@@ -1404,121 +1405,125 @@ describe("registerOrEnsureResolver (resolver-read skip)", () => {
 // #1094: manifest publish uploaded the icon/executables to the DEFAULT
 // Bulletin RPC, ignoring the deploy's --env/--rpc — storeFile/storeDirectory
 // are called with no client of their own, so they fall back to whatever
-// getProvider() reads off the module-level BULLETIN_ENDPOINTS. Asserting
-// BULLETIN_ENDPOINTS directly after publishManifest is not a hollow proxy:
-// storeFile/storeDirectory connect to exactly BULLETIN_ENDPOINTS[0] (verified
-// live against the real chain while fixing this issue — pre-fix connected to
-// DEFAULT_BULLETIN_RPC despite env:"paseo-next-v2"; post-fix connected to
-// paseo-next-v2's own wss://paseo-bulletin-next-rpc.polkadot.io).
+// getProvider() reads off the module-level bulletinSelection. Asserting
+// bulletinSelection.endpoints directly after publishManifest is not a hollow proxy:
+// storeFile/storeDirectory connect to exactly bulletinSelection.endpoints[0].
 //
-// Each test seeds BULLETIN_ENDPOINTS at the module-default seed first — this
-// is the state any *standalone* publishManifest() call starts from (a fresh
-// process, or any library caller that didn't run deploy() first in-process;
-// see the module's own JSDoc: "on top of an already-completed legacy
-// deploy"). A broken icon path makes publishManifest throw immediately after
-// resolving+setting the endpoint (readFileOrThrow), before any real
-// network/chain call — keeps this a fast, deterministic unit test.
-//
-// "devnet" is used as the non-default env below (this twin's assets/
-// environments.json only defines paseo-next-v2 and devnet — bulletin's
-// equivalent test used a "paseo-review" env that has no counterpart here).
+// Each test seeds the selection with an unrelated endpoint first — the
+// state a standalone publishManifest() call can start from after an earlier
+// deploy() in the same process. A broken icon path makes publishManifest throw
+// immediately after resolving+setting the endpoint (readFileOrThrow), before
+// any chain call. The published descriptors answer 503, so publishManifest
+// uses the shipped stack copies and the tests need no network.
 describe("publishManifest — Bulletin endpoint resolution (#1094)", () => {
-  test("resolves the given env's Bulletin endpoint before storeFile/storeDirectory run, not the module default", async (t) => {
-    const before = BULLETIN_ENDPOINTS;
-    t.after(() => setBulletinEndpoints(before));
-    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
+  const SEED = ["wss://seed.example"];
+  const ICON_ERROR = (err) => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message);
 
-    const dir = await tmpDir(t, "product-manifest-rpc-");
-    const loaded = {
+  function isolate(t) {
+    const before = bulletinSelection.endpoints;
+    const realFetch = globalThis.fetch;
+    const realError = console.error;
+    globalThis.fetch = async () => new Response(null, { status: 503 });
+    console.error = () => {};
+    t.after(() => {
+      setBulletinEndpoints(before);
+      globalThis.fetch = realFetch;
+      console.error = realError;
+    });
+    setBulletinEndpoints(SEED);
+  }
+
+  async function loadedConfig(t, prefix, domain) {
+    const dir = await tmpDir(t, prefix);
+    return {
       config: {
         ...VALID_CONFIG,
-        domain: "manifestrpctest.dot",
+        domain,
         icon: { path: "./missing-icon.png", format: "png" },
         executables: [],
       },
       sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
     };
+  }
+
+  test("resolves the selected env's Bulletin endpoint before storeFile/storeDirectory run, not the module default", async (t) => {
+    isolate(t);
+    const stack = readShippedStack("pcf-devnet");
+    const domain = `manifestrpctest.${stack.tld}`;
+    const loaded = await loadedConfig(t, "product-manifest-rpc-", domain);
 
     await assert.rejects(
-      () => publishManifest({ loaded, domain: "manifestrpctest.dot", env: "devnet" }),
-      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      () => publishManifest({ loaded, domain, env: "pcf-devnet" }),
+      ICON_ERROR,
       ">> FAIL: publishManifest #1094 setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
     );
 
-    // devnet's Bulletin endpoint(s) (assets/environments.json), distinct
-    // from BOTH the module-default seed AND paseo-next-v2's own endpoint —
-    // this assertion cannot pass by accident.
+    assert.notDeepStrictEqual(stack.chains.Bulletin.rpc, readShippedStack(DEFAULT_STACK_ID).chains.Bulletin.rpc,
+      ">> FAIL: publishManifest #1094 setup: pcf-devnet and the default stack share a Bulletin endpoint, so this test cannot tell them apart");
     assert.deepStrictEqual(
-      BULLETIN_ENDPOINTS,
-      ["wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
-      ">> FAIL: publishManifest #1094: BULLETIN_ENDPOINTS must be set to the resolved env's ('devnet') Bulletin endpoint before storeFile/storeDirectory run — it was left at DEFAULT_BULLETIN_RPC, which is exactly what storeFile/storeDirectory would connect to (getProvider() has no client of its own)",
+      bulletinSelection.endpoints,
+      stack.chains.Bulletin.rpc,
+      ">> FAIL: publishManifest #1094: the Bulletin endpoints must be set to the selected stack's ('pcf-devnet') before storeFile/storeDirectory run — they were left at the previous value, which is exactly what storeFile/storeDirectory would connect to (getProvider() has no client of its own)",
     );
   });
 
   test("an --rpc override wins even against a non-default env, with the env endpoint kept as fail-over backup", async (t) => {
-    const before = BULLETIN_ENDPOINTS;
-    t.after(() => setBulletinEndpoints(before));
-    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
-
-    const dir = await tmpDir(t, "product-manifest-rpc-override-");
-    const loaded = {
-      config: {
-        ...VALID_CONFIG,
-        domain: "manifestrpctest.dot",
-        icon: { path: "./missing-icon.png", format: "png" },
-        executables: [],
-      },
-      sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
-    };
+    isolate(t);
+    const stack = readShippedStack("pcf-devnet");
+    const domain = `manifestrpctest.${stack.tld}`;
+    const loaded = await loadedConfig(t, "product-manifest-rpc-override-", domain);
 
     await assert.rejects(
-      () => publishManifest({ loaded, domain: "manifestrpctest.dot", env: "devnet", rpc: "wss://custom-override.example" }),
-      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      () => publishManifest({ loaded, domain, env: "pcf-devnet", rpc: "wss://custom-override.example" }),
+      ICON_ERROR,
       ">> FAIL: publishManifest #1094 rpc-override setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
     );
 
     assert.deepStrictEqual(
-      BULLETIN_ENDPOINTS,
-      ["wss://custom-override.example", "wss://bulletin-paseo.tservices.es:8443", "wss://bullet.sik.rocks"],
-      ">> FAIL: publishManifest #1094 rpc-override: an explicit --rpc must win over the resolved env's own endpoint, with the env endpoint kept behind it as a fail-over backup",
+      bulletinSelection.endpoints,
+      ["wss://custom-override.example", ...stack.chains.Bulletin.rpc],
+      ">> FAIL: publishManifest #1094 rpc-override: an explicit --rpc must win over the selected stack's own endpoints, with the stack endpoints kept behind it as fail-over backups",
+    );
+  });
+
+  test("a stack passed as a descriptor file drives the endpoint without --env", async (t) => {
+    isolate(t);
+    const stack = readShippedStack("pcf-devnet");
+    const domain = `manifestrpctest.${stack.tld}`;
+    const loaded = await loadedConfig(t, "product-manifest-rpc-stack-", domain);
+
+    await assert.rejects(
+      () => publishManifest({ loaded, domain, stack: ".trinity/pcf-devnet.json" }),
+      ICON_ERROR,
+      ">> FAIL: publishManifest #1094 stack-option setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
+    );
+
+    assert.deepStrictEqual(
+      bulletinSelection.endpoints,
+      stack.chains.Bulletin.rpc,
+      ">> FAIL: publishManifest #1094 stack-option: the `stack` option must select the Bulletin endpoints the same way --env does",
     );
   });
 
   test("default env (no --env/--rpc passed) resolves to the SAME endpoint deploy() itself would use — non-regression", async (t) => {
-    const before = BULLETIN_ENDPOINTS;
-    t.after(() => setBulletinEndpoints(before));
-    setBulletinEndpoints([DEFAULT_BULLETIN_RPC]);
-
-    const dir = await tmpDir(t, "product-manifest-rpc-default-");
-    const loaded = {
-      config: {
-        ...VALID_CONFIG,
-        // #1572: must carry the DEFAULT env's real TLD (paseo-next-v2 ->
-        // "paseo", not the schema-generic ".dot" this fixture used before
-        // reconcileManifestDomain existed) — otherwise the env-TLD guard now
-        // fires before this test ever reaches the icon read it means to
-        // exercise.
-        domain: "manifestrpctest.paseo",
-        icon: { path: "./missing-icon.png", format: "png" },
-        executables: [],
-      },
-      sourcePath: path.join(dir, "polkadot-app-deploy.config.mjs"),
-    };
+    isolate(t);
+    const stack = readShippedStack(DEFAULT_STACK_ID);
+    // #1156: the domain must carry the default stack's TLD, or the env-TLD guard
+    // fires before this test gets to the icon read.
+    const domain = `manifestrpctest.${stack.tld}`;
+    const loaded = await loadedConfig(t, "product-manifest-rpc-default-", domain);
 
     await assert.rejects(
-      () => publishManifest({ loaded, domain: "manifestrpctest.paseo" }),
-      err => err.name === "NonRetryableError" && /Cannot read icon/.test(err.message),
+      () => publishManifest({ loaded, domain }),
+      ICON_ERROR,
       ">> FAIL: publishManifest #1094 default-env setup: expected the icon read to fail (fixture icon is intentionally missing) — check the fixture path, not the fix",
     );
 
-    // paseo-next-v2 is both DEFAULT_ENV_ID (environments.ts) and the CLI's
-    // implicit default when --env is omitted — must resolve to its OWN
-    // endpoint (wss://paseo-bulletin-next-rpc.polkadot.io), NOT the
-    // DEFAULT_BULLETIN_RPC seed constant (a different URL — see #1094).
+    // DEFAULT_STACK_ID is also deploy()'s default when --env is omitted.
     assert.deepStrictEqual(
-      BULLETIN_ENDPOINTS,
-      ["wss://paseo-bulletin-next-rpc.polkadot.io"],
-      ">> FAIL: publishManifest #1094 default-env: omitting --env must still resolve to paseo-next-v2's OWN Bulletin endpoint, not the unrelated DEFAULT_BULLETIN_RPC seed constant",
+      bulletinSelection.endpoints,
+      stack.chains.Bulletin.rpc,
+      ">> FAIL: publishManifest #1094 default-env: omitting --env must resolve to the default stack's OWN Bulletin endpoints, not retain the previous value",
     );
   });
 });

@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import pkg from "../package.json";
-import { InsufficientFundsError, SHIPPED_CONFIG_ORIGIN, FALLBACK_CONFIG_ORIGIN } from "./errors.js";
+import { InsufficientFundsError, BUILT_IN_STACK_ORIGIN, GENESIS_ERROR_PHRASES } from "./errors.js";
 import { maybeWriteMemoryReport, sampleFromBytes, type MemorySampleMb, type DeployContextForReport, type MemoryReport } from "./memory-report.js";
 import { writeRunState } from "./run-state.js";
 import type { CodePath } from "./code-paths.js";
@@ -444,12 +444,10 @@ export function getDeployAttributes(domain: string): Record<string, string | num
 
 const CONTRACT_ADDRESS_FAILURE = /no contract deployed at|invalid contract address for|contract call returned empty data/i;
 
-// Read from the same constants describeContractSources formats, so a reword
-// there cannot leave this matching a string nobody produces any more.
-function cameFromOurConfig(msg: string): boolean {
-  const lower = msg.toLowerCase();
-  return lower.includes(`came from ${SHIPPED_CONFIG_ORIGIN.toLowerCase()}`)
-    || lower.includes(`came from ${FALLBACK_CONFIG_ORIGIN.toLowerCase()}`);
+// Read from the same constant describeStackOrigin formats, so a reword there cannot leave this
+// matching a string nobody produces any more.
+function cameFromBuiltInStack(msg: string): boolean {
+  return msg.toLowerCase().includes(`came from ${BUILT_IN_STACK_ORIGIN.toLowerCase()}`);
 }
 
 // #1363: nonInteractivePhoneConfirmationError's (src/deploy.ts) fixed message
@@ -459,20 +457,31 @@ function cameFromOurConfig(msg: string): boolean {
 const PHONE_NONINTERACTIVE_FRAGMENT = "phone confirmation required for .+ but this run is non-interactive";
 
 // Context-dependent attribution for the contract-address kinds. A wrong contract
-// address is the operator's only when it came from their own file or --contract.
-// A bad address in a config we ship is our failure and stays visible; with no
-// stated origin we cannot tell, so it stays visible too ('unknown' prompts a bug
-// report). "Could not determine the DotNS ABI profile" is a chain-generation
-// problem outside the tool, hence environment.
+// address is the operator's only when it came from a custom stack they passed with --stack
+// or from their own contracts option. A bad address in a built-in stack is not theirs
+// and stays visible; with no stated origin we cannot tell, so it stays visible too
+// ('unknown' prompts a bug report). "Could not determine the DotNS ABI profile" is a
+// chain-generation problem outside the tool, hence environment.
 function contractAddressCategory(msg: string): DeployErrorCategory {
-  if (CONTRACT_ADDRESS_FAILURE.test(msg) && /this address came from/i.test(msg) && !cameFromOurConfig(msg)) return 'user';
+  if (CONTRACT_ADDRESS_FAILURE.test(msg) && /this address came from/i.test(msg) && !cameFromBuiltInStack(msg)) return 'user';
   return /could not determine the DotNS ABI profile/i.test(msg) ? 'environment' : 'unknown';
+}
+
+// A genesis mismatch is the operator's when the endpoint is their override or the descriptor
+// is theirs (a custom stack, or one passed with --stack); a restart a built-in stack's
+// published or shipped descriptor does not cover yet is the chain's.
+function genesisMismatchCategory(msg: string): DeployErrorCategory {
+  const { otherEndpoint, customStack, passedDescriptor } = GENESIS_ERROR_PHRASES;
+  return new RegExp(`${otherEndpoint} \\w+ endpoints|the descriptor of stack \\S+ ${customStack}|${passedDescriptor}`, "i").test(msg)
+    ? 'user'
+    : 'environment';
 }
 
 // The single place a mechanism kind becomes a fault category: the flat
 // ERROR_KIND_CATEGORY map, except where attribution depends on the message.
 function categoryOf(kind: DeployErrorKind, msg: string): DeployErrorCategory {
   if (kind === 'naming.contract_unavailable' || kind === 'naming.contract_function_removed') return contractAddressCategory(msg);
+  if (kind === 'chain.genesis_mismatch') return genesisMismatchCategory(msg);
   return ERROR_KIND_CATEGORY[kind];
 }
 
@@ -545,6 +554,8 @@ export function computeDeployOutcome(
 //   chain.tx_dropped               — tx dropped from best chain / chain may have dropped or evicted the extrinsic
 //   chain.tx_invalid               — extrinsic rejected with a generic Invalid::* error not covered by a specific kind
 //   chain.not_finalised            — an extrinsic did not finalise within the wait budget
+//   chain.genesis_mismatch         — a chain client connected to a chain whose genesis hash differs from the stack's (GenesisMismatchError)
+//   chain.genesis_timeout          — a chain client's chain did not report its genesis hash in time
 //   dotns.register_failed          — wrapper "dotns register failed" whose nested cause matched no more specific kind
 //   network.endpoints_failed       — every RPC endpoint rejected ("All promises were rejected")
 //   verify.contenthash_mismatch    — post-deploy on-chain contenthash differs from what was written
@@ -605,6 +616,8 @@ export type DeployErrorKind =
   | 'chain.tx_dropped'
   | 'chain.tx_invalid'
   | 'chain.not_finalised'
+  | 'chain.genesis_mismatch'
+  | 'chain.genesis_timeout'
   | 'dotns.register_failed'
   | 'network.endpoints_failed'
   | 'verify.contenthash_mismatch'
@@ -626,8 +639,8 @@ export type DeployErrorKind =
   | 'tool.invariant'
   | 'unknown';
 
-// DotNS's TLD is per-environment (e.g. "paseo" on paseo-next-v2 — see
-// src/dotns.ts DEFAULT_TLD / src/environments.ts's per-env `tld` field). A
+// DotNS's TLD is per stack (previewnet: "testnet", paseo-next-v2: "paseo", from each
+// descriptor's `tld`). A
 // hardcoded ".dot" here would stop matching the moment a deploy message
 // embeds a different TLD, silently degrading deploy.error_kind to 'unknown'
 // on those envs. Shared fragment so the two rules below can't drift apart.
@@ -638,6 +651,10 @@ const TLD_FRAGMENT = "[a-z]{2,}";
 // (test/fixtures/error-classification-corpus.json) pins the result.
 // Strong-signal infra kinds first, then naming, then verify, then network/chain, then tool.
 const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
+  // First: connectChainClient's two failures interpolate endpoints and stack ids, which later
+  // rules must not claim.
+  [new RegExp(`${GENESIS_ERROR_PHRASES.mismatch} 0x[0-9a-f]+, but stack \\S+ expects`, "i"), 'chain.genesis_mismatch'],
+  [new RegExp(`${GENESIS_ERROR_PHRASES.timeout} \\d+ms`, "i"), 'chain.genesis_timeout'],
   // Wrapper messages that interpolate a nested cause must precede the generic
   // infra patterns below: the interpolated inner error frequently contains
   // "Contract reverted" or a timeout phrase and would otherwise steal the
@@ -692,7 +709,7 @@ const ERROR_KIND_RULES: Array<[RegExp, DeployErrorKind]> = [
   [/is soulbound and cannot be transferred/i, 'naming.soulbound'],
   // Operator-fixable phrasings, above contract-revert so the actionable kind wins over the wrapper.
   // formatUnregistrableReason's phrase (#1185); above the label rules since it can quote the PopError it explains.
-  [/cannot register it|base name is \d+ chars|reserved for original/i, 'naming.governance_reserved'],
+  [/cannot register it|base name is \d+ chars|reserved for original|reserved for your own personhood claim|reserved for a device-name holder/i, 'naming.governance_reserved'],
   [/NameNotAvailable/i, 'naming.name_unavailable'],
   [/invalid domain label|name must be lowercase/i, 'naming.invalid_label'],
   [/insufficient balance|insufficient funds|signer balance .* < estimated fee/i, 'funding.insufficient_balance'],
@@ -827,6 +844,9 @@ export const ERROR_KIND_CATEGORY: Record<DeployErrorKind, DeployErrorCategory> =
   'chain.tx_dropped': 'environment',
   'chain.tx_invalid': 'environment',
   'chain.not_finalised': 'environment',
+  // The restart case; genesisMismatchCategory gives 'user' for an override or the operator's descriptor.
+  'chain.genesis_mismatch': 'environment',
+  'chain.genesis_timeout': 'environment',
   'dotns.register_failed': 'environment',
   'signer.message_too_large': 'environment',
   'signer.invalid_mnemonic': 'user',

@@ -1,9 +1,10 @@
 import { sr25519CreateDerive } from "@polkadot-labs/hdkd";
 import { DEV_PHRASE, entropyToMiniSecret, mnemonicToEntropy } from "@polkadot-labs/hdkd-helpers";
-import { createClient, Enum } from "polkadot-api";
+import { Enum } from "polkadot-api";
 import type { SignerTxCreator } from "polkadot-api/tx-creator";
 import { getTxCreator } from "polkadot-api/tx-creator";
-import { getWsProvider } from "./ws.js";
+import { connectChainClient } from "./genesis.js";
+import type { Stack } from "./stacks.js";
 import { Keyring } from "@polkadot/keyring";
 import { cryptoWaitReady } from "@polkadot/util-crypto";
 import { NonRetryableError } from "./errors.js";
@@ -290,7 +291,7 @@ export function accountsNeedingReauthorization(
   return auths.filter(a => !isAuthorizationSufficient(a, deadline));
 }
 
-// Minimal shape of an assets/environments.json entry needed to decide
+// Minimal shape of a stack (its policy fields) needed to decide
 // whether auto-reauthorization may write to this chain.
 export interface AutoReauthorizeEnv {
   network?: string;
@@ -298,13 +299,13 @@ export interface AutoReauthorizeEnv {
 }
 
 // #1059 maintainer constraint: auto-reauthorize is TESTNET-ONLY and must
-// never run on mainnet. `bulletinAutoAuthorize` is an environments.json flag
+// never run on mainnet. `bulletinAutoAuthorize` is a stack-policy flag
 // gating two things ONLY: the #1054 Asset Hub balance pre-fund
 // (ensurePoolAccountsFundedOnAssetHub) and the #1059 hard write-gate in
-// bootstrapPool's reauth pre-check (see allowAutoReauthorize below) — both of
+// bootstrapPool's reauth pre-check (see isAutoReauthorizeAllowed below) — both of
 // which are explicit, human-invoked bootstrap-tool paths, signed with
 // whichever key bootstrapPool resolves as the authorizer (see its
-// `authorizerMnemonic` / `envAuthorizer` precedence). polkadot-app-deploy does
+// `authorizerMnemonic` / `stack.bulletinAuthorizer` precedence). polkadot-app-deploy does
 // NOT self-authorize on the Bulletin chain during a deploy: ensureAuthorized()
 // below never signs anything, it only throws (see its no-self-authorize error
 // text) — unlike bulletin-deploy, which this flag's name is inherited from.
@@ -600,10 +601,10 @@ export async function fetchPoolAuthorizations(api: any, accounts: PoolAccount[])
 // to show, and (via detectTestnet/isAutoReauthorizeAllowed) gates the
 // explicit bootstrap-tool write paths. It must not be read as "Alice is the
 // authorizer here": testnets can be community-operated with an authorizer
-// this codebase doesn't know (e.g. devnet — see environments.json
+// this codebase doesn't know (e.g. devnet — see the stack policy's
 // `bulletinAuthorizer`, deliberately unset there).
 // bulletin #1362/#1095: this is a FALLBACK only, for callers with no
-// environments.json context (a raw library caller pointed at a custom RPC,
+// stack context (a raw library caller pointed at a custom RPC,
 // some tools/* scripts). Any caller that resolved an env should pass its
 // declared `network` field into detectTestnet() instead — spec_name
 // substring matching is a lying mirror (Bulletin on Paseo has reported
@@ -622,21 +623,21 @@ export function isTestnetSpecName(specName: string | undefined | null): boolean 
   return false;
 }
 
-// bulletin #1362/#1095: precedence for the environments.json-resolved
-// `network` field ("testnet" | "mainnet" | undefined) over a live chain
+// bulletin #1362/#1095: precedence for the stack's declared
+// `network` ("testnet" | "mainnet" | undefined) over a live chain
 // spec_name read. Shared by detectTestnet() below and DotNS.isTestnet()
 // (dotns.ts) — both need the exact same three-state decision before falling
 // back to their own spec_name probe. Three states, deliberately NOT
 // collapsed:
 //   1. network === "testnet"        → true, authoritative.
 //   2. network is a non-empty string that isn't "testnet" (e.g. "mainnet",
-//      or a typo/garbage value like "Mainnet" from a hand-edited env file)
+//      or a typo like "Mainnet" from a caller's network option)
 //      → false, fail CLOSED. A caller resolved SOME env context and it did
 //      not explicitly say "testnet" — never let an unrecognized value fall
 //      through to a spec_name guess, or a config typo reopens the exact
 //      lying-mirror bug this issue exists to close.
 //   3. network is null/undefined    → no env context was resolved at all
-//      (no --env, options.bulletinEndpoints, a raw library/tools/* caller on
+//      (no --env/--stack, a raw library/tools/* caller on
 //      a custom RPC) → undefined, meaning: fall back to the spec_name read.
 //      That read itself fails safe (false / not-testnet) on any error.
 // Callers must check `!== undefined` before touching (or populating) their
@@ -694,8 +695,8 @@ export async function ensureAuthorized(
   // lets a caller that already read the account's authorization + current block moments
   // earlier (storeChunkedContent's own hard-gate read) hand them in instead of paying a
   // second, redundant RPC round trip.
-  // bulletin #1362/#1095: `network` is the resolved env's environments.json
-  // `network` field ("testnet" | "mainnet" | undefined). Threaded into
+  // bulletin #1362/#1095: `network` is the stack's declared network
+  // ("testnet" | "mainnet" | undefined). Threaded into
   // detectTestnet() below so the failure-message branch (testnet vs. mainnet
   // wording) is driven by the declared env, not a spec_name guess, whenever
   // a caller has one.
@@ -739,14 +740,15 @@ export async function ensureAuthorized(
 // Alice ROOT funder before the concurrent E2E matrix, so legs never race on
 // the funder's Asset Hub nonce (funding inside the deploy would reintroduce
 // the #1054 nonce collision on the transfer tx itself). Testnet-only, hard-
-// gated by isAutoReauthorizeAllowed(envEntry) — same gate + rationale as the
+// gated by isAutoReauthorizeAllowed(stack) — same gate + rationale as the
 // #1059 Bulletin auto-reauthorize path (one source of truth for "this is a
 // chain we may spend Alice funds on").
 const DEFAULT_ASSET_HUB_TOPUP_THRESHOLD = 1n * BigInt(PAS_DECIMALS_DIVISOR);
 const DEFAULT_ASSET_HUB_TOPUP_TARGET = 2n * BigInt(PAS_DECIMALS_DIVISOR);
 
 export interface EnsurePoolFundedOptions {
-  envEntry: AutoReauthorizeEnv | null | undefined;
+  /** The stack whose Asset Hub the client must connect to and whose policy clears the transfers; nothing is funded when unset. */
+  stack?: Stack;
   thresholdRaw?: bigint;   // top up when free balance < this (default 1 PAS)
   targetRaw?: bigint;      // top up TO this (default 2 PAS)
   funderMnemonic?: string; // default: DEV_PHRASE (Alice ROOT, no derivation) — the account that already pays DotNS fees
@@ -759,9 +761,9 @@ export async function ensurePoolAccountsFundedOnAssetHub(
   poolMnemonic: string | undefined,
   opts: EnsurePoolFundedOptions,
 ): Promise<void> {
-  if (!isAutoReauthorizeAllowed(opts.envEntry)) {
+  if (!isAutoReauthorizeAllowed(opts.stack)) {
     console.log(
-      `Asset Hub pre-fund skipped: ${opts.envEntry?.network ?? "this environment"} not cleared (testnet-only).`,
+      `Asset Hub pre-fund skipped: ${opts.stack?.network ?? "no stack"} not cleared (testnet-only).`,
     );
     return;
   }
@@ -781,10 +783,12 @@ export async function ensurePoolAccountsFundedOnAssetHub(
 
   console.log(`Pre-funding ${accounts.length} pool account(s) on Asset Hub (${assetHubRpc})...\n`);
 
-  const client = createClient(getWsProvider(
+  const client = await connectChainClient(
+    opts.stack,
+    "AssetHub",
     assetHubRpc,
     { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS },
-  ));
+  );
   const api: any = client.getUnsafeApi();
 
   try {
@@ -822,29 +826,20 @@ export async function ensurePoolAccountsFundedOnAssetHub(
 
 export interface BootstrapPoolOptions {
   authorizerMnemonic?: string;
-  // The resolved env's `bulletinAuthorizer` (environments.json). Used only
-  // when authorizerMnemonic is not given; takes precedence over guessing.
-  // Needed because //Alice is NOT the authorizer on every testnet-shaped
-  // chain — some (e.g. devnet) are community-operated and their authorizer
-  // is unknown, so there is deliberately no blanket testnet fallback below.
-  envAuthorizer?: string;
-  // Human-readable id/name of the resolved env, used only to name it in the
-  // "no known authorizer" message when neither authorizerMnemonic nor
-  // envAuthorizer is available. Purely cosmetic — does not affect resolution.
-  envLabel?: string;
   bulletinAuthorizeV2?: boolean;
   // #1059 pre-check mode: widen "needs authorization" from "already expired"
   // to "expires within this many blocks" (see accountsNeedingReauthorization).
   // Default 0 preserves bootstrapPool's original behavior exactly — existing
-  // bin/bulletin-bootstrap invocations without this flag are unaffected.
+  // bin/polkadot-app-bootstrap invocations without this flag are unaffected.
+  // When > 0 and any account needs reauthorization, bootstrapPool writes only
+  // on a stack cleared by isAutoReauthorizeAllowed, else it throws.
   reauthBufferBlocks?: number;
-  // #1059 hard safety gate: when reauthBufferBlocks > 0 and any account
-  // needs reauthorization, bootstrapPool refuses to write unless this is
-  // explicitly true. Callers must derive it from environments.json via
-  // isAutoReauthorizeAllowed(envEntry) — never hardcode true. Defaults to
-  // false so a caller that forgets to wire this up fails loud instead of
-  // silently granting on an unintended chain.
-  allowAutoReauthorize?: boolean;
+  /**
+   * The stack whose Bulletin chain the client must connect to. Its `bulletinAuthorizer` signs when
+   * no `authorizerMnemonic` is passed, and its `network` is passed to detectTestnet() instead of the
+   * chain's spec_name (#1095). Unset for a bare --rpc: no genesis check, no stack policy.
+   */
+  stack?: Stack;
 }
 
 function printAuthStatus(a: PoolAuthorization, currentBlock: number): void {
@@ -873,10 +868,12 @@ export async function bootstrapPool(
   // "Using pool account 0: <ss58>" line and spot a mnemonic mismatch at a glance.
   if (accounts.length > 0) console.log(`Pool root: //deploy/0 = ${accounts[0].address}\n`);
 
-  const client = createClient(getWsProvider(
+  const client = await connectChainClient(
+    opts.stack,
+    "Bulletin",
     bulletinRpc,
     { heartbeatTimeout: WS_HEARTBEAT_TIMEOUT_MS },
-  ));
+  );
   const api: any = client.getUnsafeApi();
 
   try {
@@ -904,12 +901,12 @@ export async function bootstrapPool(
     // Checked before an authorizer is resolved or any tx is built — fail
     // loud, naming every affected account, rather than silently skipping or
     // (worse) attempting a write the caller didn't intend.
-    if (reauthBufferBlocks > 0 && !opts.allowAutoReauthorize) {
+    if (reauthBufferBlocks > 0 && !isAutoReauthorizeAllowed(opts.stack)) {
       const details = needsAuth
         .map(a => `  [${a.index}] ${a.address} — expires @${a.expiration} (current block ${currentBlock})`)
         .join("\n");
       throw new Error(
-        `Auto-reauthorize is testnet-only (see isAutoReauthorizeAllowed / environments.json ` +
+        `Auto-reauthorize is testnet-only (see isAutoReauthorizeAllowed / the stack policy's ` +
         `bulletinAutoAuthorize) and this call was not cleared to write. ${needsAuth.length} ` +
         `account(s) need reauthorization within the ${reauthBufferBlocks}-block buffer:\n${details}`,
       );
@@ -923,15 +920,16 @@ export async function bootstrapPool(
       const authKey = keyring.addFromUri(opts.authorizerMnemonic);
       authorizerSigner = getTxCreator(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
       console.log(`Using provided authorizer: ${authKey.address}\n`);
-    } else if (opts.envAuthorizer) {
-      // The env declares which key holds authorizer rights on its Bulletin
-      // chain (environments.json `bulletinAuthorizer`). Preferred over any
+    } else if (opts.stack?.bulletinAuthorizer) {
+      // The stack declares which key holds authorizer rights on its Bulletin
+      // chain (its policy's `bulletinAuthorizer`). Preferred over any
       // blanket guess so `polkadot-app-bootstrap --env <id>` works without a
-      // flag, and so an env with no known authorizer (e.g. devnet) never
+      // flag, and so a stack with no known authorizer (e.g. devnet) never
       // gets one guessed on its behalf.
-      const authKey = keyring.addFromUri(opts.envAuthorizer);
+      const authorizerUri = opts.stack.bulletinAuthorizer;
+      const authKey = keyring.addFromUri(authorizerUri);
       authorizerSigner = getTxCreator(authKey.publicKey, "Sr25519", (data: Uint8Array) => authKey.sign(data));
-      console.log(`Using environment authorizer ${opts.envAuthorizer} (${authKey.address})\n`);
+      console.log(`Using environment authorizer ${authorizerUri} (${authKey.address})\n`);
     } else {
       // Deliberately NOT defaulting to //Alice here. That default used to
       // fire on ANY testnet-shaped chain (detectTestnet), including
@@ -939,7 +937,7 @@ export async function bootstrapPool(
       // actually hold authorizer rights — the grant would be silently
       // rejected on-chain (BadSigner, or a Payment error if Alice is also
       // unfunded there) instead of failing with a clear, actionable message.
-      const envNote = opts.envLabel ? ` for environment '${opts.envLabel}'` : "";
+      const envNote = opts.stack ? ` for stack '${opts.stack.id}'` : "";
       console.log(
         `No known authorizer${envNote} — this environment does not declare a bulletinAuthorizer ` +
         "(likely community-operated, so the actual authorizer key is unknown here).\n" +

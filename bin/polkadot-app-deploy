@@ -6,7 +6,7 @@
 // SDK modules that trigger the "@parity/product-sdk-logger" localStorage warning.
 import "../dist/suppress-localstorage-warning.js";
 
-import { deploy, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, mnemonicConflictNotice, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner } from "../dist/deploy.js";
+import { deploy, DEFAULT_POOL_SIZE, NonRetryableError, EXIT_CODE_NO_RETRY, isConnectionError, isBenignTeardownError, resolveEffectiveMnemonic, mnemonicConflictNotice, shouldPublishManifest, nonInteractivePhoneConfirmationError, printDeploymentCompleteBanner, deployFlagConflict } from "../dist/deploy.js";
 import { VERSION, setDeployAttribute, captureWarning, noteWarning, closeTelemetry, markDeployFatal, setRunStateActive, markRelaunchOomHintShown } from "../dist/telemetry.js";
 import { handleFailedDeploy, handlePreflightVersionCheck, fetchVersionInfo, preReleaseWarning, checkNodeVersion, isInteractive } from "../dist/version-check.js";
 import { setDeployContext, installLogCapture, buildCliFlagsSummary } from "../dist/bug-report.js";
@@ -54,6 +54,8 @@ for (let i = 0; i < args.length; i++) {
   else if (args[i].startsWith("--reproducible=")) { flags.reproducibleSource = args[i].slice("--reproducible=".length); }
   else if (args[i] === "--dump-car") { flags.dumpCar = true; }
   else if (args[i].startsWith("--dump-car=")) { flags.dumpCar = args[i].slice("--dump-car=".length); }
+  else if (args[i] === "--store-blocks") { flags.storeBlocks = args[i + 1]?.startsWith("--") ? "" : args[++i] ?? ""; }
+  else if (args[i] === "--force-store") { flags.forceStore = true; }
   else if (args[i] === "--suri") { flags.suri = args[++i]; }
   else if (args[i] === "--no-transfer-to-signedin-user") { flags.noTransferToSignedinUser = true; }
   else if (args[i] === "--to") { flags.to = args[++i]; }
@@ -204,11 +206,12 @@ if (positional[0] === "product") {
   process.exit(2);
 }
 
-if (flags.help || positional.length === 0) {
+if (flags.help || (positional.length === 0 && !("storeBlocks" in flags))) {
   console.log(`polkadot-app-deploy v${VERSION}
 
 Usage:
   polkadot-app-deploy <build-dir> <domain.dot>  Deploy an app
+  polkadot-app-deploy --store-blocks <file.car>  Store every block of a CAR file under its own CID
   polkadot-app-deploy login                     Sign in with your Polkadot mobile app
   polkadot-app-deploy logout                    Sign out and clear the session
   polkadot-app-deploy whoami                    Show the currently signed-in identity
@@ -251,6 +254,20 @@ Options:
                       Usage: polkadot-app-deploy --input-car <file.car> <domain.dot>
   --dump-car[=<path>] Save the pre-upload CAR file to disk. Default path: <buildDir>.bulletin.car.
                       Override path with =<path>. Also settable via PAD_DUMP_CAR env var.
+  --store-blocks <file.car>
+                      Store every block of a CAR file on Bulletin as it is, each under its
+                      own CID: the codec and hashing come from the CID, so the CID stays the
+                      same. Blocks already on chain are skipped unless --force-store is
+                      set. The CAR roots are not used. Uploads to Bulletin only: no DotNS
+                      name and no manifest. The whole file is checked before the first
+                      upload: every block must have a CIDv1 with blake2b-256, sha2-256 or
+                      keccak-256, bytes that match its CID, and a size that the chain
+                      stores. With --rpc or BULLETIN_RPC, only that endpoint is used,
+                      without the stack's Bulletin endpoints as fallback.
+  --force-store       Store content again even when the chain already has it, so its
+                      retention period starts again. Entries from before the run do not
+                      count as stored. This includes the icon and executables of a
+                      product manifest.
   --tag "..."         Label deploy in telemetry (or set DEPLOY_TAG env var); see Telemetry in README
   --config <path>     Explicit path to a polkadot-app-deploy.config.ts (default: walk up from
                       <build-dir> looking for polkadot-app-deploy.config.{ts,js,mjs}). When a
@@ -396,7 +413,10 @@ if (!flags.help && !flags.version) {
 
 try {
   let buildDir, domain;
-  if (flags.inputCar) {
+  if ("storeBlocks" in flags) {
+    if (flags.storeBlocks && positional.length > 0) { console.error("Error: --store-blocks takes no build directory or domain"); process.exit(1); }
+    buildDir = flags.storeBlocks;
+  } else if (flags.inputCar) {
     // --input-car mode: positional[0] is the domain; no build directory needed.
     [domain] = positional;
     if (!flags.inputCar) { console.error("Error: --input-car requires a path argument"); process.exit(1); }
@@ -409,6 +429,10 @@ try {
     if (!domain) { console.error("Error: domain required (e.g. my-app.dot)"); process.exit(1); }
     if (!fs.existsSync(buildDir)) { console.error(`Error: ${buildDir} does not exist`); process.exit(1); }
   }
+  const flagConflict = deployFlagConflict(flags, process.env.IPFS_CID);
+  if (flagConflict) { console.error(`Error: ${flagConflict}`); process.exit(1); }
+  if (flags.storeBlocks && !fs.existsSync(flags.storeBlocks)) { console.error(`Error: ${flags.storeBlocks} does not exist`); process.exit(1); }
+  if (flags.storeBlocks) flags.noManifest = true;
 
   // deploy() and publishManifest() load the same selection again from the per-process cache.
   const stack = await loadStack(stackSelection);
@@ -482,6 +506,8 @@ try {
   const manifestWillPublish = shouldPublishManifest({ configFound: !!preflightedConfig, noManifest: !!flags.noManifest });
 
   const result = await deploy(buildDir, domain, {
+    storeBlocks: flags.storeBlocks,
+    forceStore: !!flags.forceStore,
     mnemonic: effectiveMnemonic,
     derivationPath: flags.derivationPath,
     productName: flags.productName,
@@ -562,7 +588,7 @@ try {
   });
 
   const output = process.env.GITHUB_OUTPUT;
-  if (output) {
+  if (output && !result.storedBlocks) {
     fs.appendFileSync(output, `cid=${result.cid}\n`);
     fs.appendFileSync(output, `domain=${result.domainName}\n`);
     fs.appendFileSync(output, `fullDomain=${result.fullDomain}\n`);
@@ -572,8 +598,12 @@ try {
     fs.appendFileSync(output, `browserUrl=${result.browserUrl ?? ""}\n`);
   }
 
-  console.log(`CID: ${result.cid}`);
-  console.log(`Domain: ${result.fullDomain}`);
+  if (result.storedBlocks) {
+    console.log(`Stored blocks: ${result.storedBlocks.stored.length}, already on chain: ${result.storedBlocks.alreadyStored.length}`);
+  } else {
+    console.log(`CID: ${result.cid}`);
+    console.log(`Domain: ${result.fullDomain}`);
+  }
 
   // Opt-in manifest publish on top of the legacy contenthash deploy.
   //
@@ -604,6 +634,7 @@ try {
           mnemonic: effectiveMnemonic,
           derivationPath: flags.derivationPath,
           productName: flags.productName,
+          forceStore: !!flags.forceStore,
           // The slot signer deploy() resolved from the login session, so the manifest's
           // uploads are billed to the same allowance the content was. Undefined for every
           // other signer shape, which publishManifest resolves from the options above.

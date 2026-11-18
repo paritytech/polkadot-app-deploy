@@ -18,6 +18,7 @@ import {
   encodeContenthash,
   storeDirectory,
   storeFile,
+  startPresenceFloor,
   assertNoRemovedSelections,
   resolveDotnsConnectOptions,
   resolveProductSigner,
@@ -27,11 +28,13 @@ import {
 } from "../deploy.js";
 import { DotNS, assertTxCreator, stripTldSuffix, parseDomainName, type OwnershipResult } from "../dotns.js";
 import { NonRetryableError } from "../errors.js";
+import { setPresenceFloor } from "../chunk-probe.js";
 import { loadStack, type Stack } from "../stacks.js";
 import { pessimisticSizePreflight } from "./byte-budget.js";
 import { composeExecutable, composeRoot, selfListedKeys } from "./compose.js";
 import type { LoadedProductConfig } from "./config-load.js";
 import { verifyEmbeddedAppManifests } from "./product-preflight.js";
+import type { ProductConfig } from "./types.js";
 
 export interface PublishManifestOptions {
   /** Loaded + validated product config (call loadProductConfig first). */
@@ -59,6 +62,7 @@ export interface PublishManifestOptions {
   derivationPath?: string;
   /** Sign as the RFC-0022 product account, the same key deploy() registers the name with. */
   productName?: string;
+  forceStore?: boolean;
   /**
    * The Bulletin allowance-slot signer deploy() resolved for the content upload, handed over
    * in-process via DeployResult. Set when the deploy ran on a login session's own slot rather
@@ -75,6 +79,51 @@ export interface PublishManifestResult {
   iconCid: string;
   executableCids: Record<string, string>;
   textRecordsWritten: number;
+}
+
+
+export async function manifestAssetUpload(
+  reconnect: ReturnType<typeof selectStorageReconnect>,
+  assets: {
+    iconBytes: Uint8Array;
+    executables: ProductConfig["executables"];
+    configDir: string;
+    buildDirCid?: PublishManifestOptions["buildDirCid"];
+    forceStore?: boolean;
+  },
+): Promise<{ iconCid: string; executableCids: Record<string, string> }> {
+  const storage = await reconnect();
+  const executableCids: Record<string, string> = {};
+  try {
+    if (assets.forceStore) await startPresenceFloor(storage.client);
+    const iconCid = await storeFile(assets.iconBytes, { ...storage, hashCode: BLAKE2B_256_MULTIHASH_CODE });
+    console.log(`  Icon CID: ${iconCid}`);
+
+    for (const exec of assets.executables) {
+      const execAbs = path.resolve(assets.configDir, exec.path);
+      if (
+        assets.buildDirCid &&
+        path.resolve(assets.buildDirCid.absPath) === execAbs
+      ) {
+        console.log(
+          `  Executable [${exec.kind}] reused build-dir CID: ${assets.buildDirCid.cid}`,
+        );
+        executableCids[exec.kind] = assets.buildDirCid.cid;
+        continue;
+      }
+      console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
+      const { storageCid } = await storeDirectory(execAbs, storage, undefined, true);
+      console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
+      executableCids[exec.kind] = storageCid;
+    }
+    return { iconCid, executableCids };
+  } finally {
+    setPresenceFloor(null);
+    // Best-effort: a reconnect inside storeDirectory may already have
+    // destroyed and replaced this client (same guard every other destroy
+    // call site in deploy.ts uses).
+    try { storage.client.destroy(); } catch { /* already destroyed */ }
+  }
 }
 
 /**
@@ -153,32 +202,13 @@ export async function publishManifest(opts: PublishManifestOptions): Promise<Pub
   // logs "Product deployer: …", and resolving twice would print the line
   // twice under --product-name.
   const signerOpts = manifestSignerOptions(opts);
-  const reconnect = selectStorageReconnect(signerOpts);
-  const storage = await reconnect();
-  let iconCid!: string;
-  const executableCids: Record<string, string> = {};
-  try {
-    iconCid = await storeFile(iconBytes, { ...storage, hashCode: BLAKE2B_256_MULTIHASH_CODE });
-    console.log(`  Icon CID: ${iconCid}`);
-
-    for (const exec of config.executables) {
-      const execAbs = path.resolve(configDir, exec.path);
-      if (opts.buildDirCid && path.resolve(opts.buildDirCid.absPath) === execAbs) {
-        console.log(`  Executable [${exec.kind}] reused build-dir CID: ${opts.buildDirCid.cid}`);
-        executableCids[exec.kind] = opts.buildDirCid.cid;
-        continue;
-      }
-      console.log(`  Uploading executable [${exec.kind}] from ${execAbs}…`);
-      const { storageCid } = await storeDirectory(execAbs, storage, undefined, true);
-      console.log(`  Executable [${exec.kind}] CID: ${storageCid}`);
-      executableCids[exec.kind] = storageCid;
-    }
-  } finally {
-    // Best-effort: a reconnect inside storeDirectory may already have
-    // destroyed and replaced this client (same guard every other destroy
-    // call site in deploy.ts uses).
-    try { storage.client.destroy(); } catch { /* already destroyed */ }
-  }
+  const { iconCid, executableCids } = await manifestAssetUpload(selectStorageReconnect(signerOpts), {
+    iconBytes,
+    executables: config.executables,
+    configDir,
+    buildDirCid: opts.buildDirCid,
+    forceStore: opts.forceStore,
+  });
 
   const dotns = new DotNS();
   await dotns.connect(resolveDotnsConnectOptions(signerOpts, stack));

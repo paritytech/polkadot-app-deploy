@@ -169,6 +169,16 @@ async function crossValidateFirstHit(
   }
 }
 
+let _presenceFloor: number | null = null;
+
+export function setPresenceFloor(floor: number | null): void {
+  _presenceFloor = floor;
+}
+
+export function presenceFloorActive(): boolean {
+  return _presenceFloor !== null;
+}
+
 export async function probeChunks(cids: string[], options: ChainProbeOptions): Promise<ChunkProbeResult[]> {
   if (cids.length === 0) return [];
 
@@ -247,6 +257,10 @@ export async function probeChunks(cids: string[], options: ChainProbeOptions): P
 
       if (!_crossValidated) {
         await crossValidateFirstHit(client, cid, decoded.block, decoded.index, batchDigests[i], requestTimeoutMs);
+      }
+
+      if (_presenceFloor !== null && decoded.block < _presenceFloor) {
+        results[start + i] = { cid, present: false };
       }
     }
 
@@ -334,6 +348,7 @@ export async function getBestBlockNumber(client: any, requestTimeoutMs: number =
 
 /** Reset session-level caches. Used in tests only. */
 export function _resetProbeSession(): void {
+  _presenceFloor = null;
   _metadataChecked = false;
   _crossValidated = false;
   _sentryBatchCount = 0;

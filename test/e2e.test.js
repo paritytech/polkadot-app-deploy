@@ -13,7 +13,10 @@ import { installE2eResultHook } from "./helpers/e2e-result.js";
 import { resolveContenthashOnChain, resolveTextRecordOnChain } from "./helpers/e2e-verify.js";
 import { startFaultProxy } from "./helpers/ws-fault-proxy.mjs";
 import { S3_OWNED_LABEL, tieredFixtureLabel, smokeLabel, digitsToLetters } from "../tools/lib/e2e-fixtures.mjs";
-import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, deploy, poolAccountDerivationPath } from "@parity/polkadot-app-deploy";
+import { DEFAULT_MNEMONIC, sanitizeDomainLabel, DotNS, deploy, poolAccountDerivationPath, probeChunks } from "@parity/polkadot-app-deploy";
+import { storeBlocksCar } from "./helpers/e2e-store-blocks.js";
+import { createClient } from "polkadot-api";
+import { getWsProvider } from "polkadot-api/ws";
 import { probeSignerPopStatus } from "./helpers/probe-pop-status.js";
 import { resolveE2eEnv, resolveE2eEnvId } from "./helpers/e2e-env.js";
 import { encodeContenthash } from "@parity/polkadot-app-deploy/deploy";
@@ -2872,6 +2875,77 @@ describe("e2e", { skip: !ENABLED }, () => {
         }
       } finally {
         fs.rmSync(fixtureDir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe("S-STORE-BLOCKS: --store-blocks and --force-store against the live pallet", { skip: SCENARIO !== "s-store-blocks", concurrency: false }, () => {
+    const STORE_TIMEOUT_MS = 5 * 60 * 1000;
+    const PROBE_ATTEMPTS = 10;
+    const PROBE_WAIT_MS = 6_000;
+
+    test(`${SIGNER} signer: new blocks stored, found on the second run, stored again with --force-store`, { timeout: 3 * STORE_TIMEOUT_MS + 5 * 60_000 }, async () => {
+      const carDir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-store-blocks-"));
+      const carFile = path.join(carDir, "blocks.car");
+      const cids = await storeBlocksCar(carFile, `${RUN_TAG}-${Date.now()}`);
+      const signerArgs = SIGNER === "direct" ? directSignerArgs() : poolOwnerArgs();
+      const args = ["--store-blocks", carFile, "--tag", process.env.DEPLOY_TAG, "--env", E2E_ENV_ID, ...signerArgs];
+      const client = createClient(getWsProvider(await resolveE2eBulletinRpc()));
+
+      async function blockNumbers(step, condition, expectation) {
+        let seen = "";
+        for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+          const entries = await probeChunks(cids, { client, atFinalized: true });
+          const numbers = entries.map((entry) => (entry.present === true ? entry.block : null));
+          if (numbers.every((number) => number !== null) && condition(numbers)) return numbers;
+          seen = entries.map((entry) => `${entry.cid}: ${entry.present === true ? `block ${entry.block}` : entry.present === false ? "absent" : entry.failureReason}`).join("; ");
+          await new Promise((resolve) => setTimeout(resolve, PROBE_WAIT_MS));
+        }
+        failWith({
+          scenario: "S-STORE-BLOCKS",
+          message: `${step}: ${expectation}. Finalized TransactionByContentHash after ${PROBE_ATTEMPTS} reads: ${seen}`,
+          hint: "the CLI reported success for this step, so a difference here is a change in the pallet or in the presence probe, not a failed upload.",
+        });
+      }
+
+      try {
+        const first = await runBulletinDeploy({ args, timeoutMs: STORE_TIMEOUT_MS });
+        assertDeploySucceeded(first, { scenario: "S-STORE-BLOCKS", step: "first run" });
+        assertStdoutMatches(first.stdout, /^Stored blocks: 3, already on chain: 0$/m, {
+          scenario: "S-STORE-BLOCKS",
+          what: "the first run must store all three blocks",
+          hint: "the block content is new in every run, so a block that the chain already has means the CAR content repeated.",
+        });
+        const firstBlocks = await blockNumbers("first run", () => true, "every block must be on chain under its own CID");
+
+        const second = await runBulletinDeploy({ args, timeoutMs: STORE_TIMEOUT_MS });
+        assertDeploySucceeded(second, { scenario: "S-STORE-BLOCKS", step: "second run" });
+        assertStdoutMatches(second.stdout, /^Stored blocks: 0, already on chain: 3$/m, {
+          scenario: "S-STORE-BLOCKS",
+          what: "the second run must find every block on chain and store none",
+          hint: "a store here means the presence probe no longer finds an entry that the first run finalised.",
+        });
+        await blockNumbers("second run", (numbers) => numbers.every((number, index) => number === firstBlocks[index]),
+          `the entries must stay at blocks ${firstBlocks.join(", ")}, because the run stored nothing`);
+
+        const forced = await runBulletinDeploy({ args: [...args, "--force-store"], timeoutMs: STORE_TIMEOUT_MS });
+        assertDeploySucceeded(forced, { scenario: "S-STORE-BLOCKS", step: "--force-store run" });
+        assertStdoutMatches(forced.stdout, /^Stored blocks: 3, already on chain: 0$/m, {
+          scenario: "S-STORE-BLOCKS",
+          what: "the --force-store run must store all three blocks again",
+          hint: "a block counted as already on chain means an entry from before the run confirmed the store.",
+        });
+        const floor = 1 + Number(parseLineOrExplain(forced.stdout, {
+          pattern: /Force store: entries up to block (\d+) do not count as stored/,
+          scenario: "S-STORE-BLOCKS",
+          what: "the --force-store run must print the block up to which entries do not count as stored",
+          hint: "the floor is the value this scenario compares the chain entries with; a changed log line needs a changed pattern here.",
+        })[1]);
+        await blockNumbers("--force-store run", (numbers) => numbers.every((number) => number >= floor),
+          `every entry must point at block ${floor} or later, because the chain must move the entry of identical bytes to the new store`);
+      } finally {
+        client.destroy();
+        fs.rmSync(carDir, { recursive: true, force: true });
       }
     });
   });

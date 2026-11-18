@@ -10350,7 +10350,7 @@ process.stdout.write(JSON.stringify({ stackId: stack?.id, endpoints }));`;
     assert.strictEqual(selection.stackId, "preview", ">> FAIL: #1095: setBulletinStack must select the stack, or its network never applies to ensureAuthorized");
     assert.deepStrictEqual(selection.endpoints, readShippedStack("preview").chains.Bulletin.rpc, ">> FAIL: setBulletinStack must select the stack's Bulletin endpoints with the stack");
     const src = fs.readFileSync("src/deploy.ts", "utf8");
-    assert.match(src, /setBulletinStack\(stack, options\.rpc\);/,
+    assert.match(src, /setBulletinStack\(stack, options\.rpc, \{ exclusiveRpc: options\.storeBlocks !== undefined \}\);/,
       ">> FAIL: #1095: deploy() must call setBulletinStack(stack, options.rpc), or the stack's network never replaces the previous run's");
     assert.match(src, /return \{ network: bulletinSelection\.stack\?\.network \};/,
       ">> FAIL: #1095: bulletinAuthorizationOptions must read the network from the selected stack");
@@ -13199,6 +13199,12 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       "nightly-pr-coverage must wire scenario s-transfer-subname to signer pool, merkle js, poolIndex 11",
     );
 
+    assert.match(
+      job,
+      /scenario:\s*s-store-blocks,\s*signer:\s*pool,\s*merkle:\s*js,\s*poolIndex:\s*14\s*}/,
+      ">> FAIL: nightly-pr-coverage: matrix must wire scenario s-store-blocks to signer pool, merkle js, poolIndex 14: --store-blocks and --force-store depend on the pallet, so only a run against the chain shows a runtime change, and an own account keeps its nonces apart from the concurrent legs",
+    );
+
     // Each new leg's poolIndex must be unique within the whole matrix (#863
     // per-leg nonce isolation) — a collision would reintroduce Alice
     // Asset-Hub nonce contention between legs.
@@ -13208,6 +13214,12 @@ describe("workflow safety nets (PR #198 follow-up — runaway-job guard)", () =>
       uniqueIndices.size, poolIndices.length,
       `nightly-pr-coverage poolIndex values must all be unique, got [${poolIndices.join(", ")}]`,
     );
+    for (const index of poolIndices) {
+      assert.ok(
+        BALANCE_SIGNERS.some((s) => s.path === `//deploy/${index}`),
+        `>> FAIL: nightly-pr-coverage: tools/check-balances.mjs SIGNERS must include //deploy/${index}, the account a leg pins, or the daily funding check cannot see its Bulletin authorization`,
+      );
+    }
   });
 
   test(".github/workflows/e2e.yml: nightly-report depends on nightly-pr-coverage", () => {
@@ -27791,7 +27803,7 @@ describe("e2e-ensure-authorized: DRIFT GUARD — signer list derived from e2e.ym
       "//deploy/0", "//deploy/1", "//deploy/2", "//deploy/3", "//deploy/4", "//deploy/5",
       // No pinned //deploy/8: s-content-only moved to 13 (bulletin #1637).
       "//deploy/6", "//deploy/7", "//deploy/9", "//deploy/10", "//deploy/11",
-      "//deploy/12", "//deploy/13",
+      "//deploy/12", "//deploy/13", "//deploy/14",
     ];
     assert.deepStrictEqual(labels, expected,
       `>> FAIL: e2e-signer-drift-guard: the derived signer set no longer matches the pinned expectation (derived: ${JSON.stringify(labels)}). ` +

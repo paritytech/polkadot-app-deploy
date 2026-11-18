@@ -1189,7 +1189,8 @@ jobs:
           # actionable parent-ownership error (not the old misleading
           # "Invalid domain label"). No E2E coverage of this path existed
           # anywhere before this leg.
-          - { scenario: s-transfer-subname,       signer: pool,   merkle: js,   poolIndex: 11 }
+            - { scenario: s-transfer-subname,       signer: pool,   merkle: js,   poolIndex: 11 }
+            - { scenario: s-store-blocks,           signer: pool,   merkle: js,   poolIndex: 14 }
     steps:
       # BULLETIN_DEPLOY_REF is only ever github.sha (schedule / unpinned
       # dispatch) or empty (release / pinned dispatch — see build-nightly's

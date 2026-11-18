@@ -113,6 +113,8 @@ export function buildCliFlagsSummary(flags: Record<string, unknown>): string {
   if (flags.password) parts.push("--password <set>");
   if (flags.derivationPath) parts.push("--derivation-path <set>");
   if (typeof flags.rpc === "string" && flags.rpc) parts.push("--rpc <set>");
+  if (flags.storeBlocks) parts.push("--store-blocks <set>");
+  if (flags.forceStore) parts.push("--force-store");
   return parts.join(" ");
 }
 

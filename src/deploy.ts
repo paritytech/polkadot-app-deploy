@@ -9,6 +9,7 @@ import { statementSigningAccount } from "./sss-allowance.js";
 import { preflightSssAllowance } from "./sss-allowance-cache.js";
 import { sha256 } from "@noble/hashes/sha256";
 import { blake2b } from "@noble/hashes/blake2b";
+import { keccak_256 } from "@noble/hashes/sha3";
 import type { PolkadotClient } from "polkadot-api";
 import { WsEvent } from "polkadot-api/ws";
 import { CID } from "multiformats/cid";
@@ -20,8 +21,9 @@ import { UnixFS } from "ipfs-unixfs";
 import { merkleizeJS, merkleizeWithStableOrder, rebuildOrderedCarFromBytes } from "./merkle.js";
 import { extractManifestFromCar, fetchPreviousManifest, writePersistentLocalManifest } from "./manifest-fetch.js";
 import { writeEmbeddedManifestPlaceholder, finaliseEmbeddedManifest } from "./manifest-embed.js";
-import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, CONTENT_HASH_RE, type ManifestFileEntry, type ManifestChunkEntry } from "./manifest.js";
-import { probeChunks, probeFinalityGap, getBestBlockNumber, type ChunkProbeResult } from "./chunk-probe.js";
+import { MANIFEST_VERSION, MANIFEST_DIR, MANIFEST_PATH, classifyFile, parseManifest, CONTENT_HASH_RE, type ManifestFileEntry, type ManifestChunkEntry, type EmbeddedManifest } from "./manifest.js";
+import { probeChunks, probeFinalityGap, getBestBlockNumber, setPresenceFloor, presenceFloorActive, type ChunkProbeResult } from "./chunk-probe.js";
+import { blockSizeViolation, carInspection, storeCarBlocks, type CarInspection, type ChunkFormat, type StoreBlocksOutcome } from "./store-blocks.js";
 import { computeStats, telemetryAttributes, renderSummary } from "./incremental-stats.js";
 import { assertTxCreator, DotNS, fetchNonce, TX_TIMEOUT_MS, validateDomainLabel, popStatusName, parseDomainName, classifyRegistrability, formatUnregistrableReason, DEFAULT_TLD, computeDomainNode, topUpTargetFor, AUTO_MAP_RENT_HEADROOM } from "./dotns.js";
 import type { ParsedDomainName, DotnsPreflightResult, PhoneSignatureStep, DotNSConnectOptions, DotnsSuccessAction } from "./dotns.js";
@@ -73,6 +75,7 @@ export interface DeployResult {
   storageSigner?: SignerTxCreator;
   /** SS58 address of that slot account. Set whenever `storageSigner` is. */
   storageSignerAddress?: string;
+  storedBlocks?: StoreBlocksOutcome;
 }
 
 export type DeployContent = string | Uint8Array | Uint8Array[];
@@ -118,6 +121,7 @@ interface ExistingProvider { client?: any; unsafeApi?: any; signer?: SignerTxCre
    * Callers that drop liveProvider leave it unset, and the client is closed here.
    */
   handOffLiveClient?: boolean;
+  chunkFormats?: ChunkFormat[];
 }
 interface ChainReceipt { txHash: string; blockHash: string; blockNumber: number; }
 // viaFallback: not confirmed by a watch event (a best-block CID probe, or provisional pending the
@@ -151,9 +155,25 @@ let POOL_SIZE = DEFAULT_POOL_SIZE;
  * compute the exact same endpoint `deploy()` would for a given env/--rpc,
  * instead of inventing a second resolution mechanism.
  */
-export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: string): string[] {
+export function resolveBulletinEndpoints(envBulletin: string[], rpcOverride?: string, exclusive = false): string[] {
   const userRpc = rpcOverride ?? process.env.BULLETIN_RPC;
-  return userRpc ? [userRpc, ...envBulletin.filter(e => e !== userRpc)] : envBulletin;
+  if (!userRpc) return envBulletin;
+  return exclusive ? [userRpc] : [userRpc, ...envBulletin.filter(e => e !== userRpc)];
+}
+
+export function deployFlagConflict(
+  flags: { config?: string; storeBlocks?: string; forceStore?: boolean; inputCar?: string; password?: string; dumpCar?: boolean | string },
+  ipfsCid?: string,
+): string | null {
+  if (flags.forceStore && ipfsCid) return "--force-store stores content again, so IPFS_CID does not apply";
+  if (flags.storeBlocks === undefined) return null;
+  if (!flags.storeBlocks) return "--store-blocks needs a path";
+  if (flags.inputCar) return "--store-blocks stores blocks as they are, so --input-car does not apply";
+  if (flags.password) return "--store-blocks stores blocks unchanged, so --password does not apply";
+  if (flags.dumpCar) return "--store-blocks builds no CAR, so --dump-car does not apply";
+  if (flags.config) return "--store-blocks publishes no manifest, so --config does not apply";
+  if (ipfsCid) return "--store-blocks stores the blocks of its CAR file, so IPFS_CID does not apply";
+  return null;
 }
 
 /** Test-only: select `endpoints` with no stack, so no genesis check. */
@@ -167,10 +187,10 @@ export function setBulletinEndpoints(endpoints: string[]): void {
  * stack, and take its network. `deploy()` calls it per run; `manifest/publish.ts` calls it
  * because it can run without a preceding `deploy()`.
  */
-export function setBulletinStack(stack: Stack, rpcOverride?: string): void {
+export function setBulletinStack(stack: Stack, rpcOverride?: string, { exclusiveRpc = false }: { exclusiveRpc?: boolean } = {}): void {
   bulletinSelection = {
     stack,
-    endpoints: resolveBulletinEndpoints(stack.chains.Bulletin.rpc, rpcOverride),
+    endpoints: resolveBulletinEndpoints(stack.chains.Bulletin.rpc, rpcOverride, exclusiveRpc),
   };
 }
 
@@ -474,6 +494,7 @@ export function createCID(data: Uint8Array, codec: number = CID_CONFIG.codec, ha
   let hash: Uint8Array;
   if (hashCode === 0xb220) hash = blake2b(data, { dkLen: CID_CONFIG.hashLength });
   else if (hashCode === 0x12) hash = sha256(data);
+  else if (hashCode === 0x1b) hash = keccak_256(data);
   else throw new Error(`Unsupported hash code: 0x${hashCode.toString(16)}`);
   return CID.createV1(codec, createMultihash(hashCode, hash));
 }
@@ -1256,9 +1277,10 @@ async function waitForChainLiveness(client: any, lastHeight: number | null, time
 export const __waitForChainLivenessForTest = waitForChainLiveness;
 
 // `opts.client` is a getter: the caller's client is reassigned on reconnect and destroyed on a WS halt.
-async function storeChunk(unsafeApi: any, signer: SignerTxCreator, chunkBytes: Uint8Array, nonce: number, opts: { client?: () => any } = {}): Promise<StoredChunk> {
-  const cid = createCID(chunkBytes, CID_CONFIG.codec, CID_CONFIG.hashCode);
-  const tx = unsafeApi.tx.TransactionStorage.store_with_cid_config({ cid: { codec: BigInt(CID_CONFIG.codec), hashing: toHashingEnum(CID_CONFIG.hashCode) }, data: chunkBytes });
+async function storeChunk(unsafeApi: any, signer: SignerTxCreator, chunkBytes: Uint8Array, nonce: number, opts: { client?: () => any; format?: ChunkFormat } = {}): Promise<StoredChunk> {
+  const format = opts.format ?? CID_CONFIG;
+  const cid = createCID(chunkBytes, format.codec, format.hashCode);
+  const tx = unsafeApi.tx.TransactionStorage.store_with_cid_config({ cid: { codec: BigInt(format.codec), hashing: toHashingEnum(format.hashCode) }, data: chunkBytes });
   const txOpts = { mortality: { mortal: true, period: CHUNK_MORTALITY_PERIOD }, nonce };
   const { value, viaFallback, receipt } = await watchTransaction(tx, signer, txOpts, () => {
     console.log(`      CID: ${cid.toString()}`);
@@ -1340,9 +1362,14 @@ function assignDenseNonces(stored: (StoredChunk | null)[], startNonce: number): 
 
 export const __assignDenseNoncesForTest = assignDenseNonces;
 
-export async function storeChunkedContent(chunks: Uint8Array[], { client: existingClient, unsafeApi: existingApi, signer: existingSigner, ss58: existingSS58, reconnect, fetchNonce: fetchNonceOverride, skipCids, probeFailedCids, gateway: providerGateway, trustedCids, skipRootStore, handOffLiveClient }: ExistingProvider = {}): Promise<{ storageCid: string; tier2Verified: number; tier2Inconclusive: number; tier2Fallback: number; liveProvider: ExistingProvider; skipProbeResults: Map<string, true | false | null>; rootSkipped: boolean }> {
+export async function storeChunkedContent(chunks: Uint8Array[], { client: existingClient, unsafeApi: existingApi, signer: existingSigner, ss58: existingSS58, reconnect, fetchNonce: fetchNonceOverride, skipCids, probeFailedCids, gateway: providerGateway, trustedCids, skipRootStore, handOffLiveClient, chunkFormats }: ExistingProvider = {}): Promise<{ storageCid: string; tier2Verified: number; tier2Inconclusive: number; tier2Fallback: number; liveProvider: ExistingProvider; skipProbeResults: Map<string, true | false | null>; rootSkipped: boolean }> {
   assertTxCreator(existingSigner, "ExistingProvider.signer");
   const _fetchNonce = fetchNonceOverride ?? fetchNonce;
+  if (chunkFormats && chunkFormats.length !== chunks.length) {
+    throw new Error(`chunkFormats lists ${chunkFormats.length} formats for ${chunks.length} chunks`);
+  }
+  const formatAt = (index: number): ChunkFormat => chunkFormats?.[index] ?? CID_CONFIG;
+  const cidAt = (index: number): CID => createCID(chunks[index], formatAt(index).codec, formatAt(index).hashCode);
   console.log(`\n   Data chunks: ${chunks.length}`);
   const totalBytes = chunks.reduce((s: number, c: Uint8Array) => s + c.length, 0);
   console.log(`   Total: ${(totalBytes / 1024).toFixed(2)} KB`);
@@ -1503,7 +1530,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
   // reconnect and pool rotation.
   const readChunkNonce = boundedNonceReader({ client: () => client, unsafeApi: () => unsafeApi, ss58: () => ss58 as string, fetchNonceFn: _fetchNonce });
   // storeChunk's best-block probe must follow `client` across reconnects.
-  const chunkOpts = { client: () => client };
+  const chunkOptsAt = (index: number) => ({ client: () => client, format: formatAt(index) });
 
   try {
 
@@ -1538,7 +1565,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     // way out of this set, and the only way storeChunkedContent can return.
     const nonceAdvanceIndices = new Set<number>();
     const markProvisional = (idx: number): void => {
-      stored[idx] = { cid: createCID(chunks[idx], CID_CONFIG.codec, 0x12), len: chunks[idx].length, viaFallback: true };
+      stored[idx] = { cid: cidAt(idx), len: chunks[idx].length, viaFallback: true };
       nonceAdvanceIndices.add(idx);
     };
     // Best-block probe that never lets present:null pass (#1657). A null after
@@ -1580,7 +1607,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     const trustedIndices: number[] = [];
     const skipCidsCandidates: { index: number; cid: ReturnType<typeof createCID> }[] = [];
     for (let i = 0; i < chunks.length; i++) {
-      const cid = createCID(chunks[i], CID_CONFIG.codec, 0x12);
+      const cid = cidAt(i);
       chunkCidsComputed[i] = cid;
       const cidStr = cid.toString();
       // trustedCids: skip without re-probing. Caller vouches these CIDs were
@@ -1706,7 +1733,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         const isRetry = uploadEmittedIndices.has(i);
         if (!isRetry) { uploadEmittedIndices.add(i); uploadEmitted++; }
         console.log(`   [${uploadEmitted}/${uploadTotal}] chunk ${i + 1} — ${(chunkData.length / 1024 / 1024).toFixed(2)} MB (nonce: ${nonce})${isRetry ? " (retry)" : ""}`);
-        return storeChunk(unsafeApi, signer as SignerTxCreator, chunkData, nonce, chunkOpts);
+        return storeChunk(unsafeApi, signer as SignerTxCreator, chunkData, nonce, chunkOptsAt(i));
       });
 
       const results = await Promise.allSettled(batchPromises);
@@ -1767,7 +1794,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
         // already on chain. Stop burning retries on a tx the chain will keep
         // rejecting, but "probably" is not evidence: it goes provisional and the
         // post-batch verify loop must find it at best (or re-upload it).
-        const failCid = createCID(fail.chunkData, CID_CONFIG.codec, 0x12);
+        const failCid = cidAt(fail.index);
         if (
           probeFailedCids &&
           probeFailedCids.has(failCid.toString()) &&
@@ -1850,7 +1877,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
               console.log(`   Chunk ${fail.index + 1}: chain still frozen at block ${heightBefore} after ${(CHUNK_LIVENESS_MAX_WAIT_MS / 1000).toFixed(0)}s wait — resubmitting anyway`);
             }
             const retryNonce = originalNonce ?? currentNonce;
-            const result = await storeChunk(unsafeApi, signer as SignerTxCreator, fail.chunkData, retryNonce, chunkOpts);
+            const result = await storeChunk(unsafeApi, signer as SignerTxCreator, fail.chunkData, retryNonce, chunkOptsAt(fail.index));
             stored[fail.index] = result;
             if (result.viaFallback) nonceAdvanceIndices.add(fail.index);
             assignedNonces.delete(fail.index);
@@ -1942,7 +1969,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
             let freshNonce: number | undefined;
             try {
               freshNonce = await readChunkNonce();
-              const result = await storeChunk(unsafeApi, signer as SignerTxCreator, chunks[idx], freshNonce, chunkOpts);
+              const result = await storeChunk(unsafeApi, signer as SignerTxCreator, chunks[idx], freshNonce, chunkOptsAt(idx));
               // A watch event in a best block is evidence; a probe-confirmed
               // result is re-verified next round.
               stored[idx] = result;
@@ -1988,7 +2015,7 @@ export async function storeChunkedContent(chunks: Uint8Array[], { client: existi
     }
     const verifiedStored = stored as StoredChunk[];
     for (let i = 0; i < chunks.length; i++) {
-      const expectedCid = createCID(chunks[i], CID_CONFIG.codec, 0x12);
+      const expectedCid = cidAt(i);
       if (verifiedStored[i].cid.toString() !== expectedCid.toString()) {
         throw new Error(`Chunk verification failed: chunk ${i + 1} CID mismatch (expected ${expectedCid}, got ${verifiedStored[i].cid})`);
       }
@@ -2714,7 +2741,7 @@ export async function storeDirectoryV2(
   // can never both print. If you change how trustedCidsA is populated, or add
   // a new manifestSource variant, re-check that this stays true.
   const trustedCidsA = new Set<string>();
-  if (prevManifest?.chunks) {
+  if (prevManifest?.chunks && !presenceFloorActive()) {
     for (const cid of Object.keys(prevManifest.chunks)) {
       trustedCidsA.add(cid);
     }
@@ -3334,6 +3361,8 @@ export interface DeployOptions {
    * CLI: --dump-car[=<path>]
    */
   dumpCar?: string | boolean;
+  storeBlocks?: string;
+  forceStore?: boolean;
   /**
    * Plan of phone signatures this deploy will need. Fired once, at preflight,
    * BEFORE storage. Notification only; used by the CLI bin to print the
@@ -3654,6 +3683,51 @@ export async function probeP2pRetrieval(
   return { retrievable, errorVariant, durationMs };
 }
 
+export async function startPresenceFloor(client: any): Promise<void> {
+  const bestBlock = await getBestBlockNumber(client);
+  if (bestBlock === null) throw new Error("--force-store: the best block number could not be read");
+  setPresenceFloor(bestBlock + 1);
+  setDeployAttribute("deploy.force_store.floor_block", bestBlock + 1);
+  console.log(`   Force store: entries up to block ${bestBlock} do not count as stored, so they are stored again`);
+}
+
+const carBlockCid = (bytes: Uint8Array, format: ChunkFormat): string => createCID(bytes, format.codec, format.hashCode).toString();
+
+async function carFileInspection(carFile: string): Promise<CarInspection> {
+  const car = fs.createReadStream(carFile);
+  try {
+    return await carInspection(car, carBlockCid);
+  } finally {
+    car.destroy();
+  }
+}
+
+async function storeBlocksFromCar(carFile: string, provider: ExistingProvider): Promise<StoreBlocksOutcome> {
+  let current = provider;
+  const car = fs.createReadStream(carFile);
+  try {
+    const outcome = await storeCarBlocks(car, {
+      cidOf: carBlockCid,
+      store: async (blocks) => {
+        const upload = await storeChunkedContent(blocks.map((block) => block.bytes), {
+          ...current,
+          chunkFormats: blocks.map((block) => block.format),
+          skipCids: new Set(blocks.map((block) => block.cid)),
+          skipRootStore: true,
+          handOffLiveClient: true,
+        });
+        current = { ...upload.liveProvider, reconnect: provider.reconnect };
+        return new Set([...upload.skipProbeResults].filter(([, present]) => present === true).map(([cid]) => cid));
+      },
+    });
+    setDeployAttribute("deploy.store_blocks.stored", outcome.stored.length);
+    setDeployAttribute("deploy.store_blocks.already_stored", outcome.alreadyStored.length);
+    return outcome;
+  } finally {
+    car.destroy();
+  }
+}
+
 export async function deploy(content: DeployContent, domainName: string | null = null, options: DeployOptions = {}): Promise<DeployResult> {
   // A mnemonic and an external signer are two ways to name the same thing — the
   // single account that signs both Bulletin storage and DotNS. Passing both is
@@ -3664,6 +3738,8 @@ export async function deploy(content: DeployContent, domainName: string | null =
   }
   assertTxCreator(options.signer, "DeployOptions.signer");
   assertTxCreator(options.storageSigner, "DeployOptions.storageSigner");
+  const flagConflict = deployFlagConflict(options, process.env.IPFS_CID);
+  if (flagConflict) throw new NonRetryableError(flagConflict);
   // Product-name deploys resolve to an injected signer up front: the product
   // account derived from the mnemonic per RFC-0022 signs storage and DotNS
   // alike, so the deployed name is owned by the very account a host hands the
@@ -3677,7 +3753,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
   const envNetwork = stack.network;
   // connect() fails when a registry with tldNode() disagrees with this TLD.
   const envTld = stack.tld;
-  setBulletinStack(stack, options.rpc);
+    setBulletinStack(stack, options.rpc, { exclusiveRpc: options.storeBlocks !== undefined });
   _deployRpcFailedOver = false;
   POOL_SIZE = options.poolSize ?? parseInt(process.env.BULLETIN_POOL_SIZE ?? String(DEFAULT_POOL_SIZE), 10);
 
@@ -3865,7 +3941,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
 
   initTelemetry();
   const randomSuffix = Math.floor(Math.random() * 100).toString().padStart(2, "0");
-  const name = parsed ? parsed.label : `test-domain-${Date.now().toString(36)}${randomSuffix}`;
+  const name = parsed ? parsed.label : `${options.storeBlocks ? "store-blocks" : "test-domain"}-${Date.now().toString(36)}${randomSuffix}`;
 
   const phoneSignerActive = isPhoneSignerActive(options);
 
@@ -3903,6 +3979,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
     console.log(`   Environment: ${stack.name} (stack ${stack.id}, ${describeStackOrigin(stack)})`);
     if (deployTag) console.log(`   Tag: ${deployTag}`);
     if (options.inputCar) console.log(`   Input CAR: ${path.resolve(options.inputCar)}`);
+    else if (options.storeBlocks) console.log(`   CAR file: ${path.resolve(options.storeBlocks)}`);
     else if (typeof content === "string") console.log(`   Build dir: ${path.resolve(content)}`);
     if (process.env.CI) console.log(`   Runner: ${resolveRunner()} (${resolveRunnerType()})`);
     if (options.password) console.log(`   Encrypted: yes`);
@@ -3926,6 +4003,24 @@ export async function deploy(content: DeployContent, domainName: string | null =
     // bytes to the IPFS CID string.
     let previousContenthashCid: string | null = null;
     try {
+      if (options.storeBlocks) {
+        const carFile = options.storeBlocks;
+        console.log("\n   Mode: store CAR blocks under their own CIDs (no DotNS name, no manifest)");
+        setDeployAttribute("deploy.content_type", "storeBlocks");
+        setDeployAttribute("deploy.encrypted", "false");
+        const inspection = await carFileInspection(carFile);
+        console.log(`   CAR check: ${inspection.blocks} blocks, ${(inspection.bytes / 1024).toFixed(2)} KB, largest block ${inspection.largestBlock.bytes} bytes`);
+        provider = await reconnect();
+        const sizeViolation = blockSizeViolation(inspection, await provider.unsafeApi.constants.TransactionStorage.MaxTransactionSize());
+        if (sizeViolation) throw sizeViolation;
+        const storageProvider: ExistingProvider = { ...provider, reconnect };
+        if (options.forceStore) await startPresenceFloor(provider.client);
+        const storedBlocks = await withSpan("deploy.storage", "1. storage", {}, () => storeBlocksFromCar(carFile, storageProvider));
+        console.log("\n" + "=".repeat(60));
+        console.log("BLOCKS STORED");
+        console.log("=".repeat(60));
+        return { domainName: "", fullDomain: "", cid: "", browserUrl: "", storedBlocks, storageSigner: options.storageSigner, storageSignerAddress: options.storageSignerAddress };
+      }
       // Check domain ownership before uploading anything
       console.log("\n" + "=".repeat(60));
       console.log("Preflight");
@@ -4046,6 +4141,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       // and go through getSignerProvider — ensureAuthorized throws when the account is not authorized.
       provider = await reconnect();
       const providerWithReconnect: ExistingProvider = { ...provider, reconnect };
+      if (options.forceStore) await startPresenceFloor(provider.client);
 
       const isTestnet = await detectTestnet(provider.unsafeApi, envNetwork);
       setDeployAttribute("deploy.is_testnet", isTestnet ? "true" : "false");
@@ -4390,6 +4486,7 @@ export async function deploy(content: DeployContent, domainName: string | null =
       // Flush the module-level failover flag in case onStatusChanged fired after
       // the deploy span attribute was already written. Idempotent if already set.
       if (_deployRpcFailedOver) setDeployAttribute("deploy.rpc.failed_over", "true");
+        setPresenceFloor(null);
       provider?.client.destroy();
       for (const c of openedClients) if (c !== provider?.client) try { c.destroy(); } catch { /* already closed */ }
     }
